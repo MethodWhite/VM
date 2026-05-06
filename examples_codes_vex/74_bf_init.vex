@@ -1,0 +1,17 @@
+// Bit fields dentro de init list de struct.
+
+struct Flags {
+    u32 a : 3;
+    u32 b : 5;
+    u32 c : 8;
+    u32 rest : 16;
+}
+
+i32 main() {
+    Flags f = {.a = 5, .b = 7, .c = 42, .rest = 12345};
+    if (f.a != 5)        return 1;
+    if (f.b != 7)        return 2;
+    if (f.c != 42)       return 3;
+    if (f.rest != 12345) return 4;
+    return 42;
+}

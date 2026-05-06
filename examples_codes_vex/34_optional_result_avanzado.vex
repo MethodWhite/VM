@@ -1,0 +1,58 @@
+// Optional/Result avanzado:
+//   1. Funcion devuelve Result<V, E> (heap alloc, sobrevive return).
+//   2. Optional<T> con asignacion implicita: `Optional<i32> x = 50;`
+//      se traduce automaticamente a `Some(50)`.  `= null;` -> `None()`.
+//   3. Errores de tipos primitivos en Result (i32 como E).
+//
+// Funcion divide(a, b) devuelve:
+//   - Err(1)  si b == 0 (division por cero)
+//   - Err(2)  si a < 0  (rechazo de negativos)
+//   - Ok(a/b) en caso normal
+//
+// El llamador maneja TODOS los casos.  Si simplemente ignorase el
+// Result en una expression-statement, el type checker rechazaria
+// (ver test 38 negativo).
+
+Result<i32, i32> divide(i32 a, i32 b) {
+    if (b == 0) {
+        return Err(1);          // error: divisor cero
+    }
+    if (a < 0) {
+        return Err(2);          // error: dividendo negativo
+    }
+    return Ok(a / b);
+}
+
+i32 to_default(Result<i32, i32> r, i32 def) {
+    if (isOk(r) == 1) {
+        return value(r);
+    }
+    return def + error(r) * 1000;   // codifica el error en el default
+}
+
+i32 main() {
+    // Implicit Some: el compilador envuelve 100 en Some(100).
+    Optional<i32> opt = 100;
+    Optional<i32> emp = null;       // implicit None()
+
+    i32 acc = 0;
+
+    // Usar Optional con sintaxis natural.
+    if (isPresent(opt) == 1) {
+        acc = acc + unwrap(opt);    // 100
+    }
+    if (isPresent(emp) == 0) {
+        acc = acc + 50;             // 50
+    }
+
+    // Funcion devuelve Result; manejamos ambos casos.
+    Result<i32, i32> r1 = divide(20, 5);    // Ok(4)
+    Result<i32, i32> r2 = divide(10, 0);    // Err(1)
+    Result<i32, i32> r3 = divide(-1, 1);    // Err(2)
+
+    acc = acc + to_default(r1, 0);    // +4
+    acc = acc + to_default(r2, 0);    // +1000 (Err(1) * 1000)
+    acc = acc + to_default(r3, 0);    // +2000 (Err(2) * 1000)
+
+    return acc;     // 100 + 50 + 4 + 1000 + 2000 = 3154
+}

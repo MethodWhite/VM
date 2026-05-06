@@ -1,0 +1,32 @@
+// =============================================================================
+// test_render_only.vex - prueba no-interactiva del editor modular
+// =============================================================================
+//
+// Construye un Editor modular, simula unas teclas con la API publica y
+// renderiza un frame.  No entra al loop de input bloqueante.
+
+#include "modules/keys.vh"
+#include "modules/input_backend.vh"
+#include "modules/screen.vh"
+#include "modules/file_io.vh"
+#include "modules/buffer.vh"
+#include "modules/extension_api.vh"
+#include "modules/syntax_vex.vh"
+#include "modules/editor_core.vh"
+
+i32 main() {
+    Editor ed = new Editor();
+    // Insertar "hola" via API publica del Buffer modular.
+    ed.buffer.insert_char(104);   // 'h'
+    ed.buffer.insert_char(111);   // 'o'
+    ed.buffer.insert_char(108);   // 'l'
+    ed.buffer.insert_char(97);    // 'a'
+
+    ed.screen.clear();
+    ed.render();
+    ed.screen.move_cursor(ed.screen.rows + 1, 1);
+    ed.screen.show_cursor();
+    print("\n[test_render_only OK]\n");
+    flush();
+    return 42;
+}

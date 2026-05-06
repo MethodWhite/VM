@@ -1,0 +1,135 @@
+{
+    "name": "vesta-shell",
+    "displayName": "VestaShellScript",
+    "description": "Language support for VestaShellScript (.vsh): syntax highlighting, snippets, REPL integration and FFI/ANSI builtins",
+    "version": "0.1.0",
+    "publisher": "desmonhak",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/desmonHak/VestaVM"
+    },
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "Programming Languages",
+        "Snippets"
+    ],
+    "keywords": [
+        "vesta", "vsh", "vestavm", "vestaShell", "scripting"
+    ],
+    "activationEvents": [
+        "onLanguage:vsh"
+    ],
+    "main": "./out/extension.js",
+    "contributes": {
+        "languages": [
+            {
+                "id": "vsh",
+                "aliases": ["VestaShellScript", "vsh"],
+                "extensions": [".vsh"],
+                "configuration": "./language-configuration.json"
+            }
+        ],
+        "grammars": [
+            {
+                "language": "vsh",
+                "scopeName": "source.vsh",
+                "path": "./syntaxes/vsh.tmLanguage.json"
+            }
+        ],
+        "snippets": [
+            {
+                "language": "vsh",
+                "path": "./snippets/vsh.json"
+            }
+        ],
+        "commands": [
+            {
+                "command": "vsh.runScript",
+                "title": "Ejecutar script VestaShell",
+                "category": "VestaShell",
+                "icon": "$(play)"
+            },
+            {
+                "command": "vsh.openRepl",
+                "title": "Abrir VestaShell REPL (--interprete)",
+                "category": "VestaShell",
+                "icon": "$(terminal)"
+            },
+            {
+                "command": "vsh.openVestaRepl",
+                "title": "Abrir VestaVM REPL",
+                "category": "VestaShell",
+                "icon": "$(server-process)"
+            }
+        ],
+        "menus": {
+            "editor/title": [
+                {
+                    "when": "resourceLangId == vsh",
+                    "command": "vsh.runScript",
+                    "group": "navigation"
+                }
+            ],
+            "editor/context": [
+                {
+                    "when": "resourceLangId == vsh",
+                    "command": "vsh.runScript",
+                    "group": "vsh@1"
+                },
+                {
+                    "when": "resourceLangId == vsh",
+                    "command": "vsh.openRepl",
+                    "group": "vsh@2"
+                }
+            ],
+            "commandPalette": [
+                {
+                    "command": "vsh.runScript",
+                    "when": "resourceLangId == vsh"
+                },
+                {
+                    "command": "vsh.openRepl"
+                },
+                {
+                    "command": "vsh.openVestaRepl"
+                }
+            ]
+        },
+        "configuration": {
+            "title": "VestaShellScript",
+            "properties": {
+                "vsh.vmPath": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Ruta al ejecutable vm de VestaVM. Si esta vacio se busca en build/vm(.exe) dentro del workspace."
+                },
+                "vsh.reuseTerminal": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Reutilizar el mismo terminal al ejecutar scripts consecutivos."
+                }
+            }
+        }
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./",
+        "pretest": "npm run compile && npm run lint",
+        "lint": "eslint src",
+        "test": "vscode-test",
+        "package": "vsce package"
+    },
+    "devDependencies": {
+        "@types/vscode": "^1.85.0",
+        "@types/mocha": "^10.0.10",
+        "@types/node": "22.x",
+        "typescript-eslint": "^8.56.1",
+        "eslint": "^9.39.3",
+        "typescript": "^5.9.3",
+        "@vscode/test-cli": "^0.0.12",
+        "@vscode/test-electron": "^2.5.2"
+    }
+}

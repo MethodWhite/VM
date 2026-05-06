@@ -1,0 +1,20 @@
+// Metodos OO sobre string.
+
+i32 main() {
+    string s = "hola mundo";
+    if (s.length() != 10) return 1;
+    if (s.bytes() != 10)  return 2;
+
+    string c = s.concat(" otra vez");
+    print("concat="); print_cstr(c.cstr()); print("\n");
+    print("len="); print_int(c.length()); print("\n");
+    if (c.length() != 19) return 3;
+
+    string a = "abc";
+    string b = "abc";
+    if (!a.equals(b)) return 4;
+
+    print_cstr(s.cstr()); print("\n");
+    flush();
+    return 42;
+}

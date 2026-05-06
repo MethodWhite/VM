@@ -213,7 +213,7 @@ namespace vm {
         return std::stoull(s, nullptr, 10);
     }
 
-    enum class OpArity { ZERO, ONE, TWO, THREE };
+    enum class OpArity { ZERO, ONE, TWO, THREE, FOUR };
 
     /**
      * @struct InstructionPattern

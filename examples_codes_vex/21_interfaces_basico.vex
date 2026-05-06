@@ -1,0 +1,51 @@
+// Interfaces basico.
+//
+// Sintaxis:
+//   interface IServicio {
+//       i32 metodo();          // metodo abstracto, sin body
+//   }
+//
+//   class Servicio : IServicio {
+//       public Servicio() { }
+//       public i32 metodo() { return 42; }   // implementa el contrato
+//   }
+//
+// Verifica:
+//   - El parser reconoce la declaracion de interfaz.
+//   - El type checker valida que Servicio implementa IServicio (mismo
+//     nombre + aridad + tipos).
+//   - El lowering registra IServicio como ClassInfo* sin instancias
+//     (no genera __new_IServicio).
+//   - La reflexion encuentra ambas: forName("IServicio") != 0 y
+//     forName("Servicio") != 0.
+//   - La instancia de Servicio dispatch correctamente metodo() = 42.
+//
+// El test devuelve 1 si TODAS las comprobaciones pasan.
+
+interface IServicio {
+    i32 metodo();
+}
+
+class Servicio : IServicio {
+    public Servicio() { }
+    public i32 metodo() { return 42; }
+}
+
+i32 main() {
+    // 1 Reflexion sobre la interfaz.
+    i64 i_cls = forName("IServicio");
+    if (i_cls == 0) return 0;        // interfaz no registrada
+
+    // 2 Reflexion sobre la implementacion.
+    i64 s_cls = forName("Servicio");
+    if (s_cls == 0) return 0;        // clase no registrada
+
+    // 3 Las dos deben ser ClassInfo* distintos.
+    if (i_cls == s_cls) return 0;
+
+    // 4 Dispatch normal sobre la implementacion.
+    Servicio s = new Servicio();
+    if (s.metodo() != 42) return 0;
+
+    return 1;
+}

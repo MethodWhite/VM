@@ -1,0 +1,54 @@
+// examples_codes_vex/92_collections_primitive.vex
+//
+// Tipos primitivos de coleccion + auto-free.
+//
+// Sintaxis natural sin necesidad de declarar wrappers ni `extern`.
+// Cero overhead vs llamar el plugin directo (sin vtable, CALLN puro).
+// Liberacion AUTOMATICA al exit del scope: NO hay free() manual.
+//
+// Esperado: R00 == 42.
+
+i32 main() {
+    i32 acc = 0;
+
+    // ===== ArrayList =====
+    ArrayList xs = arraylist(16);
+    xs.push(10);
+    xs.push(20);
+    xs.push(30);
+    if (xs.size() == 3)  { acc = acc + 10; }
+    if (xs.get(1) == 20) { acc = acc + 3; }
+    if (xs.pop() == 30)  { acc = acc + 2; }
+
+    // ===== HashMap =====
+    HashMap m = hashmap(16);
+    m.put(100, 999);
+    m.put(200, 888);
+    if (m.get(100) == 999) { acc = acc + 5; }
+    if (m.get(200) == 888) { acc = acc + 5; }
+    if (m.contains(100) == 1) { acc = acc + 2; }
+    if (m.contains(300) == 0) { acc = acc + 2; }
+    if (m.size() == 2) { acc = acc + 2; }
+
+    // ===== HashSet =====
+    HashSet s = hashset(16);
+    s.add(7);
+    s.add(8);
+    s.add(7);  // dedup
+    if (s.size() == 2)         { acc = acc + 2; }
+    if (s.contains(7) == 1)    { acc = acc + 2; }
+    if (s.contains(99) == 0)   { acc = acc + 2; }
+
+    // ===== Queue (FIFO) =====
+    Queue q = queue(16);
+    q.push(1);
+    q.push(2);
+    q.push(3);
+    if (q.pop() == 1) { acc = acc + 3; }
+    if (q.pop() == 2) { acc = acc + 2; }
+
+    // NO hay xs.free(), m.free(), s.free(), q.free():
+    // el cleanup_stack_ del lowering emite los CALLN free
+    // automaticamente al exit del scope.
+    return acc;  // 10+3+2 + 5+5+2+2+2 + 2+2+2 + 3+2 = 42
+}

@@ -1,0 +1,62 @@
+// examples_codes_vex/87_collections_hashmap.vex
+//
+// HashMap nativo reescrito (swisstable + wyhash64 + SSE2).
+//
+// Ejercita put / get / contains / remove / size sobre el nuevo HashMap
+// del plugin vesta_collections.dll para validar que el rewrite funciona
+// equivalente al anterior (FNV+linear+tombstones) pero ~2-4x mas rapido
+// en cargas densas (87.5% load vs 75% + lookup vectorial).
+//
+// Usa el FFI declarativo -- declaramos un extern por cada funcion
+// del plugin que necesitamos.  El ensamblador resuelve los simbolos via
+// LoadLibraryA(stdlib/native/collections/vesta_collections.dll) +
+// GetProcAddress, y los call-sites son CALLN identicos a los de plugins
+// propios de Vesta -- cero overhead.
+//
+// Esperado: R00 == 42.
+
+extern "stdlib/native/collections/vesta_collections" {
+    fn vcol_map_new(i64 cap) -> i64;
+    fn vcol_map_put(i64 h, i64 k, i64 v) -> void;
+    fn vcol_map_get(i64 h, i64 k) -> i64;
+    fn vcol_map_contains(i64 h, i64 k) -> i64;
+    fn vcol_map_remove(i64 h, i64 k) -> i64;
+    fn vcol_map_size(i64 h) -> i64;
+    fn vcol_map_free(i64 h) -> void;
+}
+
+i32 main() {
+    i64 m = vcol_map_new(16);
+
+    // Put 50 pares (k=i*7+1, v=i*100), forzando varios rehashes desde
+    // capacidad inicial 16.  Al final size debe ser 50.
+    i32 i = 0;
+    while (i < 50) {
+        vcol_map_put(m, i * 7 + 1, i * 100);
+        i = i + 1;
+    }
+
+    i32 acc = 0;
+
+    // Validar size correcto tras los puts.
+    if (vcol_map_size(m) == 50) { acc = acc + 10; }
+
+    // Validar gets.  Para i=7: clave = 50, valor esperado = 700.
+    if (vcol_map_get(m, 50) == 700) { acc = acc + 10; }
+
+    // Validar contains.
+    if (vcol_map_contains(m, 50) != 0) { acc = acc + 5; }
+    if (vcol_map_contains(m, 999) == 0) { acc = acc + 5; }
+
+    // Update: vuelve a poner k=50 con v=42, el tamano no cambia.
+    vcol_map_put(m, 50, 42);
+    if (vcol_map_get(m, 50) == 42) { acc = acc + 5; }
+    if (vcol_map_size(m) == 50) { acc = acc + 5; }
+
+    // Remove: borrar k=50 (el viejo retornado es el ultimo escrito = 42).
+    if (vcol_map_remove(m, 50) == 42) { acc = acc + 1; }
+    if (vcol_map_contains(m, 50) == 0) { acc = acc + 1; }
+
+    vcol_map_free(m);
+    return acc;   // 10+10+5+5+5+5+1+1 = 42
+}

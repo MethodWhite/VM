@@ -1,0 +1,66 @@
+// funciones que devuelven closures (curry, factories).
+//
+// Antes esto fallaba en runtime: el ABI de retorno solo devolvia
+// un i64 en R0 (perdiendo el env_addr) y el env block vivia en stack del
+// callee (use-after-free al hacer ret).
+//
+// Ahora:
+//   - SRET para FUNCTION: el caller alloca 16 bytes en su stack y los
+//     pasa como retbuf hidden (primer arg). El callee escribe el slot
+//     en el retbuf antes del RET (qword-a-qword copy de 16 bytes).
+//   - Env heap-alloc: si la funcion contenedora retorna FUNCTION, los
+//     env blocks de sus lambdas se alocan via RAW_ALLOC (heap raw, host
+//     pointer) en lugar de ALLOCA (stack VM).  El env sobrevive al RET y
+//     la closure es invocable sin use-after-free.
+//
+// Pone a prueba:
+//   - Currying de un parametro: make_adder(n) -> (x) => x + n
+//   - Factories de closures con captura: capturando n como int constante
+//   - Aplicacion de closures retornadas multiples veces
+//
+// Resultado esperado:
+//   add5(10)  -> 10 + 5  = 15
+//   add5(20)  -> 20 + 5  = 25
+//   add10(30) -> 30 + 10 = 40
+//   mul3(7)   -> 7 * 3   = 21
+//   sub2(50)  -> 50 - 2  = 48
+//   total     = 15 + 25 + 40 + 21 + 48 - 107 = 42
+
+fn(i32) -> i32 make_adder(i32 n) {
+    fn(i32) -> i32 f = (i32 x) => x + n;
+    return f;
+}
+
+fn(i32) -> i32 make_multiplier(i32 n) {
+    fn(i32) -> i32 g = (i32 x) => x * n;
+    return g;
+}
+
+fn(i32) -> i32 make_subtractor(i32 n) {
+    fn(i32) -> i32 h = (i32 x) => x - n;
+    return h;
+}
+
+i32 main() {
+    fn(i32) -> i32 add5  = make_adder(5);
+    fn(i32) -> i32 add10 = make_adder(10);
+    fn(i32) -> i32 mul3  = make_multiplier(3);
+    fn(i32) -> i32 sub2  = make_subtractor(2);
+
+    i32 r1 = add5(10);                 // 15
+    if (r1 != 15) return 11;
+
+    i32 r2 = add5(20);                 // 25  (misma closure, dos invocaciones)
+    if (r2 != 25) return 12;
+
+    i32 r3 = add10(30);                // 40  (closure distinta, captura distinta)
+    if (r3 != 40) return 13;
+
+    i32 r4 = mul3(7);                  // 21
+    if (r4 != 21) return 14;
+
+    i32 r5 = sub2(50);                 // 48
+    if (r5 != 48) return 15;
+
+    return r1 + r2 + r3 + r4 + r5 - 107;  // 15 + 25 + 40 + 21 + 48 - 107 = 42
+}

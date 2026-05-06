@@ -1,0 +1,61 @@
+// paralelismo OS-thread real:
+//
+// Lanza 4 hijos CPU-bound; cada uno suma 1+2+...+1000 = 500500 y envia
+// el resultado a main via msgsend(0, acc).  Main suma las 4 contribuciones.
+//
+// Con --schedulers 4, los hijos se distribuyen round-robin (sched 1, 2, 3,
+// vuelta a 0... wait_io del padre permite a los hijos correr en sus
+// schedulers).  En --schedulers 1 corre cooperativamente.
+//
+// PID 0 = main (sched=0, local=0): primer proceso creado por load_executable.
+// msgsend(0, x) deposita x en mailbox de main.
+//
+// Esperado: 4 * 500500 = 2002000 (0x1E8480)
+
+i32 main() {
+    i64 c1 = spawn {
+        i64 acc = 0;
+        i64 i = 1;
+        while (i <= 1000) {
+            acc = acc + i;
+            i = i + 1;
+        }
+        msgsend(0, acc);
+    };
+    i64 c2 = spawn {
+        i64 acc = 0;
+        i64 i = 1;
+        while (i <= 1000) {
+            acc = acc + i;
+            i = i + 1;
+        }
+        msgsend(0, acc);
+    };
+    i64 c3 = spawn {
+        i64 acc = 0;
+        i64 i = 1;
+        while (i <= 1000) {
+            acc = acc + i;
+            i = i + 1;
+        }
+        msgsend(0, acc);
+    };
+    i64 c4 = spawn {
+        i64 acc = 0;
+        i64 i = 1;
+        while (i <= 1000) {
+            acc = acc + i;
+            i = i + 1;
+        }
+        msgsend(0, acc);
+    };
+
+    i64 total = 0;
+    i64 n = 0;
+    while (n < 4) {
+        i64 m = msgrecv();
+        total = total + m;
+        n = n + 1;
+    }
+    return total;  // 4 * 500500 = 2002000
+}

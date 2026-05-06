@@ -1137,4 +1137,55 @@ void exec_instr_fstore(ProcessVM *vm, const DecodedInstr &instr) {
     }
 }
 
+// =========================================================================
+// FEXTEND  (0x00 0x5C)
+// FNARROW  (0x00 0x5D)
+//
+// Conversion de ancho float-a-float dentro del banco ZMM.  Necesario para
+// implementar IrOp::F32TOF64 y F64TOF32 en el IR emitter sin reglas
+// software complejas (la conversion del bit pattern de IEEE 754 entre f32
+// y f64 requiere redo del exponente y mantissa, no es un simple shift).
+//
+// Encoding identico a fmov/fadd/fsub/...: ctrl byte mode(2)|isf32(1)|0...,
+// regs byte (zmm_src<<4)|zmm_dst.  El emit usa emit_instr_freg.  El
+// runtime ignora el bit isf32 en estos opcodes (la direccion de la
+// conversion esta hardcoded en el opcode mismo).
+// =========================================================================
+
+/**
+ * @brief Ejecuta FEXTEND: convierte f32 -> f64 dentro del banco ZMM.
+ *
+ * Lee el f32 escalar (4 bytes bajos) del registro fuente, lo extiende
+ * a double y lo escribe como f64 en el destino.  write_f64 zerifica los
+ * bytes altos del registro destino.
+ *
+ * @param vm    Proceso virtual.
+ * @param instr reg1 = ZMM destino, reg2 = ZMM fuente.
+ */
+void exec_instr_fextend(ProcessVM *vm, const DecodedInstr &instr) {
+    const uint8_t dst = instr.data_instruction.reg_data.reg1;
+    const uint8_t src = instr.data_instruction.reg_data.reg2;
+    ZmmRegister       &d = vm->registers.zmm[dst];
+    const ZmmRegister &s = vm->registers.zmm[src];
+    d.write_f64(static_cast<double>(s.read_f32()));
+}
+
+/**
+ * @brief Ejecuta FNARROW: convierte f64 -> f32 dentro del banco ZMM.
+ *
+ * Lee el f64 escalar (8 bytes bajos) del registro fuente, lo trunca
+ * a float y lo escribe como f32 en el destino.  write_f32 zerifica los
+ * bytes altos del registro destino.
+ *
+ * @param vm    Proceso virtual.
+ * @param instr reg1 = ZMM destino, reg2 = ZMM fuente.
+ */
+void exec_instr_fnarrow(ProcessVM *vm, const DecodedInstr &instr) {
+    const uint8_t dst = instr.data_instruction.reg_data.reg1;
+    const uint8_t src = instr.data_instruction.reg_data.reg2;
+    ZmmRegister       &d = vm->registers.zmm[dst];
+    const ZmmRegister &s = vm->registers.zmm[src];
+    d.write_f32(static_cast<float>(s.read_f64()));
+}
+
 } // namespace runtime

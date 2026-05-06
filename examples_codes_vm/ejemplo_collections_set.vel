@@ -1,0 +1,281 @@
+/*
+ * ejemplo_collections_set.vel
+ *
+ * Demuestra el uso de VestaHashSet: conjunto de uint64_t unicos.
+ * Internamente implementado como VestaHashMap con valor sentinel.
+ *
+ * Funciones usadas:
+ *   vcol_set_new(cap)            r1=cap          -> r0=handle
+ *   vcol_set_add(h, elem)        r1=h, r2=elem   -> r0=1 nuevo, 0 ya existia
+ *   vcol_set_contains(h, elem)   r1=h, r2=elem   -> r0=1/0
+ *   vcol_set_remove(h, elem)     r1=h, r2=elem   -> r0=1 eliminado, 0 no existia
+ *   vcol_set_size(h)             r1=h             -> r0=numero de elementos
+ *   vcol_set_union(a, b)         r1=a, r2=b       -> r0=handle nuevo set (A | B)
+ *   vcol_set_intersect(a, b)     r1=a, r2=b       -> r0=handle nuevo set (A & B)
+ *   vcol_set_is_subset(a, b)     r1=a, r2=b       -> r0=1 si A subset de B
+ *   vcol_set_to_list(h)          r1=h             -> r0=VestaArrayList handle
+ *   vcol_set_free(h)             r1=h
+ *   vcol_alist_size(h)           r1=h             -> r0=size
+ *   vcol_alist_free(h)           r1=h
+ *
+ * Secuencia del test:
+ *   Set A = {10, 20, 30, 40}
+ *   Set B = {30, 40, 50, 60}
+ *
+ *   1. add 10,20,30 al set A; add duplicado 10 -> debe retornar 0
+ *   2. add 40 al set A -> size = 4
+ *   3. contains(20) = 1, contains(99) = 0
+ *   4. remove(10) = 1, size = 3
+ *   5. add 10 de nuevo para restaurar: size = 4
+ *   6. Crear set B = {30, 40, 50, 60}
+ *   7. union(A, B) = {10, 20, 30, 40, 50, 60} -> size = 6
+ *   8. intersect(A, B) = {30, 40} -> size = 2
+ *   9. is_subset({30,40}, B) = 1
+ *  10. to_list del intersect -> VestaArrayList size = 2
+ *  11. Liberar todo
+ *
+ * Resultado esperado en registros al llegar a hlt:
+ *   r7  = 0   (add duplicado 10 devuelve 0)
+ *   r8  = 4   (size set A tras add 10,20,30,40)
+ *   r9  = 1   (contains(20))
+ *   r10 = 0   (contains(99))
+ *   r11 = 1   (remove(10) existia)
+ *   r12 = 6   (size union A|B)
+ *   r13 = 2   (size intersect A&B)
+ *   r14 = 1   (is_subset intersect dentro de B)
+ *
+ * Compilar y ejecutar:
+ *   ./vm --build ejemplo_collections_set.vel -o ejemplo_collections_set
+ *   ./vm --run   ejemplo_collections_set.velb
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+@Import {
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_set_new")       }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_set_add")       }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_set_contains")  }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_set_remove")    }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_set_size")      }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_set_union")     }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_set_intersect") }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_set_is_subset") }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_set_to_list")   }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_set_free")      }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_alist_size")    }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_alist_free")    }
+}
+
+code:
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // -----------------------------------------------------------------------
+    // Crear Set A (capacidad 16)
+    // -----------------------------------------------------------------------
+    mov  r1, 16
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_new")
+    mov  r3, r0                           // r3 = handle Set A
+
+    // -----------------------------------------------------------------------
+    // 1. add 10, 20, 30 al Set A
+    //    vcol_set_add(handle, elem) -> r0 = 1 nuevo, 0 duplicado
+    // -----------------------------------------------------------------------
+    mov  r1, r3
+    mov  r2, 10
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_add")
+
+    mov  r1, r3
+    mov  r2, 20
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_add")
+
+    mov  r1, r3
+    mov  r2, 30
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_add")
+
+    // add duplicado 10 -> debe devolver 0 -> guardar en r7
+    mov  r1, r3
+    mov  r2, 10
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_add")
+    mov  r7, r0                           // r7 = 0 (duplicado)
+
+    // -----------------------------------------------------------------------
+    // 2. add 40 al set A -> size = 4 -> guardar en r8
+    // -----------------------------------------------------------------------
+    mov  r1, r3
+    mov  r2, 40
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_add")
+
+    mov  r1, r3
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_size")
+    mov  r8, r0                           // r8 = 4
+
+    // -----------------------------------------------------------------------
+    // 3. contains(20) = 1 -> r9; contains(99) = 0 -> r10
+    // -----------------------------------------------------------------------
+    mov  r1, r3
+    mov  r2, 20
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_contains")
+    mov  r9, r0                           // r9 = 1
+
+    mov  r1, r3
+    mov  r2, 99
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_contains")
+    mov  r10, r0                          // r10 = 0
+
+    // -----------------------------------------------------------------------
+    // 4. remove(10) = 1 -> r11; size = 3
+    //    vcol_set_remove(handle, elem) -> r0 = 1 si existia
+    // -----------------------------------------------------------------------
+    mov  r1, r3
+    mov  r2, 10
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_remove")
+    mov  r11, r0                          // r11 = 1
+
+    // -----------------------------------------------------------------------
+    // 5. Volver a agregar 10 para que Set A = {10,20,30,40} antes de union
+    // -----------------------------------------------------------------------
+    mov  r1, r3
+    mov  r2, 10
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_add")
+
+    // -----------------------------------------------------------------------
+    // Crear Set B = {30, 40, 50, 60}
+    // -----------------------------------------------------------------------
+    mov  r1, 16
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_new")
+    mov  r4, r0                           // r4 = handle Set B
+
+    mov  r1, r4
+    mov  r2, 30
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_add")
+
+    mov  r1, r4
+    mov  r2, 40
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_add")
+
+    mov  r1, r4
+    mov  r2, 50
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_add")
+
+    mov  r1, r4
+    mov  r2, 60
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_add")
+
+    // -----------------------------------------------------------------------
+    // 7. union(A, B) -> Set C; size debe ser 6 -> r12
+    //    vcol_set_union(set_a, set_b) -> r0 = handle nuevo set
+    // -----------------------------------------------------------------------
+    mov  r1, r3
+    mov  r2, r4
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_union")
+    mov  r5, r0                           // r5 = handle union
+
+    mov  r1, r5
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_size")
+    mov  r12, r0                          // r12 = 6
+
+    // -----------------------------------------------------------------------
+    // 8. intersect(A, B) -> Set D = {30,40}; size = 2 -> r13
+    //    vcol_set_intersect(set_a, set_b) -> r0 = handle nuevo set
+    // -----------------------------------------------------------------------
+    mov  r1, r3
+    mov  r2, r4
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_intersect")
+    mov  r6, r0                           // r6 = handle intersect
+
+    mov  r1, r6
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_size")
+    mov  r13, r0                          // r13 = 2
+
+    // -----------------------------------------------------------------------
+    // 9. is_subset(intersect, B) = 1 -> r14
+    //    {30,40} es subconjunto de {30,40,50,60}
+    //    vcol_set_is_subset(set_a, set_b) -> r0 = 1/0
+    // -----------------------------------------------------------------------
+    mov  r1, r6
+    mov  r2, r4
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_is_subset")
+    mov  r14, r0                          // r14 = 1
+
+    // -----------------------------------------------------------------------
+    // 10. to_list del intersect -> VestaArrayList con 2 elementos
+    //     (solo verificamos size, los valores son 30 y 40 en algun orden)
+    // -----------------------------------------------------------------------
+    mov  r1, r6
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_to_list")
+    mov  r2, r0                           // r2 = handle VestaArrayList
+
+    mov  r1, r2
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_alist_size")
+    // r0 = 2 (no necesitamos guardarlo, ya tenemos r13)
+
+    mov  r1, r2
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_alist_free")
+
+    // -----------------------------------------------------------------------
+    // 11. Liberar todos los sets
+    // -----------------------------------------------------------------------
+    mov  r1, r3
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_free")
+
+    mov  r1, r4
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_free")
+
+    mov  r1, r5
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_free")
+
+    mov  r1, r6
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_set_free")
+
+    // Resultado esperado:
+    //   r7  = 0   (add duplicado devuelve 0)
+    //   r8  = 4   (size Set A)
+    //   r9  = 1   (contains 20)
+    //   r10 = 0   (contains 99)
+    //   r11 = 1   (remove 10 existia)
+    //   r12 = 6   (size union)
+    //   r13 = 2   (size intersect)
+    //   r14 = 1   (intersect es subset de B)
+    mov  r0, r8
+    hlt

@@ -1,0 +1,50 @@
+// I/O optimo: interpolacion ${expr} + builtins print/println/echo/flush
+// + variantes coloreadas con codigos ANSI.
+//
+// Pone a prueba:
+//   - print("texto") y println("texto")  (string sin interp, baseline)
+//   - println("a=${x}, b=${y}")  (interpolacion con valores enteros)
+//   - println("ratio=${f}")  (interpolacion con float bits)
+//   - println("flag=${b}")  (interpolacion con booleano)
+//   - flush() explicito (no hay forma de validar el efecto desde aqui;
+//     se garantiza que compila + corre sin error)
+//   - print_int / print_uint / print_hex (sin newline)
+//   - Codigos de color ANSI insertados como parte del string
+//
+// Salida esperada (verificada en e2e):
+//   Hola desde Vex!
+//   x=42, y=100
+//   suma=142
+//   activo=true
+//   line1
+//   line2
+//   FIN
+
+i32 main() {
+    println("Hola desde Vex!");
+
+    i32 x = 42;
+    i32 y = 100;
+    println("x=${x}, y=${y}");
+
+    i32 s = x + y;
+    println("suma=${s}");
+
+    bool activo = true;
+    println("activo=${activo}");
+
+    print("line1");
+    print("\n");      // newline manual
+    println("line2");
+
+    // print_int / print_uint sin newline (uso explicito)
+    print("FIN");
+    flush();          // garantizar que sale antes de terminar
+
+    for (i32 i = 0; i < 3000; i++) {
+        println("numero: ${i}");  // interpolacion con loop index
+    }
+
+    println("");      // un newline final para que el output sea limpio
+    return 42;
+}

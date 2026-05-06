@@ -1,0 +1,145 @@
+// Test viabilidad: buffer dinamico (LinkedList<Line>) + render con highlighter.
+// No interactivo: precarga texto, hace render unico, sale.
+
+#include "modules/syntax_vex.vh"
+
+// -------------------------------------------------------------------
+// Line: una linea de texto en buffer raw + length + capacidad.
+// Destructor libera el buffer raw (RAII).
+// -------------------------------------------------------------------
+class Line {
+    public u8* data;
+    public i32  length;
+    public i32  capacity;
+    public Line next;       // siguiente linea o null
+
+    public Line() {
+        this.capacity = 64;
+        this.data = malloc(64);
+        this.length = 0;
+        this.data[0] = 0;
+        this.next = null;
+    }
+
+    public ~Line() {
+        if (this.data != null) { free(this.data); }
+    }
+
+    public void ensure_capacity(i32 need) {
+        if (need + 1 <= this.capacity) { return; }
+        i32 new_cap = this.capacity;
+        while (new_cap < need + 1) { new_cap = new_cap * 2; }
+        u8* nbuf = malloc(new_cap);
+        i32 i = 0;
+        while (i < this.length) { nbuf[i] = this.data[i]; i = i + 1; }
+        nbuf[this.length] = 0;
+        free(this.data);
+        this.data = nbuf;
+        this.capacity = new_cap;
+    }
+
+    public void append_char(i32 c) {
+        this.ensure_capacity(this.length + 1);
+        this.data[this.length] = c;
+        this.length = this.length + 1;
+        this.data[this.length] = 0;
+    }
+}
+
+// -------------------------------------------------------------------
+// Buffer: lista enlazada de Lines + cursor + line_count.
+// Destructor recursivo libera todas las lineas (sintesis A.32).
+// -------------------------------------------------------------------
+class Buffer {
+    public Line head;
+    public i32  line_count;
+    public i32  cursor_row;
+    public i32  cursor_col;
+
+    public Buffer() {
+        this.head = new Line();
+        this.line_count = 1;
+        this.cursor_row = 0;
+        this.cursor_col = 0;
+    }
+
+    // Buscar linea N (0-based).
+    public Line get_line(i32 idx) {
+        Line cur = this.head;
+        i32 i = 0;
+        while (cur != null && i < idx) {
+            cur = cur.next;
+            i = i + 1;
+        }
+        return cur;
+    }
+
+    // Insertar nueva linea al final.
+    public void append_line() {
+        Line cur = this.head;
+        while (cur.next != null) { cur = cur.next; }
+        cur.next = new Line();
+        this.line_count = this.line_count + 1;
+    }
+
+    // Cargar texto inicial (carga lineas separadas por '\n').
+    public void load_text(string s) {
+        u8* bdat = str_cstr(s);
+        i32 len  = str_bytes(s);
+        i32 i = 0;
+        Line cur = this.head;
+        while (i < len) {
+            i32 c = bdat[i];
+            if (c == 10) {                 // '\n'
+                cur.next = new Line();
+                cur = cur.next;
+                this.line_count = this.line_count + 1;
+            } else {
+                cur.append_char(c);
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// -------------------------------------------------------------------
+// Helper de render: pinta cada linea con el highlighter.
+// -------------------------------------------------------------------
+void render_buffer(Buffer buf, SyntaxVex sv) {
+    Line cur = buf.head;
+    i32 row = 0;
+    while (cur != null) {
+        // Mover cursor a fila row+1, col 1.
+        print("\x1b[${row + 1};1H");
+        if (cur.length > 0) {
+            sv.render_line(cur.data, 0, cur.length, 200);
+        } else {
+            print(DIM); print("~"); print(RESET);
+        }
+        print("\x1b[K");      // limpiar resto de la fila
+        cur = cur.next;
+        row = row + 1;
+    }
+}
+
+i32 main() {
+    SyntaxVex sv = new SyntaxVex();
+    Buffer buf = new Buffer();
+
+    string sample = "// editor minimo en Vex\nclass Foo {\n    public i32 contador = 0;\n    public string nombre = \"hola\";\n    public i32 sumar(i32 a, i32 b) { return a + b; }\n}\n\ni32 main() {\n    Foo f = new Foo();\n    return f.sumar(40, 2);\n}\n";
+    buf.load_text(sample);
+
+    // Limpiar pantalla y posicionar cursor.
+    print("\x1b[2J");
+    print("\x1b[H");
+
+    render_buffer(buf, sv);
+
+    // Mover cursor abajo + mensaje de estado.
+    print("\x1b[15;1H");
+    println("---");
+    println("Buffer: ${buf.line_count} lineas, render OK");
+    flush();
+
+    return 42;
+}

@@ -1,0 +1,64 @@
+// Compound assign sobre lvalues no-triviales (struct field, class
+// field, array indexado, deref de puntero) y sobre todos los operadores
+// soportados (+= -= *= /= %= &= |= ^= <<= >>=).  Antes de este sprint el
+// lowering rechazaba los casos de campo/indice/deref con error explicito
+// "compound assign aun no soportado"; ahora se desazucara a load + binop
+// + store reusando lower_field_access / lower_class_field_load /
+// lower_index_addr para que tambien funcione sobre bit fields y
+// propiedades (getter+setter).
+
+struct Box { i32 val; }
+
+class Counter {
+    public i32 n;
+    public Counter(i32 init) { this.n = init; }
+}
+
+i32 main() {
+    // 1. Compound sobre struct field
+    Box b;
+    b.val = 10;
+    b.val += 5;        // 15
+    b.val -= 2;        // 13
+    b.val *= 3;        // 39
+    println("box=${b.val}");
+    if (b.val != 39) return 1;
+
+    // 2. Compound sobre array indexado
+    i32[4] arr = {1, 2, 3, 4};
+    arr[1] += 10;      // arr[1] = 12
+    arr[2] *= 5;       // arr[2] = 15
+    arr[3] -= 1;       // arr[3] = 3
+    println("arr=${arr[0]},${arr[1]},${arr[2]},${arr[3]}");
+    if (arr[0] != 1 || arr[1] != 12 || arr[2] != 15 || arr[3] != 3) return 2;
+
+    // 3. Compound sobre puntero deref
+    i32 x = 7;
+    VirtualPtr<i32> p = &x;
+    *p += 3;           // x = 10
+    *p *= 2;           // x = 20
+    *p -= 5;           // x = 15
+    println("deref=${x}");
+    if (x != 15) return 3;
+
+    // 4. Compound sobre class field
+    Counter c = new Counter(100);
+    c.n += 50;         // 150
+    c.n -= 10;         // 140
+    c.n /= 2;          // 70
+    c.n %= 25;         // 20
+    println("class=${c.n}");
+    if (c.n != 20) return 4;
+
+    // 5. Compound bitwise
+    i32 bits = 0b1100;
+    bits |= 0b0011;    // 0b1111 = 15
+    bits &= 0b1010;    // 0b1010 = 10
+    bits ^= 0b1111;    // 0b0101 = 5
+    bits <<= 2;        // 0b10100 = 20
+    bits >>= 1;        // 0b01010 = 10
+    println("bits=${bits}");
+    if (bits != 10) return 5;
+
+    return 42;
+}

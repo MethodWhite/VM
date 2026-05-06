@@ -1,0 +1,26 @@
+// future basico:
+//
+// Patron primitivo de future + fulfill + await.  Sin sugar @Async todavia.
+//
+// 1. Parent allocate Future (state PENDING).
+// 2. Parent spawn child y le pasa el handle del Future via msgsend.
+// 3. Hijo recibe el handle, hace trabajo, fulfill(fut, value).
+// 4. Parent await fut -> bloquea hasta resuelto -> obtiene value.
+//
+// Esperado: parent obtiene 42 (constante computada por el hijo).
+
+i32 main() {
+    i64 fut = future_alloc();   // crear Future en estado PENDING
+
+    i64 child = spawn {
+        i64 my_fut = msgrecv();  // recibir el handle del Future
+        // "trabajo asincrono" trivial: una computacion local.
+        i32 result = 21 * 2;
+        fulfill(my_fut, result); // resolver con 42
+    };
+
+    msgsend(child, fut);        // pasar el handle al hijo
+
+    i64 r = await fut;          // bloquea hasta que el hijo fulfill
+    return r;                    // 42
+}

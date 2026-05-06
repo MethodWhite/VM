@@ -1,0 +1,26 @@
+/**
+ * ejemplo_add.ir
+ * Funcion mas simple posible: suma dos enteros de 64 bits con signo.
+ *
+ * Conceptos demostrados:
+ *   - Declaracion de modulo con @module
+ *   - Funcion con dos parametros y valor de retorno
+ *   - Operacion aritmetica basica (add.i64)
+ *   - Instruccion ret.i64 para retornar un valor
+ *
+ * Compilar y emitir .vel:
+ *   vm --ir-file examples_ir/ejemplo_add.ir --ir-emit-only -o build/out_ir/add.vel
+ *
+ * Compilar a .velb ejecutable:
+ *   vm --ir-file examples_ir/ejemplo_add.ir --ir-opt 1 -o build/out_ir/add
+ */
+
+@module ejemplo_add
+
+// Suma a + b y devuelve el resultado como i64.
+// Los parametros son los primeros N registros (r1=a, r2=b).
+@function add(a: i64, b: i64) -> i64 {
+entry:
+    result = add.i64 a, b   // suma directa: result = a + b
+    ret.i64 result           // retorna el valor (colocado en r0)
+}

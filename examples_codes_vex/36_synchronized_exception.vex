@@ -1,0 +1,63 @@
+// synchronized + exception safety:
+//
+// Verifica que cuando el body del synchronized lanza una excepcion,
+// el monexit se ejecuta SIEMPRE (via el handler implicito) antes de que
+// la excepcion se propague al caller.  Si el monitor no se libera, un
+// segundo synchronized desde el mismo proceso quedaria bloqueado por
+// si mismo (deadlock auto), pero como es reentrante igual no fallaria;
+// la prueba decisiva es que el caller siga pudiendo correr codigo tras
+// el throw, y que los SIGUIENTES synchronized no leak el frame de
+// excepcion (lo cual SI causaria fallos visibles).
+//
+// Test:
+//   1. Llama a doWork() que entra en synchronized(this) y throw a mitad.
+//   2. main captura la excepcion en su propio try/catch.
+//   3. Tras la captura, vuelve a llamar doWork() pero esta vez SIN
+//      lanzar.  Si los frames y locks estaban correctamente liberados,
+//      el segundo doWork retorna 42 normalmente.  Si no, el sistema
+//      colgaria o produciria comportamiento extrano.
+
+class MyExc {
+    public i32 codigo;
+    public MyExc(i32 c) { this.codigo = c; }
+}
+
+class Worker {
+    i32 contador;
+    Worker() { this.contador = 0; }
+
+    // Si throw_it = 1: lanza dentro de synchronized.
+    // Si throw_it = 0: incrementa contador y devuelve el nuevo valor.
+    i32 doWork(i32 throw_it) {
+        synchronized (this) {
+            this.contador = this.contador + 1;
+            if (throw_it == 1) {
+                throw new MyExc(99);  // sale via handler -> monexit + rethrow
+            }
+        }
+        return this.contador;
+    }
+}
+
+i32 main() {
+    Worker w = new Worker();
+    i32 acc = 0;
+
+    // 1. Primer doWork: throw -> capturado.  Debe haber liberado el monitor.
+    try {
+        w.doWork(1);    // throw inside synchronized
+        acc = 1000;     // dead code
+    } catch (MyExc e) {
+        acc = e.codigo; // 99
+    }
+
+    // 2. Segundo doWork: sin throw.  Si el monitor quedo locked o el frame
+    //    de excepcion colgado, esto fallaria/colgaria.  Si todo OK, retorna 2
+    //    (contador era 1 tras el primer call abortado).
+    i32 r = w.doWork(0); // 2
+
+    // 3. Tercero igual: confirma que multiples invocaciones siguen funcionando.
+    i32 r2 = w.doWork(0); // 3
+
+    return acc + r + r2; // 99 + 2 + 3 = 104
+}

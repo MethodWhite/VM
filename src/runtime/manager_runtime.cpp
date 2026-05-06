@@ -21,6 +21,7 @@
 #include <algorithm>
 
 #include "runtime/runtime.h"
+#include "distrib/dist_runtime.h"
 
 namespace runtime {
 

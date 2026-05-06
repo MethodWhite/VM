@@ -1,0 +1,46 @@
+// examples_codes_vex/82_host_ptr_addr_taken.vex
+//
+// Antes del fix: si una variable de tipo T* (host pointer via malloc)
+// era address-taken (alguien escribio &p en algun punto), entonces el
+// scan_address_taken la promocionaba a ALLOCA + STORE/LOAD por memoria.
+// El LOAD para releer el valor del slot devolvia un IrValue con
+// is_host_ptr=false, asi que el siguiente p[i] = v emitia `mov` (memoria
+// VM) en vez de `movh` (memoria host) y corrompia memoria VM en una
+// direccion calculada a partir del puntero host (UB tipica).
+//
+// Fix (lowering.cpp): write_local registra el local en
+// host_bearing_locals_ si el valor escrito tiene is_host_ptr=true;
+// read_local consulta el set y propaga is_host_ptr al SSA value
+// resultante del LOAD.  Patron sticky: aceptable porque los locales
+// mantienen su naturaleza host/VM a lo largo de su vida.
+//
+// Esperado: R00 == 42.
+
+i32 main() {
+    // Reservar 4 i32 en heap host.
+    i32* p = malloc(16);
+
+    // Trigger de address-taken: &p hace que p sea promocionado a
+    // ALLOCA + STORE/LOAD por memoria.  Sin el fix, el LOAD posterior
+    // de p para evaluar p[i] pierde is_host_ptr.
+    //
+    // El tipo `VirtualPtr<i32*>` significa "direccion VM que contiene
+    // un puntero HOST".  La direccion exterior es virtual (p vive en
+    // stack VM) pero el contenido es el host_ptr de malloc.
+    VirtualPtr<i32*> pp = &p;
+
+    // Estos stores DEBEN ir a memoria HOST (movh).  Sin el fix
+    // emiten mov y corrompen memoria VM.
+    p[0] = 100;
+    p[1] = 200;
+    p[2] = 50;
+    p[3] = 32;
+
+    // Estos loads DEBEN venir de memoria HOST (movh).
+    i32 sum = p[0] + p[1] + p[2] + p[3];   // 382
+
+    free(p);
+
+    // 382 - 340 == 42
+    return sum - 340;
+}

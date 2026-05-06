@@ -1,0 +1,91 @@
+// Aritmetica float completa: FADD/FSUB/FMUL/FDIV + FNEG/FABS/FSQRT
+// + FCMP (comparaciones) + ITOF/FTOI (conversiones int<->float).
+//
+// Cobertura del backend float arreglado en este sprint:
+//   - emit_float_binop: bitcast GP -> ZMM (f0/f1) via stack roundtrip,
+//     fadd/fsub/fmul/fdiv f0, f1, bitcast f0 -> GP destino.
+//   - emit_float_unop:  bitcast GP -> ZMM (f0), fneg/fabs/fsqrt f0,f0,
+//     bitcast f0 -> GP destino.
+//   - FTOI/FTOUI: bitcast GP bits -> f0, fcvt gp_dst, f0 (truncate).
+//   - ITOF/UITOF: fcvt f0, gp_src (int VALOR -> float), bitcast f0 -> GP.
+//   - FCMP fusion con BR_COND y standalone (fcmp f0, f1).
+//
+// Verificacion: R0 = 42 si todas las validaciones pasan; ademas el e2e
+// extrae lineas concretas del output ("pi+e=5.85" etc).
+
+i32 main() {
+    println("=== TEST FLOAT ARITHMETIC ===");
+
+    // --- 1. Aritmetica binaria sobre variables ---
+    f64 pi = 3.14;
+    f64 e  = 2.71;
+
+    f64 sum = pi + e;     // FADD
+    f64 dif = pi - e;     // FSUB
+    f64 mul = pi * e;     // FMUL
+    f64 div = pi / e;     // FDIV
+
+    println("pi=${pi}");
+    println("e=${e}");
+    println("sum=${sum}");
+    println("dif=${dif}");
+    println("mul=${mul}");
+    println("div=${div}");
+
+    // --- 2. Aritmetica entre constantes ---
+    println("c_sum=${1.5 + 2.25}");
+    println("c_mul=${4.0 * 0.5}");
+
+    // --- 3. Cadena larga ---
+    f64 chain = pi + e - 1.0 + 2.0;
+    println("chain=${chain}");
+
+    // --- 4. Comparaciones FCMP standalone (en variable bool) ---
+    bool gt = pi > e;
+    bool lt = pi < e;
+    bool eq = pi == 3.14;
+    println("pi>e=${gt}");
+    println("pi<e=${lt}");
+    println("pi==3.14=${eq}");
+
+    // --- 5. Comparaciones FCMP fusionadas (en if/else) ---
+    i32 dir = 0;
+    if (pi > e) {
+        dir = 1;
+    } else {
+        dir = -1;
+    }
+    println("dir=${dir}");
+
+    // --- 6. Conversion int -> float (ITOF) ---
+    i32 n = 7;
+    f64 nf = n;            // ITOF: 7 -> 7.0
+    f64 doubled = nf + nf;
+    println("nf=${nf}");
+    println("doubled=${doubled}");
+
+    // --- 7. Conversion float -> int (FTOI) ---
+    f64 v = 3.95;
+    i32 t = v;             // FTOI: 3.95 -> 3 (truncate)
+    println("trunc(3.95)=${t}");
+
+    // --- 8. Round-trip int -> float -> int ---
+    i32 a = 42;
+    f64 fa = a;            // 42 -> 42.0
+    i32 b = fa;            // 42.0 -> 42
+    println("roundtrip=${b}");
+
+    // --- 9. Validaciones internas (R0 = 42 si todas pasan) ---
+    if (sum < 5.84 || sum > 5.86)         return 1;
+    if (dif < 0.42 || dif > 0.44)         return 2;
+    if (!gt)                              return 3;
+    if (lt)                               return 4;
+    if (!eq)                              return 5;
+    if (dir != 1)                         return 6;
+    if (t != 3)                           return 7;
+    if (b != 42)                          return 8;
+    if (doubled < 13.99 || doubled > 14.01) return 9;
+
+    flush();
+    return 42;
+}

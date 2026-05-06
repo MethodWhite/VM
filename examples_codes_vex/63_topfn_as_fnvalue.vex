@@ -1,0 +1,87 @@
+// funciones top-level promocionables a function value.
+//
+//   "argumento N: tipo (void) incompatible con parametro (fn(...) -> ...)"
+// porque las funciones top-level no se promocionaban al ser pasadas como
+// argumento a un parametro tipado @c fn(...) -> ...  El workaround era
+// envolver siempre cada funcion en una lambda local
+//   fn(i32,i32) -> i32 add2 = (i32 a, i32 b) => a + b;
+// Ahora el type checker detecta el patron y el lowering emite el slot de
+// 16 bytes (fn_addr=&fn, env_addr=0) automaticamente.
+//
+// Pone a prueba:
+//   - Pasar una funcion top-level (`add2`, `mul2`, `inc`) como argumento.
+//   - Mezclar con lambdas en el mismo HOF (siguen funcionando).
+//   - Reduce + map_inplace operando sobre arrays nativos i32[N].
+//
+// Resultado esperado:
+//   sum = reduce(xs, 10, 0, add2)        -> 1+2+...+10 = 55
+//   prod = reduce(xs, 4, 1, mul2)         -> 1*2*3*4   = 24
+//   sum_inc = sum_inplace tras map(inc)   -> 2+3+4+5   = 14
+//   compose = compose_apply(doubler, inc, 10) -> double(inc(10)) = 22
+//   R0 = sum + prod + sum_inc + compose - 73 = 55 + 24 + 14 + 22 - 73 = 42
+
+i32 add2(i32 a, i32 b) {
+    return a + b;
+}
+
+i32 mul2(i32 a, i32 b) {
+    return a * b;
+}
+
+i32 inc(i32 v) {
+    return v + 1;
+}
+
+i32 reduce(i32[] arr, i32 n, i32 init, fn(i32,i32) -> i32 op) {
+    i32 acc = init;
+    i32 i = 0;
+    while (i < n) {
+        acc = op(acc, arr[i]);
+        i = i + 1;
+    }
+    return acc;
+}
+
+void map_inplace(i32[] arr, i32 n, fn(i32) -> i32 f) {
+    i32 i = 0;
+    while (i < n) {
+        arr[i] = f(arr[i]);
+        i = i + 1;
+    }
+}
+
+i32 compose_apply(fn(i32) -> i32 f, fn(i32) -> i32 g, i32 x) {
+    return f(g(x));
+}
+
+i32 main() {
+    // 1) reduce(xs, 10, 0, add2): SUM 1..10 = 55  (top-level fn como arg)
+    i32[10] xs;
+    i32 i = 0;
+    while (i < 10) { xs[i] = i + 1; i = i + 1; }
+    i32 sum = reduce(xs, 10, 0, add2);   // <-- promocion automatica
+    if (sum != 55) return 11;
+
+    // 2) reduce(ys, 4, 1, mul2): PROD 1..4 = 24  (otra top-level)
+    i32[4] ys;
+    ys[0] = 1; ys[1] = 2; ys[2] = 3; ys[3] = 4;
+    i32 prod = reduce(ys, 4, 1, mul2);
+    if (prod != 24) return 12;
+
+    // 3) map_inplace(zs, 4, inc) -> [2,3,4,5]; reduce con LAMBDA -> 14.
+    //    Mezcla top-level fn (inc) + lambda (sumador) en el mismo programa.
+    i32[4] zs;
+    zs[0] = 1; zs[1] = 2; zs[2] = 3; zs[3] = 4;
+    map_inplace(zs, 4, inc);                              // top-level
+    fn(i32,i32) -> i32 sumador = (i32 a, i32 b) => a + b; // lambda
+    i32 sum_inc = reduce(zs, 4, 0, sumador);
+    if (sum_inc != 14) return 13;
+
+    // 4) compose_apply(doubler, inc, 10) -> double(inc(10)) = double(11) = 22
+    //    Mezcla lambda + top-level en distintas posiciones de parametro.
+    fn(i32) -> i32 doubler = (i32 v) => v * 2;
+    i32 cresult = compose_apply(doubler, inc, 10);
+    if (cresult != 22) return 14;
+
+    return sum + prod + sum_inc + cresult - 73;  // 55 + 24 + 14 + 22 - 73 = 42
+}

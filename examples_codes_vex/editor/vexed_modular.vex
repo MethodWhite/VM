@@ -1,0 +1,58 @@
+// =============================================================================
+// VEXED MODULAR - Editor de codigo TUI escrito en Vex (version modular - WIP)
+// =============================================================================
+//
+// Mismo editor que vexed.vex pero dividido en modulos via VPP `#include`.
+// Cada modulo es un fichero `.vh` con responsabilidades claras:
+//
+//   modules/keys.vh           constantes KEY_* y VK_*
+//   modules/input_backend.vh  class InputBackend (FFI msvcrt + user32)
+//   modules/screen.vh         class Screen (ANSI render)
+//   modules/file_io.vh        class FileIO (FFI msvcrt fopen/fwrite/fclose)
+//   modules/buffer.vh         class Buffer (buffer plano u8* + cursor)
+//   modules/extension_api.vh  class ExtensionRegistry (carga de plugins)
+//   modules/editor_core.vh    class Editor (orquestador + ciclo principal)
+//
+// VPP procesa las directivas `#include` ANTES del lexer Vex y el resultado
+// es un solo TU monolitico que el frontend baja al `.velb`.  No hay
+// runtime overhead vs el editor monolitico; solo modularidad estructural.
+//
+// **ESTADO ACTUAL (WIP)**: compila correctamente pero crashea en
+// runtime durante `Editor.render_status()` cuando concatena varios
+// accesos a campos GC (`this.buffer.cursor_row()` + `this.buffer.cursor_col()`
+// + `this.buffer.line_count()` en sucesion).  Se trata de un caso edge
+// del regalloc + spill A.32.fix con multiples valores GC vivos a traves
+// de varios callvirts encadenados.  El codigo es ESTRUCTURAL CORRECTO
+// y queda como referencia; pendiente de un fix mas profundo en el
+// regalloc para ser ejecutable.
+//
+// USO (cuando este arreglado):
+//   ./vm --vex vexed_modular.vex -o vexedm && ./vm --run vexedm.velb
+//
+// Hasta entonces, usa el editor monolitico vexed.vex que es plenamente
+// funcional (mismo codigo, mismas clases, sin la separacion en .vh).
+
+#include "modules/keys.vh"
+#include "modules/input_backend.vh"
+#include "modules/screen.vh"
+#include "modules/file_io.vh"
+#include "modules/buffer.vh"
+#include "modules/extension_api.vh"
+#include "modules/syntax_vex.vh"
+#include "modules/editor_core.vh"
+
+// =============================================================================
+// SECCION FINAL: main
+// =============================================================================
+//
+// Crea un Editor y lanza su ciclo principal.  Los destructores RAII de
+// se encargan de liberar Buffer (y recursivamente cada Line) al
+// salir del scope.  Cualquier extension cargada via loadmodule mantiene
+// su clase registrada en el ClassRegistry global del Loader hasta el
+// fin del proceso.
+
+i32 main() {
+    Editor ed = new Editor();
+    ed.run();
+    return 0;
+}

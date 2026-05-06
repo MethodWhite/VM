@@ -1,0 +1,197 @@
+// Test exhaustivo de strings + print/println + interpolacion ${...}.
+//
+// Ejercita el contrato pleno que un programador veria al usar SOLO las
+// dos funciones publicas print() y println() para emitir cualquier valor.
+// No se invocan helpers internos (print_int, print_cstr, str_*, ...).
+//
+// Cobertura:
+//   - Interpolacion ${expr} con TODOS los tipos escalares (i8..i64, u8..u64,
+//     bool, char, f64) y con expresiones aritmeticas + llamadas a builtins.
+//   - Variables string en ${...} (requiere strraw + strgetbytes + buf-print).
+//   - Operadores nativos: + (concat) y == / != (comparacion).
+//   - Multi-alfabeto via bytes UTF-8 escapados (\xHH...): latin extendido,
+//     griego, cirilico, arabe, CJK (chino) y emojis (4 bytes).
+//   - Auto-deteccion de codificacion: ASCII-only se compacta a ASCII;
+//     mixto multi-byte se mantiene UTF-8.  str_length cuenta code points.
+//   - Concatenacion heterogenea ASCII + UTF-8 + emoji.
+//   - Comparaciones == / != entre handles del mismo string e interneados.
+//   - Casos limite: cadena vacia, un solo caracter, secuencias de control.
+//
+// Verificacion del e2e: R0 = 42 y multiples greps sobre el output capturado.
+//
+// Mapeo de bytes UTF-8 usados
+//
+//   "cafe-acento":  \xC3\xA9          (e con acento agudo, U+00E9)
+//   "n-tilde":      \xC3\xB1          (n con tilde, U+00F1)
+//   alpha griega:   \xCE\xB1          (U+03B1)
+//   beta griega:    \xCE\xB2          (U+03B2)
+//   gamma griega:   \xCE\xB3          (U+03B3)
+//   "P" cirilico:   \xD0\x9F          (U+041F)
+//   "r" cirilico:   \xD1\x80          (U+0440)
+//   "i" cirilico:   \xD0\xB8          (U+0438)
+//   "v" cirilico:   \xD0\xB2          (U+0432)
+//   "e" cirilico:   \xD0\xB5          (U+0435)
+//   "t" cirilico:   \xD1\x82          (U+0442)
+//   chino "Zhong":  \xE4\xB8\xAD      (U+4E2D)
+//   chino "Guo":    \xE5\x9B\xBD      (U+56FD)
+//   emoji grin:     \xF0\x9F\x98\x80  (U+1F600)
+//   emoji wave:     \xF0\x9F\x91\x8B  (U+1F44B)
+
+i32 main() {
+    println("=== TEST EXHAUSTIVO STRINGS + I/O ===");
+
+    // -----------------------------------------------------------------
+    // 1. Interpolacion con tipos escalares.
+    // -----------------------------------------------------------------
+    println("--- 1. tipos escalares en interp ---");
+
+    i8  i8v   = -1;
+    i16 i16v  = -32000;
+    i32 i32v  = -2147000000;
+    i64 i64v  = -9000000000;
+    u8  u8v   = 255;
+    u16 u16v  = 65000;
+    u32 u32v  = 4000000000;
+    u64 u64v  = 18000000000000000000;
+    bool bv   = true;
+    char cv   = 'A';
+
+    println("i8=${i8v}");
+    println("i16=${i16v}");
+    println("i32=${i32v}");
+    println("i64=${i64v}");
+    println("u8=${u8v}");
+    println("u16=${u16v}");
+    println("u32=${u32v}");
+    println("u64=${u64v}");
+    println("bool=${bv}");
+    println("char_code=${cv}");
+
+    // -----------------------------------------------------------------
+    // 2. Variables string + concatenacion.
+    // -----------------------------------------------------------------
+    println("--- 2. strings en interp ---");
+
+    string a = "Hola";
+    string b = " mundo";
+    string c = a + b;
+
+    println("a=${a}");
+    println("b=${b}");
+    println("c=${c}");
+
+    // String literal directo dentro de print/println (sin interp).
+    print("frase plana: ");
+    println("Vex es genial");
+
+    // -----------------------------------------------------------------
+    // 3. Multi-alfabeto: latin/griego/cirilico/arabe/CJK/emoji.
+    // -----------------------------------------------------------------
+    println("--- 3. multi-alfabeto ---");
+
+    string latin    = "caf\xC3\xA9 ma\xC3\xB1ana";
+    string griego   = "\xCE\xB1\xCE\xB2\xCE\xB3";
+    string cirilico = "\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82";
+    string cjk      = "\xE4\xB8\xAD\xE5\x9B\xBD";
+    string emoji    = "\xF0\x9F\x98\x80\xF0\x9F\x91\x8B";
+
+    println("latin=${latin}");
+    println("griego=${griego}");
+    println("cirilico=${cirilico}");
+    println("cjk=${cjk}");
+    println("emoji=${emoji}");
+
+    // -----------------------------------------------------------------
+    // 4. Metricas por encoding (bytes vs code points).
+    //
+    //   "caf\xC3\xA9 ma\xC3\xB1ana" -> 12 bytes (4+1+5+2 multibyte) /
+    //                                  10 code points
+    //   "\xCE\xB1\xCE\xB2\xCE\xB3" -> 6 bytes / 3 code points
+    //   "\xE4\xB8\xAD\xE5\x9B\xBD" -> 6 bytes / 2 code points
+    //   "\xF0\x9F\x98\x80\xF0\x9F\x91\x8B" -> 8 bytes / 2 code points
+    //
+    //   Las metricas las leemos con builtins libres (str_bytes/str_length)
+    //   pero las imprimimos via ${} para no romper la regla "solo print".
+    // -----------------------------------------------------------------
+    println("--- 4. metricas multi-byte ---");
+
+    println("latin: bytes=${str_bytes(latin)} cps=${str_length(latin)}");
+    println("griego: bytes=${str_bytes(griego)} cps=${str_length(griego)}");
+    println("cjk: bytes=${str_bytes(cjk)} cps=${str_length(cjk)}");
+    println("emoji: bytes=${str_bytes(emoji)} cps=${str_length(emoji)}");
+
+    // -----------------------------------------------------------------
+    // 5. Concatenacion heterogenea.
+    // -----------------------------------------------------------------
+    println("--- 5. concat heterogeneo ---");
+
+    string mix = "ASCII " + griego + " " + emoji;
+    println("mix=${mix}");
+    println("mix.bytes=${str_bytes(mix)}");
+
+    // -----------------------------------------------------------------
+    // 6. Comparaciones == / != entre strings.
+    // -----------------------------------------------------------------
+    println("--- 6. comparaciones ---");
+
+    string s1 = "abc";
+    string s2 = "abc";
+    string s3 = "abd";
+
+    println("s1==s2: ${s1 == s2}");
+    println("s1==s3: ${s1 == s3}");
+    println("s1!=s3: ${s1 != s3}");
+
+    // -----------------------------------------------------------------
+    // 7. Escapes y secuencias de control.
+    // -----------------------------------------------------------------
+    println("--- 7. escapes ---");
+
+    println("tab[A\tB] nl_inline[X\nY]");
+    println("comilla=\" backslash=\\");
+
+    // -----------------------------------------------------------------
+    // 8. Casos limite: cadena vacia y de un solo caracter.
+    // -----------------------------------------------------------------
+    println("--- 8. casos limite ---");
+
+    string empty = "";
+    string one   = "Z";
+
+    println("empty[${empty}] bytes=${str_bytes(empty)} cps=${str_length(empty)}");
+    println("one[${one}] bytes=${str_bytes(one)} cps=${str_length(one)}");
+
+    // -----------------------------------------------------------------
+    // 9. Expresiones complejas dentro de ${}.
+    // -----------------------------------------------------------------
+    println("--- 9. expresiones en interp ---");
+
+    i32 x = 10;
+    i32 y = 20;
+
+    println("suma=${x + y} producto=${x * y} resto=${y % 3}");
+    println("triple=${x + y + 12}");
+    println("anidado=${x + y * 2}");
+
+    // -----------------------------------------------------------------
+    // 10. Floats en interpolacion.
+    // -----------------------------------------------------------------
+    println("--- 10. floats ---");
+
+    f64 pi = 3.14;
+    f64 e  = 2.71;
+
+    println("pi=${pi}");
+    println("e=${e}");
+    println("pi+e=${pi + e}");
+    println("pi*2=${pi + pi}");
+    println("pi-e=${pi - e}");
+    println("pi*e=${pi * e}");
+    println("pi/e=${pi / e}");
+
+    // -----------------------------------------------------------------
+    // 11. Flush antes de salir para que el buffer global purgue todo.
+    // -----------------------------------------------------------------
+    flush();
+    return 42;
+}

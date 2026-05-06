@@ -20,6 +20,9 @@
  */#include "runtime/scheduler.h"
 
 #include "runtime/decode_instruction.h"
+#include "distrib/dist_runtime.h"
+#include "distrib/dist_debug.h"
+#include "runtime/runtime.h"
 
 namespace runtime {
 
@@ -262,11 +265,22 @@ namespace runtime {
             if (!instance) {
                 // no hay procesos listos; verificar si quedan procesos vivos en toda la VM
                 if (!vm_reference.has_alive_processes()) {
-                    vm_reference.vm_running = false; // ninguna VM tiene procesos vivos: detener
-                    break;                           // terminar este scheduler
+                    if (!vm_reference.vm_persistent) {
+                        // perf: notificar al hilo principal
+                        // via condition_variable para evitar el polling
+                        // sleep_for(1ms) en main.  El predicado del cv es
+                        // !vm_running, asi que primero set, luego notify.
+                        {
+                            std::lock_guard<std::mutex> lk(vm_reference.done_mtx);
+                            vm_reference.vm_running = false;
+                        }
+                        vm_reference.done_cv.notify_all();
+                        break;                           // terminar este scheduler
+                    }
+                    // modo persistente (servidor distribuido): esperar a que llegue un proceso
                 }
 
-                // hay procesos vivos en otros schedulers; dormir hasta que haya trabajo
+                // hay procesos vivos en otros schedulers (o modo persistente); dormir hasta que haya trabajo
                 is_waiting = true;
                 sem.acquire(); // bloquear hasta que make_ready() o stop() libere el semaforo
                 is_waiting = false;
@@ -275,41 +289,266 @@ namespace runtime {
                 if (should_kill || !vm_reference.vm_running)
                     break;
 
-                // intentar obtener trabajo tras despertar
-                instance = schedule_next();
+                // (BUG FIX): tras despertar, NO consumir el
+                // proceso aqui con un schedule_next + continue, porque la
+                // siguiente iteracion del while exterior llamaria
+                // schedule_next OTRA VEZ, encontraria la cola vacia (el
+                // proceso ya fue dequeued por la llamada de aqui) y volveria
+                // a dormir, perdiendo el proceso recien encolado.  El bucle
+                // exterior se encarga del schedule_next.
                 continue;
             }
 
             if (!has_hooks) {
                 // === FAST PATH: decode + execute directo sin FSM completa ni hooks ===
-                // READY/RUNNING no tienen accion; saltar directamente a DECODE
-                if (instance->state == READY || instance->state == RUNNING)
-                    instance->state = DECODE;
+                // perf: izar el state store fuera del bucle
+                // interno.  Las exec_fns que llaman on_event(EVT_HALT/IO_WAIT)
+                // requieren que state sea EXECUTE para que la FSM transicione
+                // correctamente (fsm[EXECUTE][EVT_X] -> proximo estado).
+                // Antes haciamos state.store(EXECUTE) y state.store(DECODE)
+                // en cada iteracion del while (~2 atomic stores/instr); ahora
+                // lo seteamos UNA vez aqui y el inner loop solo lo modifica
+                // cuando una exec_fn transiciona a HALT/WAIT_IO (raro).
+                instance->state.store(EXECUTE, std::memory_order_relaxed);
+
+                // traza de primera ejecucion del proceso para depuracion distribuida
+                if (instance->tsc == 0) {
+                    DIST_DBG("SCHED %u: primera ejecucion PID=(sched=%u local=%llu) "
+                             "PC=0x%llX rspawn_fid=%llu estado=%d",
+                             id_scheduler,
+                             instance->pid.scheduler_id,
+                             (unsigned long long)instance->pid.local_pid,
+                             (unsigned long long)instance->registers.rip.raw(),
+                             (unsigned long long)instance->rspawn_future_id,
+                             (int)instance->state);
+                }
 
                 while (instance->reductions_remaining > 0) {
                     decode_instruction(instance); // descodificar la instruccion en PC
 
-                    // poner en EXECUTE para que las instrucciones de control de flujo (HLT, etc.)
-                    // encuentren el estado correcto en sus transiciones internas de on_event
-                    instance->state = EXECUTE;
-                    vm_event evt = execute_instruction(instance); // ejecutar la instruccion
-                    instance->reductions_remaining--;
+                    // inline-hot: fast path para los opcodes
+                    // mas comunes (mov reg-reg, mov reg-imm, add reg-reg,
+                    // cmp reg-reg con i64).  Estos cubren ~80% de las
+                    // instrucciones en los hot loops tipicos (loops
+                    // aritmeticos, copy reg, etc.).  El switch sobre
+                    // opcode_index suele compilar a jump table.  Para
+                    // opcodes que no encajen, fallthrough al exec_cached.
+                    DecodedInstr *d = instance->decoded_ptr;
+                    const auto    fl_inl = d->flags_info;  // copia local (1 carga)
 
-                    // camino rapido: instruccion normal completada -> continuar con la siguiente
-                    if (__builtin_expect(evt == EVT_EXEC_DONE, 1)) {
-                        instance->state = DECODE; // preparar para la siguiente descodificacion
+                    // Predicate: instruccion extendida i64 SIN special-reg
+                    // (s=0 para mov, signed/unsigned para ALU).
+                    if (__builtin_expect(
+                          fl_inl.is_not_extended == 0x00 && fl_inl.mode == 3,
+                          1)) {
+                        auto    &regs = instance->registers.regs;
+                        auto    &fl   = instance->registers.flags.bits;
+                        bool     hit  = true;
+                        switch (fl_inl.opcode_index) {
+                            case 0x14: { // mov reg-reg i64 (s=0 standard)
+                                if (fl_inl._signed_instruct == 0) {
+                                    const uint8_t r1 = d->data_instruction.reg_data.reg1;
+                                    const uint8_t r2 = d->data_instruction.reg_data.reg2;
+                                    regs[r1].qword(regs[r2].qword());
+                                } else {
+                                    hit = false; // s=1 = special reg, slow path
+                                }
+                                break;
+                            }
+                            case 0x15: { // mov reg-imm i64 (direction=0 = reg dst)
+                                if (fl_inl.direction == 0) {
+                                    const uint8_t r = d->data_instruction.inmmed_data.reg;
+                                    regs[r].qword(d->data_instruction.inmmed_data.inmmed);
+                                } else {
+                                    hit = false; // direction=1 = mem dst, slow path
+                                }
+                                break;
+                            }
+                            case 0x05: { // add reg-reg i64 (signed o unsigned)
+                                const uint8_t r1 = d->data_instruction.reg_data.reg1;
+                                const uint8_t r2 = d->data_instruction.reg_data.reg2;
+                                const uint64_t a = regs[r1].qword();
+                                const uint64_t b = regs[r2].qword();
+                                const uint64_t res = a + b;
+                                regs[r1].qword(res);
+                                fl.ZF = (res == 0);
+                                fl.SF = (int64_t)res < 0;
+                                if (fl_inl._signed_instruct) {
+                                    fl.OF = (((int64_t)a ^ (int64_t)res) &
+                                             ((int64_t)b ^ (int64_t)res)) < 0;
+                                    fl.CF = 0;
+                                } else {
+                                    fl.CF = res < a; // unsigned wrap
+                                    fl.OF = 0;
+                                }
+                                break;
+                            }
+                            case 0x11: { // cmp reg-reg i64 (subtract w/o store)
+                                const uint8_t r1 = d->data_instruction.reg_data.reg1;
+                                const uint8_t r2 = d->data_instruction.reg_data.reg2;
+                                const uint64_t a = regs[r1].qword();
+                                const uint64_t b = regs[r2].qword();
+                                const uint64_t res = a - b;
+                                fl.ZF = (res == 0);
+                                fl.SF = (int64_t)res < 0;
+                                if (fl_inl._signed_instruct) {
+                                    fl.OF = (((int64_t)a ^ (int64_t)b) &
+                                             ((int64_t)a ^ (int64_t)res)) < 0;
+                                    fl.CF = 0;
+                                } else {
+                                    fl.CF = a < b; // unsigned borrow
+                                    fl.OF = 0;
+                                }
+                                break;
+                            }
+                            default:
+                                hit = false;
+                        }
+                        if (hit) {
+                            instance->registers.rip.qword(
+                                instance->registers.rip.raw() + fl_inl.size_instr);
+                            ++profiler_instr_counter;
+                            --instance->reductions_remaining;
+                            continue;
+                        }
+                    }
+                    // Fast path para jmp/jcc primary 0x11 (independiente del mode).
+                    if (__builtin_expect(fl_inl.is_not_extended == 0x11, 0)) {
+                        const uint8_t  cond = d->data_instruction.inmmed_data.reg;
+                        const uint64_t addr = d->data_instruction.inmmed_data.inmmed;
+                        const auto    &fl   = instance->registers.flags.bits;
+                        bool taken;
+                        switch (cond) {
+                            case 0x00: taken = (fl.ZF == 1); break; // EQ
+                            case 0x01: taken = (fl.ZF == 0); break; // NE
+                            case 0x02: taken = (fl.CF == 1); break; // CS/AE
+                            case 0x03: taken = (fl.CF == 0); break; // CC/B
+                            case 0x04: taken = (fl.SF == 1); break; // MI
+                            case 0x05: taken = (fl.SF == 0); break; // PL
+                            case 0x06: taken = (fl.OF == 1); break; // VS
+                            case 0x07: taken = (fl.OF == 0); break; // VC
+                            case 0x08: taken = (fl.CF == 0 && fl.ZF == 0); break; // HI
+                            case 0x09: taken = (fl.CF == 1 || fl.ZF == 1); break; // LS
+                            case 0x0A: taken = (fl.SF == fl.OF); break; // GE
+                            case 0x0B: taken = (fl.SF != fl.OF); break; // LT
+                            case 0x0C: taken = (fl.ZF == 0 && fl.SF == fl.OF); break; // GT
+                            case 0x0D: taken = (fl.ZF == 1 || fl.SF != fl.OF); break; // LE
+                            default:   taken = true; break; // 0x0F y otros
+                        }
+                        if (taken) {
+                            instance->registers.rip.qword(addr);
+                        } else {
+                            instance->registers.rip.qword(
+                                instance->registers.rip.raw() + fl_inl.size_instr);
+                        }
+                        ++profiler_instr_counter;
+                        --instance->reductions_remaining;
                         continue;
                     }
 
-                    // la instruccion cambio el estado de forma autonoma (ej. HLT via on_event)
-                    if (instance->state == HALT || instance->state == DEAD) {
+                    // Slow path: opcode no inlineable -> exec_cached.  Igual que antes.
+                    vm_event evt;
+                    if (__builtin_expect(d->exec_cached != nullptr, 1)) {
+                        d->exec_cached(instance, *d);
+                        if (__builtin_expect(d->flags_info.blocking, 0)) {
+                            evt = EVT_IO_WAIT;
+                        } else {
+                            // avanzar PC si la instruccion no fue salto.
+                            if (!d->flags_info.did_jump) {
+                                instance->registers.rip.qword(
+                                    instance->registers.rip.raw()
+                                    + d->flags_info.size_instr);
+                            } else {
+                                d->flags_info.did_jump = false;
+                            }
+                            ++profiler_instr_counter;
+                            evt = EVT_EXEC_DONE;
+                        }
+                    } else {
+                        on_event(EVT_HALT);
+                        evt = EVT_HALT;
+                    }
+                    instance->reductions_remaining--;
+
+                    // camino rapido: instruccion normal completada -> continuar
+                    if (__builtin_expect(evt == EVT_EXEC_DONE, 1)) {
+                        continue;
+                    }
+
+                    // la instruccion cambio el estado de forma autonoma (ej. HLT via on_event).
+                    // Lectura relaxed: el state lo escribieron exec_fns en este mismo thread
+                    // (HLT/DEAD) o nosotros antes (EXECUTE).  Cross-thread no relevante aqui.
+                    if (instance->state.load(std::memory_order_relaxed) == HALT
+                     || instance->state.load(std::memory_order_relaxed) == DEAD) {
                         alive_count--; // decrementar el contador de procesos vivos
+                        DIST_DBG("SCHED %u: proceso PID=(sched=%u local=%llu) -> %s  "
+                                 "r0=%llu err=%d tsc=%llu PC=0x%llX",
+                                 id_scheduler,
+                                 instance->pid.scheduler_id,
+                                 (unsigned long long)instance->pid.local_pid,
+                                 instance->state == HALT ? "HALT" : "DEAD",
+                                 (unsigned long long)instance->registers.regs[0].qword(),
+                                 (int)instance->err_thread,
+                                 (unsigned long long)instance->tsc,
+                                 (unsigned long long)instance->registers.rip.raw());
+                        // si el proceso fue creado por rspawn remoto, notificar al nodo origen con r0
+                        if (instance->rspawn_future_id != 0 &&
+                            instance->rspawn_origin_node != 0xFFFFFFFFu &&
+                            vm_reference.dist_runtime) {
+                            vm_reference.dist_runtime->notify_rspawn_halt(instance);
+                        }
                         instance = nullptr;
                         break;
                     }
 
                     // E/S genuina: poner en WAIT_IO y dejar de procesar este proceso
-                    instance->state = WAIT_IO;
+                    DIST_DBG("SCHED %u: proceso PID=(sched=%u local=%llu) -> WAIT_IO "
+                             "tsc=%llu PC=0x%llX err=%d",
+                             id_scheduler,
+                             instance->pid.scheduler_id,
+                             (unsigned long long)instance->pid.local_pid,
+                             (unsigned long long)instance->tsc,
+                             (unsigned long long)instance->registers.rip.raw(),
+                             (int)instance->err_thread);
+                    // transicion a WAIT_IO con double-check
+                    // de wake_pending para resolver el race "lost wakeup".
+                    //
+                    // Algunas exec_fns (await, msgrecv, monwait, msgsend al
+                    // bloquear por buffer remoto) llaman on_event(EVT_IO_WAIT)
+                    // explicitamente antes de retornar, dejando state ya en
+                    // WAIT_IO.  Otras dejan state=EXECUTE.  La CAS aqui es
+                    // condicional para cubrir ambos casos sin dobles
+                    // transiciones.
+                    //
+                    // Despues, INDEPENDIENTEMENTE de quien transiciono,
+                    // exchange wake_pending: si era true significa que un
+                    // hilo remoto (msgsend/fulfill/notify) intento despertar
+                    // mientras decidiamos dormir.  Revertir a READY para no
+                    // perder la senal.  Si estado actual es READY (porque
+                    // make_ready remoto ya lo cambio + encolo), no hay nada
+                    // que deshacer.
+                    {
+                        vm_state expected = EXECUTE;
+                        instance->state.compare_exchange_strong(
+                            expected, WAIT_IO,
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire);
+                        // Limpiar y leer wake_pending.
+                        if (instance->wake_pending.exchange(false,
+                                std::memory_order_acq_rel)) {
+                            // Solo revertir si seguimos en WAIT_IO/BLOCKED:
+                            // si ya esta READY (make_ready remoto exitoso),
+                            // no hay nada que tocar (ya esta encolado).
+                            vm_state cur = instance->state.load(
+                                std::memory_order_acquire);
+                            if (cur == WAIT_IO || cur == BLOCKED) {
+                                instance->state.store(READY,
+                                    std::memory_order_release);
+                                std::lock_guard<std::mutex> lock(queue_mutex);
+                                ready_queue.push_back(instance);
+                            }
+                        }
+                    }
                     instance = nullptr;
                     break;
                 }
@@ -322,10 +561,38 @@ namespace runtime {
                     // comprobar si el proceso alcanzo un estado terminal o bloqueante
                     if (instance->state == DEAD || instance->state == HALT) {
                         alive_count--; // decrementar el contador de procesos vivos
+                        DIST_DBG("SCHED %u (slow): proceso PID=(sched=%u local=%llu) -> %s  "
+                                 "r0=%llu err=%d tsc=%llu PC=0x%llX",
+                                 id_scheduler,
+                                 instance->pid.scheduler_id,
+                                 (unsigned long long)instance->pid.local_pid,
+                                 instance->state == HALT ? "HALT" : "DEAD",
+                                 (unsigned long long)instance->registers.regs[0].qword(),
+                                 (int)instance->err_thread,
+                                 (unsigned long long)instance->tsc,
+                                 (unsigned long long)instance->registers.rip.raw());
+                        // notificar al nodo origen si el proceso vino de un rspawn remoto
+                        if (instance->rspawn_future_id != 0 &&
+                            instance->rspawn_origin_node != 0xFFFFFFFFu &&
+                            vm_reference.dist_runtime) {
+                            vm_reference.dist_runtime->notify_rspawn_halt(instance);
+                        }
                         instance = nullptr;
                         break;
                     }
                     if (instance->state == WAIT_IO || instance->state == BLOCKED) {
+                        // (slow path): mismo double-check que
+                        // en fast path.  Si un make_ready remoto seteo
+                        // wake_pending entre EXECUTE y aqui, abortar la
+                        // dormida y reencolar.
+                        if (instance->wake_pending.exchange(false,
+                                std::memory_order_acq_rel)) {
+                            instance->state.store(READY, std::memory_order_release);
+                            std::lock_guard<std::mutex> lock(queue_mutex);
+                            ready_queue.push_back(instance);
+                            instance = nullptr;
+                            break;
+                        }
                         instance = nullptr; // el proceso espera un evento externo
                         break;
                     }
@@ -455,16 +722,40 @@ namespace runtime {
     void Scheduler::make_ready(GlobalPID pid) {
         ProcessVM *p = pid_index[pid]; // buscar el proceso por PID en O(1)
 
-        // incrementar alive_count solo la primera vez o al reactivar un proceso terminado
-        if (p->state == NEW || p->state == HALT || p->state == DEAD)
-            alive_count++; // el proceso pasa a contar como "vivo"
+        // poner wake_pending=true ANTES de leer state.  Esto
+        // garantiza que si el scheduler propietario observa wake_pending
+        // tras CAS EXECUTE->WAIT_IO, ve la senal y aborta la transicion.
+        p->wake_pending.store(true, std::memory_order_release);
 
-        p->state = READY; // marcar como listo para ejecutarse
+        // CAS-loop: solo transicionar a READY desde un estado durmiente
+        // (NEW, HALT, DEAD, WAIT_IO, BLOCKED).  Si esta activo
+        // (READY/RUNNING/DECODE/EXECUTE), no tocar el state: el wake_pending
+        // ya quedo marcado para el scheduler propietario.
+        vm_state prev = p->state.load(std::memory_order_acquire);
+        while (prev == NEW || prev == HALT || prev == DEAD ||
+               prev == WAIT_IO || prev == BLOCKED) {
+            if (p->state.compare_exchange_weak(prev, READY,
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_acquire)) {
+                // Transicion exitosa.  El wake_pending lo limpiamos porque
+                // la accion de despertar ya esta consumida (encolaremos abajo).
+                p->wake_pending.store(false, std::memory_order_release);
 
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex); // proteger la cola ante accesos concurrentes
-            ready_queue.push_back(p); // insertar al final de la cola FIFO
+                // incrementar alive_count solo la primera vez o al reactivar
+                if (prev == NEW || prev == HALT || prev == DEAD)
+                    alive_count++; // el proceso pasa a contar como "vivo"
+
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    ready_queue.push_back(p); // insertar al final de la cola FIFO
+                }
+                return;
+            }
+            // CAS fallo: prev fue actualizado por compare_exchange_weak con
+            // el valor real; reintentar.
         }
+        // Estado activo: no reencolar, pero wake_pending queda marcado para
+        // que el scheduler propietario lo respete antes de dormirse.
     }
 
     /**

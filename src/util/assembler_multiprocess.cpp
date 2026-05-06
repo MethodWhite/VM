@@ -28,7 +28,8 @@
 
 namespace asm_multi_process {
     int run_worker(const std::string &file_name,
-                   const std::string &output_prefix) {
+                   const std::string &output_prefix,
+                   bool skip_preprocessor) {
         //if (arch.empty()) {
         //    std::cerr << "--arch es requerido en modo --worker\n";
         //    return EXIT_FAILURE;
@@ -54,7 +55,9 @@ namespace asm_multi_process {
 
 #ifdef VESTA_HAS_PREPROCESSOR
         // Preprocesado: expandir macros, directivas #define/#if/#foreach/#import, etc.
-        {
+        // Saltable si el caller lo pidio (p.ej. el .vel proviene del lowering
+        // de Vex y ya ha sido preprocesado al nivel del .vex original).
+        if (!skip_preprocessor) {
             vpp::Preprocessor pp;
 
             // configurar rutas de busqueda para #include y #import

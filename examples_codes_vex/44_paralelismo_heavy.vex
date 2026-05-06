@@ -1,0 +1,58 @@
+// prueba de paralelismo OS-thread real con carga
+// computacional pesada (10 millones de iteraciones por hijo).
+//
+// Cada hijo hace una computacion CPU-bound trivial (suma 1+2+...+N
+// modulo i64) sin syscalls ni IPC.  Solo al final hace msgsend(0, acc).
+//
+// Con --schedulers 1: ejecucion secuencial (cooperativo).
+// Con --schedulers 4: 4 hijos en 4 threads OS reales.
+//
+// Esperado: speedup cercano a 4x con --schedulers 4 vs --schedulers 1.
+
+i32 main() {
+    i64 c1 = spawn {
+        i64 acc = 0;
+        i64 i = 1;
+        while (i <= 10000000) {
+            acc = acc + i;
+            i = i + 1;
+        }
+        msgsend(0, acc);
+    };
+    i64 c2 = spawn {
+        i64 acc = 0;
+        i64 i = 1;
+        while (i <= 10000000) {
+            acc = acc + i;
+            i = i + 1;
+        }
+        msgsend(0, acc);
+    };
+    i64 c3 = spawn {
+        i64 acc = 0;
+        i64 i = 1;
+        while (i <= 10000000) {
+            acc = acc + i;
+            i = i + 1;
+        }
+        msgsend(0, acc);
+    };
+    i64 c4 = spawn {
+        i64 acc = 0;
+        i64 i = 1;
+        while (i <= 10000000) {
+            acc = acc + i;
+            i = i + 1;
+        }
+        msgsend(0, acc);
+    };
+
+    i64 total = 0;
+    i64 n = 0;
+    while (n < 4) {
+        i64 m = msgrecv();
+        total = total + m;
+        n = n + 1;
+    }
+    return total;
+}

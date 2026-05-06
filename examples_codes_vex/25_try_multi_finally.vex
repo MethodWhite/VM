@@ -1,0 +1,37 @@
+// Multi-catch + finally.
+//
+// Verifica:
+//   - Multiples clausulas catch en orden: la primera coincidente captura.
+//   - finally se ejecuta SIEMPRE: tanto en exit normal del body como
+//     tras un catch.
+//
+// Escenario:
+//   - Lanza ExcB(50) dentro del try.
+//   - El primer catch (ExcA) NO coincide -> se prueba el siguiente.
+//   - El segundo catch (ExcB) SI coincide -> handler corre.
+//   - finally suma 7 al acumulador siempre.
+//
+// Acumulador final esperado: 1000 (handler) + 50 (e.valor) + 7 (finally) = 1057.
+
+class ExcA {
+    public ExcA() { }
+}
+
+class ExcB {
+    public i32 valor;
+    public ExcB(i32 v) { this.valor = v; }
+}
+
+i32 main() {
+    i32 acc = 0;
+    try {
+        throw new ExcB(50);
+    } catch (ExcA a) {
+        acc = 999;            // dead code: ExcA no coincide
+    } catch (ExcB b) {
+        acc = 1000 + b.valor; // handler activo: 1050
+    } finally {
+        acc = acc + 7;        // siempre: +7
+    }
+    return acc;               // 1057
+}

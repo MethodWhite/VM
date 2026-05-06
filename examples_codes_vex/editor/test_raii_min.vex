@@ -1,0 +1,66 @@
+// CASO 5 con casos previos.
+
+class Counter {
+    public static i32 cnt;
+    public static i32 instance;
+    public Counter() {}
+}
+
+class R {
+    public i32 id;
+    public R(i32 i) {
+        this.id = i;
+        Counter.instance = Counter.instance + 1;
+    }
+    public ~R() {
+        Counter.cnt = Counter.cnt + 1;
+        Counter.instance = Counter.instance - 1;
+    }
+    public i32 get() { return this.id; }
+}
+
+class Plain {
+    public i32 id;
+    public Plain(i32 i) { this.id = i; }
+    public i32 get() { return this.id; }
+}
+
+i32 caso_1() {
+    R r = new R(100);
+    return r.get();
+}
+
+i32 caso_5() {
+    R a = new R(1);
+    R b = new R(2);
+    R c = new R(3);
+    return a.get() + b.get() + c.get();
+}
+
+i32 main() {
+    Counter.cnt = 0;
+    Counter.instance = 0;
+
+    // CASO 1
+    i32 r1 = caso_1();
+    println("CASO 1: r=${r1} dtor=${Counter.cnt}");
+
+    // CASO 2: Plain en loop
+    i32 sum2 = 0; i32 i2 = 0;
+    while (i2 < 100) {
+        Plain p = new Plain(i2);
+        sum2 = sum2 + p.get();
+        i2 = i2 + 1;
+    }
+    println("CASO 2: sum=${sum2}");
+
+    // CASO 5: 3 instances RAII
+    Counter.cnt = 0;
+    Counter.instance = 0;
+    i32 r5 = caso_5();
+    i32 d5 = Counter.cnt;
+    i32 i5 = Counter.instance;
+    println("CASO 5: r=${r5} dtor=${d5} instance=${i5}");
+
+    return 0;
+}

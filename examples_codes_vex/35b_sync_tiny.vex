@@ -1,0 +1,13 @@
+// Test minimo de synchronized: 1 iteracion, sin loop.
+class Counter {
+    i32 value;
+    Counter() { this.value = 0; }
+    i32 inc() {
+        synchronized (this) { this.value = this.value + 1; }
+        return this.value;
+    }
+}
+i32 main() {
+    Counter c = new Counter();
+    return c.inc();   // esperado: 1
+}

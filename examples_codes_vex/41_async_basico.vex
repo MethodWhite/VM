@@ -1,0 +1,30 @@
+// @Async sugar:
+//
+// El programador escribe:
+//   @Async i64 fn() { return X; }
+//
+// El frontend genera AUTOMATICAMENTE:
+//   - wrapper i64 fn() que alloca Future, spawnea helper, devuelve handle
+//   - helper __async_fn(void) que recibe handle via msgrecv, ejecuta body,
+//     intercepta return como fulfill+hlt
+//
+// El caller usa: i64 r = await fn();
+//
+// MVP limitations:
+//   - @Async no soporta args (sin closures aun); workaround manual via msgsend.
+//   - return type DEBE ser i64 (handle del Future); el valor real fluye via fulfill.
+
+@Async
+i64 compute() {
+    // "trabajo asincrono" trivial.  El return X dentro del body:
+    //   - se intercepta en lower_return,
+    //   - emite fulfill(my_future, X) + hlt,
+    //   - el caller obtiene X via await.
+    return 21 * 2;
+}
+
+i32 main() {
+    i64 fut = compute();      // arranca el child + devuelve handle
+    i64 r   = await fut;      // bloquea hasta que child fulfill
+    return r;                  // 42
+}

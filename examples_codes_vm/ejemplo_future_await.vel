@@ -1,0 +1,105 @@
+/*
+ * ejemplo_future_await.vel
+ *
+ * Demuestra el modelo async/await nativo de VestaVM con FUTURE/AWAIT/FULFILL.
+ *
+ * Patron productor-consumidor:
+ *   1. El proceso padre crea un FutureObject (estado PENDING).
+ *   2. Lanza un proceso hijo (productor) con SPAWN.
+ *   3. El padre ejecuta AWAIT y se bloquea (sin consumir CPU).
+ *   4. El hijo realiza su trabajo y llama FULFILL para resolver el future.
+ *   5. El padre es despertado automaticamente y recibe el resultado en R0.
+ *
+ * Instrucciones:
+ *
+ *   FUTURE              ; R0 = GcHandle del FutureObject (estado PENDING)
+ *   AWAIT r_fut         ; bloquea; R0 = resultado cuando se resuelva
+ *   FULFILL r_fut, r_val; resuelve el future; despierta al proceso en AWAIT
+ *   REJECT  r_fut, r_err; rechaza el future con un codigo de error
+ *
+ * NOTA: En este ejemplo el padre pasa el GcHandle al hijo mediante una
+ * celda de memoria compartida (variable global en la seccion "all").
+ * En un uso real se puede pasar a traves de registros antes del spawn
+ * o mediante un canal de mensajes.
+ *
+ * Compilar y ejecutar:
+ *   vesta --build ejemplo_future_await.vel -o ejemplo_future_await
+ *   vesta --run   ejemplo_future_await.velb --stats
+ *
+ * Resultado esperado:
+ *   R0 = 42  (valor producido por el hijo y recibido por el padre tras AWAIT)
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+// -----------------------------------------------------------------------
+// Variable global: celda de 8 bytes donde el padre deja el GcHandle
+// del future para que el hijo lo lea.
+// -----------------------------------------------------------------------
+shared_handle:
+    .qword 0
+end_shared_handle:
+
+// -----------------------------------------------------------------------
+// PROCESO PADRE
+// -----------------------------------------------------------------------
+code:
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // 1. Crear el FutureObject en estado PENDING
+    future                              // R0 = GcHandle
+
+    // 2. Guardar el handle en la celda compartida y en r11
+    mov   r11, r0
+    mov   r12, @Absolute("all.shared_handle")
+    movc  [r12], r11                    // escribir en la celda compartida
+
+    // 3. Lanzar el proceso productor
+    mov   r1, @Absolute("all.productor")
+    spawn r1                            // r0 = PID del hijo (descartado aqui)
+
+    // 4. Esperar el resultado de forma cooperativa (sin consumir CPU)
+    mov   r1, r11
+    await r1                            // R0 = valor del future cuando se resuelva
+
+    // En este punto R0 = 42
+    hlt
+end_code:
+
+// -----------------------------------------------------------------------
+// PROCESO PRODUCTOR (hijo)
+// Leer el handle del future desde la celda compartida y resolverlo.
+// -----------------------------------------------------------------------
+productor:
+    // Inicializar pila del proceso hijo
+    mov rsp, 0x00FE0000
+    mov rbp, 0x00FE0000
+
+    // Ceder el CPU una vez para asegurar que el padre llego a AWAIT
+    yield
+
+    // Leer el GcHandle del future desde la memoria compartida
+    mov   r5, @Absolute("all.shared_handle")
+    movc  r6, [r5]                      // r6 = GcHandle del future
+
+    // Producir el valor de resultado
+    mov   r7, 42
+
+    // Resolver el future: despierta al padre bloqueado en AWAIT
+    fulfill r6, r7                      // padre recibira R0 = 42
+
+    hlt
+end_productor:

@@ -1,0 +1,26 @@
+// "Plugin" cargable dinamicamente via loadmodule.
+//
+// Este modulo define una clase `PluginGreeter` con un metodo `valor()`
+// que devuelve una constante.  Cuando otro modulo lo carga via
+// `loadmodule("48_loadmodule_plugin.velb")`, el prologo de `main` del
+// plugin invoca `__module_init` (registra la clase en el ClassRegistry
+// global).  Tras eso, el caller puede usar la clase via `findclass` /
+// `forName` y construirla via reflexion (futuro) o via `new` si la
+// declara como import (no soportado en MVP).
+//
+// Para MVP el caller tipicamente hace:
+//   loadmodule("48_loadmodule_plugin.velb");
+//   // PluginGreeter ya esta registrada; construirla via newobj manual
+//   // o via lookup por nombre en el bytecode.
+//
+// Este `main` debe ser trivial (return 1 indicador de carga OK).
+
+class PluginGreeter {
+    public i64 valor() { return 12345; }
+}
+
+i32 main() {
+    // Convencion: main de un plugin retorna 1 indicando "module loaded ok".
+    // Tras este return, R0 = 1 y el caller continua despues del loadmod.
+    return 1;
+}

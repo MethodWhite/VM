@@ -1,0 +1,47 @@
+// examples_codes_vex/98_arraylist_string_natural.vex
+//
+// Sintaxis natural ArrayList<string>:
+//   * El frontend ya conoce el tipo del elemento (string -> GC).
+//   * El lowering despacha automaticamente a vcol_alist_push_gc /
+//     vcol_alist_pop_gc / ... y al exit emite vcol_alist_free_gc, sin
+//     que el usuario tenga que tocar extern, getproc, ni free manual.
+//
+// Equivalente automatico de 97_gc_writebarrier.vex pero sin un solo
+// extern: el handle se libera al exit del scope con write-barrier
+// inclusive para los strings que quedan dentro del array.
+//
+// Esperado: R00 == 42.
+
+i32 main() {
+    ArrayList<string> xs = arraylist(8);
+
+    // Anadir 3 strings que el GC ya retiene como external roots
+    // gracias a la write-barrier de la variante *_gc.
+    string s1 = "hola";
+    string s2 = "mundo";
+    string s3 = "gc-protected";
+    xs.push(s1);
+    xs.push(s2);
+    xs.push(s3);
+
+    // Verificar el tamano + que get devuelva exactamente los mismos
+    // handles que metimos (igualdad i64).  Las comparaciones usan el
+    // cast implicito string -> i64 (el handle es opaco).
+    i32 acc = 0;
+    if (xs.size() == 3)         { acc = acc + 10; }
+    i64 h0 = xs.get(0);
+    i64 h1 = xs.get(1);
+    i64 h2 = xs.get(2);
+    i64 r1 = s1;
+    i64 r2 = s2;
+    i64 r3 = s3;
+    if (h0 == r1)               { acc = acc + 10; }
+    if (h1 == r2)               { acc = acc + 10; }
+    if (h2 == r3)               { acc = acc + 12; }
+
+    // No hace falta dispose ni free: el cleanup automatico del scope
+    // emite vcol_alist_free_gc(proc, xs) que libera las refs del
+    // write-barrier ANTES de liberar el ArrayList.  Sin leak.
+
+    return acc;   // 10 + 10 + 10 + 12 = 42
+}

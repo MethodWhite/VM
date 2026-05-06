@@ -1,0 +1,117 @@
+/*
+ * ejemplo_distrib_msgsend_remoto.vel
+ *
+ * Demuestra el envio de mensajes a un proceso en un nodo VDP remoto usando
+ * MSGSEND con un PID remoto codificado.
+ *
+ * Diferencia entre PID local y PID remoto:
+ *
+ *   PID local  (bit 63 = 0):
+ *     bits 31-0 = local_pid
+ *     El mensaje se deposita directamente en el Mailbox del proceso local.
+ *
+ *   PID remoto (bit 63 = 1):
+ *     bits 62-32 = node_idx  (indice del nodo en NodeRegistry, 31 bits)
+ *     bits 31-0  = remote_local_pid (PID del proceso en el nodo remoto)
+ *     El mensaje se envia como VDP_MSGSEND al nodo remoto.
+ *     Entrega garantizada at-least-once: se reintenta hasta VDP_MSGSEND_ACK.
+ *
+ * Instruccion:
+ *
+ *   MSGSEND  r_pid, r_addr, r_len
+ *       r_pid  = PID del proceso destino (local o remoto).
+ *       r_addr = direccion VM del buffer de datos a enviar.
+ *       r_len  = longitud del mensaje en bytes.
+ *       R0 = 1 si enviado/encolado; 0 si error (nodo sin conexion, etc.).
+ *
+ * Construccion de un PID remoto:
+ *
+ *   node_idx  = 0   (primer nodo estatico del NodeRegistry)
+ *   local_pid = PID que se obtuvo cuando el proceso remoto fue creado con RSPAWN
+ *
+ *   remote_pid = (1 << 63) | (node_idx << 32) | local_pid
+ *
+ * PREREQUISITO:
+ *   - El nodo remoto (indice 0) debe estar conectado y autenticado.
+ *   - El proceso receptor remoto (local_pid = 1) debe estar bloqueado en MSGRECV.
+ *   - En un uso real, se usa primero RSPAWN para obtener el PID del proceso remoto.
+ *
+ * Compilar y ejecutar:
+ *   vesta --build ejemplo_distrib_msgsend_remoto.vel -o ejemplo_distrib_msgsend_remoto
+ *   vesta --run   ejemplo_distrib_msgsend_remoto.velb --stats
+ *
+ * Resultado esperado:
+ *   R0 = 1  (mensaje encolado con exito para envio al nodo remoto)
+ *   El nodo remoto recibira el mensaje via VDP_MSGSEND y lo deposita
+ *   en el Mailbox del proceso con local_pid = 1.
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+// -----------------------------------------------------------------------
+// Mensaje a enviar al nodo remoto (16 bytes)
+// -----------------------------------------------------------------------
+remote_msg:
+    .byte 0x56, 0x44, 0x50, 0x2D, 0x4D, 0x53, 0x47, 0x00  // "VDP-MSG\0"
+    .byte 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // version = 1
+end_remote_msg:
+
+// -----------------------------------------------------------------------
+// PROCESO PRINCIPAL
+// -----------------------------------------------------------------------
+code:
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // ---- Construir el PID remoto ----
+    // Queremos enviar al proceso con local_pid=1 en el nodo con node_idx=0.
+    //
+    // Formula:   remote_pid = (1 << 63) | (node_idx << 32) | local_pid
+    //
+    // Paso a paso con los registros disponibles:
+    //   r1 = 1  (remote flag: bit 63)
+    //   r2 = 63 (posicion del bit)
+    //   r3 = node_idx = 0
+    //   r4 = local_pid = 1
+    //
+    //   remote_pid = (r1 << r2) | (r3 << 32) | r4
+
+    // bit de PID remoto (bit 63 = 1)
+    mov   r1, 1
+    shl   r1, r1, 63                // r1 = 0x8000000000000000
+
+    // node_idx = 0 en bits 62-32
+    mov   r3, 0
+    shl   r3, r3, 32                // r3 = 0 (node_idx=0 no aporta bits)
+
+    // local_pid = 1 en bits 31-0
+    mov   r4, 1                     // local_pid = 1
+
+    // combinar: remote_pid = r1 | r3 | r4
+    or    r5, r1, r3                // r5 = 0x8000000000000000
+    or    r5, r5, r4                // r5 = 0x8000000000000001  (remote, node=0, pid=1)
+
+    // ---- Enviar el mensaje ----
+    mov   r6, @Absolute("all.remote_msg")   // r6 = dir del buffer
+    mov   r7, 16                            // r7 = 16 bytes de mensaje
+
+    // MSGSEND r_pid, r_addr, r_len -> R0 = 1 si enviado, 0 si error
+    msgsend r5, r6, r7
+
+    // R0 = 1: el mensaje fue encolado para envio al nodo remoto.
+    //         El hilo de reintentos lo reenviara hasta recibir VDP_MSGSEND_ACK.
+    // R0 = 0: error (nodo no conectado, sesion inactiva, PID invalido).
+    hlt
+end_code:

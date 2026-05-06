@@ -1,0 +1,14 @@
+void main() {
+    println("start");
+    flush();
+    u64 j = 0;
+    println("j init=${j}");
+    flush();
+    while (j < 4) {
+        println("in loop j=${j}");
+        flush();
+        j = j + 1;
+    }
+    println("fin");
+    flush();
+}

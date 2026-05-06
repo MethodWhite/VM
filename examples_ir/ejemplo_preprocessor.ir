@@ -1,0 +1,99 @@
+/**
+ * ejemplo_preprocessor.ir
+ * Demostracion del preprocesador de VestaVM.
+ *
+ * El preprocesador (vpp::Preprocessor) se activa automaticamente antes de
+ * parsear el .ir cuando el ejecutable se compila con VESTA_HAS_PREPROCESSOR.
+ * Se puede invocar de forma aislada con:
+ *   vm --ir-file ... --preprocess-only
+ *
+ * Directivas del preprocesador soportadas (sintaxis identica a C):
+ *   #define NOMBRE valor       // definir macro sin parametros
+ *   #define NOMBRE(p) expr     // definir macro con parametros
+ *   #ifdef / #ifndef / #endif  // compilacion condicional
+ *   #include "fichero.ir"      // inclusion de otro fichero
+ *   #undef NOMBRE              // eliminar definicion
+ *
+ * Este fichero define la constante MAX_ITER y usa compilacion condicional
+ * para elegir entre dos implementaciones.
+ *
+ * Para ver la salida del preprocesador antes de parsear:
+ *   vm --ir-file examples_ir/ejemplo_preprocessor.ir --preprocess-only
+ *
+ * Para compilar directamente (el preprocesador corre en silencio):
+ *   vm --ir-file examples_ir/ejemplo_preprocessor.ir --ir-opt 1 -o build/out_ir/prep
+ */
+
+// Constante usada en el bucle: numero maximo de iteraciones
+#define MAX_ITER 100
+
+// Habilitar la version optimizada del calculo
+#define USE_FAST_PATH
+
+@module ejemplo_preprocessor
+
+/**
+ * Calcula la suma 1 + 2 + ... + n acotada a MAX_ITER.
+ * La macro MAX_ITER se expande aqui a 100 por el preprocesador.
+ */
+@function sum_bounded(n: i64) -> i64 {
+entry:
+    limit = const.i64 MAX_ITER     // expandido a 100 por el preprocesador
+    // Usar el menor de n y MAX_ITER como limite del bucle
+    too_big = cmp.gt.i64 n, limit
+    br.cond too_big, use_limit, use_n
+
+use_limit:
+    cap = mov.i64 limit
+    br  loop_init
+
+use_n:
+    cap = mov.i64 n
+    br  loop_init
+
+loop_init:
+    actual = phi.i64 [cap, use_limit], [cap, use_n]
+    s0     = const.i64 0
+    br     loop_check
+
+loop_check:
+    sum_c = phi.i64 [s0,     loop_init], [sum_next, loop_body]
+    i_c   = phi.i64 [actual, loop_init], [i_prev,   loop_body]
+    zero  = const.i64 0
+    done  = cmp.le.i64 i_c, zero
+    br.cond done, loop_exit, loop_body
+
+loop_body:
+    sum_next = add.i64 sum_c, i_c
+    one      = const.i64 1
+    i_prev   = sub.i64 i_c, one    // decrementar: suma de n a 1
+    br       loop_check
+
+loop_exit:
+    ret.i64 sum_c
+
+}
+
+#ifdef USE_FAST_PATH
+// Version rapida: formula cerrada n*(n+1)/2
+// Solo se incluye si USE_FAST_PATH esta definida
+@function sum_fast(n: i64) -> i64 {
+entry:
+    one     = const.i64 1
+    two     = const.i64 2
+    np1     = add.i64 n, one      // n + 1
+    prod    = mul.i64 n, np1      // n * (n + 1)
+    result  = div.i64 prod, two   // / 2
+    ret.i64 result
+}
+#endif
+
+#ifndef USE_FAST_PATH
+// Version de referencia (solo incluida si USE_FAST_PATH NO esta definida)
+@function sum_fast(n: i64) -> i64 {
+entry:
+    // sin optimizacion: delegar a sum_bounded
+    result = mov.i64 n
+    ret.i64 result
+}
+#endif

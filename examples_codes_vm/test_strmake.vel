@@ -1,0 +1,28 @@
+// Test minimo strmake.
+@Format("velb")
+@Module(test_strmake)
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section { @Name("code"), @SpaceAddress("anonymous"), @Align(0x1000) }
+@Section { @Name("all"),  @SpaceAddress("anonymous"), @Align(0x1000) }
+
+@InitPc(0x1000)
+
+code:
+main:
+    enter 0
+    mov r1, @Absolute("all.str_hello")
+    mov r2, 5
+    strmake r3, r1, r2
+    mov r0, r3
+    leave
+    hlt
+
+all:
+str_hello:
+    db 0x48, 0x65, 0x6C, 0x6C, 0x6F

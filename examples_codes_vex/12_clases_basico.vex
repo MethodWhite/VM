@@ -1,0 +1,40 @@
+// examples_codes_vex/12_clases_basico.vex
+//
+// Demuestra POO basico:
+//   - Declaracion de clase con campos y metodos.
+//   - Constructor que inicializa campos via this.
+//   - new ClassName(args): crea instancia (findclass + newobj +
+//     callvirt al constructor en vtable[0]).
+//   - obj.field: acceso a campo via offset (relativo a host_ptr).
+//   - obj.method(): despacho virtual via vtable.
+//
+// Pipeline interno:
+//   - Cada clase declarada se traduce a una IrFunction __new_<X>(args)
+//     que encapsula findclass + newobj + gcderef + callvirt 0.
+//   - Una IrFunction __module_init() registra todas las clases via
+//     defclass + deffield + defmethod (codigo runtime, no metadata
+//     estatica del .velb).
+//   - main inserta automaticamente un prologo `call __module_init`.
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/12_clases_basico.vex -o cb
+//   vm --run cb.velb --stats
+//
+// Resultado esperado: R00 == 7  (3 + 4)
+
+class Punto {
+    i32 x;
+    i32 y;
+    Punto(i32 a, i32 b) {
+        this.x = a;
+        this.y = b;
+    }
+    i32 sum() {
+        return this.x + this.y;
+    }
+}
+
+i32 main() {
+    Punto p = new Punto(3, 4);
+    return p.sum();
+}

@@ -1,0 +1,31 @@
+// test cross-module: caller carga plugin compilado con
+// --vex-base 0x10000000 (para no solapar con caller en 0x0).
+//
+// Pasos:
+//   1. loadmodule(path) abre el plugin .velb, lo carga en VA 0x10000000+,
+//      auto-invoca su main (que registra `PluginGreeter` via __module_init
+//      en el ClassRegistry global), y vuelve.
+//   2. forName("PluginGreeter") busca la clase en el ClassRegistry global.
+//      Devuelve un ClassInfo* (i64 != 0) si la clase fue registrada por
+//      el plugin.  Esto confirma que loadmodule realmente ejecuto el
+//      __module_init del plugin.
+//
+// Resultado:
+//   100 si todo OK (plugin cargado + clase registrada)
+//    50 si plugin cargado pero clase NO registrada (no deberia pasar)
+//     0 si loadmodule fallo (file not found / parse error)
+//
+// El path es absoluto al .velb del plugin que el script de test (o el
+// usuario) deja en F:/C/VM/_test_plugin.velb.
+
+i32 main() {
+    i64 lm = loadmodule("F:/C/VM/_test_plugin.velb");
+    if (lm == 0) {
+        return 0; // load failure
+    }
+    i64 cls = forName("PluginGreeter");
+    if (cls == 0) {
+        return 50; // cargado pero clase no registrada
+    }
+    return 100;     // exito cross-module
+}

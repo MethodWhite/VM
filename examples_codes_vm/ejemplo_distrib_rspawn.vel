@@ -1,0 +1,138 @@
+/*
+ * ejemplo_distrib_rspawn.vel
+ *
+ * Demuestra la instruccion RSPAWN: crear un proceso en un nodo VDP remoto.
+ *
+ * RSPAWN serializa el bytecode de la funcion indicada (hasta 64 KB),
+ * lo envia al nodo destino via VDP_RSPAWN, y retorna un FutureObject
+ * cuyo resultado sera el PID remoto cuando el proceso sea creado.
+ *
+ * Instruccion:
+ *
+ *   RSPAWN  r_fn, r_node
+ *       r_fn   = direccion VM del bytecode a ejecutar en el nodo remoto.
+ *       r_node = indice del nodo destino en el NodeRegistry local.
+ *       R0     = GcHandle del FutureObject (estado PENDING).
+ *                R0 = 0xFFFFFFFF si el nodo no esta conectado o hubo error.
+ *
+ * El proceso que hizo RSPAWN puede luego hacer AWAIT sobre el future
+ * para obtener el PID remoto del proceso creado, o puede continuar
+ * sin esperar (fire-and-forget).
+ *
+ * Convenciones de llamada para el proceso remoto:
+ *   - R1..R12: argumentos (igual que CALLN).
+ *   - R15: argc (numero de argumentos validos).
+ *   - Los argumentos se copian desde el proceso local antes de enviar.
+ *   - El proceso remoto empieza con el bytecode serializado al inicio.
+ *
+ * Limitaciones actuales (v1):
+ *   - El bloque de bytecode enviado es contiguo desde fn_addr hasta
+ *     fn_addr + 64 KB.  La funcion remota debe ser autocontenida en ese rango.
+ *   - La memoria del proceso remoto es independiente del local.
+ *   - No se puede acceder a etiquetas del nodo local desde el remoto.
+ *
+ * PREREQUISITO: antes de ejecutar este programa, el DistRuntime debe estar
+ * activo y el nodo con indice 0 debe estar conectado y autenticado.
+ * Desde el CLI de vesta:
+ *   > dist start --port 7789
+ *   > dist add-node 192.168.1.10 7789
+ *
+ * Compilar y ejecutar:
+ *   vesta --build ejemplo_distrib_rspawn.vel -o ejemplo_distrib_rspawn
+ *   vesta --run   ejemplo_distrib_rspawn.velb --stats
+ *
+ * Resultado esperado:
+ *   R0 = GcHandle del future (valor != 0xFFFFFFFF indica envio exitoso)
+ *   Tras AWAIT: R0 = PID remoto codificado del proceso creado
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+// -----------------------------------------------------------------------
+// Celda compartida para el GcHandle del future (8 bytes)
+// -----------------------------------------------------------------------
+future_handle:
+    .qword 0
+end_future_handle:
+
+// -----------------------------------------------------------------------
+// PROCESO PRINCIPAL
+// -----------------------------------------------------------------------
+code:
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // Configurar los argumentos que recibira el proceso remoto:
+    //   r15 = argc (numero de argumentos)
+    //   r1  = primer argumento (valor 42)
+    mov   r15, 1        // 1 argumento
+    mov   r1,  42       // argumento: el numero 42
+
+    // Direccion del bytecode a ejecutar en el nodo remoto
+    mov   r2, @Absolute("all.fn_remota")
+
+    // Indice del nodo destino en el NodeRegistry (0 = primer nodo estatico)
+    mov   r3, 0
+
+    // RSPAWN r_fn, r_node -> R0 = GcHandle del FutureObject (PENDING)
+    rspawn r2, r3
+
+    // Guardar el handle para usar con AWAIT
+    mov   r11, r0
+    mov   r12, @Absolute("all.future_handle")
+    movc  [r12], r11
+
+    // Comprobar si el envio fue exitoso (R0 == 0xFFFFFFFF = error)
+    mov   r13, 0xFFFFFFFF
+    cmpu  r11, r13
+    jmp.jeq error_rspawn    // si R0 == 0xFFFFFFFF: fallo
+
+    // Esperar el PID remoto del proceso creado (bloqueante hasta que el
+    // nodo remoto responda con VDP_RSPAWN_ACK)
+    mov   r1, r11
+    await r1                // R0 = PID remoto del proceso (cuando se resuelva)
+
+    // En este punto R0 contiene el PID remoto codificado.
+    // El proceso remoto fn_remota se esta ejecutando en el nodo destino.
+    hlt
+
+error_rspawn:
+    // R11 = 0xFFFFFFFF: error al enviar rspawn
+    // (nodo no conectado, sesion inactiva, o buffer de bytecode vacio)
+    mov   r0, 0xFFFFFFFF
+    hlt
+end_code:
+
+// -----------------------------------------------------------------------
+// FUNCION REMOTA
+// Este bytecode sera serializado y enviado al nodo remoto.
+// El proceso remoto empieza con este bytecode y recibe R1=42 (argc=1).
+//
+// IMPORTANTE: esta funcion debe ser autocontenida en 64 KB.
+// No puede referenciar etiquetas del nodo local.
+// -----------------------------------------------------------------------
+fn_remota:
+    // El proceso remoto recibe:
+    //   R1  = 42    (primer argumento pasado desde el nodo local)
+    //   R15 = 1     (argc)
+
+    // Realizar algun calculo con el argumento recibido
+    mov   r0, r1        // r0 = 42
+    add   r0, r0, 100   // r0 = 142
+
+    // Terminar el proceso remoto con el resultado en R0
+    // El PID de este proceso se devuelve al nodo local via VDP_RSPAWN_ACK
+    hlt
+end_fn_remota:

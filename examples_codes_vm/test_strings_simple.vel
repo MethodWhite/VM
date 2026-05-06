@@ -1,0 +1,66 @@
+/*
+ * test_strings_simple.vel - prueba minima del sistema de strings
+ *
+ * Compila y ejecuta:
+ *   ./vm --build test_strings_simple.vel -o test_strings_simple
+ *   ./vm --run   test_strings_simple.velb
+ *
+ * Salida esperada:
+ *   [handle=small number]
+ *   5
+ *   Hello
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+@Import {
+    @Method { @Lib("stdlib/native/io/vesta_io") @Name("vio_println")    }
+    @Method { @Lib("stdlib/native/io/vesta_io") @Name("vio_print_uint") }
+}
+
+code:
+    getproc r14
+
+    // Crear "Hello" desde buffer en VM memory
+    // strmake r_dst, r_src, r_len
+    mov r1, @Absolute("all.str_hello")
+    mov r2, 5
+    strmake r3, r1, r2                         // r3 = GcHandle de "Hello"
+
+    // Imprimir GcHandle (numero pequeno: 0, 1, 2...)
+    mov r1, r3
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // handle
+
+    // STRLEN: vio_print_uint(n) -> r1=n, r15=1
+    strlen r4, r3                              // r4 = 5
+    mov r1, r4
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // imprime 5
+
+    // Imprimir el buffer original via vio_println(proc, vm_addr, len)
+    mov r1, r14
+    mov r2, @Absolute("all.str_hello")
+    mov r3, 5
+    mov r15, 3
+    calln @Method("stdlib/native/io/vesta_io:vio_println")     // "Hello"
+
+    hlt
+end_code:
+
+align 16
+data:
+    str_hello db "Hello", 0x00, 0x00, 0x00     // "Hello" + padding
+end_data:

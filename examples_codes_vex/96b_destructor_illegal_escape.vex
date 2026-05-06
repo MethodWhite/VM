@@ -1,0 +1,23 @@
+// Test negativo: debe FALLAR la compilacion con error claro
+//
+// la regla se relaja para FieldAccess sobre objetos cuya clase
+// hereda RAII (sintetiza dtor recursivo).  Pero las demas rutas de
+// escape ilegal siguen prohibidas: aqui asignamos a un deref de
+// puntero raw (no hay scope owner que invoque el dtor).
+
+class Resource {
+    public i32 value;
+    public Resource(i32 v) { this.value = v; }
+    public ~Resource() {
+        // dtor body
+    }
+}
+
+i32 main() {
+    i64* slot = malloc(8);
+    Resource r = new Resource(7);
+    *slot = r;     // <-- ERROR: Resource tiene destructor; un deref
+                    // a memoria raw no participa del cleanup_stack_.
+    free(slot);
+    return r.value;
+}

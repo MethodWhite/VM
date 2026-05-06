@@ -29,6 +29,17 @@
 #include "gc/raw_allocator.h"
 #include "loader/oop_types.h"
 
+#include <atomic>
+#include <vector>
+
+namespace distrib {
+    class Mailbox; ///< Declaracion adelantada del buzon de mensajes distribuido
+}
+
+namespace runtime {
+    class StringInternPool; ///< Pool de interning de strings (definicion en string_intern.h)
+}
+
 /**
  * @brief Numero de reducciones por defecto que se le asignan a cada proceso al entrar en ejecucion.
  *
@@ -169,12 +180,47 @@ namespace runtime {
                 uint8_t reg_final; ///< Registro destino o fuente de la operacion
                 uint8_t scale;     ///< Factor de escala del registro indice (1, 2, 4 u 8)
             } mem_data;
+
+            /**
+             * @brief Operandos para instrucciones de acceso a static fields
+             *        (getstatic / setstatic, opcodes extended 0x60 / 0x61).
+             *
+             * Encoding fisico FIXED_8:
+             *   [0x00][0x60|0x61][regs_byte][_pad8][offset_u32_LE]
+             *     byte2 (regs_byte) = (r0 << 4) | r1
+             *     bytes 4-7         = offset uint32 little-endian
+             *
+             * Para @c getstatic: r0 = r_dst (destino del valor leido),
+             *                    r1 = r_class (registro con ClassInfo*).
+             * Para @c setstatic: r0 = r_class (registro con ClassInfo*),
+             *                    r1 = r_value (valor a almacenar).
+             *
+             * El opcode siempre opera sobre @c i64 (8 bytes); el frontend
+             * Vex realiza @c truncate post-load para tipos mas pequenos
+             * (mismo patron que los accesos a campos de instancia).
+             */
+            struct {
+                uint8_t  r0;       ///< Registro 0 (dst para getstatic, class para setstatic)
+                uint8_t  r1;       ///< Registro 1 (class para getstatic, value para setstatic)
+                uint16_t _pad;     ///< Padding de alineacion
+                uint32_t offset;   ///< Offset dentro de @c ClassInfo::static_data (bytes)
+            } static_data;
         } data_instruction = {
             static_cast<uint64_t>(0),
             static_cast<uint64_t>(0)
         }; ///< Operandos inicializados a cero
 
         InstrFormat *metadata = nullptr; ///< Descriptor de la instruccion: funcion de ejecucion, metadatos, etc.
+
+        /**
+         * @brief cache directo del exec function pointer.
+         *
+         * Antes el hot path del scheduler hacia `decoded_ptr->metadata->exec(...)`
+         * que es una doble indireccion (decoded_ptr -> metadata -> exec).
+         * Cachear el pointer aqui ahorra una carga por instruccion VM.
+         * Lo seteamos junto con metadata en decode_instruction (cache hit y miss).
+         */
+        void (*exec_cached)(ProcessVM *, const DecodedInstr &) = nullptr;
 
         uint64_t pc = 0; ///< Direccion virtual del PC donde se encontro esta instruccion
     } DecodedInstr;
@@ -209,6 +255,7 @@ namespace runtime {
         THREAD_STACK_UNDERFLOW,
 
         THREAD_INVALID_SYSCALL, ///< Llamada al sistema invalida o no soportada
+        THREAD_NULL_POINTER,    ///< UNWRAP encontro un valor nulo (NullPointerException)
     } state_err_thread;
 
     /**
@@ -262,6 +309,27 @@ namespace runtime {
 
         context_registers_vm registers; ///< Contexto completo de registros del proceso
 
+        /**
+         * @brief GC stack scanning conservativo.
+         *
+         * Limite superior INMUTABLE del stack del proceso, seteado al spawn
+         * y al cargar el proceso main.  El stack crece hacia abajo desde
+         * @c stack_high hacia @c stack_low_water.  El GC stack scan recorre
+         * el rango [stack_low_water, stack_high) para encontrar handles y
+         * host_ptrs vivos.
+         */
+        uint64_t stack_high      = 0;
+
+        /**
+         * @brief minimo @c rsp visto desde el ultimo GC.
+         *
+         * Actualizado en @c subsp (1 cmp + cmov, ~1 ns; subsp es raro = 1
+         * vez por entry de funcion).  Reseteado al rsp actual tras cada GC.
+         * Permite escanear solo el rango realmente usado del stack
+         * en lugar del 1 MiB completo.
+         */
+        uint64_t stack_low_water = 0;
+
         uint64_t tsc{}; ///< Contador de instrucciones ejecutadas (Time Stamp Counter virtual)
 
         /**
@@ -278,11 +346,31 @@ namespace runtime {
         /**
          * @brief Estado actual del proceso dentro de la FSM del scheduler.
          *
-         * Nunca debe modificarse directamente desde fuera del scheduler ya que
-         * los cambios de estado son concurrentes y deben coordinarse a traves
-         * de on_event().
+         * el campo es @c std::atomic<vm_state> para permitir
+         * acceso seguro desde varios hilos (scheduler propietario + remoto
+         * que invoca @c make_ready desde otro scheduler en escenarios
+         * multi-thread real con @c --schedulers N>1).  Los operadores
+         * implicitos @c operator T() y @c operator=(T) realizan load/store
+         * con memory_order seq_cst por defecto; las rutas calientes que
+         * necesitan ordering relajado usan @c .load(...)/.store(...)
+         * explicitamente.
          */
-        vm_state state = NEW;
+        std::atomic<vm_state> state { NEW };
+
+        /**
+         * @brief bandera de wake-up pendiente para resolver
+         * la race "lost wakeup" en multi-thread.
+         *
+         * Cuando otro hilo (msgsend cross-scheduler, fulfill, monitor notify,
+         * etc.) invoca @c make_ready y observa que el proceso esta en un
+         * estado activo (EXECUTE/DECODE/RUNNING/READY), no puede transicionar
+         * el state a READY (perderia la ejecucion en curso).  En su lugar
+         * pone @c wake_pending=true.  El scheduler propietario, al transicionar
+         * EXECUTE -> WAIT_IO por bloqueo, hace exchange(false) sobre este
+         * flag.  Si era true, abandona la transicion y vuelve a READY (un
+         * mensaje llego mientras el proceso decidia dormirse).
+         */
+        std::atomic<bool> wake_pending { false };
 
         // --- Cache de instrucciones descodificadas (icache) ---
         DecodedInstr icache[ICACHE_SIZE] = {}; ///< Tabla de instrucciones descodificadas indexada por icache_index(PC)
@@ -302,9 +390,110 @@ namespace runtime {
         // --- Sistema de objetos (OOP) ---
         loader::FrameHeader *frame_stack = nullptr; ///< Cabeza de la cadena de FrameHeaders activos (push en CALLVIRT, pop en RET/THROW)
 
+        /**
+         * @brief Pool de FrameHeader con free list LIFO (A.34.fix13).
+         *
+         * Antes cada CALLVIRT/CALLM/CALLVMR/CALLCLOSURE hacia `new
+         * loader::FrameHeader{}` (heap C++ alloc) y el RET hacia `delete
+         * frame`.  Para 30M calls eso son 30M malloc + 30M free, ~150 ns
+         * cada uno = ~9s solo en heap C++.  El pool reemplaza esa ruta
+         * por O(1) acquire/release sobre un free list intrusivo (reusa
+         * el campo `prev` del FrameHeader cuando el frame esta libre).
+         *
+         * Asigna chunks de 256 frames.  Crece bajo demanda.  Los chunks
+         * se liberan en el destructor del pool (al morir el ProcessVM).
+         */
+        struct FrameHeaderPool {
+            std::vector<loader::FrameHeader *> chunks; ///< Chunks alocados con `new[]`.
+            loader::FrameHeader              *free_list_head = nullptr;
+            static constexpr size_t           CHUNK_SIZE = 256;
+
+            /**
+             * @brief Saca un FrameHeader libre del pool.  Si el free list
+             * esta vacio, aloca un nuevo chunk de @c CHUNK_SIZE frames.
+             * El frame devuelto NO esta inicializado: el caller debe
+             * setear todos los campos antes de usarlo.
+             */
+            inline loader::FrameHeader *acquire() {
+                if (!free_list_head) {
+                    auto *chunk = new loader::FrameHeader[CHUNK_SIZE];
+                    chunks.push_back(chunk);
+                    // Encadenar el chunk al free list via campo `prev`.
+                    for (size_t i = 0; i < CHUNK_SIZE; ++i) {
+                        chunk[i].prev = free_list_head;
+                        free_list_head = &chunk[i];
+                    }
+                }
+                loader::FrameHeader *f = free_list_head;
+                free_list_head = f->prev;
+                return f;
+            }
+
+            /**
+             * @brief Devuelve un FrameHeader al pool.  El frame puede
+             * estar en cualquier estado; lo unico que importa es el
+             * campo `prev` que se reusa para el free list.
+             */
+            inline void release(loader::FrameHeader *f) {
+                f->prev = free_list_head;
+                free_list_head = f;
+            }
+
+            ~FrameHeaderPool() {
+                for (auto *c : chunks) delete[] c;
+            }
+        };
+
+        FrameHeaderPool frame_pool; ///< Pool de FrameHeader para CALLVIRT/CALLM/CALLVMR/RET.
+
         uint64_t current_exception = 0; ///< Handle de la excepcion activa durante el unwinding (0 = sin excepcion)
 
+        /**
+         * @brief Frame de excepcion ligero apilado por TRYENTER / desapilado por TRYLEAVE.
+         *
+         * Permite que compiladores de alto nivel instalen handlers de excepcion en
+         * tiempo de ejecucion sin necesidad de anotaciones en el bytecode.
+         * do_throw comprueba esta pila antes de recorrer MethodInfo.handlers.
+         */
+        struct ExceptionFrame {
+            uint64_t              handler_pc; ///< Direccion absoluta VM del bloque catch
+            loader::ClassInfo    *type;        ///< Tipo capturado (nullptr = catch-all)
+            uint64_t              saved_rsp;   ///< RSP al momento del tryenter.
+                                               ///< @c do_throw lo restaura antes de saltar
+                                               ///< al handler para descartar los push del
+                                               ///< regalloc que no llegaron a pop por el throw.
+            uint64_t              saved_rbp;   ///< Idem para RBP (frame pointer).
+            uint64_t              saved_frame_stack; ///< Puntero al @c frame_stack al
+                                                    ///< momento del tryenter; @c do_throw
+                                                    ///< unwindea hasta este punto antes de
+                                                    ///< saltar al handler (descarta frames
+                                                    ///< de calls dentro del try-body que no
+                                                    ///< retornaron normalmente).
+            struct ExceptionFrame *prev;       ///< Frame anterior en la pila
+        };
+
+        ExceptionFrame *exc_frame_stack = nullptr; ///< Pila de frames TRYENTER activos
+
+        /// Slot reusable para FatalError instance.  Aloca lazy en
+        /// el primer @c throw_fatal y se reutiliza en throws sucesivos
+        /// (evita alocacion en heap durante un error fatal, donde el GC
+        /// puede estar en mal estado).  Layout: ObjectHeader (24) + 4
+        /// fields qword-aligned (kind/pc/message/trace) = 56 bytes.
+        /// El message y trace apuntan a buffers tambien lazy-asignados
+        /// (@c fatal_msg_buf y @c fatal_trace_buf) que se reusan.
+        void   *fatal_slot      = nullptr;
+        char   *fatal_msg_buf   = nullptr;   ///< buffer de mensajes (256 bytes)
+        char   *fatal_trace_buf = nullptr;   ///< buffer de stack trace (4096 bytes)
+
+        StringInternPool *str_intern_pool = nullptr; ///< Pool de strings internados (creado bajo demanda)
+
         Scheduler &scheduler; ///< Referencia al scheduler propietario de este proceso
+
+        distrib::Mailbox *mailbox = nullptr; ///< Buzon de mensajes distribuido (creado bajo demanda por DistRuntime)
+
+        // --- Campos para procesos creados remotamente via rspawn ---
+        uint64_t rspawn_future_id    = 0;            ///< future_id en el nodo origen que debe resolverse con r0 al terminar (0 = no es rspawn)
+        uint32_t rspawn_origin_node  = 0xFFFFFFFFu;  ///< node_idx del nodo que envio el rspawn (0xFFFFFFFF = no es rspawn)
 
         /**
          * @brief Construye un proceso virtual y lo asocia al scheduler indicado.

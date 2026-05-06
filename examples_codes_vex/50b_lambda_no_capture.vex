@@ -1,0 +1,11 @@
+// Test minimo: lambda sin captura, llamada directa.
+//
+// Resultado esperado: R0 = 42 (square(6) = 6*7 que es lo que hace el lambda
+// pero quitando la asignacion intermedia para simplificar).
+//
+// Solo verifica que el call indirecto al helper sintetico funcione.
+
+i32 main() {
+    fn(i32) -> i32 sq = (i32 x) => x + x + x + x + x + x + x;
+    return sq(6);
+}

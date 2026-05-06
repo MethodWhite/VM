@@ -1,0 +1,32 @@
+// Reflexion: getField busca un campo por nombre.
+//
+// Builtin nuevo:
+//   getField(cls, "name") -> i64 (FieldInfo*)
+//                            0 si el campo no existe.
+//
+// Verifica:
+//   - Para un campo existente ("edad" en Animal), getField retorna != 0.
+//   - Para un campo inexistente ("noexiste"), retorna 0.
+//   - Combinando con forName, podemos hacer reflexion completa: localizar
+//     una clase por nombre y luego sus campos por nombre, todo O(1) via
+//     las tablas hash del ClassRegistry.
+//
+// El test devuelve 1 si AMBAS comprobaciones pasan, 0 si alguna falla.
+
+class Animal {
+    public i32 edad;
+    public Animal(i32 e) { this.edad = e; }
+}
+
+i32 main() {
+    i64 cls = forName("Animal");
+    if (cls == 0) return 0;     // forName fallo
+
+    i64 f_ok  = getField(cls, "edad");
+    i64 f_bad = getField(cls, "noexiste");
+
+    if (f_ok == 0)  return 0;   // campo existente no encontrado
+    if (f_bad != 0) return 0;   // campo inexistente reportado como existente
+
+    return 1;
+}

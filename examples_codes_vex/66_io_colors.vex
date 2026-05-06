@@ -1,0 +1,42 @@
+// I/O con colores ANSI: identificadores magicos RED/GREEN/BOLD/RESET
+// que se interpolan dentro de strings sin alocacion en runtime.
+//
+// Pone a prueba:
+//   - Identificadores ANSI usados directamente en print/println (1 calln)
+//   - Identificadores ANSI dentro de ${...} (sintaxis natural)
+//   - Mezcla de colores + valores interpolados en la misma linea
+//   - Background colors + atributos (BOLD, UNDERLINE)
+//   - Helpers de pantalla CLEAR_SCREEN y CURSOR_HOME
+//
+// Salida esperada (visualmente coloreada en consola; visualmente plana
+// en pipe pero con los escape codes presentes):
+//   <RED>error<RESET>: <BOLD>algo paso<RESET>
+//   <GREEN>OK<RESET> count=42
+//   <YELLOW>warning<RESET>: usuario=admin
+//   <UNDERLINE>linea con underline<RESET>
+//
+// Verificacion en e2e: contar que la salida tenga >= 6 secuencias ESC
+// (\x1b[) que confirman los codigos ANSI fueron emitidos.
+
+i32 main() {
+    // 1) Color simple aplicado a un string fijo.
+    println("${RED}error${RESET}: ${BOLD}algo paso${RESET}");
+
+    // 2) Color + valor interpolado.
+    i32 count = 42;
+    println("${GREEN}OK${RESET} count=${count}");
+
+    // 3) Color + identificador con interpolacion.
+    println("${YELLOW}warning${RESET}: usuario=admin");
+
+    // 4) Atributo de estilo (UNDERLINE).
+    println("${UNDERLINE}linea con underline${RESET}");
+
+    // 5) Background + foreground combinados.
+    println("${BG_BLUE}${WHITE}azul de fondo, blanco de letra${RESET}");
+
+    // 6) flush explicito al final.
+    flush();
+
+    return 42;
+}

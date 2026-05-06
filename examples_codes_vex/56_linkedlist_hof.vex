@@ -1,0 +1,60 @@
+// Test integrador: LinkedList con higher-order functions.
+//
+// Pone a prueba:
+//   - Closures con captura mutable (acc capturada y modificada).
+//   - Closures pasadas como argumentos a metodos (each callback).
+//   - Captura por referencia: la mutacion en la closure se ve fuera.
+//
+// Resultado esperado: R0 = 21  (3 base + 1*3 + 2*3 + 3*3 = 3 + 18)
+
+class Node {
+    public i32 value;
+    public Node next;
+    public Node(i32 v) {
+        this.value = v;
+        this.next = null;
+    }
+}
+
+class LinkedList {
+    public Node head;
+
+    public LinkedList() {
+        this.head = null;
+    }
+
+    public void prepend(i32 v) {
+        Node n = new Node(v);
+        n.next = this.head;
+        this.head = n;
+    }
+
+    // each: aplica `f(value)` a cada nodo, descartando el resultado.
+    // Util cuando f tiene side effects (e.g. mutacion de capturas).
+    public void each(fn(i32) -> i32 f) {
+        Node cur = this.head;
+        while (cur != null) {
+            i32 ignored = f(cur.value);
+            cur = cur.next;
+        }
+    }
+}
+
+i32 main() {
+    LinkedList l = new LinkedList();
+    l.prepend(3);
+    l.prepend(2);
+    l.prepend(1);
+
+    i32 acc = 3;        // base
+    i32 factor = 3;     // factor (capturado read-only)
+
+    // Closure con captura MUTABLE de acc + captura por valor de factor.
+    fn(i32) -> i32 add_factored = (i32 v) => {
+        acc = acc + v * factor;
+        return 0;
+    };
+    l.each(add_factored);
+
+    return acc;  // 3 + 1*3 + 2*3 + 3*3 = 21
+}

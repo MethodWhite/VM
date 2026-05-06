@@ -175,6 +175,18 @@ namespace runtime {
     void decode_instr_two_op_reg(ProcessVM *vm, DecodedInstr &instr);
 
     /**
+     * @brief Descodifica instrucciones con codificacion de bytes crudos.
+     *
+     * Almacena byte2 en reg1 y byte3 en reg2 sin extraccion de nibbles.
+     * Usado por instrucciones de strings (0x43-0x54) cuya convencion de encoding
+     * es (r_dst<<4)|r_src en byte2, datos adicionales en byte3.
+     *
+     * @param vm    Proceso virtual cuyo RIP apunta al inicio de la instruccion.
+     * @param instr Estructura de instruccion que se rellena.
+     */
+    void decode_instr_raw_bytes(ProcessVM *vm, DecodedInstr &instr);
+
+    /**
      * @brief Descodifica una instruccion de un solo registro con modo (INC/DEC).
      *
      * Formato: [opcode1][byte]
@@ -371,6 +383,81 @@ namespace runtime {
      * @param instr Estructura de instruccion que se rellena.
      */
     void decode_instr_sib(ProcessVM *vm, DecodedInstr &instr);
+
+    /**
+     * @brief Descodifica JUMPTABLE / TYPESWITCH (3 operandos empaquetados, FIXED_4).
+     *
+     * Formato: [0x00][0x27|0x28][byte2][byte3]
+     *   byte2 bits 7-4 = r_val/r_obj, bits 3-0 = r_table.
+     *   byte3 = count (numero de entradas, uint8).
+     * Resultado en mem_data: reg_base=r_val, reg_index=r_table, scale=count.
+     *
+     * @param vm    Proceso virtual cuyo RIP apunta al inicio de la instruccion.
+     * @param instr Estructura de instruccion que se rellena.
+     */
+    void decode_instr_jumptable(ProcessVM *vm, DecodedInstr &instr);
+
+    /**
+     * @brief Descodifica una instruccion de tres registros (msgsend).
+     *
+     * Formato FIXED_4: [0x00][opcode2][b2][b3]
+     *   b2 = (r_pid<<4) | r_addr
+     *   b3 = (r_len<<4)
+     * Almacena en mem_data: reg_base=r_pid, reg_index=r_addr, reg_final=r_len.
+     *
+     * @param vm    Proceso virtual cuyo RIP apunta al inicio de la instruccion.
+     * @param instr Estructura de instruccion que se rellena.
+     */
+    void decode_instr_three_reg(ProcessVM *vm, DecodedInstr &instr);
+
+    /**
+     * @brief Descodifica una instruccion de acceso a static field (getstatic /
+     *        setstatic, FIXED_8).
+     *
+     * Formato fisico: @c [0x00][opcode2][regs_byte][_pad8][offset_u32_LE]
+     *   regs_byte = (r0 << 4) | r1
+     *   offset    = uint32 little-endian (bytes 4-7 desde el inicio)
+     *
+     * Almacena en @c data_instruction.static_data:
+     *   r0     = nibble alto de regs_byte
+     *   r1     = nibble bajo de regs_byte
+     *   offset = uint32 leido de los 4 ultimos bytes
+     *
+     * El significado de r0/r1 depende del opcode:
+     *   - getstatic: r0=r_dst, r1=r_class
+     *   - setstatic: r0=r_class, r1=r_value
+     *
+     * @param vm    Proceso virtual cuyo RIP apunta al inicio de la instruccion.
+     * @param instr Estructura de instruccion que se rellena.
+     */
+    void decode_instr_static_offset(ProcessVM *vm, DecodedInstr &instr);
+
+    /**
+     * @brief Descodificador de @c dlopen / @c dlsym (FFI runtime, FIXED_4).
+     *
+     * Layout fisico desde @c rip+2:
+     *   byte 0 (rip+2): b2 = (r_dst<<4) | rB
+     *   byte 1 (rip+3): b3 = (rC<<4)    | rD
+     *
+     * Almacena en @c data_instruction.mem_data:
+     *   reg_base  = nibble alto de b2 (r_dst)
+     *   reg_index = nibble bajo de b2 (rB)
+     *   reg_final = nibble alto de b3 (rC)
+     *   scale     = nibble bajo de b3 (rD, solo usado por dlsym)
+     *
+     * Para dlopen: r_dst=destino, rB=r_path_addr, rC=r_path_len, rD=0.
+     * Para dlsym:  r_dst=destino, rB=r_handle,    rC=r_name_addr, rD=r_name_len.
+     */
+    void decode_instr_dlopen_dlsym(ProcessVM *vm, DecodedInstr &instr);
+
+    /**
+     * @brief A.24 - Descodificador de @c callni (FIXED_4, 1 reg).
+     *
+     * Layout: @c [0x00][0x64][b2][b3] donde @c b2 = (r_fn<<4) | 0.
+     * Almacena @c r_fn en @c data_instruction.reg_data.reg1.  El argc se
+     * lee en runtime desde R15 igual que CALLN estatico.
+     */
+    void decode_instr_callni(ProcessVM *vm, DecodedInstr &instr);
 
     // =========================================================================
     //  Funciones principales del pipeline

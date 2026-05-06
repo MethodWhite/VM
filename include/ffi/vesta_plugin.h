@@ -44,7 +44,7 @@ extern "C" {
 #endif
 
 /** @brief Version de la API expuesta al plugin. Incrementar en cambios incompatibles. */
-#define VESTA_PLUGIN_API_VERSION 1
+#define VESTA_PLUGIN_API_VERSION 2
 
 /**
  * @brief Handle opaco al ManageVM de VestaVM.
@@ -222,6 +222,47 @@ typedef struct VestaPluginAPI {
      * @param msg Cadena terminada en '\0' a imprimir.
      */
     void       (*log)           (const char *msg);
+
+    /* --- - GC roots externos (write-barrier para colecciones nativas) --- */
+
+    /**
+     * @brief Incrementa el refcount externo de @p gc_handle.
+     *
+     * Cualquier estructura nativa que retenga un GcHandle (e.g.
+     * `ArrayList<string>` que hace push de un StringObject) DEBE llamar
+     * a esta funcion al adquirir la referencia, y a @c gc_release al
+     * liberarla.  Mientras el refcount sea >0, el GC tratara el handle
+     * como root vivo durante el mark phase y NO recolectara el objeto
+     * aunque ningun root normal (HandleTable bytecode) lo referencie.
+     *
+     * Coste: O(1) amortizado (1 lookup + increment en un hashmap del
+     * GcHeap del proceso activo).  Cero overhead en el GC cycle excepto
+     * iterar el map (mucho mas pequeno que escanear todos los slots).
+     *
+     * Thread-safety: el GcHeap es per-process y NO multi-thread; el
+     * plugin se ejecuta en el mismo thread que ejecuta bytecode del
+     * proceso activo.  Si el plugin necesita llamar desde otro thread,
+     * debe sincronizar externamente.
+     *
+     * @param proc_ptr   Handle al ProcessVM activo (usar `getproc` desde
+     *                   bytecode o pasarlo como arg explicito).
+     * @param gc_handle  GcHandle a pinnar (uint32_t encoded como uint64_t).
+     *                   Si @c gc_handle == 0 (GC_NULL_HANDLE), no-op.
+     */
+    void       (*gc_addref)     (uint64_t proc_ptr, uint64_t gc_handle);
+
+    /**
+     * @brief Decrementa el refcount externo de @p gc_handle.
+     *
+     * Llamar cuando la estructura nativa deja de retener el handle (pop,
+     * remove, clear, free).  Si el refcount llega a 0, la entrada se
+     * elimina del map del GcHeap; el objeto sera colectado en el proximo
+     * major_gc si nadie mas lo referencia.
+     *
+     * @param proc_ptr   Handle al ProcessVM activo.
+     * @param gc_handle  GcHandle a despinnar.  Si no estaba pinnado, no-op.
+     */
+    void       (*gc_release)    (uint64_t proc_ptr, uint64_t gc_handle);
 
 } VestaPluginAPI;
 

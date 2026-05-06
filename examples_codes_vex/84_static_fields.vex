@@ -1,0 +1,46 @@
+// examples_codes_vex/84_static_fields.vex
+//
+// static fields plenamente lowered.
+//
+// Sintaxis: declaracion `public static T name = init;` dentro de una clase
+// y acceso `ClassName.field` (lectura + escritura) desde cualquier funcion.
+// Implementado mediante:
+//   - Type checker: detecta IdentExpr cuyo nombre coincide con clase
+//     declarada y trata el FieldAccess como acceso a static field; marca
+//     property_kind=3.
+//   - Lowering del __module_init: emite deffield con is_static=1 para los
+//     static fields, asignando offsets en cls->static_data del runtime.
+//   - Lowering de lectura/escritura: emite findclass + getstatic / setstatic
+//     usando los nuevos opcodes 0x60 y 0x61 (FIXED_8 con offset uint32).
+//   - Runtime: getstatic / setstatic acceden a cls->static_data + offset
+//     directamente, 1 instruccion por acceso (vs 2-3 si reusabamos getfield
+//     con cache global).
+//
+// Esperado: R00 == 42.
+//   - Counter.count parte en 0 (incrementado por defecto del slot zero).
+//   - 5 incrementos llevan count a 5.
+//   - Logger.total = 37.
+//   - count + total = 5 + 37 = 42.
+
+class Counter {
+    public static i32 count = 0;
+}
+
+class Logger {
+    public static i32 total = 0;
+}
+
+void increment_counter() {
+    Counter.count = Counter.count + 1;
+}
+
+i32 main() {
+    Counter.count = 0;
+    increment_counter();
+    increment_counter();
+    increment_counter();
+    increment_counter();
+    increment_counter();
+    Logger.total = 37;
+    return Counter.count + Logger.total;
+}

@@ -1,0 +1,156 @@
+/**
+ * ejemplo_array_ops.ir
+ * Arrays tipados: ARRAY_ALLOC, ARRAY_LEN, ARRAY_LOAD, ARRAY_STORE
+ *
+ * Conceptos demostrados:
+ *   - array_alloc  : delega en helper nativo vesta_array:va_alloc(proc, esize, count)
+ *                    que retorna un GcHandle a un objeto con layout:
+ *                      [ObjectHeader:24B][length:u64:8B][data[]:T[]]
+ *   - array_len    : leer el campo length en offset 0 del bloque de datos
+ *                    (el emisor usa movc con SIB [base, r0, 0, 0])
+ *   - array_load   : acceder al elemento i con movc SIB [arr, idx, stride, 8]
+ *   - array_store  : escribir el elemento i con movc SIB; si tipo=handle -> gcwb
+ *
+ * Modelo de memoria:
+ *   El array vive en memoria VM (no en el heap GC directamente).
+ *   El "handle" que retorna array_alloc es la direccion VM del bloque.
+ *   Offset 0: u64 length  (numero de elementos)
+ *   Offset 8: T data[0]   (primer elemento)
+ *   Offset 8 + i*sizeof(T): T data[i]
+ *
+ * Strides por tipo:
+ *   i8/u8/bool -> 1   i16/u16 -> 2   i32/u32/f32 -> 4
+ *   i64/u64/f64/ptr/handle -> 8
+ *
+ * Nota: array_alloc requiere la libreria nativa stdlib/native/array/vesta_array.
+ *
+ * Compilar:
+ *   vm --ir-file examples_ir/ejemplo_array_ops.ir --ir-opt 1 -o build/out_ir/array
+ */
+
+@module ejemplo_array_ops
+
+// Obtener el numero de elementos de un array
+@function arr_length(arr: i64) -> i64 {
+entry:
+    n = array_len.i64 arr
+    ret.i64 n
+}
+
+// Leer el elemento en la posicion idx de un array de i64
+@function arr_get_i64(arr: i64, idx: i64) -> i64 {
+entry:
+    v = array_load.i64 arr, idx
+    ret.i64 v
+}
+
+// Escribir un valor i64 en la posicion idx de un array de i64
+@function arr_set_i64(arr: i64, idx: i64, val: i64) -> void {
+entry:
+    array_store.i64 arr, idx, val
+    ret.void
+}
+
+// Escribir un GcHandle en la posicion idx (genera write barrier automatico)
+@function arr_set_handle(arr: i64, idx: i64, h: handle) -> void {
+entry:
+    array_store.handle arr, idx, h
+    ret.void
+}
+
+// Sumar todos los elementos de un array de i64
+@function arr_sum(arr: i64) -> i64 {
+entry:
+    n      = array_len.i64 arr
+    zero   = const.i64 0
+    one    = const.i64 1
+    br loop_check
+
+loop_check:
+    acc = phi.i64 [zero, entry], [acc_next, loop_body]
+    i   = phi.i64 [zero, entry], [i_next,   loop_body]
+    // i >= n -> terminar
+    done = cmp.ge.i64 i, n
+    br.cond done, loop_exit, loop_body
+
+loop_body:
+    v        = array_load.i64 arr, i
+    acc_next = add.i64 acc, v
+    i_next   = add.i64 i, one
+    br loop_check
+
+loop_exit:
+    ret.i64 acc
+}
+
+// Encontrar el valor maximo de un array de i64 (n >= 1)
+@function arr_max(arr: i64) -> i64 {
+entry:
+    n    = array_len.i64 arr
+    zero = const.i64 0
+    one  = const.i64 1
+    // Empezar con el primer elemento como maximo inicial
+    init = array_load.i64 arr, zero
+    br loop_check
+
+loop_check:
+    cur = phi.i64 [init, entry],  [cur_next, loop_next]
+    i   = phi.i64 [one,  entry],  [i_next,   loop_next]
+    done = cmp.ge.i64 i, n
+    br.cond done, loop_exit, loop_body
+
+loop_body:
+    v      = array_load.i64 arr, i
+    bigger = cmp.gt.i64 v, cur
+    br.cond bigger, take_v, keep_cur
+
+take_v:
+    br loop_next
+
+keep_cur:
+    br loop_next
+
+loop_next:
+    // phi selecciona v si bigger, cur si no
+    cur_next = phi.i64 [v, take_v], [cur, keep_cur]
+    i_next   = add.i64 i, one
+    br loop_check
+
+loop_exit:
+    ret.i64 cur
+}
+
+// Copiar un array de i64 elemento a elemento a un array destino
+@function arr_copy_i64(dst: i64, src: i64) -> void {
+entry:
+    n    = array_len.i64 src
+    zero = const.i64 0
+    one  = const.i64 1
+    br loop_check
+
+loop_check:
+    i    = phi.i64 [zero, entry], [i_next, loop_body]
+    done = cmp.ge.i64 i, n
+    br.cond done, loop_exit, loop_body
+
+loop_body:
+    v      = array_load.i64 src, i
+    array_store.i64 dst, i, v
+    i_next = add.i64 i, one
+    br loop_check
+
+loop_exit:
+    ret.void
+}
+
+// Ejemplo: GEP para acceso directo a un campo de objeto vía desplazamiento manual
+// (patrón bajo nivel: gcderef + addcur)
+@function obj_gep_demo(obj: handle) -> void {
+entry:
+    // Obtener puntero al campo en offset 48 del objeto GC
+    gep.ptr obj, 48
+    // A partir de aqui, cur0 apunta al campo.
+    // El compilador HHL emitiria raw_asm "readcur rN, cur0" o usaria LOAD sobre el cursor
+    gcwb_ir obj
+    ret.void
+}

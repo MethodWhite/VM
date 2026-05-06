@@ -1,0 +1,32 @@
+// examples_codes_vex/03_contador.vex
+//
+// Cuenta del 1 al 5 imprimiendo un mensaje en cada iteracion
+//
+// Demuestra:
+//   - Asignacion a variable local con SSA-construction Braun-style.
+//   - Bucle 'for' (desazucarado a 'while' + scope para el init).
+//   - Operador postfijo i++.
+//   - Builtin println() invocado dentro del cuerpo del loop con literales
+//     distintos en cada iteracion (compartidos via static_data).
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/03_contador.vex -o contador
+//   vm --run contador.velb
+//
+// Salida esperada:
+//   == Contador Vex ==
+//   iteracion
+//   iteracion
+//   iteracion
+//   iteracion
+//   iteracion
+//   == Fin ==
+
+i32 main() {
+    println("== Contador Vex ==");
+    for (i32 i = 0; i < 5; i++) {
+        println("iteracion");
+    }
+    println("== Fin ==");
+    return 0;
+}

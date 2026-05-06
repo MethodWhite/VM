@@ -1,0 +1,175 @@
+/*
+ * ejemplo_strings.vel
+ *
+ * Demuestra el sistema de cadenas de VestaVM:
+ *   STRMAKE, STRLEN, STRCAT, STRFLAT, STRCMP, STRSLICE,
+ *   STRHASH, STRINTERN, STRGETENC, STRGETBYTES, STRGETKIND,
+ *   STRRESERVE, STRFINALIZE, STRRAW, STRCONV
+ *
+ * Compilar y ejecutar:
+ *   ./vm --build ejemplo_strings.vel -o ejemplo_strings
+ *   ./vm --run   ejemplo_strings.velb
+ *
+ * Convencion de llamada nativa:
+ *   vio_print_uint(n)         -> r1=n,         r15=1
+ *   vio_println(proc,addr,len)-> r1=proc,r2=addr,r3=len, r15=3
+ *
+ * Registros reservados para GcHandles durante el programa:
+ *   r12 = GcHandle de "Hello"
+ *   r13 = GcHandle de "Hello World" (FLAT)
+ *   r14 = ProcessVM*
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+@Import {
+    @Method { @Lib("stdlib/native/io/vesta_io") @Name("vio_println")    }
+    @Method { @Lib("stdlib/native/io/vesta_io") @Name("vio_print_uint") }
+}
+
+code:
+    getproc r14                                // r14 = ProcessVM*
+
+    // cabecera
+    mov r1, r14
+    mov r2, @Absolute("all.msg_title")
+    mov r3, 26
+    mov r15, 3
+    calln @Method("stdlib/native/io/vesta_io:vio_println")
+
+    // =========================================================================
+    // 1. STRMAKE: crear StringObject desde buffer en VM memory
+    //    strmake r_dst, r_src, r_len
+    // =========================================================================
+    mov r1, @Absolute("all.str_hello")         // VM addr de "Hello"
+    mov r2, 5                                  // 5 bytes
+    strmake r12, r1, r2                        // r12 = GcHandle de "Hello" (reservado)
+
+    // =========================================================================
+    // 2. STRLEN y STRGETBYTES
+    // =========================================================================
+    strlen r1, r12                             // r1 = 5 (code points)
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // "5"
+
+    strgetbytes r1, r12                        // r1 = 5 (bytes)
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // "5"
+
+    // =========================================================================
+    // 3. STRCAT: concatenacion perezosa ROPE
+    // =========================================================================
+    mov r1, @Absolute("all.str_world")
+    mov r2, 6                                  // " World" = 6 bytes
+    strmake r5, r1, r2                         // r5 = GcHandle de " World"
+
+    strcat r6, r12, r5                         // r6 = ROPE("Hello" ++ " World")
+
+    strgetkind r1, r6
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // "1" (ROPE)
+
+    // =========================================================================
+    // 4. STRFLAT: materializar ROPE a FLAT
+    // =========================================================================
+    strflat r13, r6                            // r13 = FLAT "Hello World" (reservado)
+
+    strgetkind r1, r13
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // "0" (FLAT)
+
+    strlen r1, r13                             // r1 = 11 code points
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // "11"
+
+    // =========================================================================
+    // 5. STRCMP: comparacion
+    // =========================================================================
+    mov r1, @Absolute("all.str_hello")
+    mov r2, 5
+    strmake r11, r1, r2                        // r11 = otro "Hello"
+
+    strcmp r1, r12, r11                        // r1 = 0 (iguales)
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // "0"
+
+    // =========================================================================
+    // 6. STRSLICE: vista sin copia
+    //    r_range = (cp_start << 32) | cp_len
+    // =========================================================================
+    // "World" de "Hello World": start=6, len=5 -> r_range = 0x0000000600000005
+    mov r1, 0x0000000600000005
+    strslice r11, r13, r1                      // r11 = SLICE "World"
+
+    strgetkind r1, r11
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // "2" (SLICE)
+
+    strlen r1, r11
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // "5"
+
+    // =========================================================================
+    // 7. STRHASH: hash FNV-1a
+    // =========================================================================
+    strhash r1, r12                            // r1 = hash de "Hello"
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // hash value
+
+    // =========================================================================
+    // 8. STRINTERN: pool de strings
+    // =========================================================================
+    mov r1, @Absolute("all.str_hello")
+    mov r2, 5
+    strmake r4, r1, r2                         // r4 = nuevo "Hello"
+    strintern r5, r4                           // r5 = handle canonico
+
+    strmake r6, r1, r2                         // r6 = otro "Hello"
+    strintern r7, r6                           // r7 = mismo handle canonico
+
+    // r5 == r7 si el interning funciona
+    cmpu r5, r7
+    setcc r1, 4                                // cond 4 = JE (igual)
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // "1" si iguales
+
+    // =========================================================================
+    // 9. STRGETENC
+    // =========================================================================
+    strgetenc r1, r12                          // r1 = 0 (ASCII tras compactacion)
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // "0" (ASCII)
+
+    // =========================================================================
+    // 10. Crear "VestaVM" y medir su longitud
+    // =========================================================================
+    mov r1, @Absolute("all.str_vesta")
+    mov r2, 7
+    strmake r10, r1, r2                        // r10 = "VestaVM"
+
+    strlen r1, r10
+    mov r15, 1
+    calln @Method("stdlib/native/io/vesta_io:vio_print_uint")  // "7"
+
+    hlt
+end_code:
+
+align 16
+data:
+    str_hello   db "Hello",   0x00, 0x00, 0x00    // "Hello" + padding
+    str_world   db " World",  0x00, 0x00           // " World" + padding
+    str_vesta   db "VestaVM", 0x00                 // "VestaVM" + null
+    msg_title   db "--- Sistema de Strings ---", 0x00
+end_data:

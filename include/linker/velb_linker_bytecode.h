@@ -22,25 +22,31 @@
  *  - Clase @c Linker que combina multiples modulos objeto en un ejecutable final.
  *  - Estructuras de reporte (@c LinkerReport, @c LinkerError, @c LinkerWarning).
  *
- * Formato VELB (layout del header, 88 bytes):
+ * Formato VELB (layout del header, 120 bytes):
  * @verbatim
  *   Offset  Size  Campo
  *   ------  ----  -----
- *      0      4   magic          ("VELB" en LE / "BLEV" en BE)
- *      4      4   format_v       (version del formato)
- *      8      4   max_v          (version maxima de VM compatible)
- *     12      4   min_v          (version minima de VM compatible)
- *     16      8   checksum       (checksum del ejecutable)
- *     24      8   flags          (meta-informacion del ejecutable)
- *     32      8   timestamp      (marca de tiempo de compilacion)
- *     40      4   arch           (arquitectura objetivo)
- *     44      4   count          (numero de secciones)
- *     48      8   table_offset   (offset a la tabla de secciones)
- *     56      8   n_spaces       (numero de espacios de direcciones)
+ *      0      4   magic              ("VELB" en LE / "BLEV" en BE)
+ *      4      4   format_v           (version del formato)
+ *      8      4   max_v              (version maxima de VM compatible)
+ *     12      4   min_v              (version minima de VM compatible)
+ *     16      8   checksum           (checksum del ejecutable)
+ *     24      8   flags              (meta-informacion del ejecutable)
+ *     32      8   timestamp          (marca de tiempo de compilacion)
+ *     40      4   arch               (arquitectura objetivo)
+ *     44      4   count              (numero de secciones)
+ *     48      8   table_offset       (offset a la tabla de secciones)
+ *     56      8   n_spaces           (numero de espacios de direcciones)
  *     64      8   offset_section_strings
- *     72      8   start_pc       (PC inicial del programa)
+ *     72      8   start_pc           (PC inicial del programa)
  *     80      8   offset_import_table
  *     88      8   offset_label_table
+ *     96      4   size_import_table
+ *    100      4   size_label_table
+ *    104      8   offset_debug_section (0 = sin info de depuracion)
+ *    112      4   size_debug_section
+ *    116      1   debug_level        (0=ninguno 1=lineas 2=+vars 3=+scopes)
+ *    117      3   _debug_pad         (reservado, debe ser 0)
  * @endverbatim
  *
  * @note Todas las estructuras usan @c __attribute__((packed)) / @c pragma pack(push,1)
@@ -73,7 +79,10 @@ extern "C" {
 
 
 #define MAGIC_NUMBER_VELB 0x424C4556
-#define VERSION_VELB 0x1
+// bumped to 0x2 cuando se anyadio la tabla de relocations al header.
+// Loaders viejos (v1) no entenderan los campos nuevos; no es backward
+// compatible.  Las .velb existentes deben recompilarse.
+#define VERSION_VELB 0x2
 #define VERSION_VELA 0x1
 
 /**
@@ -216,7 +225,54 @@ typedef struct PACKED HeaderVELB {
      */
     uint32_t size_label_table = 0;
 
-    table_spaces_address *address_spaces = nullptr; // tabla de espacios de direcciones
+    /**
+     * Offset desde el inicio del archivo a la seccion de informacion de depuracion.
+     * El valor 0 indica que el ejecutable no contiene informacion de depuracion.
+     * La seccion comienza con el magic 0x47425644 ("DVBG") para validacion.
+     */
+    uint64_t offset_debug_section = 0; // 8, offset 104
+
+    /**
+     * Tamano en bytes de la seccion de depuracion completa.
+     * Incluye el encabezado DebugSectionHeader, todas las entradas y el blob de cadenas.
+     */
+    uint32_t size_debug_section = 0; // 4, offset 112
+
+    /**
+     * Nivel de granularidad de la informacion de depuracion generada.
+     *   0 = sin informacion (offset_debug_section debe ser 0)
+     *   1 = solo mapeo bytecode -> (archivo, linea)
+     *   2 = nivel 1 + tabla de variables locales con nombre y offset en pila
+     *   3 = nivel 2 + columna, scopes con nombre y rango, soporte completo
+     */
+    uint8_t debug_level = 0; // 1, offset 116
+
+    uint8_t _debug_pad[3] = {}; // 3, offset 117 (reservado, debe ser 0)
+
+    /**
+     * @brief A.9: offset al inicio de la tabla de relocations dentro del .velb.
+     *
+     * Cada entry registra un slot de bytecode que contiene una direccion
+     * absoluta (e.g. resultado de @c @Absolute("code.foo")).  Permite al
+     * loader (`load_module_dynamic`) reescribir esos slots cuando un modulo
+     * se carga en una VA distinta de la original (rebase transparente sin
+     * heuristics ni flags de compilacion).  El valor 0 indica que el .velb
+     * no contiene tabla de relocations (build viejo o sin relocations
+     * resolubles).
+     */
+    uint64_t offset_reloc_table = 0; // 8, offset 120
+
+    /**
+     * @brief A.9: numero de entries en la tabla de relocations.
+     */
+    uint32_t size_reloc_table = 0;   // 4, offset 128
+
+    /**
+     * @brief Relleno hasta alineacion de 16 bytes (offset 132 -> 144).
+     */
+    uint8_t _reloc_pad[12] = {};     // 12, offsets 132-143
+
+    table_spaces_address *address_spaces = nullptr; // tabla de espacios de direcciones (NO se serializa)
 } HeaderVELB;
 
 /**
@@ -243,6 +299,49 @@ typedef struct PACKED entry_label_table {
      */
     uint32_t size_label;
 } entry_label_table;
+
+/**
+ * @brief entrada en la tabla de relocations.
+ *
+ * Cada entrada describe un slot DENTRO del bytecode (offset desde el inicio
+ * de los bytes ejecutables, NO desde el inicio del archivo) que contiene
+ * una direccion absoluta resuelta por el linker.  El loader puede usar
+ * estos datos para reescribir los slots cuando un modulo se carga en una
+ * VA distinta de la original (`load_module_dynamic` rebase transparente).
+ *
+ * Layout (24 bytes packed):
+ *
+ *   +0  bytecode_offset  (u64)  Offset desde el inicio de los bytes ejecutables.
+ *                                Sumar @c offset_real_bytecode + section.file_offset
+ *                                para obtener offset dentro del .velb completo.
+ *   +8  target_value     (u64)  Valor original escrito en el slot (la direccion
+ *                                absoluta resuelta por el linker).  El loader
+ *                                puede comparar contra el rango VA del modulo
+ *                                para decidir si patchear o no.
+ *  +16  type             (u8)   Tipo de relocation: 1=Absolute64, 2=Relative32,
+ *                                3=Relative64.  Para A.9 MVP solo se usa
+ *                                Absolute64 (lo que produce @c @Absolute(...)).
+ *  +17  _pad             (u8x7) Relleno hasta 24 bytes.
+ */
+typedef struct PACKED entry_relocation_table {
+    uint64_t bytecode_offset;
+    uint64_t target_value;
+    uint8_t  type;
+    uint8_t  _pad[7];
+} entry_relocation_table;
+
+/**
+ * @brief codigos compactos de tipo de relocation usados en
+ * @c entry_relocation_table::type.  Mapeo desde el enum @c Type del
+ * linker (que tiene mas variantes pero las relevantes para .velb son
+ * absolute64 -- el resto se descarta o se transforma).
+ */
+enum class RelocTypeVELB : uint8_t {
+    NONE       = 0,
+    ABSOLUTE64 = 1,
+    RELATIVE32 = 2,
+    RELATIVE64 = 3,
+};
 
 /**
  * Entrada en la tabla de importaciones de funciones
@@ -994,6 +1093,16 @@ namespace Assembly::Bytecode::Linker {
          * bytecode final que plasmar, esto esta generado por una unidad de ensamblado
          */
         std::vector<uint8_t> final_bytecode;
+
+        /**
+         * @brief tabla de relocations Absolute64 capturadas durante
+         * @c apply_relocations.  Cada entry guarda el offset (relativo al
+         * inicio del @c final_bytecode) y el target_value escrito en ese
+         * slot.  Se serializa al .velb tras el bytecode y se actualiza
+         * @c final_header.offset_reloc_table / size_reloc_table.  El loader
+         * la usa en @c load_module_dynamic para rebase transparente.
+         */
+        std::vector<entry_relocation_table> applied_relocations_;
 
         /**
          * Header que escribir en el archivo final

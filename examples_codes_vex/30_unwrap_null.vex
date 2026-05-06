@@ -1,0 +1,26 @@
+// unwrap de null lanza NullPointerException; capturable
+// con try/catch (catch-all en MVP, ya que la excepcion no tiene
+// ClassInfo asignada en el bytecode `unwrap`).
+//
+// Verifica que la integracion entre la instruccion VM `unwrap` (0x26)
+// y el manejador de excepciones (`tryenter`/`do_throw`) funciona end
+// to end desde codigo Vex.
+//
+// Resultado esperado: 999 (handler activado).
+
+class Box {
+    public i32 v;
+    public Box(i32 x) { this.v = x; }
+}
+
+i32 main() {
+    Box b = null;
+    i32 res = 0;
+    try {
+        Box ok = unwrap(b);   // null -> NullPointerException
+        res = 111;            // dead code: no se ejecuta
+    } catch () {
+        res = 999;            // catch-all captura la excepcion
+    }
+    return res;
+}

@@ -1,0 +1,32 @@
+// foreach sobre arrays nativos T[N].
+//
+// Sintaxis:
+//   for (TYPE NAME : array_expr) body
+//
+// El lowering desazucara a un counted loop:
+//   { i64 __idx = 0;
+//     while (__idx < N) {
+//       TYPE NAME = array_expr[__idx];
+//       body;
+//       __idx = __idx + 1;
+//     }
+//   }
+//
+// Limitacion MVP: solo arrays con tamano conocido en compile time
+// (T[N], no T[] decay-to-pointer).
+//
+// Test: suma de 1..10 = 55.
+
+i32 main() {
+    i32[10] arr;
+    i32 i = 0;
+    while (i < 10) {
+        arr[i] = i + 1;
+        i = i + 1;
+    }
+    i32 sum = 0;
+    for (i32 x : arr) {
+        sum = sum + x;
+    }
+    return sum;       // 55
+}

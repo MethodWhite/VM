@@ -1,0 +1,30 @@
+// Sintaxis `T !!name` en var-decl y parametros.
+//
+// `Tag !!tag = init` es sugar para `nonnull Tag tag = !!init`:
+//   - Marca el tipo como nonnull (compile-time: rechaza null literal).
+//   - Envuelve el inicializador con `!!` (runtime: NPE si null).
+//
+// `func(Tag !!arg)` es sugar para que el callee inyecte `unwrap` al
+// entry de la funcion: si el caller pasa null, fallamos pronto con
+// stack trace al entry, en vez de mucho mas tarde en el primer uso.
+//
+// Test:
+//   1) `Tag !!tag = new Tag(11)` valida no-null en runtime (no excepcion).
+//   2) `addOne(tag)` recibe tag con `Tag !!arg`; entry hace unwrap.
+//   3) result = tag.v + addOne(tag) = 11 + 12 = 23.
+//
+// Resultado esperado: 23.
+
+class Tag {
+    public i32 v;
+    public Tag(i32 x) { this.v = x; }
+}
+
+i32 addOne(Tag !!arg) {
+    return arg.v + 1;
+}
+
+i32 main() {
+    Tag !!tag = new Tag(11);    // nonnull + runtime check via !!
+    return tag.v + addOne(tag); // 11 + 12 = 23
+}

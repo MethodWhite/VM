@@ -24,6 +24,7 @@
 
 #include "runtime/exec_instruction.h"
 #include "runtime/proceso_runtime.h"
+#include "runtime/exception_runtime.h"
 #include "gc/gc_heap.h"
 #include "gc/raw_allocator.h"
 #include "loader/oop_types.h"
@@ -72,7 +73,7 @@ namespace runtime {
      * @param vm            Proceso virtual sobre el que se lanza la excepcion.
      * @param exception_ptr Puntero host al ObjectHeader de la excepcion (0 = invalido).
      */
-    static void do_throw(ProcessVM *vm, uint64_t exception_ptr) {
+    void do_throw(ProcessVM *vm, uint64_t exception_ptr) {
         if (exception_ptr == 0) {
             // excepcion nula -> error de segmentacion
             vm->err_thread = THREAD_SEGMENTATION_FAULT;
@@ -86,7 +87,51 @@ namespace runtime {
         // guardar la excepcion activa para que RETHROW pueda relanzarla
         vm->current_exception = exception_ptr;
 
-        loader::FrameHeader *frame = vm->frame_stack; // comenzar desde el frame actual
+        // --- comprobar primero la pila de frames TRYENTER (frames ligeros de alto nivel) ---
+        ProcessVM::ExceptionFrame *ef = vm->exc_frame_stack;
+        while (ef != nullptr) {
+            bool matches = (ef->type == nullptr) || is_instance_of(exc_class, ef->type);
+            if (matches) {
+                uint64_t handler_addr   = ef->handler_pc; // guardar antes de liberar
+                uint64_t saved_rsp      = ef->saved_rsp;
+                uint64_t saved_rbp      = ef->saved_rbp;
+                auto    *saved_fs       = (loader::FrameHeader *)(uintptr_t)ef->saved_frame_stack;
+
+                // desapilar todos los frames TRYENTER hasta el handler encontrado
+                while (vm->exc_frame_stack != nullptr && vm->exc_frame_stack != ef) {
+                    ProcessVM::ExceptionFrame *tmp = vm->exc_frame_stack;
+                    vm->exc_frame_stack = tmp->prev;
+                    delete tmp; // liberar frame apilado por TRYENTER
+                }
+                vm->exc_frame_stack = ef->prev; // el handler se consume al saltar
+                delete ef;
+
+                // Unwind del CPU stack y de frame_stack al estado
+                // del tryenter.  Esto descarta:
+                //   - Pushes del regalloc dentro del try-body que no
+                //     llegaron a sus pop por el throw -> evita corrupcion
+                //     de registros vivos al volver al merge.
+                //   - Frames de calls anidados (callvirt/callm) que no
+                //     retornaron normalmente -> evita stack frame leak
+                //     y pop de retorno desde direccion incorrecta.
+                vm->registers.stack_pointer.qword(saved_rsp);
+                vm->registers.base_pointer.qword(saved_rbp);
+                while (vm->frame_stack != nullptr && vm->frame_stack != saved_fs) {
+                    loader::FrameHeader *tmp = vm->frame_stack;
+                    vm->frame_stack = tmp->prev;
+                    vm->frame_pool.release(tmp); // fix13
+                }
+
+                // convencion: R00 contiene el puntero al objeto excepcion
+                vm->registers.regs[R00].qword(exception_ptr);
+                vm->registers.rip.qword(handler_addr); // saltar al handler
+                vm->decoded_ptr->flags_info.did_jump = true;
+                return;
+            }
+            ef = ef->prev;
+        }
+
+        loader::FrameHeader *frame = vm->frame_stack; // continuar con la cadena de FrameHeaders
 
         while (frame != nullptr) {
             loader::MethodInfo *method = frame->method;
@@ -114,7 +159,7 @@ namespace runtime {
                     while (cur != nullptr && cur != frame) {
                         loader::FrameHeader *tmp = cur;
                         cur = cur->prev;
-                        delete tmp; // liberar cada frame intermedio
+                        vm->frame_pool.release(tmp); // fix13
                     }
                     vm->frame_stack = frame; // restaurar el frame del handler
 
@@ -131,7 +176,7 @@ namespace runtime {
             // handler no encontrado en este frame: subir al anterior
             loader::FrameHeader *done = frame;
             frame = frame->prev;
-            delete done; // liberar el frame que acaba de ser descartado
+            vm->frame_pool.release(done); // fix13
         }
 
         // excepcion no capturada en ningun frame: matar el proceso
@@ -201,9 +246,11 @@ namespace runtime {
 
         uint64_t obj_ptr = vm->registers.regs[r_obj].qword();
         if (obj_ptr == 0) {
-            // objeto nulo -> error de segmentacion
-            vm->err_thread = THREAD_SEGMENTATION_FAULT;
-            vm->scheduler.on_event(EVT_ERROR);
+            // throw_fatal capturable con try/catch.  Si no hay
+            // handler activo, ruta antigua (mata el proceso).
+            runtime::throw_fatalf(vm, runtime::FATAL_NULL_POINTER,
+                "CALLVIRT: deref de objeto null (r%u, vtbl_idx=%u)",
+                (unsigned)r_obj, (unsigned)vtbl_idx);
             return;
         }
 
@@ -211,38 +258,261 @@ namespace runtime {
         loader::ClassInfo *cls = hdr->class_ptr; // obtener la clase del objeto
 
         if (cls == nullptr || vtbl_idx >= cls->vtable_size || cls->vtable == nullptr) {
-            // clase invalida o indice fuera de rango -> error de instruccion ilegal
-            vm->err_thread = THREAD_ILLEGAL_INSTRUCTION;
-            vm->scheduler.on_event(EVT_ERROR);
+            runtime::throw_fatalf(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                "CALLVIRT: clase invalida o vtable_idx fuera de rango (idx=%u, size=%u)",
+                (unsigned)vtbl_idx,
+                cls ? (unsigned)cls->vtable_size : 0u);
             return;
         }
 
         loader::MethodInfo *method = cls->vtable[vtbl_idx]; // resolver el metodo en la vtable
         if (method == nullptr || method->code_vaddr == 0) {
-            // metodo abstracto o no implementado
-            vm->err_thread = THREAD_ILLEGAL_INSTRUCTION;
-            vm->scheduler.on_event(EVT_ERROR);
+            runtime::throw_fatalf(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                "CALLVIRT: metodo abstracto o sin implementacion (vtbl_idx=%u)",
+                (unsigned)vtbl_idx);
             return;
         }
 
         uint64_t ret_addr = vm->registers.rip.raw()
                             + static_cast<uint64_t>(instr.flags_info.size_instr); // PC de retorno
 
-        // crear y empujar el FrameHeader para el soporte de excepciones
-        auto *frame       = new loader::FrameHeader{};
-        frame->prev       = vm->frame_stack;                        // encadenar con el frame anterior
-        frame->method     = method;                                  // metodo en ejecucion
-        frame->return_pc  = ret_addr;                                // PC de retorno
-        frame->frame_base = vm->registers.stack_pointer.qword();    // base del frame en la pila
-        vm->frame_stack   = frame;                                   // actualizar la cadena de frames
+        // -----------------------------------------------------------------
+        // AOP: si el metodo tiene cadena de advices, recorrerla y construir
+        // la secuencia efectiva [b1, b2, ..., bN, M, a1, a2, ..., aK].  Cada
+        // paso se traduce en (a) un FrameHeader empujado (para excepciones),
+        // (b) un return_pc empujado en la pila (para que RET salte al
+        // siguiente paso), todo en orden inverso al de ejecucion (LIFO).
+        // Si advice_chain es NULL o no hay BEFORE/AFTER, fast path identico
+        // al original (overhead cero).
+        // -----------------------------------------------------------------
 
-        // empujar la direccion de retorno en la pila convencional (para RET)
-        vm->registers.stack_pointer.qword(vm->registers.stack_pointer.qword() - 8);
-        vm->vm_mem.write_bytes(vm->registers.stack_pointer.raw(), &ret_addr, 8);
+        // Helper local para empujar (frame + return_pc) atomicamente.  Se
+        // invoca varias veces consecutivas para construir la cadena AOP.
+        // El parametro opcional @c around_target marca el frame como un
+        // advice AROUND con un target a invocar via @c proceed (A.5.4 ext).
+        auto push_step = [&](loader::MethodInfo *m, uint64_t ret_to,
+                             loader::MethodInfo *around_target = nullptr) {
+            // A.34.fix13 - acquire del pool en lugar de heap C++ new.
+            auto *frame            = vm->frame_pool.acquire();
+            frame->prev            = vm->frame_stack;
+            frame->method          = m;
+            frame->return_pc       = ret_to;
+            frame->frame_base      = vm->registers.stack_pointer.qword();
+            frame->proceed_target  = around_target;
+            vm->frame_stack        = frame;
+            vm->registers.stack_pointer.qword(
+                vm->registers.stack_pointer.qword() - 8);
+            // El ret_addr se escribe al stack VM para soportar callvm puro
+            // anidado dentro del metodo virtual: ese callvm hace push de su
+            // propio ret_addr y el RET correspondiente lo lee del stack.
+            // En el RET del callvirt mismo, usamos frame->return_pc directo
+            // (evita la read), detectando el caso por RSP == frame_base - 8.
+            vm->vm_mem.write_bytes(vm->registers.stack_pointer.raw(),
+                                    &ret_to, 8);
+        };
 
-        // saltar al cuerpo del metodo
-        vm->registers.rip.qword(method->code_vaddr);
-        vm->decoded_ptr->flags_info.did_jump = true; // notificar el salto
+        if (method->advice_chain == nullptr) {
+            // Fast path: dispatch directo sin advices, overhead cero.
+            push_step(method, ret_addr);
+            vm->registers.rip.qword(method->code_vaddr);
+            vm->decoded_ptr->flags_info.did_jump = true;
+            return;
+        }
+
+        // Recolectar BEFORE/AFTER/AROUND en orden de declaracion.  Para
+        //  ext soportamos UN AROUND (el primero); sucesivos AROUNDs
+        // se ignoran silenciosamente (multi-AROUND nesting requiere stack
+        // de targets, deferido).
+        loader::MethodInfo *befores[16];
+        loader::MethodInfo *afters [16];
+        loader::MethodInfo *around = nullptr;
+        size_t n_b = 0, n_a = 0;
+        for (loader::AdviceEntry *e = method->advice_chain; e != nullptr; e = e->next) {
+            if (e->kind == loader::ADVICE_BEFORE && n_b < 16) {
+                befores[n_b++] = e->advice_method;
+            } else if (e->kind == loader::ADVICE_AFTER && n_a < 16) {
+                afters[n_a++]  = e->advice_method;
+            } else if (e->kind == loader::ADVICE_AROUND && around == nullptr) {
+                around = e->advice_method;
+            }
+        }
+
+        if (n_b == 0 && n_a == 0 && around == nullptr) {
+            push_step(method, ret_addr);
+            vm->registers.rip.qword(method->code_vaddr);
+            vm->decoded_ptr->flags_info.did_jump = true;
+            return;
+        }
+
+        // Si hay AROUND, M se reemplaza por el advice AROUND en la
+        // secuencia.  El advice puede invocar @c proceed para llamar al
+        // M original (almacenado en frame.proceed_target).  Si el advice
+        // no llama a proceed, M nunca se ejecuta (semantica esperada).
+        loader::MethodInfo *m_slot = (around != nullptr) ? around : method;
+        loader::MethodInfo *proceed_tgt = (around != nullptr) ? method : nullptr;
+
+        loader::MethodInfo *seq[33];
+        size_t n_seq = 0;
+        for (size_t i = 0; i < n_b; ++i) seq[n_seq++] = befores[i];
+        seq[n_seq++] = m_slot;
+        const size_t m_slot_index = n_seq - 1;
+        for (size_t i = 0; i < n_a; ++i) seq[n_seq++] = afters[i];
+
+        // Push del ultimo al primero.  Cada paso recibe su own return_pc;
+        // el slot de M (o de AROUND) recibe ademas proceed_target.
+        push_step(seq[n_seq - 1], ret_addr,
+                  (n_seq - 1 == m_slot_index) ? proceed_tgt : nullptr);
+        for (size_t i = n_seq - 1; i > 0; --i) {
+            const size_t idx = i - 1;
+            push_step(seq[idx], seq[i]->code_vaddr,
+                      (idx == m_slot_index) ? proceed_tgt : nullptr);
+        }
+
+        vm->registers.rip.qword(seq[0]->code_vaddr);
+        vm->decoded_ptr->flags_info.did_jump = true;
+    }
+
+    // =========================================================================
+    //  0xFE PROCEED (sin operandos)
+    //
+    //  Invoca el target original de un advice AROUND.  Lee el campo
+    //  @c proceed_target del frame actual (puesto por CALLVIRT/CALLM al
+    //  detectar AROUND).  Equivale a un @c callm r1, proceed_target con
+    //  los registros actuales (r1=this, args en r2..rN).
+    //
+    //  Si el frame actual no es un AROUND (proceed_target == nullptr),
+    //  fallamos con THREAD_ILLEGAL_INSTRUCTION (proceed solo es valido
+    //  dentro del body de un advice AROUND activo).
+    // =========================================================================
+
+    void exec_instr_proceed(ProcessVM *vm, const DecodedInstr &instr) {
+        loader::FrameHeader *cur = vm->frame_stack;
+        if (cur == nullptr || cur->proceed_target == nullptr) {
+            runtime::throw_fatal(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                "PROCEED: instruccion fuera de un frame AROUND");
+            return;
+        }
+        loader::MethodInfo *target = cur->proceed_target;
+        if (target->code_vaddr == 0) {
+            runtime::throw_fatal(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                "PROCEED: target del AROUND no tiene codigo");
+            return;
+        }
+        const uint64_t ret_addr = vm->registers.rip.raw()
+                                + static_cast<uint64_t>(instr.flags_info.size_instr);
+
+        // Push frame para target (sin nuevo proceed_target: el target
+        // no es AROUND de si mismo).  La calling convention preserva
+        // r1=this y args ya en su sitio.
+        auto *frame            = vm->frame_pool.acquire(); // A.34.fix13
+        frame->prev            = vm->frame_stack;
+        frame->method          = target;
+        frame->return_pc       = ret_addr;
+        frame->frame_base      = vm->registers.stack_pointer.qword();
+        frame->proceed_target  = nullptr;
+        vm->frame_stack        = frame;
+        vm->registers.stack_pointer.qword(
+            vm->registers.stack_pointer.qword() - 8);
+        // Mantener el write para callvm anidado dentro del callee.
+        vm->vm_mem.write_bytes(vm->registers.stack_pointer.raw(),
+                                &ret_addr, 8);
+        vm->registers.rip.qword(target->code_vaddr);
+        vm->decoded_ptr->flags_info.did_jump = true;
+    }
+
+    // =========================================================================
+    //  0xFD CALLM reg_obj, reg_method
+    //
+    //  Como CALLVIRT, pero el segundo operando es un MethodInfo* directo
+    //  (no un vtable_idx).  Util para dispatch dinamico:
+    //    - Llamadas a traves de un tipo de interfaz (lookup por nombre).
+    //    - Reflexion: invocar un MethodInfo* obtenido via getMethod.
+    //    - Callbacks generados por el runtime sin conocer el slot vtable.
+    //
+    //  Formato FIXED_4: [0xFD][ctrl][reg_byte][_]
+    //    reg1 = r_obj (objeto receptor, host_ptr a ObjectHeader)
+    //    reg2 = r_method (MethodInfo* obtenido via findmethod/getmethod)
+    //
+    //  El objeto se valida solo para nullness; el ClassInfo del header NO
+    //  se consulta porque el method ya viene resuelto.  Esto permite
+    //  invocar advices, callbacks, lambdas, etc.
+    //
+    //  IMPORTANTE: la cadena AOP advice_chain del MethodInfo SI se
+    //  recorre, igual que en CALLVIRT, para mantener semantica uniforme.
+    //  Sin esto un dispatcher dinamico se saltaria los aspectos.
+    // =========================================================================
+
+    void exec_instr_callm(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t r_obj    = instr.data_instruction.reg_data.reg1;
+        const uint8_t r_method = instr.data_instruction.reg_data.reg2;
+
+        const uint64_t obj_ptr = vm->registers.regs[r_obj].qword();
+        if (obj_ptr == 0) {
+            runtime::throw_fatal(vm, runtime::FATAL_NULL_POINTER,
+                "CALLM: deref de objeto null");
+            return;
+        }
+        auto *method = reinterpret_cast<loader::MethodInfo *>(
+            vm->registers.regs[r_method].qword());
+        if (method == nullptr || method->code_vaddr == 0) {
+            runtime::throw_fatal(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                "CALLM: MethodInfo nulo o sin codigo");
+            return;
+        }
+        const uint64_t ret_addr = vm->registers.rip.raw()
+                                + static_cast<uint64_t>(instr.flags_info.size_instr);
+
+        // Helper local: empuja frame + return_pc (mismo patron que CALLVIRT).
+        auto push_step = [&](loader::MethodInfo *m, uint64_t ret_to) {
+            auto *frame       = vm->frame_pool.acquire(); // A.34.fix13
+            frame->prev       = vm->frame_stack;
+            frame->method     = m;
+            frame->return_pc  = ret_to;
+            frame->frame_base = vm->registers.stack_pointer.qword();
+            frame->proceed_target = nullptr;
+            vm->frame_stack   = frame;
+            vm->registers.stack_pointer.qword(
+                vm->registers.stack_pointer.qword() - 8);
+            // Mantener write para callvm anidado (ver push_step de CALLVIRT).
+            vm->vm_mem.write_bytes(vm->registers.stack_pointer.raw(),
+                                    &ret_to, 8);
+        };
+
+        // Fast path: sin advices, dispatch directo.
+        if (method->advice_chain == nullptr) {
+            push_step(method, ret_addr);
+            vm->registers.rip.qword(method->code_vaddr);
+            vm->decoded_ptr->flags_info.did_jump = true;
+            return;
+        }
+
+        // Slow path: recorrer advice_chain como en CALLVIRT.  Construir
+        // [BEFORE..., M, AFTER...] e instalar la cadena en pila.
+        loader::MethodInfo *befores[16];
+        loader::MethodInfo *afters [16];
+        size_t n_b = 0, n_a = 0;
+        for (loader::AdviceEntry *e = method->advice_chain;
+             e != nullptr; e = e->next) {
+            if      (e->kind == loader::ADVICE_BEFORE && n_b < 16) befores[n_b++] = e->advice_method;
+            else if (e->kind == loader::ADVICE_AFTER  && n_a < 16) afters [n_a++] = e->advice_method;
+        }
+        if (n_b == 0 && n_a == 0) {
+            push_step(method, ret_addr);
+            vm->registers.rip.qword(method->code_vaddr);
+            vm->decoded_ptr->flags_info.did_jump = true;
+            return;
+        }
+        loader::MethodInfo *seq[33];
+        size_t n_seq = 0;
+        for (size_t i = 0; i < n_b; ++i) seq[n_seq++] = befores[i];
+        seq[n_seq++] = method;
+        for (size_t i = 0; i < n_a; ++i) seq[n_seq++] = afters[i];
+        push_step(seq[n_seq - 1], ret_addr);
+        for (size_t i = n_seq - 1; i > 0; --i) {
+            push_step(seq[i - 1], seq[i]->code_vaddr);
+        }
+        vm->registers.rip.qword(seq[0]->code_vaddr);
+        vm->decoded_ptr->flags_info.did_jump = true;
     }
 
     // =========================================================================
@@ -265,15 +535,16 @@ namespace runtime {
 
         auto *cls = reinterpret_cast<loader::ClassInfo *>(vm->registers.regs[r_cls].qword());
         if (cls == nullptr || vtbl_idx >= cls->vtable_size || cls->vtable == nullptr) {
-            vm->err_thread = THREAD_ILLEGAL_INSTRUCTION;
-            vm->scheduler.on_event(EVT_ERROR);
+            runtime::throw_fatalf(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                "CALLSUPER: ClassInfo invalido o vtable_idx fuera de rango (idx=%u)",
+                (unsigned)vtbl_idx);
             return;
         }
 
         loader::MethodInfo *method = cls->vtable[vtbl_idx]; // resolver metodo en la clase indicada
         if (method == nullptr || method->code_vaddr == 0) {
-            vm->err_thread = THREAD_ILLEGAL_INSTRUCTION;
-            vm->scheduler.on_event(EVT_ERROR);
+            runtime::throw_fatal(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                "CALLSUPER: metodo abstracto o sin implementacion");
             return;
         }
 
@@ -281,15 +552,16 @@ namespace runtime {
                             + static_cast<uint64_t>(instr.flags_info.size_instr);
 
         // crear FrameHeader para soporte de excepciones
-        auto *frame       = new loader::FrameHeader{};
+        auto *frame       = vm->frame_pool.acquire(); // A.34.fix13
         frame->prev       = vm->frame_stack;
         frame->method     = method;
         frame->return_pc  = ret_addr;
         frame->frame_base = vm->registers.stack_pointer.qword();
+        frame->proceed_target = nullptr;
         vm->frame_stack   = frame;
 
-        // empujar la direccion de retorno en la pila convencional
         vm->registers.stack_pointer.qword(vm->registers.stack_pointer.qword() - 8);
+        // Mantener write para callvm anidado.
         vm->vm_mem.write_bytes(vm->registers.stack_pointer.raw(), &ret_addr, 8);
 
         // saltar al metodo de la superclase
@@ -420,9 +692,9 @@ namespace runtime {
         if (ok) {
             vm->registers.regs[R00].qword(obj_ptr); // cast correcto: devolver el puntero
         } else {
-            // tipo incompatible: senalizar ClassCastException
-            vm->err_thread = THREAD_ILLEGAL_INSTRUCTION;
-            vm->scheduler.on_event(EVT_ERROR);
+            // tipo incompatible: ClassCastException via FatalError
+            runtime::throw_fatal(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                "CHECKCAST: tipo incompatible (ClassCastException)");
         }
     }
 

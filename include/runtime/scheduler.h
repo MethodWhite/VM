@@ -403,7 +403,15 @@ namespace runtime {
      * @param process Proceso cuyo scheduler contiene los hooks registrados.
      * @param stage   Fase del pipeline en la que se disparan los hooks.
      */
-    //#define PROFILE_FAST
+    // PROFILE_FAST activado por defecto en builds Release
+    // (NDEBUG).  Convierte vm_hook en macro vacia para eliminar 4 llamadas
+    // de funcion por instruccion VM en el hot path (decode begin/end +
+    // execute begin/end).  Cuando NDEBUG no esta definido se mantiene la
+    // version normal por si el usuario quiere registrar hooks de debug.
+#if defined(NDEBUG) && !defined(PROFILE_FAST)
+#  define PROFILE_FAST
+#endif
+
 #ifdef PROFILE_FAST
 #   define vm_hook(...) do {} while(0)
 #else

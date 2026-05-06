@@ -8,6 +8,7 @@
 cmake-build-debug
 cmake-build-release
 cmake-build-*
+cmake-*
 build*
 build-windows
 build-linux
@@ -53,3 +54,4 @@ claude*
 chatgpt*
 copilot*
 deepseck*
+tests/vex/test_vex_e2e.sh

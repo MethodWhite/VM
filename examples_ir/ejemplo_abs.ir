@@ -1,0 +1,36 @@
+/**
+ * ejemplo_abs.ir
+ * Valor absoluto de un entero de 64 bits con signo.
+ *
+ * Conceptos demostrados:
+ *   - Bloques basicos multiples (entry, negate, positive)
+ *   - Salto condicional: br.cond isneg, bloque_true, bloque_false
+ *   - Comparacion: cmp.lt.i64 devuelve 1 si x < 0, 0 en caso contrario
+ *   - El emisor IR fusiona CMP + BR_COND en una sola comparacion .vel
+ *
+ * La estructura de control es:
+ *   if (x < 0) goto negate; else goto positive;
+ *
+ * Compilar con nivel O2 para eliminar el bloque muerto si se prueba con x>=0:
+ *   vm --ir-file examples_ir/ejemplo_abs.ir --ir-opt 2 -o build/out_ir/abs
+ */
+
+@module ejemplo_abs
+
+// Retorna el valor absoluto de x: |x|.
+// Si x >= 0 retorna x directamente; si x < 0 retorna 0 - x.
+@function abs_val(x: i64) -> i64 {
+entry:
+    zero  = const.i64 0           // constante 0 para comparacion y resta
+    isneg = cmp.lt.i64 x, zero    // isneg = (x < 0) ? 1 : 0
+    br.cond isneg, negate, positive // bifurca segun el signo
+
+negate:
+    // Rama negativa: devolver -x = 0 - x
+    neg_x = sub.i64 zero, x
+    ret.i64 neg_x
+
+positive:
+    // Rama positiva: x ya es positivo, retornar tal cual
+    ret.i64 x
+}

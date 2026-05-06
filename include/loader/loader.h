@@ -44,11 +44,16 @@
 #include <cstdint>   // uint8_t, uint32_t
 #include <cstddef>   // size_t
 #include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <memory>
 
 #include "arena/arena_manager.h"
 #include "emmit/bytereader.h"
 #include "ffi/native_ffi.h"
 #include "linker/velb_linker_bytecode.h"
+#include "loader/class_registry.h"
 #include "runtime/runtime.h"
 
 namespace runtime {
@@ -212,6 +217,17 @@ namespace loader {
         std::vector<Assembly::Bytecode::Relocation> relocations{};
 
         /**
+         * @brief tabla de relocations leida del .velb tras el link.
+         *
+         * Cada entry contiene el offset DENTRO del bytecode (no del archivo)
+         * y el target_value original.  Permite al loader hacer rebase
+         * preciso cuando carga el modulo en una VA distinta de la original
+         * (`load_module_dynamic`).  Vacia si el .velb no tiene tabla de
+         * relocations (formato viejo o sin relocations resolubles).
+         */
+        std::vector<entry_relocation_table> velb_relocations{};
+
+        /**
          * @brief Metadatos arbitrarios en formato JSON.
          *
          * Puede incluir:
@@ -261,6 +277,21 @@ namespace loader {
          */
         std::vector<std::unique_ptr<Executable> > executables;
 
+        /**
+         * @brief Proximo VA libre para asignar a modulos cargados
+         * dinamicamente via @c load_module_dynamic.  Empieza en 0x80000000
+         * (2 GiB).  Por debajo de eso se reservan las stacks de proceso
+         * (esquema en exec_instr_spawn: stack_base = 0x10000000 +
+         * (local_pid % 0x1000) * 0x100000 -> hasta 0x10FFF00000 con 4096
+         * procesos a 1 MiB cada uno).  Fijar la base de plugins a 2 GiB
+         * elimina cualquier solapamiento entre stacks de proceso, code
+         * section del caller (en VA 0x0..N) y los plugins cargados
+         * dinamicamente.  La carga dinamica solo usa este contador si
+         * detecta solapamiento entre la VA original del modulo y otros
+         * executables ya cargados.
+         */
+        uint64_t next_dyn_base = 0x80000000ULL;
+
 
         /**
          * referencia al manager de instancias de VM
@@ -275,6 +306,23 @@ namespace loader {
 
         explicit Loader(
             runtime::ManageVM &instance_manager);
+
+        /**
+         * @brief Copia el bytecode de TODOS los executables cargados al
+         *        @c vm_mem del proceso destino.
+         *
+         * Replica la copia que hace @c load_executable, pero sobre un proceso
+         * que ya existe (caso: hijos creados con @c spawn que comparten codigo
+         * pero tienen vm_mem privado vacio).  Para cada Executable iterado en
+         * @c executables, recorre sus secciones y emite un
+         * @c vm_to_host_memcpy con el rango (address_init, exe->bytecode.size()).
+         *
+         * Coste O(numero_executables * secciones * tamano_bytecode).  En
+         * spawn se llama una sola vez por hijo.
+         *
+         * @param dest Proceso destino que recibira la copia del codigo.
+         */
+        void copy_executables_to(runtime::ProcessVM &dest);
 
         /**
          * Permite obtener una cadena de la seccion strings, en base a su offset
@@ -349,6 +397,30 @@ namespace loader {
          */
         runtime::ProcessVM *load_executable(runtime::VM &vm, std::vector<uint8_t> raw_bytecode_file);
 
+        /**
+         * @brief carga DINAMICA de un .velb adicional en una VM ya corriendo.
+         *
+         * Diferencias clave con @c load_executable:
+         *   - NO crea un proceso nuevo: el modulo se anade al pool de
+         *     `executables` y su bytecode se copia al `vm_mem` de TODOS los
+         *     procesos vivos para que cualquiera pueda saltar a su codigo.
+         *   - Devuelve el `init_pc` del modulo cargado (entry point del main
+         *     del nuevo modulo) para que el caller pueda ejecutarlo via
+         *     `callvmr` y que el prologo de su `main` invoque `__module_init`
+         *     (registrando clases en el ClassRegistry global).
+         *
+         * El caller tipico es la instruccion bytecode @c loadmod, que reusa
+         * la convencion CALLVM (push de return addr + jump al init_pc) para
+         * ejecutar el modulo cargado de forma sincrona.
+         *
+         * @param vm Instancia VM activa donde cargar el modulo.
+         * @param raw_bytecode_file Bytes del archivo .velb a cargar.
+         * @return @c init_pc (entry point) del modulo cargado, o 0 si el
+         *         parse falla o el archivo esta vacio.
+         */
+        uint64_t load_module_dynamic(runtime::VM &vm,
+                                      std::vector<uint8_t> raw_bytecode_file);
+
         void resolve_labels(Assembly::Bytecode::Section &section);
 
         void load_sections(Assembly::Bytecode::Label &label);
@@ -383,12 +455,100 @@ namespace loader {
          */
         runtime::VM *create_vm_instance(size_t num_schedulers);
 
+        /**
+         * @brief Instancia una clase generica con tipos concretos (monomorphization runtime).
+         *
+         * Busca en generic_cache_ la clave "ClassName<T1,T2,...>".  Si ya existe,
+         * devuelve el ClassInfo* cacheado.  Si no, clona el ClassInfo de @p generic y
+         * sustituye los type_params por los tipos concretos proporcionados.
+         *
+         * @param generic    ClassInfo de la clase generica (CLASS_FLAG_GENERIC).
+         * @param type_args  Array de ClassInfo* de tipos concretos.
+         * @param count      Numero de tipos (debe coincidir con type_param_count).
+         * @return Puntero a la especializacion (cacheada o recien creada).
+         */
+        loader::ClassInfo *specialize_class(loader::ClassInfo *generic,
+                                            loader::ClassInfo **type_args,
+                                            size_t count);
+
+        /**
+         * @brief Acceso al registro global de clases definidas en runtime.
+         *
+         * El @c ClassRegistry mantiene la tabla nombre -> ClassInfo* y la
+         * propiedad de toda la memoria asociada (FieldInfo[], MethodInfo[],
+         * tablas hash de lookup, advices, strings).  Consultar
+         * @c class_registry.h para la API de definicion y busqueda.
+         */
+        ClassRegistry &class_registry() noexcept { return class_registry_; }
+        const ClassRegistry &class_registry() const noexcept { return class_registry_; }
+
     private:
+        /**
+         * @brief Registro de clases dinamicas.
+         *
+         * Vive como miembro del Loader para que su vida coincida con la
+         * de la VM.  Las instrucciones VM @c defclass / @c defmethod /
+         * @c deffield invocan este registry indirectamente via el VM
+         * que conoce su Loader.
+         */
+        ClassRegistry class_registry_;
+
         /**
          * Un mutex en el loader para evitar problemas en el
          * caso de usar multihilo
          */
         std::mutex loader_mutex;
+
+        /**
+         * @brief Cache de especializaciones de clases genericas.
+         *
+         * Clave: nombre calificado de la especializacion, e.g. "List<int>".
+         * Valor: puntero al ClassInfo clonado para esa especializacion concreta.
+         *
+         * Protegido por loader_mutex en specialize_class().
+         */
+        std::unordered_map<std::string, loader::ClassInfo *> generic_cache_;
+
+        /**
+         * @brief Almacen de ClassInfo clonados para especializaciones genericas.
+         *
+         * Los punteros en generic_cache_ apuntan a ClassInfo almacenados aqui.
+         * Se usa unique_ptr para la gestion automatica del ciclo de vida.
+         */
+        std::vector<std::unique_ptr<loader::ClassInfo>> generic_store_;
+
+        /**
+         * @brief Almacen de nombres calificados de especializaciones.
+         *
+         * Cada entrada es el buffer de caracteres del nombre "List<int>" u
+         * otro nombre especializado.  Se gestiona con unique_ptr<char[]> para
+         * liberar automaticamente al destruir el Loader.
+         */
+        std::vector<std::unique_ptr<char[]>> generic_store_names_;
+
+        /**
+         * @brief Almacen de arrays GenericParam[] clonados para especializaciones.
+         *
+         * Cada especializacion clona el array de parametros de tipo para poder
+         * sustituir concrete sin modificar la plantilla original.
+         */
+        std::vector<std::unique_ptr<loader::GenericParam[]>> generic_store_params_;
+
+        /**
+         * @brief Almacen de arrays FieldInfo[] clonados para especializaciones.
+         *
+         * Incluye campos de instancia y arrays de argumentos de metodos clonados
+         * durante la resolucion de tipos concretos en specialize_class().
+         */
+        std::vector<std::unique_ptr<loader::FieldInfo[]>> generic_store_fields_;
+
+        /**
+         * @brief Almacen de arrays MethodInfo[] clonados para especializaciones.
+         *
+         * Copia superficial de la tabla de metodos del ClassInfo generico con
+         * los tipos de argumentos y retorno ya resueltos a concretos.
+         */
+        std::vector<std::unique_ptr<loader::MethodInfo[]>> generic_store_methods_;
     };
 }
 

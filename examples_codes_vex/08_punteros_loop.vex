@@ -1,0 +1,24 @@
+// examples_codes_vex/08_punteros_loop.vex
+//
+// Demuestra que las variables address-taken (`&i`) sobreviven correctamente
+// a las iteraciones de un while: el liveness IR propaga el live-out a
+// traves de los back-edges del loop (sin esto, el regalloc reusa el
+// registro del puntero base y la siguiente iteracion lee desde la
+// direccion equivocada).
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/08_punteros_loop.vex -o pl
+//   vm --run pl.velb --stats
+//
+// Resultado esperado: R00 == 55  (1+2+3+...+10)
+
+i32 main() {
+    i32 i = 0;
+    i32 sum = 0;
+    VirtualPtr<i32> pi = &i;
+    while (*pi < 10) {
+        *pi = *pi + 1;
+        sum += *pi;
+    }
+    return sum;
+}

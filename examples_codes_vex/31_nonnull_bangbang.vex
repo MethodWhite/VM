@@ -1,0 +1,32 @@
+// Operador !! (assert non-null) + modificador nonnull.
+//
+// Sintaxis nueva:
+//   !!a             // expresion: equivalente a unwrap(a); lanza
+//                   // NullPointerException en runtime si a == null.
+//   nonnull T x     // declaracion: rechaza compile-time la asignacion
+//                   // de literal null.  Para asignar un valor nullable
+//                   // a un nonnull, hay que pasar por !! primero.
+//
+// Ambos comparten el mismo runtime (instruccion VM `unwrap` 0x26).
+//
+// Test:
+//   - tag = new Tag(11)
+//   - safe = !!tag        (assert non-null, queda host_ptr)
+//   - res  = safe.v + 100 = 111
+//   - una segunda variable nonnull se inicializa con !!tag tambien
+//     para confirmar que el flujo nullable -> nonnull funciona.
+//   - return = 2 * safe.v = 22 + 100 = 222
+//
+// Resultado esperado: 222.
+
+class Tag {
+    public i32 v;
+    public Tag(i32 x) { this.v = x; }
+}
+
+i32 main() {
+    Tag tag = new Tag(11);
+    Tag safe = !!tag;          // unwrap; safe es no-null en runtime
+    nonnull Tag forced = !!tag; // nonnull declarado; init = !!tag, OK
+    return safe.v + forced.v + 200;  // 11 + 11 + 200 = 222
+}

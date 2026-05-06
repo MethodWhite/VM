@@ -1,0 +1,26 @@
+// Operadores nativos + cstring + encoding.
+
+i32 main() {
+    string a = "hola";
+    string b = " mundo";
+    string c = a + b;          // operator + nativo
+
+    print_cstr(str_cstr(c)); print("\n");
+    if (str_length(c) != 10) return 1;
+
+    string d = "hola";
+    if (a != d) return 2;
+    if (a == b) return 3;
+
+    cstring p = str_cstr(c);
+    print("via cstring: "); print_cstr(p); print("\n");
+
+    // encoding explicito.  Note: strings ASCII puros se compactan
+    // automaticamente; str_convert NO los re-expande.  Validamos solo
+    // que la conversion no rompa nada (length se preserva).
+    string utf16 = str_convert(c, ENC_UTF16);
+    if (str_length(utf16) != 10) return 4;
+
+    flush();
+    return 42;
+}

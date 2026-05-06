@@ -1,0 +1,287 @@
+{
+    "name": "VestaShellScript",
+    "scopeName": "source.vsh",
+    "fileTypes": ["vsh"],
+    "patterns": [
+        { "include": "#comments" },
+        { "include": "#strings" },
+        { "include": "#function_decl" },
+        { "include": "#class_decl" },
+        { "include": "#keywords_control" },
+        { "include": "#keywords_decl" },
+        { "include": "#keywords_logical" },
+        { "include": "#special_self" },
+        { "include": "#constants_lang" },
+        { "include": "#builtins_io" },
+        { "include": "#builtins_type" },
+        { "include": "#builtins_collection" },
+        { "include": "#builtins_string" },
+        { "include": "#builtins_math" },
+        { "include": "#builtins_random" },
+        { "include": "#builtins_fs" },
+        { "include": "#builtins_shell" },
+        { "include": "#builtins_ffi" },
+        { "include": "#builtins_ansi" },
+        { "include": "#builtins_net" },
+        { "include": "#builtins_time" },
+        { "include": "#builtins_misc" },
+        { "include": "#numbers" },
+        { "include": "#operators" },
+        { "include": "#punctuation" }
+    ],
+    "repository": {
+
+        "comments": {
+            "patterns": [
+                {
+                    "name": "comment.line.double-slash.vsh",
+                    "match": "//.*$"
+                },
+                {
+                    "name": "comment.block.vsh",
+                    "begin": "/\\*",
+                    "end": "\\*/",
+                    "beginCaptures": { "0": { "name": "punctuation.definition.comment.begin.vsh" } },
+                    "endCaptures":   { "0": { "name": "punctuation.definition.comment.end.vsh" } }
+                }
+            ]
+        },
+
+        "strings": {
+            "name": "string.quoted.double.vsh",
+            "begin": "\"",
+            "end": "\"",
+            "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.vsh" } },
+            "endCaptures":   { "0": { "name": "punctuation.definition.string.end.vsh" } },
+            "patterns": [
+                {
+                    "name": "meta.embedded.expression.vsh",
+                    "begin": "\\$\\{",
+                    "end": "\\}",
+                    "beginCaptures": { "0": { "name": "punctuation.section.embedded.begin.vsh" } },
+                    "endCaptures":   { "0": { "name": "punctuation.section.embedded.end.vsh" } },
+                    "patterns": [
+                        { "include": "#keywords_control" },
+                        { "include": "#keywords_decl" },
+                        { "include": "#keywords_logical" },
+                        { "include": "#constants_lang" },
+                        { "include": "#builtins_io" },
+                        { "include": "#builtins_type" },
+                        { "include": "#builtins_collection" },
+                        { "include": "#builtins_string" },
+                        { "include": "#builtins_math" },
+                        { "include": "#builtins_misc" },
+                        { "include": "#numbers" },
+                        { "include": "#operators" }
+                    ]
+                },
+                {
+                    "name": "constant.character.escape.vsh",
+                    "match": "\\\\[nrtbf0\\\\\"/$]"
+                }
+            ]
+        },
+
+        "function_decl": {
+            "patterns": [
+                {
+                    "comment": "Declaracion de funcion: fn nombre(",
+                    "match": "\\bfn\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+                    "captures": {
+                        "1": { "name": "entity.name.function.vsh" }
+                    }
+                }
+            ]
+        },
+
+        "class_decl": {
+            "patterns": [
+                {
+                    "comment": "Declaracion de clase y herencia: class Nombre [: Padre]",
+                    "match": "\\bclass\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))?",
+                    "captures": {
+                        "1": { "name": "entity.name.type.class.vsh" },
+                        "2": { "name": "entity.other.inherited-class.vsh" }
+                    }
+                }
+            ]
+        },
+
+        "keywords_control": {
+            "name": "keyword.control.vsh",
+            "match": "\\b(if|elif|else|while|for|in|break|continue|return|try|catch|throw)\\b"
+        },
+
+        "keywords_decl": {
+            "name": "keyword.declaration.vsh",
+            "match": "\\b(let|fn|class|import|super)\\b"
+        },
+
+        "keywords_logical": {
+            "name": "keyword.operator.logical.vsh",
+            "match": "\\b(and|or|not)\\b"
+        },
+
+        "special_self": {
+            "name": "variable.language.self.vsh",
+            "match": "\\bself\\b"
+        },
+
+        "constants_lang": {
+            "patterns": [
+                {
+                    "name": "constant.language.boolean.vsh",
+                    "match": "\\b(true|false)\\b"
+                },
+                {
+                    "name": "constant.language.null.vsh",
+                    "match": "\\bnull\\b"
+                },
+                {
+                    "name": "constant.language.numeric.vsh",
+                    "match": "\\b(pi|inf)\\b"
+                },
+                {
+                    "name": "variable.other.constant.vsh",
+                    "match": "\\bANSI\\b"
+                }
+            ]
+        },
+
+        "builtins_io": {
+            "name": "support.function.builtin.io.vsh",
+            "match": "\\b(echo|print|println|input)\\b(?=\\s*\\()"
+        },
+
+        "builtins_type": {
+            "name": "support.function.builtin.type.vsh",
+            "match": "\\b(str|int|float|bool|type|isinstance|classname|doc|help)\\b(?=\\s*\\()"
+        },
+
+        "builtins_collection": {
+            "name": "support.function.builtin.collection.vsh",
+            "match": "\\b(len|append|pop|keys|values|contains|range|sort|reverse|slice|flat|zip|enumerate|sum|any_of|all_of|unique|index_of)\\b(?=\\s*\\()"
+        },
+
+        "builtins_string": {
+            "name": "support.function.builtin.string.vsh",
+            "match": "\\b(split|join|trim|upper|lower|starts_with|ends_with|replace|substr|lstrip|rstrip|find_str|count_str|repeat|pad_left|pad_right|char_code|from_char|is_numeric|hex|bin_str)\\b(?=\\s*\\()"
+        },
+
+        "builtins_math": {
+            "name": "support.function.builtin.math.vsh",
+            "match": "\\b(abs|min|max|floor|ceil|round|sqrt|pow|clamp|sign|gcd|lcm|log2|log10|sin|cos|tan|is_nan|is_inf)\\b(?=\\s*\\()"
+        },
+
+        "builtins_random": {
+            "name": "support.function.builtin.random.vsh",
+            "match": "\\b(rand_seed|rand|rand_int|rand_float|rand_choice|rand_shuffle)\\b(?=\\s*\\()"
+        },
+
+        "builtins_fs": {
+            "name": "support.function.builtin.filesystem.vsh",
+            "match": "\\b(exists|is_dir|is_file|basename|dirname|stem|extension|glob|read_file|write_file|getcwd|chdir|listdir|listdir_full|mkdir|makedirs|rmdir|remove_file|remove_all|rename_path|copy_file|abspath|normpath|join_path|file_size)\\b(?=\\s*\\()"
+        },
+
+        "builtins_shell": {
+            "name": "support.function.builtin.shell.vsh",
+            "match": "\\b(shell|shell_ex|sleep|exit|assert|error)\\b(?=\\s*\\()"
+        },
+
+        "builtins_ffi": {
+            "name": "support.function.builtin.ffi.vsh",
+            "match": "\\b(ffi_open|ffi_sym|ffi_call|ffi_call_f|ffi_close|ffi_call_sym|ffi_str)\\b(?=\\s*\\()"
+        },
+
+        "builtins_ansi": {
+            "patterns": [
+                {
+                    "name": "support.function.builtin.ansi.vsh",
+                    "match": "\\b(ansi_enable|ansi_code|ansi_rgb|ansi_rgb_bg|colorize|ansi_cursor_up|ansi_cursor_down|ansi_cursor_left|ansi_cursor_right|ansi_cursor_pos|ansi_clear|ansi_clear_line|strip_ansi)\\b(?=\\s*\\()"
+                },
+                {
+                    "name": "support.function.builtin.ansi.color.vsh",
+                    "match": "\\b(red|green|yellow|blue|magenta|cyan|white|bold|dim|italic|underline|strike)\\b(?=\\s*\\()"
+                }
+            ]
+        },
+
+        "builtins_net": {
+            "name": "support.function.builtin.network.vsh",
+            "match": "\\b(tcp_connect|tcp_listen|tcp_accept|tcp_send|tcp_recv|udp_bind|udp_send|udp_recv|socket_close|tls_connect|http_get|http_post|http_put|http_delete|http_request)\\b(?=\\s*\\()"
+        },
+
+        "builtins_time": {
+            "name": "support.function.builtin.time.vsh",
+            "match": "\\b(time_ms|time_s|time_now)\\b(?=\\s*\\()"
+        },
+
+        "builtins_misc": {
+            "name": "support.function.builtin.misc.vsh",
+            "match": "\\b(getenv|setenv|platform|pid|cpu_count|format|json_str)\\b(?=\\s*\\()"
+        },
+
+        "numbers": {
+            "patterns": [
+                {
+                    "name": "constant.numeric.float.vsh",
+                    "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*(?:[eE][+-]?[0-9]+)?\\b"
+                },
+                {
+                    "name": "constant.numeric.hex.vsh",
+                    "match": "\\b0[xX][0-9a-fA-F][0-9a-fA-F_]*\\b"
+                },
+                {
+                    "name": "constant.numeric.binary.vsh",
+                    "match": "\\b0[bB][01][01_]*\\b"
+                },
+                {
+                    "name": "constant.numeric.integer.vsh",
+                    "match": "\\b[0-9][0-9_]*\\b"
+                }
+            ]
+        },
+
+        "operators": {
+            "patterns": [
+                {
+                    "name": "keyword.operator.arithmetic.vsh",
+                    "match": "\\*\\*|[+\\-*/%]"
+                },
+                {
+                    "name": "keyword.operator.comparison.vsh",
+                    "match": "==|!=|<=|>=|[<>]"
+                },
+                {
+                    "name": "keyword.operator.assignment.compound.vsh",
+                    "match": "\\+=|-=|\\*=|/=|%="
+                },
+                {
+                    "name": "keyword.operator.assignment.vsh",
+                    "match": "(?<![=!<>])=(?!=)"
+                }
+            ]
+        },
+
+        "punctuation": {
+            "patterns": [
+                {
+                    "name": "punctuation.separator.comma.vsh",
+                    "match": ","
+                },
+                {
+                    "name": "punctuation.separator.colon.vsh",
+                    "match": ":"
+                },
+                {
+                    "name": "punctuation.accessor.dot.vsh",
+                    "match": "\\."
+                },
+                {
+                    "name": "punctuation.terminator.statement.vsh",
+                    "match": ";"
+                }
+            ]
+        }
+    }
+}

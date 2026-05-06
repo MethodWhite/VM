@@ -1,0 +1,77 @@
+// HOF (higher-order functions): pasar lambdas Y funciones
+// top-level como parametros (gap N).
+//
+// Pone a prueba:
+//   - Lambdas como parametros (tipo fn(i32)->i32 y fn(i32,i32)->i32).
+//   - Funciones top-level (`add2`, `max2`) promocionadas a function value
+//     automaticamente por el type checker.
+//   - reduce(arr, n, init, op): fold sobre array nativo i32[N].
+//   - map(arr, n, f): transforma in-place via lambda sin captura.
+//   - Una HOF (compose_apply) que aplica f despues de g sin retornar lambda.
+//
+// Resultado esperado:
+//   R0 = sum_after_inc + max_val + compose_result - target
+//      = 65            + 9       + 30             - 62
+//      = 42
+//   sum_after_inc = sum( map((x) => x+1, [1,2,3,4,5,6,7,8,9,10]) ) = 65
+//   max_val       = reduce([1,9,3,7,5], 5, 0, max2) = 9   (top-level)
+//   compose_result = compose_apply(double, add5, 10) = double(add5(10)) = 30
+
+i32 reduce(i32[] arr, i32 n, i32 init, fn(i32,i32) -> i32 op) {
+    i32 acc = init;
+    i32 i = 0;
+    while (i < n) {
+        acc = op(acc, arr[i]);
+        i = i + 1;
+    }
+    return acc;
+}
+
+void map_inplace(i32[] arr, i32 n, fn(i32) -> i32 f) {
+    i32 i = 0;
+    while (i < n) {
+        arr[i] = f(arr[i]);
+        i = i + 1;
+    }
+}
+
+i32 compose_apply(fn(i32) -> i32 f, fn(i32) -> i32 g, i32 x) {
+    return f(g(x));
+}
+
+// Funciones top-level que se pasan como function values al HOF reduce/map.
+i32 add2(i32 a, i32 b) {
+    return a + b;
+}
+
+i32 max2(i32 a, i32 b) {
+    if (a > b) return a;
+    return b;
+}
+
+i32 main() {
+    // 1) map_inplace + reduce: [1..10] -> [2..11], sum = 2+3+...+11 = 65.
+    //    `add2` es funcion top-level (promocionada a fn(i32,i32)->i32).
+    i32[10] xs;
+    i32 i = 0;
+    while (i < 10) { xs[i] = i + 1; i = i + 1; }
+    fn(i32) -> i32 inc = (i32 v) => v + 1;        // lambda
+    map_inplace(xs, 10, inc);
+    i32 sum_after_inc = reduce(xs, 10, 0, add2);  // top-level promocionada
+    if (sum_after_inc != 65) return 11;
+
+    // 2) reduce con max top-level: max([1,9,3,7,5]) = 9.
+    i32[5] ys;
+    ys[0] = 1; ys[1] = 9; ys[2] = 3; ys[3] = 7; ys[4] = 5;
+    i32 max_val = reduce(ys, 5, 0, max2);          // top-level promocionada
+    if (max_val != 9) return 12;
+
+    // 3) compose_apply: double(add5(10)) = double(15) = 30.
+    fn(i32) -> i32 add5    = (i32 n) => n + 5;
+    fn(i32) -> i32 doubler = (i32 n) => n * 2;
+    i32 compose_result = compose_apply(doubler, add5, 10);
+    if (compose_result != 30) return 13;
+
+    // Validacion final: 65 + 9 + 30 - 62 = 42.
+    return sum_after_inc + max_val + compose_result - 62;
+}

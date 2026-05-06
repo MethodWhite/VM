@@ -1,0 +1,108 @@
+/**
+ * ejemplo_getfield_setfield.ir
+ * Acceso a campos de objetos GC: GETFIELD y SETFIELD
+ *
+ * Conceptos demostrados:
+ *   - GETFIELD: leer un campo de un objeto GC por desplazamiento de bytes
+ *   - SETFIELD con tipo no-HANDLE: escritura simple sin barrera de GC
+ *   - SETFIELD con tipo HANDLE: escritura con write barrier automatico (gcwb)
+ *   - Layout tipico de un objeto: ObjectHeader (24 bytes) + campos propios
+ *
+ * Layout de ejemplo para un objeto "Punto":
+ *   offset  0..23  ObjectHeader (class_ptr, flags, hash_code, owner_pid, ...)
+ *   offset 24..31  campo x: i64
+ *   offset 32..39  campo y: i64
+ *   offset 40..47  campo label: handle (GcHandle a un StringObject)
+ *
+ * El emitter genera la secuencia:
+ *   gcderef cur0, r_obj   ; cur0 = host ptr al inicio del objeto
+ *   addcur  cur0, offset  ; avanzar al campo deseado
+ *   readcur r_dst, cur0   ; GETFIELD: leer el campo
+ *   writecur cur0, r_src  ; SETFIELD: escribir el campo
+ *   gcwb    r_obj         ; write barrier (solo si tipo == handle)
+ *
+ * Compilar:
+ *   vm --ir-file examples_ir/ejemplo_getfield_setfield.ir --ir-opt 1 -o build/out_ir/gfs
+ */
+
+@module ejemplo_getfield_setfield
+
+// Punto de entrada: todas las funciones de este modulo requieren objetos GC reales.
+// Se devuelve el offset del primer campo propio (tras ObjectHeader de 24 bytes)
+// para verificar que el modulo cargo y los calculos de layout son correctos.
+@function demo_run() -> i64 {
+entry:
+    // ObjectHeader ocupa 24 bytes; el campo x del Punto empieza en offset 24
+    first_field_offset = const.i64 24
+    ret.i64 first_field_offset
+}
+
+// Lee el campo x (offset 24) de un Punto
+@function punto_get_x(p: handle) -> i64 {
+entry:
+    x = getfield.i64 p, 24
+    ret.i64 x
+}
+
+// Lee el campo y (offset 32) de un Punto
+@function punto_get_y(p: handle) -> i64 {
+entry:
+    y = getfield.i64 p, 32
+    ret.i64 y
+}
+
+// Escribe el campo x (offset 24) de un Punto — tipo i64, sin write barrier
+@function punto_set_x(p: handle, val: i64) -> void {
+entry:
+    setfield.i64 p, 24, val
+    ret.void
+}
+
+// Escribe el campo label (offset 40) de un Punto — tipo handle, genera gcwb
+@function punto_set_label(p: handle, s: handle) -> void {
+entry:
+    setfield.handle p, 40, s
+    ret.void
+}
+
+// Traslada un punto sumando dx a x y dy a y
+@function punto_translate(p: handle, dx: i64, dy: i64) -> void {
+entry:
+    old_x  = getfield.i64 p, 24
+    old_y  = getfield.i64 p, 32
+    new_x  = add.i64 old_x, dx
+    new_y  = add.i64 old_y, dy
+    setfield.i64 p, 24, new_x
+    setfield.i64 p, 32, new_y
+    ret.void
+}
+
+// Calcula la distancia al cuadrado entre dos puntos (sin raiz cuadrada)
+// para evitar importar funciones matematicas en este ejemplo.
+// dist2 = (bx-ax)^2 + (by-ay)^2
+@function punto_dist2(a: handle, b: handle) -> i64 {
+entry:
+    ax   = getfield.i64 a, 24
+    ay   = getfield.i64 a, 32
+    bx   = getfield.i64 b, 24
+    by   = getfield.i64 b, 32
+    dx   = sub.i64 bx, ax
+    dy   = sub.i64 by, ay
+    dx2  = mul.i64 dx, dx
+    dy2  = mul.i64 dy, dy
+    dist = add.i64 dx2, dy2
+    ret.i64 dist
+}
+
+// Copia todos los campos i64 de un Punto a otro
+@function punto_copy(dst: handle, src: handle) -> void {
+entry:
+    x_val = getfield.i64 src, 24
+    y_val = getfield.i64 src, 32
+    setfield.i64 dst, 24, x_val
+    setfield.i64 dst, 32, y_val
+    // Copiar el label (handle) — esto emite write barrier en dst
+    lbl   = getfield.handle src, 40
+    setfield.handle dst, 40, lbl
+    ret.void
+}

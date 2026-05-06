@@ -1,0 +1,12 @@
+// examples_codes_vex/00_aritmetica.vex
+//
+// Ejemplo end-to-end mas minimo: expresion aritmetica.
+//
+// Devuelve 1 + 2 * 3 = 7 (precedencia C: multiplicacion antes que suma).
+//
+// Resultado esperado:
+//   exit code / R00 == 7
+
+i32 main() {
+    return 1 + 2 * 3;
+}

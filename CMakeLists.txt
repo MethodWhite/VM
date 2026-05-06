@@ -133,15 +133,41 @@ if(VESTA_BUILD_PREPROCESSOR)
     list(APPEND VM_INCLUDES ${CMAKE_SOURCE_DIR}/preprocessor/include)
 endif()
 
-# Sources del ejecutable principal
+# Frontend del lenguaje Vex como libreria estatica aislada (vex_lib).
+# Decision arquitectonica: el frontend del HLL se compila
+# fuera del GLOB principal y se enlaza al ejecutable como dependencia
+# explicita, prefigurando la futura libvesta_rt.
+add_subdirectory(src/vex)
+
+# Sources del ejecutable principal.  Se EXCLUYEN los .cpp de src/vex/
+# porque ya se compilan dentro de vex_lib (incluirlos en ambos lados
+# causaria definicion multiple de simbolos en el linker).
 file(GLOB_RECURSE VM_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/libs/SourceCode/DistanciaLevenshtein/Levenshtein_c.c
         ${CMAKE_CURRENT_SOURCE_DIR}/libs/SourceCode/DistanciaLevenshtein/Levenshtein.cpp
 )
+list(FILTER VM_SOURCES EXCLUDE REGEX "/src/vex/")
 # main.cpp se agrega explicitamente (GLOB_RECURSE con "main.cpp" encontraria
 # tambien preprocessor/src/main.cpp y causaria definicion multiple de main)
 list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_closure.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_spimm.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_pattern.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_async.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_weak.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_sync.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_generic.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_distrib.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_exc.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_string.cpp)
+
+# Modulo de programacion distribuida (VDP protocol)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/mailbox.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/dirty_tracker.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/node_registry.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/vdp_session.cpp)
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/dist_runtime.cpp)
 
 
 set(CAPSTONE_BUILD_STATIC ON CACHE BOOL "" FORCE)
@@ -163,6 +189,7 @@ target_link_libraries(vm
         PRIVATE sqlite3
         PRIVATE capstone
         PRIVATE keystone
+        PRIVATE vex_lib
 )
 if(VESTA_BUILD_PREPROCESSOR)
     target_link_libraries(vm PRIVATE vpp_lib)
@@ -202,7 +229,7 @@ if (WIN32)
     target_link_libraries(vm PRIVATE applink)
 else ()
     find_package(OpenSSL REQUIRED)
-    target_link_libraries(vm PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    target_link_libraries(vm PRIVATE OpenSSL::SSL OpenSSL::Crypto dl)
 endif ()
 
 # Opciones globales para todos los builds
@@ -240,6 +267,24 @@ target_link_options(vm PRIVATE
         #-flto=thin                # mi MinGW no soporta LTO
         >
 )
+
+add_library(vesta_install STATIC
+        src/install/install.cpp
+        src/install/install_options.cpp
+        src/install/manifest.cpp
+)
+
+if(WIN32)
+    target_sources(vesta_install PRIVATE src/install/platform_win.cpp)
+    target_link_libraries(vesta_install PRIVATE Shell32 Advapi32 Ole32 User32 Shlwapi)
+else()
+    target_sources(vesta_install PRIVATE src/install/platform_linux.cpp)
+endif()
+
+target_include_directories(vesta_install PUBLIC include)
+
+# Linkar al binario principal:
+target_link_libraries(vm PRIVATE vesta_install)
 
 # Enlace estático solo en Windows + Release
 target_link_options(vm PRIVATE

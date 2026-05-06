@@ -1,0 +1,202 @@
+/*
+ * ejemplo_generics.vel
+ *
+ * Demuestra la instruccion SPECIALIZE: instanciacion de clases genericas
+ * en tiempo de ejecucion mediante monomorphization en el Loader.
+ *
+ * SPECIALIZE crea (o reutiliza de la cache) una ClassInfo especializada
+ * a partir de una ClassInfo generica y un array de punteros a ClassInfo
+ * que representan los argumentos de tipo concretos.
+ *
+ * Instruccion:
+ *
+ *   SPECIALIZE r_dst, r_class, r_types, count
+ *     r_class  = ClassInfo* de la clase generica (marcada con CLASS_FLAG_GENERIC)
+ *     r_types  = puntero a un array de (count) ClassInfo* (los tipos concretos)
+ *     count    = numero de parametros de tipo (max 15, cabe en 4 bits)
+ *     r_dst    = ClassInfo* de la especializacion (nueva o de la cache)
+ *
+ * Codificacion binaria (FIXED_4):
+ *   byte0 = 0x00
+ *   byte1 = 0x3A
+ *   byte2 = (r_dst << 4) | r_class
+ *   byte3 = (r_types << 4) | count
+ *
+ * Layout de ClassInfo relevante:
+ *   +0   name        (stringx, 16B)
+ *   +16  flags       (uint64_t) -- CLASS_FLAG_GENERIC = 0x10
+ *   +24  instance_size (uint32_t)
+ *   +32  supers*     (8B)
+ *   +40  super_count (8B)
+ *   +48  type_params*  (ClassInfo**) -- parametros genericos de la especializacion
+ *   +56  type_param_count (size_t)
+ *   +64  generic_parent* (ClassInfo*) -- apunta a la clase generica origen
+ *   ... (campos restantes: fields, methods, vtable, etc.)
+ *
+ * La instruccion SPECIALIZE:
+ *   1. Construye la clave "ClassName<T1,T2,...>" con los nombres de los tipos.
+ *   2. Busca en generic_cache_ del Loader.
+ *   3. Si no existe: clona la ClassInfo generica, rellena type_params con los
+ *      punteros concretos, limpia CLASS_FLAG_GENERIC, establece generic_parent.
+ *   4. Devuelve la ClassInfo especializada en r_dst.
+ *
+ * Este ejemplo construye:
+ *   - ClassGeneric: clase generica con CLASS_FLAG_GENERIC y un parametro T.
+ *   - ClassInt y ClassStr: dos ClassInfo que representan los tipos concretos.
+ *   - types_array: array de 1 puntero para pasar como r_types.
+ *   - Llama SPECIALIZE dos veces con distintos tipos para verificar que:
+ *       * La primera llamada crea la especializacion.
+ *       * La segunda llamada con el mismo tipo devuelve el puntero cacheado.
+ *       * Una tercera llamada con tipo distinto crea otra especializacion.
+ *       * Las dos especializaciones son objetos distintos (punteros distintos).
+ *       * La especializacion tiene generic_parent == ClassGeneric.
+ *
+ * Resultado esperado al llegar a hlt:
+ *   R9  = ptr a ClassGeneric<ClassInt>    (primera especializacion)
+ *   R10 = igual a R9                      (segunda llamada -> cache hit)
+ *   R11 = ptr a ClassGeneric<ClassStr>    (tercera llamada -> nueva)
+ *   R12 = 0  (R9 != R11: son clases distintas)
+ *   R13 = 1  (R9 == R10: cache funciona)
+ *
+ * Compilar y ejecutar:
+ *   vesta --build ejemplo_generics.vel -o ejemplo_generics
+ *   vesta --run   ejemplo_generics.velb --stats
+ *
+ * CLASS_FLAG_GENERIC (0x10) se define en include/loader/oop_types.h.
+ * alloc() devuelve memoria zeroeada.
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+code:
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // ----------------------------------------------------------------
+    // 1. ClassGeneric (168 bytes, zeroeado)  -> r1
+    //    flags (offset 16) = 0x10  (CLASS_FLAG_GENERIC)
+    //    instance_size (offset 24, dword) = 8   (tamano instancia generica)
+    // ----------------------------------------------------------------
+    mov   r3, 168
+    alloc r3
+    mov   r1, r0                        // r1 = ClassGeneric
+
+    // flags (offset 16) = 0x10 (CLASS_FLAG_GENERIC)
+    mov   r14, r1
+    addu  r14, 16
+    xchg  cur0, r14
+    mov   r5, 0x10
+    writecur cur0, r5
+
+    // instance_size (offset 24, dword) = 8
+    mov   r14, r1
+    addu  r14, 24
+    xchg  cur0, r14
+    mov   r5, 8
+    writecur cur0, r5d
+
+    // ----------------------------------------------------------------
+    // 2. ClassInt (168 bytes, zeroeado)  -> r2
+    //    Representa el tipo concreto "int" para la monomorphization.
+    //    instance_size (offset 24) = 8
+    // ----------------------------------------------------------------
+    mov   r3, 168
+    alloc r3
+    mov   r2, r0                        // r2 = ClassInt
+
+    mov   r14, r2
+    addu  r14, 24
+    xchg  cur0, r14
+    mov   r5, 8
+    writecur cur0, r5d
+
+    // ----------------------------------------------------------------
+    // 3. ClassStr (168 bytes, zeroeado)  -> r3
+    //    Representa el tipo concreto "str" para la monomorphization.
+    //    instance_size (offset 24) = 16
+    // ----------------------------------------------------------------
+    mov   r6, 168
+    alloc r6
+    mov   r3, r0                        // r3 = ClassStr
+
+    mov   r14, r3
+    addu  r14, 24
+    xchg  cur0, r14
+    mov   r5, 16
+    writecur cur0, r5d
+
+    // ----------------------------------------------------------------
+    // 4. types_array (8 bytes): un slot para un ClassInfo*
+    //    Se usara para pasar r_types a SPECIALIZE.
+    //    Primero cargamos ClassInt -> types_array[0]
+    // ----------------------------------------------------------------
+    mov   r6, 8
+    alloc r6
+    mov   r4, r0                        // r4 = types_array
+
+    // types_array[0] = ClassInt (r2)
+    mov   r14, r4
+    xchg  cur0, r14
+    writecur cur0, r2
+
+    // ================================================================
+    // T1: SPECIALIZE r9, r1, r4, 1
+    //     ClassGeneric<ClassInt> -- primera creacion
+    // ================================================================
+    specialize r9, r1, r4, 1           // r9 = ClassGeneric<ClassInt>
+
+    // ================================================================
+    // T2: SPECIALIZE r10, r1, r4, 1
+    //     Misma clave -> debe devolver el puntero cacheado (r10 == r9)
+    // ================================================================
+    specialize r10, r1, r4, 1          // r10 = cache hit (debe == r9)
+
+    // Verificar r13 = (r9 == r10) ? 1 : 0
+    mov   r13, 0
+    cmp   r9, r10
+    jmp.jne check_t3
+    mov   r13, 1                       // r13 = 1 si cache hit correcto
+
+check_t3:
+    // ----------------------------------------------------------------
+    // Cambiar types_array[0] = ClassStr para la tercera llamada
+    // ----------------------------------------------------------------
+    mov   r14, r4
+    xchg  cur0, r14
+    writecur cur0, r3                  // types_array[0] = ClassStr
+
+    // ================================================================
+    // T3: SPECIALIZE r11, r1, r4, 1
+    //     ClassGeneric<ClassStr> -- nueva especializacion
+    // ================================================================
+    specialize r11, r1, r4, 1          // r11 = ClassGeneric<ClassStr>
+
+    // Verificar r12 = (r9 == r11) ? 1 : 0  (deben ser DISTINTOS)
+    mov   r12, 0
+    cmp   r9, r11
+    jmp.jne verify_done
+    mov   r12, 1                       // r12 = 1 solo si son IGUALES (error)
+
+verify_done:
+    // Resultado esperado:
+    //   r9  = ptr ClassGeneric<ClassInt>
+    //   r10 = ptr ClassGeneric<ClassInt>  (mismo que r9, cache)
+    //   r11 = ptr ClassGeneric<ClassStr>  (distinto de r9)
+    //   r12 = 0  (r9 != r11: espe. distintas -- OK)
+    //   r13 = 1  (r9 == r10: cache funciona -- OK)
+    mov   r0, r13
+    hlt
+
+end_code:

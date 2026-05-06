@@ -1,0 +1,30 @@
+// examples_codes_vex/06_struct_multi.vex
+//
+// Test de multiples instancias struct vivas a la vez con tres campos
+// cada una.  Antes del fix de `mov reg, rsp` truncaba a 8 bits, lo que
+// hacia que las direcciones base obtenidas por ALLOCA se confundieran
+// y el resultado fuera 0.
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/06_struct_multi.vex -o sm
+//   vm --run sm.velb --stats
+//
+// Resultado esperado: R00 == 21  (1+2+3 + 4+5+6)
+
+struct V3 {
+    i32 x;
+    i32 y;
+    i32 z;
+}
+
+i32 main() {
+    V3 a;
+    V3 b;
+    a.x = 1;
+    a.y = 2;
+    a.z = 3;
+    b.x = 4;
+    b.y = 5;
+    b.z = 6;
+    return a.x + a.y + a.z + b.x + b.y + b.z;
+}

@@ -1,0 +1,110 @@
+/**
+ * ejemplo_excepciones.ir
+ * Manejo de excepciones: TRYENTER, TRYLEAVE, THROW, LANDINGPAD
+ *
+ * Conceptos demostrados:
+ *   - tryenter %handler_pc, %type  : empujar un ExceptionFrame en la pila del proceso.
+ *       handler_pc = GcHandle/direccion del bloque catch
+ *       type       = ClassInfo* del tipo capturado (0 = catch-all)
+ *   - tryleave                     : pop del ExceptionFrame al salir del bloque try.
+ *   - throw %obj                   : lanzar una excepcion con un objeto GC.
+ *       do_throw() busca el primer ExceptionFrame cuyo tipo coincide con la clase
+ *       del objeto o es catch-all, y salta al handler_pc.
+ *   - landingpad                   : marca el inicio del bloque catch; en el emisor
+ *       el objeto de excepcion llega en r0 y se mueve al destino del landingpad.
+ *   - unwrap %ptr                  : lanza NullPointerException si ptr == 0.
+ *
+ * Patron de emision (bloque try/catch):
+ *
+ *   tryenter %catch_addr, %exc_class   ; push ExceptionFrame
+ *   ... codigo del try ...
+ *   tryleave                           ; pop ExceptionFrame (salida normal)
+ *   br after_try
+ *
+ *   catch_block:
+ *   %exc = landingpad.handle           ; r0 -> %exc (objeto de excepcion)
+ *   ... manejo del error ...
+ *   br after_try
+ *
+ *   after_try:
+ *   ...
+ *
+ * Nota: handler_pc y exc_class son valores IR (GcHandle/ptr). En codigo real,
+ * el compilador HHL los resuelve con @Absolute y ClassInfo*.
+ * Aqui usamos constantes de ejemplo para ilustrar la estructura.
+ *
+ * Compilar:
+ *   vm --ir-file examples_ir/ejemplo_excepciones.ir --ir-opt 1 --ir-emit-only
+ */
+
+@module ejemplo_excepciones
+
+// Divide a entre b, lanzando una excepcion si b == 0
+// Para simplificar, exc_class = 0 (catch-all) y handler = valor ficticio
+@function safe_div(a: i64, b: i64, exc_obj: handle) -> i64 {
+entry:
+    zero     = const.i64 0
+    is_zero  = cmp.eq.i64 b, zero
+    br.cond is_zero, throw_block, div_block
+
+throw_block:
+    throw exc_obj       // lanza el objeto de excepcion proporcionado
+    unreachable
+
+div_block:
+    result = div.i64 a, b
+    ret.i64 result
+}
+
+// Desenvuelve un puntero nullable: lanza si es nulo, retorna si no
+@function unwrap_ptr(p: handle) -> handle {
+entry:
+    safe = unwrap p      // lanza NullPointerException si p == 0
+    ret.handle safe
+}
+
+// Comprueba si un valor es nulo sin lanzar
+@function check_null(p: handle) -> bool {
+entry:
+    is_nil = isnull p       // 1 si p == 0, 0 en caso contrario
+    ret.bool is_nil
+}
+
+// Patron try/catch (pseudo-codigo: el compilador HHL generaria estas direcciones)
+// Aqui handler_addr y class_info son constantes de ejemplo (desplazamientos relativos)
+@function try_catch_demo(val: i64, exc_obj: handle) -> i64 {
+entry:
+    // tryenter recibe: (1) GcHandle/addr del bloque catch, (2) ClassInfo* del tipo
+    // En IR abstracto usamos constantes; el compilador HHL usaria referencias reales.
+    catch_addr  = const.i64 0   // placeholder: el compilador resuelve esto
+    class_info  = const.i64 0   // placeholder: catch-all (tipo == nullptr)
+    tryenter catch_addr, class_info
+
+    // -- cuerpo del bloque try --
+    one    = const.i64 1
+    result = add.i64 val, one
+
+    // salida normal del bloque try: pop el ExceptionFrame
+    tryleave
+    br after_try
+
+catch_block:
+    // landingpad: el emisor emite "mov %exc, r0"
+    exc = landingpad.handle
+    // manejo de error: retornar -1
+    minus_one = const.i64 -1
+    br after_try
+
+after_try:
+    // phi entre resultado normal y resultado de error
+    final = phi.i64 [result, entry], [minus_one, catch_block]
+    ret.i64 final
+}
+
+// Rethrow: volver a lanzar la excepcion capturada
+// (en la VM se implementaria con throw sobre el mismo objeto capturado)
+@function rethrow_demo(exc: handle) -> void {
+entry:
+    throw exc
+    unreachable
+}

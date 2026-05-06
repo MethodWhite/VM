@@ -1,0 +1,143 @@
+/**
+ * ejemplo_string_ops.ir
+ * Operaciones de cadena: instrucciones SSA IR de la familia str*
+ *
+ * Conceptos demostrados:
+ *   - strmake  : crear un StringObject desde un buffer de VM con encoding dado
+ *   - strlen   : obtener el numero de code points
+ *   - strcat   : concatenar dos cadenas -> nueva cadena (ROPE)
+ *   - strcmp   : comparar lexicograficamente (-1 / 0 / 1)
+ *   - strflat  : materializar una cadena ROPE/SLICE a FLAT
+ *   - strhash  : calcular o recuperar el hash FNV-1a (cacheado)
+ *   - strintern: deduplicar en el pool de internamiento
+ *   - strraw   : obtener puntero host nulo-terminado (para FFI Win32)
+ *   - strslice : crear una vista SLICE sin copiar datos
+ *   - strreserve: reservar FLAT con capacidad fija para escritura manual
+ *   - strfinalize: confirmar escritura manual (actualizar byte_len+hash)
+ *   - strconv  : convertir entre encodings (ASCII/ANSI/UTF-8/UTF-16/UTF-32)
+ *
+ * Encodings disponibles (StringEncoding):
+ *   0 = ASCII, 1 = ANSI, 2 = UTF-8, 3 = UTF-16LE, 4 = UTF-32LE
+ *
+ * Notas:
+ *   - Todas las funciones retornan GcHandle (tipo handle) salvo strlen/strcmp
+ *     (retornan i64) y strraw (retorna ptr).
+ *   - strcat genera una cadena ROPE; usar strflat antes de acceso byte a byte.
+ *   - strintern es ideal para nombres de campo / tokens del compilador.
+ *
+ * Compilar:
+ *   vm --ir-file examples_ir/ejemplo_string_ops.ir --ir-opt 1 -o build/out_ir/strops
+ */
+
+@module ejemplo_string_ops
+
+// Contar los code points de una cadena
+@function str_length(s: handle) -> i64 {
+entry:
+    n = strlen.i64 s
+    ret.i64 n
+}
+
+// Comparar dos cadenas: retorna -1, 0, o 1
+@function str_compare(a: handle, b: handle) -> i64 {
+entry:
+    r = strcmp.i64 a, b
+    ret.i64 r
+}
+
+// Comprueba igualdad de cadenas (strcmp == 0)
+@function str_equal(a: handle, b: handle) -> bool {
+entry:
+    cmp_r  = strcmp.i64 a, b
+    zero   = const.i64 0
+    result = cmp.eq.i64 cmp_r, zero
+    ret.bool result
+}
+
+// Concatenar dos cadenas y retornar la nueva
+@function str_concat(a: handle, b: handle) -> handle {
+entry:
+    joined = strcat.handle a, b
+    ret.handle joined
+}
+
+// Concatenar tres cadenas: a ++ b ++ c
+@function str_concat3(a: handle, b: handle, c: handle) -> handle {
+entry:
+    ab  = strcat.handle a, b
+    abc = strcat.handle ab, c
+    ret.handle abc
+}
+
+// Obtener la version FLAT de una cadena (sin ROPE ni SLICE)
+@function str_flatten(s: handle) -> handle {
+entry:
+    flat = strflat.handle s
+    ret.handle flat
+}
+
+// Obtener puntero host nulo-terminado para FFI nativa (Win32 *A o *W)
+@function str_raw_ptr(s: handle) -> ptr {
+entry:
+    // strflat primero garantiza que el buffer es contiguo
+    flat = strflat.handle s
+    p    = strraw.ptr flat
+    ret.ptr p
+}
+
+// Internar una cadena: retorna el GcHandle canonico del pool
+// Util para comparacion de identidad (==) en lugar de por valor
+@function str_intern(s: handle) -> handle {
+entry:
+    canonical = strintern.handle s
+    ret.handle canonical
+}
+
+// Calcular o recuperar el hash FNV-1a de una cadena (cacheado en el objeto)
+@function str_hash(s: handle) -> u64 {
+entry:
+    h = strhash.u64 s
+    ret.u64 h
+}
+
+// Extraer una subcadena [from, from+len) usando una vista SLICE sin copia.
+// range = (cp_from << 32) | cp_len  (empaquetado en un solo i64)
+@function str_slice(s: handle, cp_from: i64, cp_len: i64) -> handle {
+entry:
+    shift    = const.i64 32
+    hi       = shl.i64 cp_from, shift   // cp_from en bits 63-32
+    range    = or.i64 hi, cp_len        // cp_len  en bits 31-0
+    view     = strslice.handle s, range
+    ret.handle view
+}
+
+// Convertir una cadena a UTF-16LE (enc=3)
+@function str_to_utf16(s: handle) -> handle {
+entry:
+    utf16 = strconv.handle s, 3
+    ret.handle utf16
+}
+
+// Convertir una cadena a UTF-8 (enc=2)
+@function str_to_utf8(s: handle) -> handle {
+entry:
+    utf8 = strconv.handle s, 2
+    ret.handle utf8
+}
+
+// Clonar una cadena: strflat + reserva + copia manual (ejemplo de strreserve/strfinalize)
+// En la practica se usa strconv/strcat; esto muestra el API de bajo nivel.
+@function str_clone_flat(s: handle) -> handle {
+entry:
+    // 1. Asegurar FLAT para conocer byte_len (el compilador HHL lo pasa como extra)
+    flat    = strflat.handle s
+    // 2. Obtener numero de code points (como capacidad en bytes, una aproximacion)
+    cap     = strlen.i64 flat
+    // 3. Reservar un FLAT con esa capacidad (byte_len=0 inicial)
+    buf     = strreserve.handle cap
+    // ... (aqui el HHL escribiria bytes a traves de strraw o loops)
+    // 4. Confirmar escritura indicando el nuevo byte_len (aqui 0 por simplicidad)
+    zero    = const.i64 0
+    strfinalize buf, zero
+    ret.handle buf
+}

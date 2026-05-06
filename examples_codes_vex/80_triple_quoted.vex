@@ -1,0 +1,26 @@
+// Strings triple-quoted ("""...""") con saltos de linea literales
+// dentro del literal y escapes (\t, \n) honrados.  Antes el lexer Vex
+// emitia error "no soportados" y el preprocesador VPP confundia las
+// triples con varios literales sueltos -> ahora ambas pasadas (VPP +
+// Vex) reconocen """ como un solo token multilinea.
+i32 main() {
+    string s = """linea1
+linea2
+linea3""";
+    println(s);
+    println("---");
+
+    // Con escapes (\t, \n).
+    string t = """A\tB\tC
+DEF""";
+    println(t);
+    println("---");
+
+    // Una sola linea pero con comillas internas.
+    string q = """contiene "comillas" y otras 'simples'""";
+    println(q);
+
+    if (str_length(s) < 18) return 1;
+    if (str_length(t) < 8) return 2;
+    return 42;
+}

@@ -1,0 +1,318 @@
+{
+    "Funcion": {
+        "prefix": "fn",
+        "body": [
+            "fn ${1:nombre}(${2:params}) {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Declaracion de funcion"
+    },
+
+    "Funcion con docstring": {
+        "prefix": "fnd",
+        "body": [
+            "fn ${1:nombre}(${2:params}) {",
+            "\t\"${3:Descripcion de la funcion.}\"",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Funcion con docstring"
+    },
+
+    "Clase": {
+        "prefix": "class",
+        "body": [
+            "class ${1:Nombre} {",
+            "\tfn __init__(self${2:, params}) {",
+            "\t\t${0}",
+            "\t}",
+            "}"
+        ],
+        "description": "Declaracion de clase con __init__"
+    },
+
+    "Clase con herencia": {
+        "prefix": "classh",
+        "body": [
+            "class ${1:Nombre} : ${2:Padre} {",
+            "\tfn __init__(self${3:, params}) {",
+            "\t\tsuper.__init__(self)",
+            "\t\t${0}",
+            "\t}",
+            "}"
+        ],
+        "description": "Clase con herencia de otra clase"
+    },
+
+    "Metodo de clase": {
+        "prefix": "method",
+        "body": [
+            "fn ${1:nombre}(self${2:, params}) {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Metodo de clase (con self)"
+    },
+
+    "If": {
+        "prefix": "if",
+        "body": [
+            "if ${1:condicion} {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Sentencia if"
+    },
+
+    "If / else": {
+        "prefix": "ifel",
+        "body": [
+            "if ${1:condicion} {",
+            "\t${2}",
+            "} else {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Sentencia if/else"
+    },
+
+    "If / elif / else": {
+        "prefix": "ifelifel",
+        "body": [
+            "if ${1:condicion} {",
+            "\t${2}",
+            "} elif ${3:otra_condicion} {",
+            "\t${4}",
+            "} else {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Sentencia if/elif/else"
+    },
+
+    "While": {
+        "prefix": "while",
+        "body": [
+            "while ${1:condicion} {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Bucle while"
+    },
+
+    "For in lista": {
+        "prefix": "for",
+        "body": [
+            "for ${1:item} in ${2:lista} {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Bucle for/in"
+    },
+
+    "For con range": {
+        "prefix": "forr",
+        "body": [
+            "for ${1:i} in range(${2:n}) {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Bucle for con range(n)"
+    },
+
+    "For con range inicio/fin": {
+        "prefix": "forrr",
+        "body": [
+            "for ${1:i} in range(${2:inicio}, ${3:fin}) {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Bucle for con range(inicio, fin)"
+    },
+
+    "Try / catch": {
+        "prefix": "try",
+        "body": [
+            "try {",
+            "\t${1}",
+            "} catch ${2:e} {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Bloque try/catch"
+    },
+
+    "Try / catch tipado": {
+        "prefix": "tryc",
+        "body": [
+            "try {",
+            "\t${1}",
+            "} catch ${2:e}: ${3:TipoError} {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Try/catch con tipo especifico"
+    },
+
+    "Let": {
+        "prefix": "let",
+        "body": [
+            "let ${1:nombre} = ${0}"
+        ],
+        "description": "Declaracion de variable"
+    },
+
+    "Let con tipo": {
+        "prefix": "lett",
+        "body": [
+            "let ${1:nombre}: ${2:int} = ${0}"
+        ],
+        "description": "Declaracion de variable con anotacion de tipo"
+    },
+
+    "Import": {
+        "prefix": "import",
+        "body": [
+            "import \"${1:ruta/modulo.vsh}\""
+        ],
+        "description": "Importar un modulo .vsh"
+    },
+
+    "Echo interpolado": {
+        "prefix": "echo",
+        "body": [
+            "echo(\"${1:mensaje}\")"
+        ],
+        "description": "Imprimir con echo"
+    },
+
+    "Println": {
+        "prefix": "println",
+        "body": [
+            "println(\"${1:mensaje}\")"
+        ],
+        "description": "Imprimir con println"
+    },
+
+    "Shell": {
+        "prefix": "shell",
+        "body": [
+            "let ${1:salida} = shell(\"${2:comando}\")"
+        ],
+        "description": "Ejecutar comando de shell"
+    },
+
+    "Shell con codigo de salida": {
+        "prefix": "shex",
+        "body": [
+            "let ${1:res} = shell_ex(\"${2:comando}\")",
+            "echo(${1:res}[\"output\"])",
+            "echo(str(${1:res}[\"code\"]))"
+        ],
+        "description": "Ejecutar comando y obtener salida + codigo de error"
+    },
+
+    "Leer fichero": {
+        "prefix": "readf",
+        "body": [
+            "let ${1:contenido} = read_file(\"${2:ruta}\")"
+        ],
+        "description": "Leer un fichero"
+    },
+
+    "Escribir fichero": {
+        "prefix": "writef",
+        "body": [
+            "write_file(\"${1:ruta}\", ${2:contenido})"
+        ],
+        "description": "Escribir en un fichero"
+    },
+
+    "FFI llamada rapida": {
+        "prefix": "ffic",
+        "body": [
+            "let ${1:resultado} = ffi_call_sym(\"${2:libreria.dll}\", \"${3:FuncionNombre}\"${4:, args})"
+        ],
+        "description": "Llamada FFI directa (open+sym+call+close)"
+    },
+
+    "FFI apertura manual": {
+        "prefix": "ffim",
+        "body": [
+            "let ${1:lib} = ffi_open(\"${2:libreria.dll}\")",
+            "let ${3:sym} = ffi_sym(${1:lib}, \"${4:FuncionNombre}\")",
+            "let ${5:res} = ffi_call(${3:sym}${6:, args})",
+            "ffi_close(${1:lib})"
+        ],
+        "description": "FFI manual: open, sym, call, close"
+    },
+
+    "Colorize": {
+        "prefix": "colorize",
+        "body": [
+            "echo(colorize(\"${1:texto}\", \"${2:red}\"))"
+        ],
+        "description": "Imprimir texto coloreado"
+    },
+
+    "Barra de progreso ANSI": {
+        "prefix": "progress",
+        "body": [
+            "fn barra_progreso(pct: int) {",
+            "\tlet lleno = pct / 5",
+            "\tlet vacio = 20 - lleno",
+            "\tlet barra = green(repeat(\"#\", lleno)) + dim(repeat(\"-\", vacio))",
+            "\techo(\"\\r[\" + barra + \"] \" + str(pct) + \"%\")",
+            "}"
+        ],
+        "description": "Funcion barra de progreso con colores ANSI"
+    },
+
+    "Clase Error personalizado": {
+        "prefix": "errclass",
+        "body": [
+            "class ${1:MiError} : Error {",
+            "\tfn __init__(self, mensaje) {",
+            "\t\tsuper.__init__(self, mensaje)",
+            "\t\t${0}",
+            "\t}",
+            "}"
+        ],
+        "description": "Clase de error personalizada que hereda de Error"
+    },
+
+    "Map literal": {
+        "prefix": "map",
+        "body": [
+            "let ${1:m} = {",
+            "\t\"${2:clave}\": ${3:valor}",
+            "}"
+        ],
+        "description": "Mapa literal"
+    },
+
+    "Lista literal": {
+        "prefix": "list",
+        "body": [
+            "let ${1:lst} = [${2}]"
+        ],
+        "description": "Lista literal"
+    },
+
+    "Assert": {
+        "prefix": "assert",
+        "body": [
+            "assert(${1:condicion}, \"${2:mensaje de error}\")"
+        ],
+        "description": "Asercion con mensaje"
+    },
+
+    "Lanzar error": {
+        "prefix": "throw",
+        "body": [
+            "throw ${1:MiError}(\"${2:mensaje}\")"
+        ],
+        "description": "Lanzar una excepcion"
+    }
+}

@@ -1,0 +1,56 @@
+// Test integrador: LinkedList<i32> basico (forma natural).
+//
+// Pone a prueba:
+//   - Clases con campos de tipo CLASS auto-referente (Node tiene Node next).
+//   - null literal asignado a referencia de clase.
+//   - Comparacion `cur != null` con tipos CLASS.
+//   - Loops con seguimiento de punteros (cur = cur.next).
+//   - Constructor + metodos de instancia.
+//   - `new X(...)` dentro de un metodo de instancia (preserva this).
+//
+// Resultado esperado: R0 = 6  (1 + 2 + 3).
+
+class Node {
+    public i32 value;
+    public Node next;
+
+    public Node(i32 v) {
+        this.value = v;
+        this.next = null;
+    }
+}
+
+class LinkedList {
+    public Node head;
+    public i32  length;
+
+    public LinkedList() {
+        this.head = null;
+        this.length = 0;
+    }
+
+    public void prepend(i32 v) {
+        Node n = new Node(v);
+        n.next = this.head;
+        this.head = n;
+        this.length = this.length + 1;
+    }
+
+    public i32 sum() {
+        i32 total = 0;
+        Node cur = this.head;
+        while (cur != null) {
+            total = total + cur.value;
+            cur = cur.next;
+        }
+        return total;
+    }
+}
+
+i32 main() {
+    LinkedList l = new LinkedList();
+    l.prepend(1);
+    l.prepend(2);
+    l.prepend(3);
+    return l.sum();
+}

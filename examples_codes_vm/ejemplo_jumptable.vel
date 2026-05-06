@@ -1,0 +1,115 @@
+/*
+ * ejemplo_jumptable.vel
+ *
+ * Demuestra JUMPTABLE: despacho O(1) por valor entero.
+ *
+ * Simula una sentencia switch sobre un codigo de operacion (opcode):
+ *
+ *   switch (opcode) {
+ *     case 0: R0 = "OP_ADD"  -> R0 = 1
+ *     case 1: R0 = "OP_SUB"  -> R0 = 2
+ *     case 2: R0 = "OP_MUL"  -> R0 = 3
+ *     default: R0 = 0
+ *   }
+ *
+ * JUMPTABLE sintaxis:
+ *   jumptable r_val, r_table, count
+ *
+ *   r_val   = registro con el indice (0..count-1)
+ *   r_table = registro con la direccion VM del array de uint64
+ *   count   = numero de entradas (inmediato 1-255)
+ *
+ * Si r_val >= count, la instruccion es NOP y la ejecucion continua
+ * con la siguiente instruccion (caso default).
+ *
+ * Compilar y ejecutar:
+ *   vesta --build ejemplo_jumptable.vel -o ejemplo_jumptable
+ *   vesta --run   ejemplo_jumptable.velb --stats
+ *
+ * Resultado esperado:
+ *   Primera pasada  (opcode=0): R0 = 1  (caso OP_ADD)
+ *   Segunda pasada  (opcode=1): R0 = 2  (caso OP_SUB)
+ *   Tercera pasada  (opcode=2): R0 = 3  (caso OP_MUL)
+ *   Cuarta pasada   (opcode=9): R0 = 0  (caso default, fuera de rango)
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+// -----------------------------------------------------------------------
+// Punto de entrada
+// -----------------------------------------------------------------------
+code:
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // Cargar la direccion de la tabla de saltos en r9
+    mov   r9, @Absolute("all.tabla_opcodes")
+
+    // --- Caso 0: OP_ADD ---
+    mov   r1, 0
+    jumptable r1, r9, 3      // salta a caso_add
+    jmp   caso_default       // no alcanzado si r1 < 3
+
+caso_regreso_0:
+    // R0 = 1 tras caso_add; continuar con el siguiente test
+
+    // --- Caso 1: OP_SUB ---
+    mov   r1, 1
+    jumptable r1, r9, 3      // salta a caso_sub
+    jmp   caso_default
+
+caso_regreso_1:
+    // --- Caso 2: OP_MUL ---
+    mov   r1, 2
+    jumptable r1, r9, 3      // salta a caso_mul
+    jmp   caso_default
+
+caso_regreso_2:
+    // --- Caso fuera de rango: opcode = 9 ---
+    mov   r1, 9
+    jumptable r1, r9, 3      // NOP: r1 >= 3, cae al default
+    jmp   caso_default       // ejecutado porque jumptable fue NOP
+
+caso_regreso_default:
+    hlt
+
+// -----------------------------------------------------------------------
+// Casos del switch
+// -----------------------------------------------------------------------
+caso_add:
+    mov   r0, 1          // codigo de resultado para OP_ADD
+    jmp   caso_regreso_0
+
+caso_sub:
+    mov   r0, 2          // codigo de resultado para OP_SUB
+    jmp   caso_regreso_1
+
+caso_mul:
+    mov   r0, 3          // codigo de resultado para OP_MUL
+    jmp   caso_regreso_2
+
+caso_default:
+    mov   r0, 0          // opcode desconocido
+    jmp   caso_regreso_default
+
+// -----------------------------------------------------------------------
+// Tabla de saltos: 3 entradas de 8 bytes (uint64) en little-endian.
+// Cada entrada es la direccion absoluta del caso correspondiente.
+// -----------------------------------------------------------------------
+tabla_opcodes:
+    .qword @Absolute("all.caso_add")
+    .qword @Absolute("all.caso_sub")
+    .qword @Absolute("all.caso_mul")
+end_tabla:

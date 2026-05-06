@@ -1,0 +1,43 @@
+// Polimorfismo via interface type.
+//
+// Verifica el dispatch dinamico cuando el receptor esta tipado como
+// interfaz: `IServicio s = new Impl()` y luego `s.metodo()` debe
+// resolver al metodo de Impl en runtime, no al abstract de IServicio.
+//
+// El lowering detecta que el tipo del receptor es interfaz y emite
+// la secuencia: getclass(obj) -> findmethod(class, "metodo") -> callm.
+// Para clases concretas, el dispatch sigue usando CALLVIRT directo
+// con vtable_index (overhead cero).
+//
+// Ejemplos:
+//   - Una sola implementacion: ImplA.metodo() = 10  -> R0 esperado 10.
+//   - Dos implementaciones: ImplA y ImplB con valores distintos
+//     prueban que cambiar el tipo concreto cambia el dispatch.
+//
+// Resultado esperado: 30 (10 de ImplA + 20 de ImplB).
+
+interface IServicio {
+    i32 metodo();
+}
+
+class ImplA : IServicio {
+    public ImplA() { }
+    public i32 metodo() { return 10; }
+}
+
+class ImplB : IServicio {
+    public ImplB() { }
+    public i32 metodo() { return 20; }
+}
+
+i32 main() {
+    // Receptor tipado como interfaz; la instancia es ImplA -> dispatch a 10.
+    IServicio sa = new ImplA();
+    i32 va = sa.metodo();
+
+    // Misma variable de tipo interfaz, pero ahora apunta a ImplB -> 20.
+    IServicio sb = new ImplB();
+    i32 vb = sb.metodo();
+
+    return va + vb;   // 10 + 20 = 30
+}

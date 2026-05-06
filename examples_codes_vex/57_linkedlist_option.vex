@@ -1,0 +1,55 @@
+// Test integrador: LinkedList con ADT IntOption (Some/None).
+//
+// Pone a prueba:
+//   - Enum cross-funcion via SRET (head_opt devuelve IntOption).
+//   - PHI de enums entre branches if/else.
+//   - Pattern matching destructuring del payload.
+//
+// Resultado esperado: R0 = 100 (head=42, +50, +8 = 100)
+
+enum IntOption {
+    None,
+    Some(i32)
+}
+
+class Node {
+    public i32 value;
+    public Node next;
+    public Node(i32 v) {
+        this.value = v;
+        this.next = null;
+    }
+}
+
+class LinkedList {
+    public Node head;
+    public LinkedList() { this.head = null; }
+
+    public void prepend(i32 v) {
+        Node n = new Node(v);
+        n.next = this.head;
+        this.head = n;
+    }
+
+    // Devuelve Some(value) si tiene head, None si vacia.
+    public IntOption head_opt() {
+        if (this.head != null) {
+            return IntOption.Some(this.head.value);
+        } else {
+            return IntOption.None;
+        }
+    }
+}
+
+i32 main() {
+    LinkedList l = new LinkedList();
+    l.prepend(7);
+    l.prepend(42);
+
+    IntOption o = l.head_opt();
+    match o {
+        case Some(v) => return v + 50 + 8;  // 42+58 = 100
+        case None    => return -1;
+    }
+    return -2;
+}

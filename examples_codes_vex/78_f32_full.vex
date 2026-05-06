@@ -1,0 +1,58 @@
+// Test exhaustivo f32 + casts f32<->f64 + arith.
+//
+// Cobertura del backend float-32 anadido en este sprint:
+//   - Constantes f32 (CONST con bits IEEE 754 de 32 bits en GP).
+//   - Aritmetica f32 (FADD/FSUB/FMUL/FDIV con sufijo .ps en bytecode).
+//   - F32TOF64 via nuevo opcode bytecode `fextend` (0x5C).
+//   - F64TOF32 via nuevo opcode bytecode `fnarrow` (0x5D).
+//   - ITOF a f32 (fcvt.ps con direction=0 GP->ZMM).
+//   - FTOI desde f32 (fcvt.ps con direction=1 ZMM->GP).
+//   - Round-trip i32 -> f32 -> i32 manteniendo el valor.
+//   - Cadenas de f32 + f32 + f32.
+//   - Imprimir variables f32 via ${...} (extiende automaticamente a f64
+//     antes del bitcast a uint64 que vio_print_float espera).
+i32 main() {
+    // f32 const + arith
+    f32 a = 1.5;
+    f32 b = 2.25;
+    f32 c = a + b;
+    println("c=${c}");          // 3.75
+    if (c < 3.74 || c > 3.76) return 1;
+
+    // F32TOF64
+    f64 d = a;
+    println("d=${d}");          // 1.5
+    if (d < 1.49 || d > 1.51) return 2;
+
+    // F64TOF32 (con truncamiento de precision)
+    f64 big = 1.234567890123;
+    f32 small = big;
+    println("small=${small}");  // 1.23457 (truncado)
+    if (small < 1.234 || small > 1.235) return 3;
+
+    // ITOF a f32
+    i32 n = 7;
+    f32 nf = n;
+    println("nf=${nf}");        // 7
+    if (nf < 6.99 || nf > 7.01) return 4;
+
+    // FTOI desde f32
+    f32 fp = 3.95;
+    i32 ti = fp;
+    println("ti=${ti}");        // 3
+    if (ti != 3) return 5;
+
+    // Round-trip i32 -> f32 -> i32
+    i32 orig = 42;
+    f32 mid = orig;
+    i32 back = mid;
+    println("back=${back}");    // 42
+    if (back != 42) return 6;
+
+    // f32 + f32 + f32 chain
+    f32 chain = a + b + a;
+    println("chain=${chain}");  // 5.25
+    if (chain < 5.24 || chain > 5.26) return 7;
+
+    return 42;
+}

@@ -1,0 +1,39 @@
+// examples_codes_vex/10_heap_malloc.vex
+//
+// Demuestra el allocator manual:
+//   - `malloc(n)` reserva n bytes en memoria HOST y devuelve void*
+//     (apto para asignar a cualquier T* via la conversion implicita
+//     void* -> T*).
+//   - El IR marca el resultado con is_host_ptr=true; LOAD/STORE en
+//     el emisor consultan el bit y emiten `movh` (s=1, memoria host)
+//     en lugar del `mov` habitual.
+//   - La aritmetica de punteros y el subscript propagan is_host_ptr
+//     desde el operando base, asi `arr[i]` sobre un malloc tambien
+//     usa `movh` automaticamente.
+//   - `free(p)` libera el bloque (usa el RawAllocator del proceso).
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/10_heap_malloc.vex -o hm
+//   vm --run hm.velb --stats
+//
+// Resultado esperado: R00 == 285  (1*1 + 2*2 + ... + 9*9)
+
+i32 main() {
+    // 10 i32 contiguos en heap host.
+    i32* arr = malloc(40);
+
+    i32 i = 0;
+    while (i < 10) {
+        arr[i] = i * i;
+        i = i + 1;
+    }
+
+    i32 sum = 0;
+    i = 0;
+    while (i < 10) {
+        sum = sum + arr[i];
+        i = i + 1;
+    }
+    free(arr);
+    return sum;
+}

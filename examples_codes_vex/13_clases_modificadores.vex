@@ -1,0 +1,36 @@
+// examples_codes_vex/13_clases_modificadores.vex
+//
+// Demuestra modificadores de visibilidad (public/private/protected) y
+// metodos expression-bodied (=>)
+//
+// Estado actual:
+//   - Parser y AST aceptan public/private/protected/static/final en
+//     campos y metodos, en cualquier orden.
+//   - El type checker propaga los flags al ClassLayout / ClassMethodInfo.
+//   - El enforcement de visibilidad y la semantica completa de `static`
+//   - Expression-bodied (=> expr ;) ya funciona; el parser lo desazucara
+//     a `{ return expr; }` para metodos no-void y `{ expr; }` para void.
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/13_clases_modificadores.vex -o cm
+//   vm --run cm.velb --stats
+//
+// Resultado esperado: R00 == 25 (5 * 5)
+
+class Vec {
+    private i32 x;
+    public  i32 y;
+
+    public Vec(i32 a) {
+        this.x = a;
+        this.y = a;
+    }
+
+    // Expression-bodied + final.
+    public final i32 dot() => this.x * this.y;
+}
+
+i32 main() {
+    Vec v = new Vec(5);
+    return v.dot();
+}

@@ -1,0 +1,45 @@
+// =============================================================================
+// extensions/ext_lineno.vex - Extension de ejemplo: contador de teclas
+// =============================================================================
+//
+// Es una mini-extension que demuestra el modelo de plugins:
+//
+//   1. El usuario compila este `.vex` separado a `ext_lineno.velb` con
+//      el flag `--vex-base 0x80000000` para asignar VA fija (no obligatorio
+//      desde A.9 ext rebase transparente, pero recomendado para diagnostics).
+//
+//   2. El editor llama `loadmodule("examples_codes_vex/editor/extensions/ext_lineno.velb")`.
+//      `loadmodule` ejecuta el `main` de la extension (que registra la
+//      clase ExtLineNo en el ClassRegistry global) y devuelve el codigo
+//      de retorno.  La clase queda visible para `findclass` desde el
+//      editor.
+//
+//   3. El editor invoca metodos de la extension via reflexion
+//      (forName + getMethod + callm).  Para esta version MVP sin
+//      newInstance, la extension se llama via metodos `static` -- no
+//      soportado todavia tampoco en Vex.  Por simplicidad, la extension
+//      define una funcion de modulo que devuelve un counter incremental.
+//
+// La extension aqui solo CUENTA cuantas veces se ha cargado el modulo
+// (util para verificar que loadmodule efectivamente ejecuta el main).
+// Una extension real registraria comandos con callbacks reales -- el
+// modelo se establecera en una iteracion posterior cuando Vex tenga
+// `Class.newInstance()` y `Method.invoke(obj, args[])`.
+
+class ExtLineNo {
+    public i32 magic;
+    public ExtLineNo() {
+        this.magic = 0xDEAD;
+    }
+    public i32 hello() {
+        return 1234;
+    }
+}
+
+i32 main() {
+    // El __module_init de Vex (auto-generado) registra ExtLineNo en el
+    // ClassRegistry ANTES de invocar este main.  Aqui solo confirmamos
+    // que la carga corrio: devolvemos un valor magico que el editor
+    // puede comprobar.
+    return 0xCAFE;
+}

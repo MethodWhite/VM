@@ -21,6 +21,8 @@
 
 #include "cli/sync_io.h"
 #include "runtime/manager_runtime.h"
+#include "runtime/exception_runtime.h"
+#include "distrib/dist_runtime.h"
 
 namespace runtime {
 
@@ -38,7 +40,8 @@ namespace runtime {
         ManageVM &mgr_vm_,
         uint64_t  id_vm,
         size_t    num_schedulers
-    ) : manager_mem_public(mgr_vm_.manager_mem),               // referencia al ArenaManager publico del gestor
+    ) : pool(num_schedulers > 0 ? num_schedulers : 1), // A.7.2.5-rev3 perf: solo crear los threads necesarios para los schedulers (antes ThreadPool por defecto creaba hardware_concurrency() = 8-16 threads, costando 8-16ms en Windows aunque solo se use 1)
+        manager_mem_public(mgr_vm_.manager_mem),               // referencia al ArenaManager publico del gestor
         loader_priv(std::make_unique<loader::Loader>(mgr_vm_)), // cargador privado de esta instancia
         loader_public(mgr_vm_.loader),                          // referencia al cargador publico del gestor
         mgr_vm(mgr_vm_),
@@ -52,6 +55,30 @@ namespace runtime {
             auto sched = std::make_unique<Scheduler>(i, *this); // scheduler con ID i
             schedulers.push_back(std::move(sched));             // mover al vector
         }
+
+        // inicializar el runtime distribuido con configuracion minima:
+        // permite IPC local (msgsend/msgrecv entre procesos de la misma VM)
+        // sin abrir ningun puerto TCP ni hilo de descubrimiento UDP.
+        // Para activar la red llamar a dist_runtime->start() explicitamente.
+        // perf: el constructor de DistRuntime ya no inicializa
+        // OpenSSL RNG (genera node_id solo cuando se llama start()), asi
+        // que esto es esencialmente gratis (~us) para programas locales.
+        distrib::DistRuntimeConfig dr_cfg{};
+        dr_cfg.local_node_id    = 0;      // se genera lazy en start() si hace falta
+        dr_cfg.vdp_listen_port  = 0;      // sin servidor TCP por defecto
+        dr_cfg.discover_port    = 0;      // sin descubrimiento UDP
+        dr_cfg.enable_discovery = false;
+        std::snprintf(dr_cfg.local_node_name, sizeof(dr_cfg.local_node_name),
+                      "vm-%llu", static_cast<unsigned long long>(id_vm));
+        dist_runtime = std::make_unique<distrib::DistRuntime>(*this, dr_cfg);
+
+        // registrar la clase predefinida @c FatalError en el
+        // ClassRegistry del Loader publico (compartido por todas las VMs
+        // del manager).  Idempotente: la primera VM crea la clase, las
+        // siguientes la encuentran ya creada.  Sin esto, los opcodes que
+        // intentaran lanzar @c FatalError caerian al camino antiguo
+        // (mata el proceso sin posibilidad de captura).
+        runtime::init_exception_classes(loader_public);
     }
 
     /**

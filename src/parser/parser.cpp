@@ -28,6 +28,7 @@ namespace vm {
     static const std::unordered_map<std::string, InstructionPattern> InstructionSet = {
         // DOS operandos
         {"mov", {"mov", OpArity::TWO}},
+        {"movh", {"movh", OpArity::TWO}},
         {"xchg", {"xchg", OpArity::TWO}},
         {"readcur",  {"readcur",  OpArity::TWO}},
         {"writecur", {"writecur", OpArity::TWO}},
@@ -48,6 +49,42 @@ namespace vm {
         {"alloc", {"alloc", OpArity::ONE}},
         {"free", {"free", OpArity::ONE}},
 
+        // Meta-programacion OOP: definir clases / fields / methods en runtime
+        // y consultarlas por nombre.  Cada una toma 2 registros (destino +
+        // direccion VM de la struct DefXxxParams).
+        {"defclass",  {"defclass",  OpArity::TWO}},
+        {"deffield",  {"deffield",  OpArity::TWO}},
+        {"defmethod", {"defmethod", OpArity::TWO}},
+        {"findclass", {"findclass", OpArity::TWO}},
+        {"findmethod",{"findmethod",OpArity::TWO}},
+        {"findfield", {"findfield", OpArity::TWO}},
+        {"callm",     {"callm",     OpArity::TWO}},
+        {"proceed",   {"proceed",   OpArity::ZERO}},
+        // addadvice toma 3 operandos textualmente: r_target, r_advice, kind.
+        // El emisor empaqueta r_target en reg1 (lo de byte2), r_advice en
+        // reg2 (hi de byte2) y kind en byte3.
+        {"addadvice", {"addadvice", OpArity::THREE}},
+        // getstatic / setstatic toman 3 operandos: 2 registros + offset_imm.
+        //   getstatic r_dst, r_class, offset_u32
+        //   setstatic r_class, r_value, offset_u32
+        // El emisor empaqueta los 2 regs en byte2 = (r0<<4)|r1 y emite el
+        // offset uint32 en bytes 4-7 (byte3 es padding reservado).  FIXED_8.
+        {"getstatic", {"getstatic", OpArity::THREE}},
+        {"setstatic", {"setstatic", OpArity::THREE}},
+        // A.24 - FFI runtime dinamico:
+        //   dlopen r_dst, r_path_addr, r_path_len
+        //   dlsym  r_dst, r_handle, r_name_addr, r_name_len
+        //   callni r_fn        (argc en R15, args en R01..R12)
+        // El parser permite hasta THREE operandos por entrada del InstrSet;
+        // dlsym tiene 4 pero los 4 se empacan en 2 bytes (b2/b3) por nibble,
+        // asi que lo registramos con un parser separado: arity=THREE registra
+        // (r_dst, r_handle, r_name_addr) y el ultimo arg (r_name_len) se
+        // pasa via convencion al emit (helper acepta hasta 4).  Ver el
+        // emit_instr_dlsym dedicado mas abajo.
+        {"dlopen", {"dlopen", OpArity::THREE}},
+        {"dlsym",  {"dlsym",  OpArity::FOUR}},
+        {"callni", {"callni", OpArity::ONE}},
+
         // CERO operandos
         {"gcrun", {"gcrun", OpArity::ZERO}},
 
@@ -56,12 +93,33 @@ namespace vm {
         {"mulu", {"mulu", OpArity::TWO}},
         {"divu", {"divu", OpArity::TWO}},
         {"cmpu", {"cmpu", OpArity::TWO}},
+        {"modu", {"modu", OpArity::TWO}},
 
         {"adds", {"adds", OpArity::TWO}},
         {"subs", {"subs", OpArity::TWO}},
         {"muls", {"muls", OpArity::TWO}},
         {"divs", {"divs", OpArity::TWO}},
         {"cmps", {"cmps", OpArity::TWO}},
+        {"mods", {"mods", OpArity::TWO}},
+
+        {"setcc",    {"setcc",    OpArity::TWO}},
+        {"tryenter", {"tryenter", OpArity::TWO}},
+        {"tryleave", {"tryleave", OpArity::ZERO}},
+        {"strmake",  {"strmake",  OpArity::THREE}},
+        {"strlen",   {"strlen",   OpArity::TWO}},
+        {"strcat",   {"strcat",   OpArity::THREE}},
+        {"strcmp",   {"strcmp",   OpArity::THREE}},
+        {"strconv",    {"strconv",    OpArity::THREE}},
+        {"strraw",     {"strraw",     OpArity::TWO}},
+        {"strslice",   {"strslice",   OpArity::THREE}},
+        {"strflat",    {"strflat",    OpArity::TWO}},
+        {"strhash",    {"strhash",    OpArity::TWO}},
+        {"strintern",  {"strintern",  OpArity::TWO}},
+        {"strgetenc",  {"strgetenc",  OpArity::TWO}},
+        {"strgetbytes",{"strgetbytes",OpArity::TWO}},
+        {"strgetkind", {"strgetkind", OpArity::TWO}},
+        {"strreserve", {"strreserve", OpArity::TWO}},
+        {"strfinalize",{"strfinalize",OpArity::TWO}},
 
         {"xor", {"xor", OpArity::TWO}},
         {"and", {"and", OpArity::TWO}},
@@ -114,7 +172,33 @@ namespace vm {
         {"yield",   {"yield",   OpArity::ZERO}},
         {"resume",  {"resume",  OpArity::ONE}},
         {"spawn",   {"spawn",   OpArity::ONE}},
+        // A.7.2.5-rev2 ext: spawnon r_fn, r_hint -- spawn con scheduler hint.
+        // r_hint: -1 (signed) = Here (mismo scheduler que el padre);
+        // 0..N-1 = Pinned al scheduler indicado (modulo num_schedulers).
+        {"spawnon", {"spawnon", OpArity::TWO}},
+        // A.9: loadmod r_path_addr, r_path_len -- carga dinamica de un .velb;
+        // r0 = init_pc del modulo cargado (>0) o 0 si failure.
+        {"loadmod", {"loadmod", OpArity::TWO}},
+        // A.17.x: panic r_msg_addr, r_msg_len -- lanza FatalError con
+        // kind=FATAL_USER_ABORT.  Capturable con try/catch FatalError.
+        {"panic",   {"panic",   OpArity::TWO}},
+        // A.17.y: setmethdbg r_method, r_params -- registra debug info
+        // (file + start_line) para un MethodInfo en la tabla global.
+        {"setmethdbg", {"setmethdbg", OpArity::TWO}},
         {"swapctx", {"swapctx", OpArity::TWO}},
+
+        // --- Closures GC y raw ---
+        {"mkclosure",      {"mkclosure",      OpArity::TWO}},
+        {"callclosure",    {"callclosure",    OpArity::ONE}},
+        {"mkrawclosure",   {"mkrawclosure",   OpArity::TWO}},
+        {"callrawclosure", {"callrawclosure", OpArity::ONE}},
+
+        // --- TCO (tail call optimization) ---
+        {"tailcall", {"tailcall", OpArity::ONE}},
+
+        // --- Nullable ---
+        {"isnull", {"isnull", OpArity::TWO}},
+        {"unwrap",  {"unwrap",  OpArity::TWO}},
 
         // --- Punto flotante escalar y vectorial ---
         {"fmov",     {"fmov",     OpArity::TWO}},
@@ -144,6 +228,8 @@ namespace vm {
         {"fneg.ps",  {"fneg.ps",  OpArity::TWO}},
         {"fcvt",     {"fcvt",     OpArity::TWO}},
         {"fcvt.ps",  {"fcvt.ps",  OpArity::TWO}},
+        {"fextend",  {"fextend",  OpArity::TWO}},
+        {"fnarrow",  {"fnarrow",  OpArity::TWO}},
         {"fmowi",    {"fmowi",    OpArity::TWO}},
         {"fload",    {"fload",    OpArity::TWO}},
         {"fstore",   {"fstore",   OpArity::TWO}},
@@ -168,16 +254,53 @@ namespace vm {
         {"import", {"import", OpArity::ONE}},
 
 
-        {"jmp", {"jmp", OpArity::ONE}},
-        {"jmp.je", {"jmp.je", OpArity::ONE}},
+        {"jmp",     {"jmp",     OpArity::ONE}},
+        {"jmp.je",  {"jmp.je",  OpArity::ONE}},
+        {"jmp.jz",  {"jmp.jz",  OpArity::ONE}},
         {"jmp.jne", {"jmp.jne", OpArity::ONE}},
+        {"jmp.jnz", {"jmp.jnz", OpArity::ONE}},
+        {"jmp.jcs", {"jmp.jcs", OpArity::ONE}},
+        {"jmp.jae", {"jmp.jae", OpArity::ONE}},
+        {"jmp.jcc", {"jmp.jcc", OpArity::ONE}},
+        {"jmp.jb",  {"jmp.jb",  OpArity::ONE}},
+        {"jmp.jmi", {"jmp.jmi", OpArity::ONE}},
+        {"jmp.jpl", {"jmp.jpl", OpArity::ONE}},
+        {"jmp.jvs", {"jmp.jvs", OpArity::ONE}},
+        {"jmp.jvc", {"jmp.jvc", OpArity::ONE}},
+        {"jmp.jhi", {"jmp.jhi", OpArity::ONE}},
+        {"jmp.jls", {"jmp.jls", OpArity::ONE}},
+        {"jmp.jge", {"jmp.jge", OpArity::ONE}},
+        {"jmp.jlt", {"jmp.jlt", OpArity::ONE}},
+        {"jmp.jgt", {"jmp.jgt", OpArity::ONE}},
+        {"jmp.jle", {"jmp.jle", OpArity::ONE}},
 
-        {"jrel", {"jrel", OpArity::ONE}},
-        {"jrel.je", {"jrel.je", OpArity::ONE}},
+        {"jrel",     {"jrel",     OpArity::ONE}},
+        {"jrel.je",  {"jrel.je",  OpArity::ONE}},
+        {"jrel.jz",  {"jrel.jz",  OpArity::ONE}},
         {"jrel.jne", {"jrel.jne", OpArity::ONE}},
+        {"jrel.jnz", {"jrel.jnz", OpArity::ONE}},
+        {"jrel.jcs", {"jrel.jcs", OpArity::ONE}},
+        {"jrel.jae", {"jrel.jae", OpArity::ONE}},
+        {"jrel.jcc", {"jrel.jcc", OpArity::ONE}},
+        {"jrel.jb",  {"jrel.jb",  OpArity::ONE}},
+        {"jrel.jmi", {"jrel.jmi", OpArity::ONE}},
+        {"jrel.jpl", {"jrel.jpl", OpArity::ONE}},
+        {"jrel.jvs", {"jrel.jvs", OpArity::ONE}},
+        {"jrel.jvc", {"jrel.jvc", OpArity::ONE}},
+        {"jrel.jhi", {"jrel.jhi", OpArity::ONE}},
+        {"jrel.jls", {"jrel.jls", OpArity::ONE}},
+        {"jrel.jge", {"jrel.jge", OpArity::ONE}},
+        {"jrel.jlt", {"jrel.jlt", OpArity::ONE}},
+        {"jrel.jgt", {"jrel.jgt", OpArity::ONE}},
+        {"jrel.jle", {"jrel.jle", OpArity::ONE}},
 
         {"calln", {"calln", OpArity::ONE}},
         {"callvm", {"callvm", OpArity::ONE}},
+        // closures: callvmr = "callvm con direccion en registro" (1 op).
+        // Mismo opcode bytecode que callvm pero AddressingMode REG en
+        // lugar de INMED.  Necesario para CALLIND y CALLCLOSURE del IR
+        // donde el target lo tiene un registro (resultado de LOAD).
+        {"callvmr", {"callvmr", OpArity::ONE}},
 
         {"enter", {"enter", OpArity::ONE}},
 
@@ -188,6 +311,46 @@ namespace vm {
         {"vminfo", {"vminfo", OpArity::ONE}},
         {"vminfomanager", {"vminfomanager", OpArity::ONE}},
 
+        /* --- Pattern matching nativo --- */
+        {"jumptable",  {"jumptable",  OpArity::THREE}},
+        {"typeswitch", {"typeswitch", OpArity::THREE}},
+
+        /* --- Async/await --- */
+        {"future",  {"future",  OpArity::ZERO}},
+        {"await",   {"await",   OpArity::ONE}},
+        {"fulfill", {"fulfill", OpArity::TWO}},
+        {"reject",  {"reject",  OpArity::TWO}},
+
+        /* --- Aritmetica sobre registros especiales (rsp/rbp) con inmediato --- */
+        {"subsp", {"subsp", OpArity::TWO}},
+        {"addsp", {"addsp", OpArity::TWO}},
+
+        /* --- Referencias debiles --- */
+        {"weakref",   {"weakref",   OpArity::ONE}},
+        {"deref_weak",{"deref_weak",OpArity::ONE}},
+        {"free_weak", {"free_weak", OpArity::ONE}},
+
+        /* --- Lookup inverso ptr -> handle --- */
+        {"gchandle",  {"gchandle",  OpArity::TWO}},
+
+        /* --- PID del proceso actual --- */
+        {"getpid",    {"getpid",    OpArity::ONE}},
+
+        /* --- Monitor / sincronizacion --- */
+        {"monenter",  {"monenter",  OpArity::ONE}},
+        {"monexit",   {"monexit",   OpArity::ONE}},
+        {"monwait",   {"monwait",   OpArity::ONE}},
+        {"monnoti",   {"monnoti",   OpArity::ONE}},
+        {"monnota",   {"monnota",   OpArity::ONE}},
+
+        /* --- Genericos en tiempo de ejecucion --- */
+        {"specialize",{"specialize",OpArity::THREE}},
+
+        /* --- Instrucciones distribuidas VDP --- */
+        {"rspawn",  {"rspawn",  OpArity::TWO}},
+        {"msgsend", {"msgsend", OpArity::THREE}},
+        {"msgrecv", {"msgrecv", OpArity::TWO}},
+        {"memsync", {"memsync", OpArity::ONE}},
 
     };
 
@@ -626,6 +789,15 @@ namespace vm {
                 expect(TokenType::COMMA, "Se esperaba ',' despues del primer operando");
                 operands.emplace_back(parse_operand());
                 expect(TokenType::COMMA, "Se esperaba ',' despues del segundo operando");
+                operands.emplace_back(parse_operand());
+                break;
+            case OpArity::FOUR:
+                operands.emplace_back(parse_operand());
+                expect(TokenType::COMMA, "Se esperaba ',' despues del primer operando");
+                operands.emplace_back(parse_operand());
+                expect(TokenType::COMMA, "Se esperaba ',' despues del segundo operando");
+                operands.emplace_back(parse_operand());
+                expect(TokenType::COMMA, "Se esperaba ',' despues del tercer operando");
                 operands.emplace_back(parse_operand());
                 break;
         }

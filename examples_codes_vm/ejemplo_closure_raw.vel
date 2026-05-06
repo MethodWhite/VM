@@ -1,0 +1,96 @@
+/*
+ * ejemplo_closure_raw.vel
+ *
+ * Demuestra las instrucciones MKRAWCLOSURE y CALLRAWCLOSURE.
+ *
+ * Un "raw closure" encapsula la direccion de una funcion y la direccion
+ * de un bloque de entorno (variables capturadas) en un objeto liviano sin
+ * participacion del GC.  El ciclo de vida del objeto es manual: se crea con
+ * MKRAWCLOSURE y se libera con FREE cuando ya no se necesita.
+ *
+ * Convencion de llamada de CALLRAWCLOSURE:
+ *   - R1-R12 : argumentos de entrada (establecidos por el llamante antes de CALLRAWCLOSURE)
+ *   - R0     : valor de retorno (establecido por la funcion llamada)
+ *   - R14    : puntero al bloque de entorno (cargado automaticamente por CALLRAWCLOSURE)
+ *   - R15    : numero de argumentos (argc, establecido por el llamante)
+ *
+ * Estructura de un RawClosureObject en memoria:
+ *   offset  0 : fn_addr  (uint64) - direccion de la funcion
+ *   offset  8 : env_addr (uint64) - direccion del bloque de entorno
+ *   offset 16 : env_size (uint64) - tamano del bloque de entorno en bytes
+ *
+ * Este ejemplo:
+ *   1. Define la funcion "sumar" que devuelve r1 + r2 en r0.
+ *   2. Crea un raw closure apuntando a "sumar" con entorno nulo (env=0).
+ *   3. Prepara r1=10, r2=32 y llama al closure.
+ *   4. Verifica que r0 == 42 al llegar a hlt.
+ *
+ * Resultado esperado al llegar a hlt:
+ *   r0 == 42   (10 + 32)
+ *
+ * Compilar y ejecutar:
+ *   vesta --build ejemplo_closure_raw.vel -o ejemplo_closure_raw
+ *   vesta --run   ejemplo_closure_raw.velb --stats
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+// -----------------------------------------------------------------------
+// Funcion "sumar": recibe dos enteros en r1 y r2, devuelve la suma en r0.
+// Sigue la convencion de CALLRAWCLOSURE: r1=arg1, r2=arg2, r0=retorno.
+// -----------------------------------------------------------------------
+sumar:
+    // r0 = r1 + r2  (addu es de dos operandos: r0 += r1)
+    mov r0, r1
+    addu r0, r2
+    ret
+end_sumar:
+
+// -----------------------------------------------------------------------
+// Programa principal
+// -----------------------------------------------------------------------
+code:
+    // Inicializar la pila (necesario para que RET funcione correctamente)
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // --- Crear el raw closure ---
+    // r1 = direccion de la funcion "sumar" (resuelta en tiempo de enlace)
+    mov r1, @Absolute("all.sumar")
+    // r2 = direccion del entorno (0 = sin entorno capturado)
+    mov r2, 0
+
+    // MKRAWCLOSURE r_fn, r_env:
+    //   Aloca un RawClosureObject con fn_addr=r1, env_addr=r2.
+    //   El puntero al objeto queda en R0.
+    mkrawclosure r1, r2        // r0 = puntero raw al RawClosureObject
+
+    // Guardar el puntero del closure en r10 (R0 sera sobreescrito por la llamada)
+    mov r10, r0
+
+    // --- Preparar argumentos y llamar al closure ---
+    // Convencion: r1=primer arg, r2=segundo arg, r15=argc
+    mov r1, 10
+    mov r2, 32
+    mov r15, 2
+
+    // CALLRAWCLOSURE r_closure:
+    //   Carga env_addr de la estructura en R14, empuja ret_addr en la pila
+    //   y salta a fn_addr.  La funcion "sumar" retorna y deja r0=42.
+    callrawclosure r10         // llama a sumar(10, 32) -> r0 = 42
+
+    // r0 debe ser 42 aqui
+    hlt
+end_code:

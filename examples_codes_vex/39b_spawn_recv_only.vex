@@ -1,0 +1,13 @@
+// Test simplificado: hijo envia un valor al padre, padre lo recibe.
+// El hijo necesita conocer el PID del padre.  Como no hay capturas
+// lambda, usamos el hecho de que el padre es siempre PID=0 (primer
+// proceso) en el scheduler[0].
+
+i32 main() {
+    i64 child = spawn {
+        // El padre es el proceso PID=0 (encoded) en single-scheduler.
+        msgsend(0, 555);
+    };
+    i64 reply = msgrecv();
+    return reply;   // 555
+}

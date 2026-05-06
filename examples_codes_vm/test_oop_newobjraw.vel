@@ -12,7 +12,8 @@
  *                     methods=+120, method_count=+128
  *   FieldInfo  (48B): size=+32(d), offset=+36(d)
  *   MethodInfo(112B): code_vaddr=+72
- *   ObjectHeader(16B): class_ptr=+0, flags=+8(d), hash_code=+12(d)
+ *   ObjectHeader(24B, ABI v2): class_ptr=+0, flags=+8(d), hash_code=+12(d),
+ *                              owner_pid=+16(d), lock_depth=+20(w), _mon_pad=+22(w)
  *
  * alloc() devuelve memoria zeroeada.
  */

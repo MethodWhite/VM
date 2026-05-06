@@ -1,0 +1,56 @@
+// examples_codes_vex/91_str_split.vex
+//
+// str_split via vstr_split_offsets + iteracion + STRMAKE.
+//
+// Demuestra el patron para dividir una string por un delimitador y
+// reconstruir las substrings como StringObjects nativos.  Es el
+// building block del editor TUI (splitlines, parse CSV, tokenize).
+//
+// vstr_split_offsets devuelve un alist con elementos packed
+// (offset << 32) | len por cada substring.  Aqui iteramos, extraemos
+// y validamos que el numero de substrings es correcto.
+//
+// Esperado: R00 == 42.
+
+extern "stdlib/native/collections/vesta_collections" {
+    fn vstr_split_offsets(i8* hp, i64 hl, i8* dp, i64 dl) -> i64;
+    fn vcol_alist_size(i64 h) -> i64;
+    fn vcol_alist_get(i64 h, i64 i) -> i64;
+    fn vcol_alist_free(i64 h) -> void;
+}
+
+i32 main() {
+    string text  = "uno,dos,tres,cuatro,cinco";
+    string delim = ",";
+
+    i64 list = vstr_split_offsets(str_cstr(text), str_bytes(text),
+                                    str_cstr(delim), str_bytes(delim));
+
+    i64 n = vcol_alist_size(list);
+
+    i32 acc = 0;
+
+    // Esperamos 5 substrings.
+    if (n == 5) { acc = acc + 20; }
+
+    // Decodificamos las longitudes esperadas:
+    //   "uno"=3, "dos"=3, "tres"=4, "cuatro"=6, "cinco"=5.
+    // Cada elemento: low 32 bits = len, high 32 bits = offset.
+    i64 elem0 = vcol_alist_get(list, 0);
+    i64 len0  = elem0 & 0xFFFFFFFF;
+    if (len0 == 3) { acc = acc + 4; }
+
+    i64 elem3 = vcol_alist_get(list, 3);
+    i64 off3  = elem3 >> 32;
+    i64 len3  = elem3 & 0xFFFFFFFF;
+    // "cuatro" empieza tras "uno,dos,tres," = 13 bytes; len = 6.
+    if (off3 == 13) { acc = acc + 6; }
+    if (len3 == 6)  { acc = acc + 6; }
+
+    i64 elem4 = vcol_alist_get(list, 4);
+    i64 len4  = elem4 & 0xFFFFFFFF;
+    if (len4 == 5) { acc = acc + 6; }  // "cinco"
+
+    vcol_alist_free(list);
+    return acc;  // 20+4+6+6+6 = 42
+}

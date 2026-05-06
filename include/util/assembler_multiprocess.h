@@ -156,18 +156,28 @@ namespace asm_multi_process {
      * Este modo es invocado por el driver como subproceso independiente.  Realiza
      * el ciclo completo de compilacion para un solo archivo:
      *   - Lectura del archivo fuente.
+     *   - Preprocesado VPP (si VESTA_HAS_PREPROCESSOR y skip_preprocessor=false).
      *   - Analisis lexico (Lexer).
      *   - Analisis sintactico (Parser -> AST).
      *   - Emision de bytecode (Assembler -> .velb).
      *   - Enlazado local (Linker parcial).
      *   - Generacion de .velb y .velb-map.
      *
-     * @param file_name     Ruta del archivo fuente .vel a compilar.
-     * @param output_prefix Prefijo de nombre para los archivos de salida generados.
+     * El parametro @p skip_preprocessor permite saltarse VPP cuando el
+     * .vel de entrada ya viene de una fuente que lo aplico previamente
+     * (por ejemplo, texto generado por el lowering Vex -> ir_emitter,
+     * que ya esta totalmente expandido).  Pasar el .vel por VPP en ese
+     * caso seria redundante y puede romper si el codigo generado contiene
+     * tokens que VPP malinterprete.
+     *
+     * @param file_name           Ruta del archivo fuente .vel a compilar.
+     * @param output_prefix       Prefijo de nombre para los archivos de salida.
+     * @param skip_preprocessor   true para saltarse VPP (defecto false).
      * @return EXIT_SUCCESS si el ensamblado fue correcto; EXIT_FAILURE si hubo errores.
      */
     int run_worker(const std::string &file_name,
-                   const std::string &output_prefix);
+                   const std::string &output_prefix,
+                   bool skip_preprocessor = false);
 
     /**
      * @brief Ejecuta un comando externo y captura toda su salida estandar.

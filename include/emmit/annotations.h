@@ -150,6 +150,59 @@ namespace Assembly::Bytecode {
     void apply_absolute(const vm::AnnotationNode *node, Assembler &assembler);
 
     /**
+     * @brief Procesa la anotacion \@Module para declarar el modulo del fichero fuente.
+     *
+     * Registra el nombre calificado del modulo ("com.vesta.core") en el contexto del
+     * ensamblador y lo convierte en el modulo activo para los simbolos que se emitan
+     * a continuacion.  Solo debe aparecer una vez por fichero fuente.
+     *
+     * Ejemplo:
+     * @code
+     *   @Module(com.vesta.collections)
+     * @endcode
+     *
+     * @param node      Nodo AST de la anotacion; node->value contiene el nombre del modulo.
+     * @param assembler Contexto global del ensamblador que se modifica.
+     */
+    void apply_module(const vm::AnnotationNode *node, Assembler &assembler);
+
+    /**
+     * @brief Procesa la anotacion \@Export para marcar un simbolo como publico del modulo.
+     *
+     * Anade el simbolo al listado de exports del modulo activo en el contexto.
+     * Solo los simbolos exportados son accesibles desde otros modulos.
+     *
+     * Ejemplo:
+     * @code
+     *   @Module(com.vesta.collections)
+     *   @Export(List)
+     *   @Export(Map)
+     * @endcode
+     *
+     * @param node      Nodo AST de la anotacion; node->value contiene el nombre del simbolo.
+     * @param assembler Contexto global del ensamblador que se modifica.
+     */
+    void apply_export(const vm::AnnotationNode *node, Assembler &assembler);
+
+    /**
+     * @brief Procesa la anotacion \@Generic para declarar parametros de tipo en el emitter.
+     *
+     * Registra los parametros de tipo de la clase o metodo que sigue, separados por comas
+     * en el valor de la anotacion.  El emitter usa esta informacion durante la fase de
+     * monomorphization para generar especializaciones.
+     *
+     * Ejemplo:
+     * @code
+     *   @Generic(T)
+     *   @Generic(K,V)
+     * @endcode
+     *
+     * @param node      Nodo AST de la anotacion; node->value contiene los parametros ("T" o "K,V").
+     * @param assembler Contexto global del ensamblador que se modifica.
+     */
+    void apply_generic(const vm::AnnotationNode *node, Assembler &assembler);
+
+    /**
      * @brief Tabla de despacho de anotaciones: nombre -> funcion manejadora.
      *
      * Mapea el nombre de cada anotacion reconocida por el ensamblador a su funcion
@@ -167,6 +220,9 @@ namespace Assembly::Bytecode {
         { "Import",       apply_import        }, ///< Registra una importacion para el linker
         { "Relative",     apply_relative      }, ///< Relocalizacion relativa (PIC)
         { "Absolute",     apply_absolute      }, ///< Relocalizacion absoluta
+        { "Module",       apply_module        }, ///< Declara el modulo del fichero fuente
+        { "Export",       apply_export        }, ///< Marca un simbolo como publico del modulo
+        { "Generic",      apply_generic       }, ///< Declara parametros de tipo (monomorphization)
     };
 
     /**

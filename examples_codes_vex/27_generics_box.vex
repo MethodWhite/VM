@@ -1,0 +1,30 @@
+// Generics MVP via monomorphizacion.
+//
+// Sintaxis:
+//   class Box<T> { T value; ... }     // template
+//   Box<i32> b = new Box<i32>(42);    // instanciado i32
+//   Box<i64> b2 = new Box<i64>(99);   // instanciado i64 (otra clase concreta)
+//
+// El type checker detecta los instanciados, clona el AST de Box
+// sustituyendo T por el tipo concreto, y genera nuevas clases:
+//   Box_i32 { i32 value; ... }
+//   Box_i64 { i64 value; ... }
+//
+// Cada instanciado es una clase independiente con su propia vtable y
+// layout.  El lowering procesa Box_i32 / Box_i64 como clases normales.
+//
+// El template Box<T> NUNCA se instancia ni baja a bytecode.
+//
+// Resultado esperado: 42 + 99 = 141.
+
+class Box<T> {
+    public T value;
+    public Box(T v) { this.value = v; }
+    public T read() { return this.value; }
+}
+
+i32 main() {
+    Box<i32> b32 = new Box<i32>(42);
+    Box<i64> b64 = new Box<i64>(99);
+    return b32.read() + b64.read();
+}

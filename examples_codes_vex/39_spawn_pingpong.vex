@@ -1,0 +1,27 @@
+// spawn + IPC (msgsend/msgrecv) ping-pong:
+//
+// Demuestra concurrencia + paso de mensajes entre padre e hijo:
+//   1. Padre obtiene su propio PID con pid().
+//   2. Padre arranca un hijo via spawn { ... }.
+//   3. Hijo recibe el PID del padre via msgrecv() (bloquea hasta dato).
+//   4. Hijo envia su respuesta (un valor) via msgsend(parent_pid, ...).
+//   5. Hijo termina (hlt automatico al final del body).
+//   6. Padre envia su PID al hijo via msgsend(child_pid, parent_pid).
+//   7. Padre recibe la respuesta del hijo via msgrecv().
+//   8. Devuelve la respuesta como resultado.
+//
+// Esperado: hijo responde 777 (constante), padre lo recibe y devuelve 777.
+
+i32 main() {
+    i64 self = pid();             // PID del padre
+
+    i64 child = spawn {
+        i64 from = msgrecv();     // bloquea hasta que el padre envie su PID
+        msgsend(from, 777);       // responde al padre con 777
+    };
+
+    msgsend(child, self);         // envia el PID del padre al hijo
+    i64 reply = msgrecv();        // bloquea hasta que el hijo responda
+
+    return reply;                  // 777
+}

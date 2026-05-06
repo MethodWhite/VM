@@ -1,0 +1,67 @@
+/**
+ * ejemplo_power.ir
+ * Potencia entera: pow_int(base, exp) -> i64
+ *
+ * Conceptos demostrados:
+ *   - Exponenciacion rapida (exponentiation by squaring) en SSA
+ *   - Bucle con dos phi nodes: resultado acumulado y exponente restante
+ *   - Operaciones: mul.i64, shr.i64 (dividir exp por 2), and.i64 (bit par/impar)
+ *   - Uso combinado de cmp + br.cond
+ *
+ * Algoritmo (exponenciacion por cuadrados iterativa):
+ *   result = 1, b = base
+ *   while exp > 0:
+ *     if exp & 1: result *= b
+ *     b *= b
+ *     exp >>= 1
+ *   return result
+ *
+ * Compilar:
+ *   vm --ir-file examples_ir/ejemplo_power.ir --ir-opt 2 -o build/out_ir/power
+ */
+
+@module ejemplo_power
+
+// Calcula base^exp donde exp >= 0. Retorna 1 para exp=0.
+@function pow_int(base: i64, exp: i64) -> i64 {
+entry:
+    r0    = const.i64 1    // acumulador inicial
+    br    loop_check
+
+loop_check:
+    // Phi nodes: result y b evolucionan en cada iteracion
+    result = phi.i64 [r0,     entry],       [result_next, loop_end_step]
+    b      = phi.i64 [base,   entry],       [b_sq,        loop_end_step]
+    e      = phi.i64 [exp,    entry],       [e_shr,       loop_end_step]
+    zero   = const.i64 0
+    // Condicion de salida: exp == 0
+    done   = cmp.eq.i64 e, zero
+    br.cond done, loop_exit, loop_odd_check
+
+loop_odd_check:
+    // Si el bit menos significativo de e es 1, multiplicar result por b
+    one     = const.i64 1
+    lsb     = and.i64 e, one        // lsb = e & 1
+    is_odd  = cmp.ne.i64 lsb, zero // is_odd = (lsb != 0)
+    br.cond is_odd, mul_result, skip_mul
+
+mul_result:
+    // exp es impar: result *= b
+    result_mul = mul.i64 result, b
+    br         loop_end_step
+
+skip_mul:
+    // exp es par: result no cambia
+    result_mul = mov.i64 result
+    br         loop_end_step
+
+loop_end_step:
+    // b = b*b; exp >>= 1
+    result_next = phi.i64 [result_mul, mul_result], [result_mul, skip_mul]
+    b_sq        = mul.i64 b, b
+    e_shr       = shr.i64 e, one    // e >>= 1 (division entera por 2)
+    br          loop_check
+
+loop_exit:
+    ret.i64 result    // resultado final: base^exp
+}

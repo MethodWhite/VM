@@ -1,0 +1,31 @@
+// Inicializacion C-style.
+
+struct Point {
+    i32 x;
+    i32 y;
+}
+
+i32 main() {
+    // Array init posicional.
+    i32[5] arr = {10, 20, 30, 40, 50};
+    if (arr[0] != 10) return 1;
+    if (arr[2] != 30) return 2;
+    if (arr[4] != 50) return 3;
+
+    // Struct init posicional.
+    Point p = {7, 35};
+    if (p.x != 7)  return 4;
+    if (p.y != 35) return 5;
+
+    // Struct init designado.
+    Point q = {.y = 100, .x = 200};
+    if (q.x != 200) return 6;
+    if (q.y != 100) return 7;
+
+    // Struct init parcial designado.
+    Point r = {.x = 12};
+    if (r.x != 12) return 8;
+    // r.y queda con valor por defecto (0).
+
+    return 42;
+}

@@ -1,0 +1,10 @@
+// Test minimo: lambda sin captura, asignacion a variable
+// fn(T)->R y llamada directa.
+//
+// Resultado esperado: R0 = 42 (cuadrado de 6 + 6 = 42... no, mejor: 7*7-7 = 42)
+// Mejor: lambda(6) = 6 * 7 = 42
+
+i32 main() {
+    fn(i32) -> i32 mul7 = (i32 x) => x * 7;
+    return mul7(6);
+}

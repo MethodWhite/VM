@@ -786,8 +786,13 @@ void exec_instr_mov_reg(ProcessVM *vm, const DecodedInstr &instr) {
         return;
     }
 
-    // s=1: variante reg_ext -- codificar registro especial como (modo<<4)|reg2
-    uint8_t special = (uint8_t)((mode << 4) | (reg2 & 0xF)); // reconstruir el codigo del registro especial
+    // s=1: variante reg_ext -- todos los codigos de registros especiales caben en 4 bits
+    // (cur0..cur3 = 0..3, rip/rbp/rsp/rflags = 8..11), por lo que el selector se halla
+    // unicamente en el nibble alto de byte2 (campo reg2 tras decodificar).  El campo
+    // mode del ctrl byte indica el ancho real del operando general y se respeta para
+    // mov_table[mode], evitando truncamientos accidentales (antes mode siempre era 0
+    // por venir de bits[5:4] del codigo especial, lo que truncaba a 8 bits).
+    uint8_t special = (uint8_t)(reg2 & 0xF); // codigo de registro especial (4 bits)
     if (d == 0) {
         // MOV reg_ext, reg -- escribir valor de registro general en registro especial
         write_special(vm, special, vm->registers.regs[reg1].raw());
@@ -1119,6 +1124,162 @@ void exec_instr_movc_reg(ProcessVM *vm, const DecodedInstr &instr) {
     GeneralRegister tmp;
     tmp.qword(vm->registers.regs[reg2].raw());                          // copy source into temp (full 64-bit)
     mov_table[instr.flags_info.mode](vm, vm->registers.regs[reg1], tmp, false, reg1); // conditional MOV at mode width
+}
+
+// =========================================================================
+// ModOp -- modulo entero (resto de la division)
+//
+// mods/modu: r_dst = r_dst % r_src
+// Resultado indefinido si el divisor es cero; en ese caso se activan CF y OF
+// para que el programa pueda detectar el error.
+// =========================================================================
+
+/**
+ * @brief MOD / UMOD: resto de la division entera.
+ *
+ * - Con signo  (mods): resultado tiene el signo del dividendo (semantica C %).
+ * - Sin signo  (modu): resultado siempre no negativo.
+ * Division por cero: resultado = 0, CF = 1, OF = 1.
+ */
+struct ModOp {
+    static constexpr bool is_compare = false; // el resultado se escribe de vuelta
+
+    /** @brief Returns a % b (divide-by-zero must be checked externally; we return 0). */
+    template<typename T>
+    static inline T compute(T a, T b) {
+        if (b == 0) return static_cast<T>(0); // division por cero: resultado definido como 0
+        return a % b;
+    }
+
+    /** @brief Sets CF/OF on divide-by-zero; clears them otherwise. */
+    template<typename T>
+    static inline void flags(ProcessVM *vm, T /*a*/, T b, T /*result*/, bool /*is_signed*/) {
+        if (b == 0) {
+            vm->registers.flags.bits.OF = 1; // senalizar condicion excepcional
+            vm->registers.flags.bits.CF = 1;
+        } else {
+            vm->registers.flags.bits.OF = 0; // operacion normal sin desbordamiento
+            vm->registers.flags.bits.CF = 0;
+        }
+    }
+};
+
+// re-declarar los macros de tablas para ModOp (fueron indefinidos tras las instrucciones ALU base)
+#define DECL_BIN_TABLE(n, Op) \
+    static constexpr BinaryFn n##_table[] = { \
+        &binary_wrapper<uint8_t,  Op>, \
+        &binary_wrapper<uint16_t, Op>, \
+        &binary_wrapper<uint32_t, Op>, \
+        &binary_wrapper<uint64_t, Op>  \
+    }
+
+#define DECL_IMM_TABLES(n, Op) \
+    static constexpr BinaryImmFn n##_imm_table[] = { \
+        &binary_imm_wrapper<uint8_t,  Op>, \
+        &binary_imm_wrapper<uint16_t, Op>, \
+        &binary_imm_wrapper<uint32_t, Op>, \
+        &binary_imm_wrapper<uint64_t, Op>  \
+    }; \
+    static constexpr BinaryMemImmFn n##_mem_imm_table[] = { \
+        &binary_mem_imm_wrapper<uint8_t,  Op>, \
+        &binary_mem_imm_wrapper<uint16_t, Op>, \
+        &binary_mem_imm_wrapper<uint32_t, Op>, \
+        &binary_mem_imm_wrapper<uint64_t, Op>  \
+    }
+
+#define DEFINE_REG_EXEC(n) \
+    void exec_instr_##n##_reg(ProcessVM *vm, const DecodedInstr &instr) { \
+        const int rdst = instr.data_instruction.reg_data.reg1; \
+        const int rsrc = instr.data_instruction.reg_data.reg2; \
+        n##_table[instr.flags_info.mode]( \
+            vm, vm->registers.regs[rdst], vm->registers.regs[rsrc], \
+            instr.flags_info._signed_instruct, rdst); \
+    }
+
+#define DEFINE_IMM_EXEC(n, imm_tbl, mem_tbl) \
+    void exec_instr_##n##_imm(ProcessVM *vm, const DecodedInstr &instr) { \
+        const int rdst = instr.data_instruction.inmmed_data.reg; \
+        uint64_t  imm  = instr.data_instruction.inmmed_data.inmmed; \
+        if (instr.flags_info.direction == 0) { \
+            imm_tbl[instr.flags_info.mode]( \
+                vm, vm->registers.regs[rdst], imm, \
+                instr.flags_info._signed_instruct, rdst); \
+            return; \
+        } \
+        uint64_t addr = vm->registers.regs[rdst].raw(); \
+        mem_tbl[instr.flags_info.mode](vm, addr, imm, instr.flags_info._signed_instruct); \
+    }
+
+#define DEFINE_SIB_EXEC(n, Op) \
+    static constexpr SIBFn n##_sib_reg_dst[] = { \
+        &sib_reg_dst_wrapper<uint8_t,  Op>, &sib_reg_dst_wrapper<uint16_t, Op>, \
+        &sib_reg_dst_wrapper<uint32_t, Op>, &sib_reg_dst_wrapper<uint64_t, Op>  \
+    }; \
+    static constexpr SIBFn n##_sib_mem_dst[] = { \
+        &sib_mem_dst_wrapper<uint8_t,  Op>, &sib_mem_dst_wrapper<uint16_t, Op>, \
+        &sib_mem_dst_wrapper<uint32_t, Op>, &sib_mem_dst_wrapper<uint64_t, Op>  \
+    }; \
+    void exec_instr_##n##_sib(ProcessVM *vm, const DecodedInstr &instr) { \
+        exec_sib_generic<Op>(vm, instr, n##_sib_reg_dst, n##_sib_mem_dst); \
+    }
+
+DECL_BIN_TABLE(mod, ModOp);
+DECL_IMM_TABLES(mod, ModOp);
+DEFINE_SIB_EXEC(mod, ModOp)
+DEFINE_REG_EXEC(mod)
+DEFINE_IMM_EXEC(mod, mod_imm_table, mod_mem_imm_table)
+
+#undef DEFINE_REG_EXEC
+#undef DEFINE_IMM_EXEC
+#undef DEFINE_SIB_EXEC
+#undef DECL_BIN_TABLE
+#undef DECL_IMM_TABLES
+
+// =========================================================================
+// SETCC -- almacena el resultado de una condicion de flags en un registro
+//
+// Encoding FIXED_4: [0x00][0x43][ctrl][0x00]
+//   ctrl = (cond<<4) | dst_reg    (cond: mismo codigo que JCC)
+// El registro destino recibe 1 si la condicion es verdadera, 0 si no.
+// =========================================================================
+
+/**
+ * @brief Ejecuta SETCC r_dst, cond: escribe 0 o 1 segun la condicion de flags.
+ *
+ * Usa el mismo codigo de condicion que JCC (0x00 = JO, 0x01 = JNO, ..., 0x0E = JLE, 0x0F = JMP/true).
+ *
+ * @param vm    Puntero a la maquina virtual.
+ * @param instr Instruccion descodificada; cond en reg1>>4, dst en reg1&0xF (o via byte2).
+ */
+void exec_instr_setcc(ProcessVM *vm, const DecodedInstr &instr) {
+    // byte2: bits[7:4] = condicion, bits[3:0] = registro destino
+    const uint8_t cond    = (instr.data_instruction.reg_data.reg1 >> 4) & 0xF; // codigo de condicion
+    const uint8_t dst_reg = instr.data_instruction.reg_data.reg1        & 0xF; // indice del registro destino
+
+    auto &f   = vm->registers.flags.bits;
+    bool taken = false; // resultado de la condicion
+
+    switch (cond) {
+        case 0x00: taken = f.OF;                                break; // JO
+        case 0x01: taken = !f.OF;                               break; // JNO
+        case 0x02: taken = f.CF;                                break; // JB/JNAE
+        case 0x03: taken = !f.CF;                               break; // JNB/JAE
+        case 0x04: taken = f.ZF;                                break; // JE/JZ
+        case 0x05: taken = !f.ZF;                               break; // JNE/JNZ
+        case 0x06: taken = f.CF || f.ZF;                        break; // JBE/JNA
+        case 0x07: taken = !f.CF && !f.ZF;                      break; // JNBE/JA
+        case 0x08: taken = f.SF;                                break; // JS
+        case 0x09: taken = !f.SF;                               break; // JNS
+        case 0x0A: taken = f.ZF && !(f.SF ^ f.OF);             break; // JE y sin desbordamiento con signo
+        case 0x0B: taken = !f.ZF;                               break; // JNE (alias JNLE)
+        case 0x0C: taken = (f.SF ^ f.OF);                       break; // JL/JNGE
+        case 0x0D: taken = !(f.SF ^ f.OF);                      break; // JNL/JGE
+        case 0x0E: taken = f.ZF || (f.SF ^ f.OF);              break; // JLE/JNG
+        case 0x0F: taken = true;                                 break; // siempre verdadero
+        default:   taken = false;                                break;
+    }
+
+    vm->registers.regs[dst_reg].qword(taken ? 1 : 0); // escribir resultado booleano en el registro
 }
 
 } // namespace runtime

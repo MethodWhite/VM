@@ -63,7 +63,12 @@ namespace runtime {
     ProcessVM::ProcessVM(Scheduler &scheduler, GlobalPID pid)
         : pid(pid),
           vm_mem(tlb, manager_mem_priv), // combinar TLB privado con ArenaManager privado
-          scheduler(scheduler) {}
+          scheduler(scheduler) {
+        // fix8 - el GC necesita conocer el ProcessVM owner para
+        // escanear stack/regs durante major_gc.  Set una sola vez aqui;
+        // el puntero permanece valido durante toda la vida del proceso.
+        gc_heap.set_owner_process(this);
+    }
 
     /**
      * @brief Destructor: marca el proceso como DEAD y libera su memoria.

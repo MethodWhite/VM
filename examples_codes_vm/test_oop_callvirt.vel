@@ -11,8 +11,10 @@
  * Offsets REALES de ClassInfo (136 bytes):
  *   +80 vtable** (8B)   +88 vtable_size (8B)
  *
- * Offsets REALES de ObjectHeader (16 bytes):
- *   +0 class_ptr (8B)   +8 flags (4B dword)
+ * Offsets REALES de ObjectHeader (24 bytes, ABI v2):
+ *   +0  class_ptr  (8B)    +8  flags      (4B dword)
+ *   +12 hash_code  (4B)    +16 owner_pid  (4B)
+ *   +20 lock_depth (2B)    +22 _mon_pad   (2B)
  *
  * NOTA: "xchg cur0, rN" DESTRUYE rN. Patron seguro:
  *   mov r14, rN / xchg cur0, r14
@@ -107,10 +109,10 @@ code:
     writecur cur0, r5
 
 // -----------------------------------------------------------------------
-// 5. ObjectHeader  (16 bytes)  -> r4
+// 5. ObjectHeader  (24 bytes, ABI v2)  -> r4
 //    class_ptr = r2, flags = 2 (OBJ_FLAG_RAW_OWNED)
 // -----------------------------------------------------------------------
-    mov   r3, 16
+    mov   r3, 24
     alloc r3
     mov   r4, r0
 

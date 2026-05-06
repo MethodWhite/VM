@@ -1,0 +1,63 @@
+/**
+ * ejemplo_factorial.ir
+ * Factorial iterativo: fact(n) -> i64
+ *
+ * Conceptos demostrados:
+ *   - Bucle iterativo con acumulador usando phi nodes
+ *   - Caso base con retorno anticipado (short-circuit)
+ *   - Multiplicacion dentro de un bucle SSA (mul.i64)
+ *
+ * Algoritmo:
+ *   if n <= 1: return 1
+ *   acc=1, i=2
+ *   while i <= n: acc *= i; i++
+ *   return acc
+ *
+ * Nota sobre phi nodes y el emisor:
+ *   Los phi nodes del bucle se bajan a copias de registro en .vel.
+ *   En este caso: acc_c <- acc o acc_next, i_c <- i o i_next.
+ *
+ * Compilar:
+ *   vm --ir-file examples_ir/ejemplo_factorial.ir --ir-opt 2 -o build/out_ir/fact
+ */
+
+@module ejemplo_factorial
+
+// Calcula n! de forma iterativa. Para n <= 1 retorna 1.
+// No realiza comprobacion de desbordamiento.
+@function fact(n: i64) -> i64 {
+entry:
+    one   = const.i64 1
+    // Caso base: n <= 1 -> retornar 1 directamente
+    base  = cmp.le.i64 n, one
+    br.cond base, ret_one, loop_init
+
+ret_one:
+    ret.i64 one                     // 0! = 1! = 1
+
+loop_init:
+    // Estado inicial: acumulador=1, contador i=2
+    acc   = const.i64 1
+    i     = const.i64 2
+    br    loop_check
+
+loop_check:
+    /* Los phi nodes unifican:
+         acc_c: valor inicial (acc=1) o resultado parcial (acc_next)
+         i_c  : indice inicial (2)    o indice incrementado (i_next)  */
+    acc_c = phi.i64 [acc, loop_init], [acc_next, loop_body]
+    i_c   = phi.i64 [i,   loop_init], [i_next,   loop_body]
+    // Condicion de salida: i > n
+    done  = cmp.gt.i64 i_c, n
+    br.cond done, loop_exit, loop_body
+
+loop_body:
+    // acc = acc * i; i = i + 1
+    acc_next = mul.i64 acc_c, i_c
+    step     = const.i64 1
+    i_next   = add.i64 i_c, step
+    br       loop_check
+
+loop_exit:
+    ret.i64 acc_c    // retorna n!
+}

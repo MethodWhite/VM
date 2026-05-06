@@ -1,0 +1,33 @@
+// examples_codes_vex/05_struct_punto.vex
+//
+// Demuestra structs: tipos agregados con campos, asignacion
+// y acceso por nombre, con multiples instancias vivas a la vez.  Cada
+// struct se reserva en pila con ALLOCA del IR y los campos se acceden
+// con offsets relativos al puntero base.
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/05_struct_punto.vex -o struct_p
+//   vm --run struct_p.velb --stats
+//
+// Resultado esperado: R00 == 42  (10 + 32)
+//
+// Nota historica: hubo un bug en `mov reg, rsp` (truncaba a 8 bits porque
+// el ctrl byte del MOV con registro especial codificaba mode=bits[5:4] del
+// codigo del especial, que para rsp/rbp/rip/rflags vale 0 = 8-bit).  Se
+// corrigio forzando mode = ancho del operando general en el emisor y
+// reconstruyendo el codigo especial sin combinar mode en el ejecutor
+// (src/emmit/emmit_decl.cpp::emit_instr_mov_reg y
+//  src/runtime/exec_instruction_alu.cpp::exec_instr_mov_reg).
+// Tras el fix, todos los casos multi-struct funcionan correctamente.
+
+struct Punto {
+    i32 x;
+    i32 y;
+}
+
+i32 main() {
+    Punto p;
+    p.x = 10;
+    p.y = 32;
+    return p.x + p.y;
+}

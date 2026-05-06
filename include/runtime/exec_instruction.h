@@ -355,6 +355,149 @@ namespace runtime {
     /** @brief Ejecuta CMP reg, imm: compara registro con inmediato; solo flags. */
     void exec_instr_cmp_imm(ProcessVM *vm, const DecodedInstr &instr);
 
+    /** @brief Ejecuta MOD reg, reg: resto de la division entera y actualiza flags. */
+    void exec_instr_mod_reg(ProcessVM *vm, const DecodedInstr &instr);
+    /** @brief Ejecuta MOD con acceso a memoria SIB. */
+    void exec_instr_mod_sib(ProcessVM *vm, const DecodedInstr &instr);
+    /** @brief Ejecuta MOD reg, imm: resto de la division con inmediato. */
+    void exec_instr_mod_imm(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta SETCC r_dst, cond: almacena 0 o 1 en el registro segun la condicion de flags.
+     *
+     * Encoding FIXED_4: [0x00][0x43][byte2][0x00]
+     *   byte2 = (cond<<4) | dst_reg
+     * El codigo de condicion es el mismo que usa JCC (0x00=JO, 0x0F=siempre).
+     */
+    void exec_instr_setcc(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta TRYENTER: apila un nuevo frame de excepcion en exc_frame_stack.
+     *
+     * Encoding FIXED_4 REG: [0x00][0x44][ctrl][byte3]
+     *   reg1 = registro con la PC handler (direccion absoluta en VM)
+     *   reg2 = registro con ClassInfo* del tipo capturado (0 = catch-all)
+     */
+    void exec_instr_tryenter(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta TRYLEAVE: desapila el frame de excepcion del tope de exc_frame_stack.
+     *
+     * Encoding FIXED_2: [0x00][0x45]
+     */
+    void exec_instr_tryleave(ProcessVM *vm, const DecodedInstr &instr);
+
+    // =========================================================================
+    //  Ejecutores: instrucciones de cadenas (StringObject)
+    // =========================================================================
+
+    /**
+     * @brief Ejecuta STRMAKE r_dst, r_src: crea un StringObject a partir de un buffer en VM.
+     *
+     * Encoding FIXED_4: [0x00][0x46][ctrl][byte3]
+     *   ctrl = (r_dst<<4)|r_src   - r_src apunta al buffer UTF-8 en memoria VM
+     *   byte3 = (encoding<<4)|r_len - r_len contiene la longitud en bytes
+     * r_dst recibe el GcHandle del nuevo StringObject.
+     */
+    void exec_instr_strmake(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta STRLEN r_dst, r_src: almacena el numero de code points en r_dst.
+     *
+     * Encoding FIXED_4: [0x00][0x47][ctrl][0x00]  ctrl = (r_dst<<4)|r_src
+     */
+    void exec_instr_strlen(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta STRCAT r_dst, r_a, r_b: concatena dos StringObjects en uno nuevo.
+     *
+     * Encoding FIXED_4: [0x00][0x48][ctrl][byte3]  ctrl=(r_dst<<4)|r_a, byte3=r_b
+     */
+    void exec_instr_strcat(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta STRCMP r_dst, r_a, r_b: compara dos StringObjects.
+     *
+     * r_dst recibe -1, 0 o 1. ZF/SF se actualizan segun el resultado.
+     * Encoding FIXED_4: [0x00][0x49][ctrl][byte3]  ctrl=(r_dst<<4)|r_a, byte3=r_b
+     */
+    void exec_instr_strcmp(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta STRCONV r_dst, r_src, enc: convierte la codificacion de un StringObject.
+     *
+     * Encoding FIXED_4: [0x00][0x4A][ctrl][byte3]  ctrl=(r_dst<<4)|r_src, byte3=encoding
+     * Crea un nuevo StringObject con la codificacion indicada.
+     */
+    void exec_instr_strconv(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta STRRAW r_dst, r_src: devuelve un puntero host al buffer interno del string.
+     *
+     * Util para pasar strings a la Win32 API (MessageBoxA, CreateFileA, etc.).
+     * Encoding FIXED_4: [0x00][0x4B][ctrl][0x00]  ctrl=(r_dst<<4)|r_src
+     * r_dst recibe la direccion host (uint64) del buffer de datos del StringObject.
+     */
+    void exec_instr_strraw(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta STRSLICE r_dst, r_src, r_range: vista sin copia sobre un substring.
+     *
+     * r_range debe contener (cp_start << 32) | cp_len (ambos en code points).
+     * Materializa ROPE antes de crear el slice.
+     * Encoding FIXED_4: [0x00][0x4C][ctrl][byte3]  ctrl=(r_dst<<4)|r_src, byte3=r_range (nibble)
+     */
+    void exec_instr_strslice(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta STRFLAT r_dst, r_src: materializa ROPE/SLICE a FLAT.
+     *
+     * Si el origen ya es FLAT, r_dst recibe el mismo GcHandle sin copiar.
+     * Encoding FIXED_4: [0x00][0x4D][ctrl][0x00]  ctrl=(r_dst<<4)|r_src
+     */
+    void exec_instr_strflat(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta STRHASH r_dst, r_src: calcula y cachea el hash FNV-1a.
+     *
+     * Materializa ROPE/SLICE si es necesario. r_dst recibe el hash de 32 bits.
+     * Encoding FIXED_4: [0x00][0x4E][ctrl][0x00]  ctrl=(r_dst<<4)|r_src
+     */
+    void exec_instr_strhash(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta STRINTERN r_dst, r_src: interna el string en el pool del proceso.
+     *
+     * Devuelve el GcHandle canonico (puede diferir de r_src si ya existia un identico).
+     * Encoding FIXED_4: [0x00][0x4F][ctrl][0x00]  ctrl=(r_dst<<4)|r_src
+     */
+    void exec_instr_strintern(ProcessVM *vm, const DecodedInstr &instr);
+
+    /** @brief Ejecuta STRGETENC r_dst, r_src: almacena el byte de codificacion en r_dst. */
+    void exec_instr_strgetenc(ProcessVM *vm, const DecodedInstr &instr);
+
+    /** @brief Ejecuta STRGETBYTES r_dst, r_src: almacena el byte_len en r_dst. */
+    void exec_instr_strgetbytes(ProcessVM *vm, const DecodedInstr &instr);
+
+    /** @brief Ejecuta STRGETKIND r_dst, r_src: almacena el kind (0=FLAT 1=ROPE 2=SLICE) en r_dst. */
+    void exec_instr_strgetkind(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta STRRESERVE r_dst, r_cap: aloca FLAT vacio con capacidad reservada.
+     *
+     * Permite patron string-builder: STRRESERVE -> STRRAW (write) -> STRFINALIZE.
+     * Encoding FIXED_4: [0x00][0x53][ctrl][0x00]  ctrl=(r_dst<<4)|r_cap
+     */
+    void exec_instr_strreserve(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta STRFINALIZE r_dst, r_newlen: actualiza byte_len/length/hash de un FLAT mutable.
+     *
+     * Debe usarse tras STRRESERVE + escritura directa en el buffer.
+     * Encoding FIXED_4: [0x00][0x54][ctrl][0x00]  ctrl=(r_dst<<4)|r_newlen
+     */
+    void exec_instr_strfinalize(ProcessVM *vm, const DecodedInstr &instr);
+
     // =========================================================================
     //  Ejecutores: control de flujo y pila
     // =========================================================================
@@ -491,6 +634,49 @@ namespace runtime {
      * reg1 = registro con el GcHandle; reg2 = indice del cursor destino (0-3).
      */
     void exec_instr_gcderef(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta GETPID: deposita el PID encoded del proceso actual en r_dst.
+     *
+     * El formato es @c (scheduler_id << 32) | (local_pid & 0xFFFFFFFF), igual
+     * convencion que devuelve @c spawn en R0 al crear un proceso hijo.  Asi
+     * el hijo puede tomar su propio PID con @c getpid y enviarselo al padre
+     * via mailbox para iniciar comunicacion bidireccional.
+     *
+     * Para uso en @c msgsend, este formato funciona como "PID local" porque
+     * @c distrib::DistRuntime::msgsend extrae el local_pid de los bits 31-0
+     * y busca el proceso en cualquier scheduler.
+     *
+     * Formato: [0x00][0x57][byte2][0x00]  (FIXED_4)
+     *   byte2 bits 3-0 = r_dst.
+     *
+     * @param vm    Proceso virtual cuyo PID se devuelve.
+     * @param instr reg_data.reg1 = r_dst.
+     */
+    void exec_instr_getpid(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta GCHANDLE: lookup inverso payload_ptr -> GcHandle.
+     *
+     * Es el inverso de @c GCDEREF: dado un puntero host al payload de un objeto
+     * GC vivo, devuelve el GcHandle del objeto.  Usa @c GcHeap::handle_for_ptr
+     * que mantiene un mapa hash interno para coste O(1) amortizado.
+     *
+     * Si el puntero no corresponde a ningun objeto vivo (no esta en el mapa
+     * inverso), devuelve @c GC_NULL_HANDLE.  El llamante puede comprobar este
+     * caso para fallar limpio (no hay segfault ni corrupcion).
+     *
+     * Caso de uso primario: @c synchronized(obj) en Vex.  El frontend tiene
+     * @c obj como host_ptr (resultado de @c gcderef en el constructor); para
+     * @c monenter necesita el GcHandle, que lo obtiene con @c GCHANDLE.
+     *
+     * Formato: [0x00][0x55][byte2][0x00]  (FIXED_4)
+     *   byte2 = (r_src << 4) | r_dst.
+     *
+     * @param vm    Proceso virtual que ejecuta GCHANDLE.
+     * @param instr Instruccion descodificada con reg_data.reg1 = r_dst, reg2 = r_src.
+     */
+    void exec_instr_gchandle(ProcessVM *vm, const DecodedInstr &instr);
 
     /**
      * @brief Ejecuta ADDCUR: suma un inmediato con signo al registro cursor indicado.
@@ -637,6 +823,12 @@ namespace runtime {
     void exec_instr_newobjraw(ProcessVM *vm, const DecodedInstr &instr);
     /** @brief CALLVIRT: llamada virtual via vtable; empuja FrameHeader. */
     void exec_instr_callvirt(ProcessVM *vm, const DecodedInstr &instr);
+    /** @brief CALLM: llamada via MethodInfo* directo (sin vtable lookup); util para
+     *         dispatch dinamico (interfaces, reflexion).  Recorre advice_chain igual que CALLVIRT. */
+    void exec_instr_callm(ProcessVM *vm, const DecodedInstr &instr);
+    /** @brief PROCEED: dentro de un advice @Around, invoca el target original via
+     *         frame.proceed_target con la calling convention actual (r1=this, args en r2..). */
+    void exec_instr_proceed(ProcessVM *vm, const DecodedInstr &instr);
     /** @brief CALLSUPER: llamada al metodo de la superclase via vtable de la clase indicada. */
     void exec_instr_callsuper(ProcessVM *vm, const DecodedInstr &instr);
     /** @brief THROW: lanza una excepcion buscando handler en la cadena de frames. */
@@ -724,6 +916,71 @@ namespace runtime {
     void exec_instr_spawn(ProcessVM *vm, const DecodedInstr &instr);
 
     /**
+     * @brief SPAWN_ON con hint de scheduler.
+     *
+     * Crea un nuevo proceso con PC=reg1 y lo asigna a un scheduler
+     * concreto segun el valor (signed) en reg2:
+     *   - reg2 == -1 (Here): mismo scheduler que el padre.
+     *   - reg2 >=  0       : pinned al scheduler reg2 % num_schedulers.
+     *
+     * Sirve a `spawn here { ... }` y `spawn on(N) { ... }` en Vex.
+     * El resto (PC, RSP/RBP, copia de codigo, make_ready, retorno del PID
+     * encoded en R0) es identico a SPAWN.
+     *
+     * @param vm    Proceso virtual que ejecuta SPAWN_ON.
+     * @param instr reg1 = direccion de inicio; reg2 = scheduler hint signed.
+     */
+    void exec_instr_spawn_on(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief LOADMOD r_path_addr, r_path_len -- carga dinamica de un .velb.
+     *
+     * Lee `path_len` bytes desde `vm_mem[path_addr]` (string UTF-8 con la ruta
+     * al archivo .velb), abre el archivo, llama a `Loader::load_module_dynamic`
+     * y deja el resultado en R0:
+     *   - 0 si el archivo no existe o esta vacio (failure).
+     *   - init_pc del modulo cargado (>0) en caso de exito.
+     *
+     * NO ejecuta automaticamente el modulo cargado: el caller (la builtin Vex
+     * @c loadmodule) debe usar `callvmr` con el init_pc devuelto para
+     * invocar el main del nuevo modulo, cuyo prologo llama a `__module_init`
+     * y registra las clases en el ClassRegistry global.
+     *
+     * @param vm    Proceso virtual que invoca la carga.
+     * @param instr reg1 = registro con direccion VM al buffer de path,
+     *              reg2 = registro con longitud en bytes del path.
+     */
+    void exec_instr_loadmod(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief PANIC (0x5A): lanza un @c FatalError con kind=FATAL_USER_ABORT
+     *        y message = bytes leidos de @c [vm_addr, len] desde la VM mem.
+     *
+     * Usado por el builtin Vex @c panic("...") para abortar el proceso de
+     * forma capturable.  Si hay try/catch FatalError activo lo captura;
+     * si no, mata el proceso (no la VM).
+     *
+     * @param vm    Proceso virtual que ejecuta panic.
+     * @param instr reg1 = registro con direccion VM del mensaje,
+     *              reg2 = registro con longitud en bytes del mensaje.
+     */
+    void exec_instr_panic(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief SETMETHDBG (0x5B): registra debug info para un MethodInfo*.
+     *
+     * params en VM mem (24 bytes):
+     *   +0  [8]  method_ptr   (debe coincidir con r_method, redundancia)
+     *   +8  [8]  file_addr    (VA del nombre del archivo)
+     *   +16 [4]  file_len     (longitud en bytes)
+     *   +20 [4]  start_line   (linea 1-based del inicio del metodo)
+     *
+     * Idempotente: sobreescribe entrada previa para el mismo MethodInfo.
+     * Emitido por @c __module_init del frontend Vex tras cada @c defmethod.
+     */
+    void exec_instr_setmethdbg(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
      * @brief SWAPCTX: intercambio de contexto cooperativo entre dos fibras.
      *
      * Guarda {PC, SP, BP, R0-R15} en el buffer VM de reg2 y carga desde reg1.
@@ -737,6 +994,428 @@ namespace runtime {
      * @param instr reg1 = ctx destino, reg2 = ctx origen (VM addresses).
      */
     void exec_instr_swapctx(ProcessVM *vm, const DecodedInstr &instr);
+
+    // -------------------------------------------------------------------------
+    // Closures GC y raw  (opcodes extendidos 0x20-0x23)
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief MKCLOSURE: crea un ClosureObject gestionado por el GC.
+     * @param vm    Proceso virtual que ejecuta MKCLOSURE.
+     * @param instr reg1 = MethodInfo*, reg2 = env addr en memoria VM.
+     */
+    void exec_instr_mkclosure(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief CALLCLOSURE: invoca un ClosureObject GC a traves de su MethodInfo.
+     * @param vm    Proceso virtual que ejecuta CALLCLOSURE.
+     * @param instr reg1 = GcHandle del ClosureObject.
+     */
+    void exec_instr_callclosure(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief MKRAWCLOSURE: crea un RawClosureObject sin GC (para FFI nativo).
+     * @param vm    Proceso virtual que ejecuta MKRAWCLOSURE.
+     * @param instr reg1 = fn_addr, reg2 = env_addr en memoria VM.
+     */
+    void exec_instr_mkrawclosure(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief CALLRAWCLOSURE: invoca la funcion nativa de un RawClosureObject.
+     * @param vm    Proceso virtual que ejecuta CALLRAWCLOSURE.
+     * @param instr reg1 = puntero raw al RawClosureObject.
+     */
+    void exec_instr_callrawclosure(ProcessVM *vm, const DecodedInstr &instr);
+
+    // -------------------------------------------------------------------------
+    // TCO  (opcode extendido 0x24)
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief TAILCALL: llamada en posicion de cola; reutiliza el frame actual.
+     *
+     * Restaura SP al frame_base del FrameHeader activo y salta a la funcion
+     * destino sin empujar una nueva direccion de retorno.
+     *
+     * @param vm    Proceso virtual que ejecuta TAILCALL.
+     * @param instr reg1 = direccion de la funcion destino.
+     */
+    void exec_instr_tailcall(ProcessVM *vm, const DecodedInstr &instr);
+
+    // -------------------------------------------------------------------------
+    // Nullable  (opcodes extendidos 0x25-0x26)
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief ISNULL: r_dst = (r_src == 0) ? 1 : 0. Sin excepcion.
+     * @param vm    Proceso virtual que ejecuta ISNULL.
+     * @param instr reg1 = destino, reg2 = valor a comprobar.
+     */
+    void exec_instr_isnull(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief UNWRAP: r_dst = r_src si != 0; lanza NullPointerException si == 0.
+     * @param vm    Proceso virtual que ejecuta UNWRAP.
+     * @param instr reg1 = destino, reg2 = valor nullable.
+     */
+    void exec_instr_unwrap(ProcessVM *vm, const DecodedInstr &instr);
+
+    // -------------------------------------------------------------------------
+    // Tabla de saltos y cambio de tipo  (opcodes extendidos 0x27-0x28)
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief JUMPTABLE: salto O(1) por valor entero sobre una tabla de direcciones.
+     *
+     * Lee la direccion de la posicion r_val de la tabla apuntada por r_table y
+     * salta a ella.  Si r_val >= count no salta (cae al siguiente opcode).
+     *
+     * @param vm    Proceso virtual que ejecuta JUMPTABLE.
+     * @param instr mem_data.reg_base=r_val, mem_data.reg_index=r_table, mem_data.scale=count.
+     */
+    void exec_instr_jumptable(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief TYPESWITCH: despacho por tipo de objeto (O(n) sobre n entradas de la tabla).
+     *
+     * Obtiene ClassInfo del ObjectHeader del objeto en r_obj.  Recorre la tabla de
+     * pares [ClassInfo*, target_addr] buscando la clase exacta.  Si encuentra
+     * coincidencia salta a target_addr; si no, cae al siguiente opcode.
+     *
+     * @param vm    Proceso virtual que ejecuta TYPESWITCH.
+     * @param instr mem_data.reg_base=r_obj, mem_data.reg_index=r_table, mem_data.scale=count.
+     */
+    void exec_instr_typeswitch(ProcessVM *vm, const DecodedInstr &instr);
+
+    // -------------------------------------------------------------------------
+    // Async/await nativo  (opcodes extendidos 0x29-0x2C)
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief FUTURE: crea un FutureObject gestionado por el GC en estado PENDING.
+     *
+     * Aloca mediante gc_heap.alloc y devuelve el GcHandle en R0.
+     * El handle debe pasarse a FULFILL o REJECT para resolverlo, y a AWAIT para esperar.
+     *
+     * @param vm    Proceso virtual que ejecuta FUTURE.
+     * @param instr Sin operandos (FIXED_2).
+     */
+    void exec_instr_future(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief AWAIT: suspende el proceso hasta que el FutureObject sea resuelto.
+     *
+     * Si el future ya esta RESOLVED o REJECTED: escribe result en R0 y continua.
+     * Si sigue PENDING: registra el PID del proceso en waiter_pid y bloquea
+     * (blocking=true) sin avanzar el PC.  Al ser despertado por FULFILL/REJECT
+     * re-ejecuta AWAIT, que ahora encuentra el estado resuelto y retorna el valor.
+     *
+     * @param vm    Proceso virtual que ejecuta AWAIT.
+     * @param instr reg1 = GcHandle del FutureObject.
+     */
+    void exec_instr_await(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief FULFILL: resuelve un FutureObject con un valor (RESOLVED).
+     *
+     * Escribe result=r_val y state=RESOLVED en el FutureObject.
+     * Si waiter_pid != 0 llama a make_ready(waiter_pid) para despertar al proceso.
+     *
+     * @param vm    Proceso virtual que ejecuta FULFILL.
+     * @param instr reg1 = GcHandle del FutureObject, reg2 = valor de resolucion.
+     */
+    void exec_instr_fulfill(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief REJECT: rechaza un FutureObject con un codigo de error (REJECTED).
+     *
+     * Escribe result=r_err y state=REJECTED en el FutureObject.
+     * Si waiter_pid != 0 llama a make_ready(waiter_pid) para despertar al proceso.
+     *
+     * @param vm    Proceso virtual que ejecuta REJECT.
+     * @param instr reg1 = GcHandle del FutureObject, reg2 = codigo de error.
+     */
+    void exec_instr_reject(ProcessVM *vm, const DecodedInstr &instr);
+
+    // -------------------------------------------------------------------------
+    // Aritmetica de puntero de pila  (opcodes extendidos 0x2E-0x2F)
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief SUBSP: resta un inmediato al puntero de pila RSP o RBP.
+     *
+     * Tipicamente usado para reservar espacio de variables locales al inicio
+     * de una funcion sin usar la instruccion generica SUB.
+     *
+     * @param vm    Proceso virtual que ejecuta SUBSP.
+     * @param instr inmmed_data.reg=0 (RSP) o 1 (RBP); inmmed_data.inmmed = delta.
+     */
+    void exec_instr_subsp(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief ADDSP: suma un inmediato al puntero de pila RSP o RBP.
+     *
+     * Tipicamente usado para liberar el espacio de variables locales al final
+     * de una funcion.
+     *
+     * @param vm    Proceso virtual que ejecuta ADDSP.
+     * @param instr inmmed_data.reg=0 (RSP) o 1 (RBP); inmmed_data.inmmed = delta.
+     */
+    void exec_instr_addsp(ProcessVM *vm, const DecodedInstr &instr);
+
+    // -------------------------------------------------------------------------
+    // Referencias debiles  (opcodes extendidos 0x30, 0x32, 0x34)
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief WEAKREF: crea una referencia debil opaca a un objeto GC.
+     *
+     * Registra el GcHandle en la tabla de referencias debiles del GcHeap.
+     * El GC anula automaticamente la referencia si el objeto es recolectado.
+     * Devuelve el indice opaco (uint32_t) en R0.
+     *
+     * @param vm    Proceso virtual que ejecuta WEAKREF.
+     * @param instr reg1 = GcHandle del objeto.
+     */
+    void exec_instr_weakref(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief DEREF_WEAK: desreferencia un indice de weak ref.
+     *
+     * Si el objeto sigue vivo: r_dst = GcHandle original.
+     * Si el objeto fue recolectado: r_dst = GC_NULL_HANDLE (0xFFFFFFFF).
+     *
+     * @param vm    Proceso virtual que ejecuta DEREF_WEAK.
+     * @param instr reg1 = registro destino, reg2 = indice opaco de la weak ref.
+     */
+    void exec_instr_deref_weak(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief FREE_WEAK: libera una entrada de la tabla de weak refs.
+     *
+     * Debe llamarse cuando ya no se necesita la referencia debil para no
+     * acumular entradas muertas en la tabla.
+     *
+     * @param vm    Proceso virtual que ejecuta FREE_WEAK.
+     * @param instr reg1 = indice opaco de la weak ref a liberar.
+     */
+    void exec_instr_free_weak(ProcessVM *vm, const DecodedInstr &instr);
+
+    // -------------------------------------------------------------------------
+    // Monitor / sincronizacion  (opcodes extendidos 0x35-0x39)
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief MONENTER: adquiere el monitor reentrante del objeto GC.
+     *
+     * Si el monitor esta libre o ya lo posee el proceso actual, lo adquiere e
+     * incrementa lock_depth en ObjectHeader.  Si esta ocupado por otro proceso,
+     * el proceso actual entra en la cola de espera (blocking=true) y re-ejecuta
+     * MONENTER al ser despertado por MONEXIT.
+     *
+     * @param vm    Proceso virtual que ejecuta MONENTER.
+     * @param instr reg1 = GcHandle del objeto cuyo monitor se quiere adquirir.
+     */
+    void exec_instr_monenter(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief MONEXIT: libera el monitor del objeto GC.
+     *
+     * Decrementa lock_depth.  Cuando llega a 0, el monitor queda libre; si hay
+     * procesos en la cola de espera del GcHeap, despierta al primero (make_ready).
+     *
+     * @param vm    Proceso virtual que ejecuta MONEXIT.
+     * @param instr reg1 = GcHandle del objeto cuyo monitor se libera.
+     */
+    void exec_instr_monexit(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief MONWAIT: libera completamente el monitor y suspende el proceso.
+     *
+     * Libera el monitor (lock_depth -> 0) y registra el PID en la cola de espera
+     * del monitor.  El proceso queda bloqueado hasta que MONNOTI o MONNOTA lo
+     * despierte.  Tras despertar debe llamar MONENTER para readquirir el lock.
+     *
+     * @param vm    Proceso virtual que ejecuta MONWAIT.
+     * @param instr reg1 = GcHandle del objeto.
+     */
+    void exec_instr_monwait(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief MONNOTI: despierta un proceso de la cola de espera del monitor.
+     *
+     * Extrae el primer PID de monitor_waiters_ y llama make_ready.  No transfiere
+     * la propiedad del monitor; el proceso despertado debe llamar MONENTER de nuevo.
+     *
+     * @param vm    Proceso virtual que ejecuta MONNOTI.
+     * @param instr reg1 = GcHandle del objeto.
+     */
+    void exec_instr_monnoti(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief MONNOTA: despierta todos los procesos de la cola de espera del monitor.
+     *
+     * Extrae todos los PIDs de monitor_waiters_ y llama make_ready en cada uno.
+     *
+     * @param vm    Proceso virtual que ejecuta MONNOTA.
+     * @param instr reg1 = GcHandle del objeto.
+     */
+    void exec_instr_monnota(ProcessVM *vm, const DecodedInstr &instr);
+
+    // -------------------------------------------------------------------------
+    // Genericos en tiempo de ejecucion  (opcode extendido 0x3A)
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief SPECIALIZE: instancia en tiempo de ejecucion una clase generica.
+     *
+     * Codificacion FIXED_4: byte2 = (r_dst<<4)|r_class, byte3 = (r_types<<4)|r_count.
+     *   r_class = registro con puntero a ClassInfo generica (CLASS_FLAG_GENERIC).
+     *   r_types = registro con puntero a array de ClassInfo* (tipos concretos).
+     *   r_count = nibble bajo de byte3; numero de parametros de tipo (1-15).
+     *   r_dst   = nibble alto de byte2; registro destino para el ClassInfo* result.
+     *
+     * Si la especializacion ya existe en la cache del Loader la retorna directamente.
+     * Si no, clona el ClassInfo original sustituyendo los type_params por los concretos.
+     *
+     * @param vm    Proceso virtual que ejecuta SPECIALIZE.
+     * @param instr byte2=(r_dst<<4)|r_class, byte3=(r_types<<4)|r_count.
+     */
+    void exec_instr_specialize(ProcessVM *vm, const DecodedInstr &instr);
+
+    // -------------------------------------------------------------------------
+    // Meta-programacion OOP (opcodes extendidos 0xC9-0xCC)
+    //
+    // Permiten definir clases en runtime via @c ClassRegistry.  El bytecode
+    // construye structs DefXxxParams en memoria VM y las pasa por puntero;
+    // el ejecutor las lee y delega al @c class_registry() del Loader.
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief Crea una clase nueva con el nombre indicado en los parametros.
+     *        Devuelve ClassInfo* en r_dst (0 si fallo).
+     */
+    void exec_instr_defclass (ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Anade un campo a la clase en r_dst.  R0 recibe 1/0 (ok/fail).
+     */
+    void exec_instr_deffield (ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Anade un metodo a la clase en r_dst.  R0 recibe el indice
+     *        del metodo en la vtable o UINT32_MAX si fallo.
+     */
+    void exec_instr_defmethod(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Busca una clase por nombre.  Devuelve ClassInfo* en r_dst
+     *        (0 si no existe).
+     */
+    void exec_instr_findclass(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Busca un metodo por nombre dentro de una clase via su tabla
+     *        hash (O(1)).  Devuelve MethodInfo* en r_dst (0 si no existe).
+     *        Pareja con @c addadvice para registrar aspectos en runtime.
+     */
+    void exec_instr_findmethod(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Busca un campo por nombre dentro de una clase via su tabla
+     *        hash (O(1)).  Devuelve FieldInfo* en r_dst (0 si no existe).
+     *        Reusa el layout @c FindMethodParamsLayout para los params.
+     */
+    void exec_instr_findfield(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Registra un advice (BEFORE/AFTER/AROUND) sobre un metodo
+     *        target.  R0 = 1 ok / 0 fallo (firmas incompatibles, etc).
+     *        El kind viaja en el byte3 de la instruccion.
+     */
+    void exec_instr_addadvice(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Lee un static field (i64) de una clase (opcode extended 0x60).
+     *
+     * Operandos descodificados (data_instruction.static_data):
+     *   r0     = registro destino (recibe el valor i64 leido)
+     *   r1     = registro con ClassInfo* (host pointer al descriptor)
+     *   offset = byte offset dentro de @c ClassInfo::static_data
+     *
+     * Lee 8 bytes desde @c cls->static_data + offset (memoria HOST).  El
+     * frontend Vex hace truncate post-load para tipos mas pequenos
+     * (i8/i16/i32) usando el mismo patron que para fields de instancia.
+     *
+     * Si @c cls es nullptr o @c cls->static_data es nullptr (la clase no
+     * declara static fields), lanza @c FATAL_NULL_POINTER capturable via
+     * @c try { } catch (FatalError) { }.
+     */
+    void exec_instr_getstatic(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Carga una libreria nativa por nombre (FFI runtime, opcode 0x62).
+     *
+     * Operandos (data_instruction.mem_data):
+     *   reg_base   = r_dst             (recibe el handle host como i64)
+     *   reg_index  = r_path_addr        (registro con direccion VM del nombre)
+     *   reg_final  = r_path_len         (registro con longitud del nombre, bytes)
+     *
+     * Lee los bytes del path desde @c vm_mem y delega a
+     * @c FFI::load_native_module (LoadLibraryA / dlopen).  Devuelve el handle
+     * cacheado como puntero host (uint64_t) en r_dst.  Si la carga falla,
+     * lanza @c FATAL_NULL_POINTER capturable.  El handle es valido durante
+     * toda la sesion (cache global del FFI).
+     */
+    void exec_instr_dlopen(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Resuelve un simbolo de una libreria nativa cargada (opcode 0x63).
+     *
+     * Operandos (data_instruction.mem_data):
+     *   reg_base   = r_dst        (recibe la direccion del simbolo, i64)
+     *   reg_index  = r_handle     (registro con handle de @c dlopen)
+     *   reg_final  = r_name_addr  (registro con direccion VM del nombre)
+     *   scale      = r_name_len   (registro con longitud del nombre)
+     *
+     * Lee los bytes del nombre desde @c vm_mem y delega a
+     * @c GetProcAddress / @c dlsym.  Devuelve la direccion del simbolo como
+     * @c uint64_t en r_dst.  Si no se encuentra, lanza @c FATAL_NULL_POINTER
+     * capturable.
+     */
+    void exec_instr_dlsym(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Invoca una funcion nativa por puntero (FFI dinamico, opcode 0x64).
+     *
+     * Operandos (data_instruction.reg_data):
+     *   reg1 = r_fn  (registro con direccion del simbolo, ya resuelto via dlsym)
+     *
+     * Convencion espejo de CALLN estatico: argc en R15 (clamp a [0,12]),
+     * args en R01..R12, retorno en R00.  Reusa exactamente
+     * @c invoke_native_unchecked para mantener la misma calling convention.
+     * Sin proteccion SEH/EH: si necesitas captura de crashes nativos, usa
+     * el wrapper estatico CALLN o envuelve la llamada en @c try/@c catch
+     * @c FatalError desde Vex.
+     */
+    void exec_instr_callni(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Escribe un static field (i64) en una clase (opcode extended 0x61).
+     *
+     * Operandos descodificados (data_instruction.static_data):
+     *   r0     = registro con ClassInfo* (host pointer al descriptor)
+     *   r1     = registro con valor a escribir (i64)
+     *   offset = byte offset dentro de @c ClassInfo::static_data
+     *
+     * Escribe 8 bytes a @c cls->static_data + offset (memoria HOST).  El
+     * frontend Vex hace truncate / sign-extend pre-store para tipos mas
+     * pequenos cuando el field declarado es signed.
+     *
+     * Mismo manejo de errores que @c getstatic: @c FATAL_NULL_POINTER si
+     * @c cls o @c static_data son nullptr.
+     */
+    void exec_instr_setstatic(ProcessVM *vm, const DecodedInstr &instr);
 
     // -------------------------------------------------------------------------
     // Punto flotante escalar y vectorial  (opcodes extendidos 0xF0-0xFC)
@@ -794,6 +1473,22 @@ namespace runtime {
     void exec_instr_fcvt(ProcessVM *vm, const DecodedInstr &instr);
 
     /**
+     * @brief FEXTEND: convierte f32 -> f64 dentro del banco ZMM.
+     *
+     * @param vm    Proceso virtual.
+     * @param instr reg1 = ZMM destino, reg2 = ZMM fuente.
+     */
+    void exec_instr_fextend(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief FNARROW: convierte f64 -> f32 dentro del banco ZMM.
+     *
+     * @param vm    Proceso virtual.
+     * @param instr reg1 = ZMM destino, reg2 = ZMM fuente.
+     */
+    void exec_instr_fnarrow(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
      * @brief FMOVI: carga un inmediato IEEE 754 en un registro ZMM.
      * @param vm    Proceso virtual.
      * @param instr inmmed_data.reg = ZMM destino; inmmed_data.inmmed = bits f64.
@@ -813,6 +1508,38 @@ namespace runtime {
      * @param instr reg1 = GP con direccion VM, reg2 = ZMM fuente; mode = ancho.
      */
     void exec_instr_fstore(ProcessVM *vm, const DecodedInstr &instr);
+
+    // -------------------------------------------------------------------------
+    // Instrucciones distribuidas  (opcodes extendidos 0x3B-0x3E)
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief RSPAWN: crea un proceso en un nodo remoto.
+     * @param vm    Proceso virtual que ejecuta RSPAWN.
+     * @param instr reg1 = r_fn (dir bytecode), reg2 = r_node (indice NodeRegistry).
+     */
+    void exec_instr_rspawn(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief MSGSEND: envia un mensaje a otro proceso (local o remoto).
+     * @param vm    Proceso virtual emisor.
+     * @param instr mem_data: reg_base=r_pid, reg_index=r_addr, reg_final=r_len.
+     */
+    void exec_instr_msgsend(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief MSGRECV: extrae el primer mensaje del buzon; bloquea si vacio.
+     * @param vm    Proceso virtual receptor.
+     * @param instr reg1 = r_buf (dir VM destino), reg2 = r_max (tamano maximo).
+     */
+    void exec_instr_msgrecv(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief MEMSYNC: sincroniza una region de memoria con un nodo remoto.
+     * @param vm    Proceso virtual que ejecuta MEMSYNC.
+     * @param instr reg1 = r_params (dir de MemsyncParams en VM memory).
+     */
+    void exec_instr_memsync(ProcessVM *vm, const DecodedInstr &instr);
 
     /**
      * @brief Descodifica FMOVI: ctrl_byte con ZMM index empaquetado + imm64.

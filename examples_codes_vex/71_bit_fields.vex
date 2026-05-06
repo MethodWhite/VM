@@ -1,0 +1,38 @@
+// Bit fields read + write.
+
+struct Flags {
+    u32 a : 3;
+    u32 b : 5;
+    u32 c : 8;
+    u32 rest : 16;
+}
+
+i32 main() {
+    Flags f;
+    VirtualPtr<u32> p = &f.a;
+    *p = 0;            // limpiar todo
+
+    // Escrituras independientes: read-modify-write para cada campo.
+    f.a = 5;
+    f.b = 7;
+    f.c = 42;
+    f.rest = 12345;
+
+    if (f.a != 5)        return 1;
+    if (f.b != 7)        return 2;
+    if (f.c != 42)       return 3;
+    if (f.rest != 12345) return 4;
+
+    // Verificar que los campos no se solapan: cambiar a y leer b.
+    f.a = 0;
+    if (f.b != 7)        return 5;
+    f.a = 7;             // cambiar a otro valor
+    if (f.b != 7)        return 6;
+    if (f.a != 7)        return 7;
+
+    // Test trim: asignar valor mayor que el rango debe truncarse.
+    f.a = 15;            // 15 = 0b1111, pero solo 3 bits caben -> 0b111 = 7
+    if (f.a != 7)        return 8;
+
+    return 42;
+}

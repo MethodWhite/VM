@@ -1,0 +1,38 @@
+// synchronized + return safety:
+//
+// Verifica que un `return` dentro del body del synchronized libera
+// el monitor antes de retornar.  El emit_cleanups_all() en lower_return
+// emite tryleave + monexit por cada synchronized activo.
+//
+// Test:
+//   - inc_or_zero(flag): si flag != 0, return 0 desde DENTRO de synchronized
+//     SIN incrementar.  Si flag == 0, incrementa y retorna el valor normal.
+//   - main alterna entre return temprano (flag=1) y normal (flag=0).
+//     Si el monitor no se liberase tras el return temprano, los
+//     siguientes synchronized (reentrantes pero con frame de excepcion
+//     colgado) corrompian estado y darian valores incorrectos.
+
+class Counter {
+    i32 valor;
+    Counter() { this.valor = 0; }
+
+    i32 inc_or_zero(i32 flag) {
+        synchronized (this) {
+            if (flag == 1) {
+                return 0;             // return temprano: cleanup_stack debe correr
+            }
+            this.valor = this.valor + 1;
+        }
+        return this.valor;
+    }
+}
+
+i32 main() {
+    Counter c = new Counter();
+    i32 a = c.inc_or_zero(0);   // 1: incrementa, retorna 1
+    i32 b = c.inc_or_zero(1);   // 0: return temprano, NO incrementa
+    i32 c2 = c.inc_or_zero(0);  // 2: incrementa de nuevo
+    i32 d = c.inc_or_zero(1);   // 0: return temprano
+    i32 e = c.inc_or_zero(0);   // 3: incrementa
+    return a + b + c2 + d + e;  // 1 + 0 + 2 + 0 + 3 = 6
+}

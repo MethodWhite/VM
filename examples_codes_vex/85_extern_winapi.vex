@@ -1,0 +1,37 @@
+// examples_codes_vex/85_extern_winapi.vex
+//
+// FFI declarativo: extern "lib.dll" { fn ...; }
+//
+// Permite llamar a cualquier funcion de una DLL del sistema (kernel32,
+// user32, ...) o de cualquier libreria nativa, con CERO overhead vs un
+// plugin propio.  El ensamblador resuelve `kernel32.dll:GetCurrentProcessId`
+// igual que `stdlib/native/io/vesta_io:vio_println` -- mismo
+// LoadLibraryA + GetProcAddress de @c src/ffi/native_ffi.cpp.
+//
+// El frontend Vex:
+//   - Parser reconoce `extern "lib" { fn name(params) -> R; ... }` y
+//     emite un AST::ExternFnDecl por cada funcion del bloque.
+//   - Type checker registra cada extern fn como Symbol::Function con
+//     FunctionSig::extern_lib != "".
+//   - Lowering en lower_call detecta el callee en extern_lib_by_fn_name_
+//     y emite @c CALLN @Method("<lib>:<name>") en vez de CALLVM, registrando
+//     el import via @c out_mod_->register_native_import.
+//
+// Esperado: R00 == 42.
+//   GetCurrentProcessId() devuelve el PID actual (>0); GetTickCount tambien.
+//   Validamos: pid != 0 (1) + tick != 0 (1) + 40 = 42.
+
+extern "kernel32.dll" {
+    fn GetCurrentProcessId() -> i32;
+    fn GetTickCount() -> i32;
+}
+
+i32 main() {
+    i32 pid  = GetCurrentProcessId();
+    i32 tick = GetTickCount();
+
+    i32 acc = 40;
+    if (pid != 0)  { acc = acc + 1; }
+    if (tick != 0) { acc = acc + 1; }
+    return acc;
+}

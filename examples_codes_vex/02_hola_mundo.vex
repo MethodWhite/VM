@@ -1,0 +1,20 @@
+// examples_codes_vex/02_hola_mundo.vex
+//
+// Hola Mundo en Vex
+//
+// Demuestra:
+//   - Literal de string Vex.
+//   - Builtin println traducido a llamada FFI vesta_io.vio_println.
+//   - El emisor IR genera bloque @Import + seccion de datos automaticamente.
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/02_hola_mundo.vex -o hola
+//   vm --run hola.velb
+//
+// Salida esperada:
+//   Hola Mundo desde Vex!
+
+i32 main() {
+    println("Hola Mundo desde Vex!");
+    return 0;
+}

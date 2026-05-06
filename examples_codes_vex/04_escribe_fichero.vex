@@ -1,0 +1,39 @@
+// examples_codes_vex/04_escribe_fichero.vex
+//
+// Escribe un fichero "salida_vex.txt" con un contenido predefinido
+//
+// Demuestra:
+//   - Builtins de I/O de fichero: fopen, fwrite, fclose.
+//   - Cadena nativa via FFI a vesta_io.dll.
+//   - Manejo del FILE* devuelto por fopen como i64.
+//   - Mensaje de progreso por println antes y despues de la operacion.
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/04_escribe_fichero.vex -o escribir
+//   vm --run escribir.velb
+//
+// Salida esperada (stdout):
+//   == Escritura de fichero Vex ==
+//   bytes escritos:
+//   == Hecho ==
+//
+// Efecto secundario: crea el fichero "salida_vex.txt" con el contenido
+//   "Hola desde Vex! Este fichero fue escrito por la VM."
+
+i32 main() {
+    println("== Escritura de fichero Vex ==");
+
+    i64 fp = fopen("salida_vex.txt", "w");
+    if (fp == 0) {
+        println("ERROR: no se pudo abrir el fichero");
+        return 1;
+    }
+
+    i64 bytes_written = fwrite(fp, "Hola desde Vex! Este fichero fue escrito por la VM.\n");
+    println("bytes escritos:");
+    print_int(bytes_written);
+
+    fclose(fp);
+    println("== Hecho ==");
+    return 0;
+}

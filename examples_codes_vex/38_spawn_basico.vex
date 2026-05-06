@@ -1,0 +1,15 @@
+// spawn basico:
+//
+// Verifica que `spawn { body }` arranca un proceso hijo y devuelve un
+// PID encoded != 0.  El hijo no hace nada visible (un mov + hlt), pero
+// el padre comprueba que la PID es valida y devuelve un valor positivo.
+
+i32 main() {
+    i64 pid = spawn {
+        i32 dummy = 42;  // hijo: trabajo trivial, luego hlt automatico
+    };
+    if (pid != 0) {
+        return 100;       // OK: hijo creado
+    }
+    return 0;             // FAIL: spawn no produjo PID
+}

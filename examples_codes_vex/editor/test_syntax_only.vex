@@ -1,0 +1,37 @@
+// =============================================================================
+// test_syntax_only.vex - test directo del highlighter SyntaxVex
+// =============================================================================
+//
+// Aisla el SyntaxVex del editor TUI: tokeniza varias lineas de codigo Vex y
+// las imprime con escapes ANSI inline.  Util para validar el highlighter
+// como extension sin necesitar la interaccion del editor.
+
+#include "modules/syntax_vex.vh"
+
+void render_string(SyntaxVex sv, string s) {
+    u8* bdat = str_cstr(s);
+    i32 len  = str_bytes(s);
+    sv.render_line(bdat, 0, len, 200);
+    print("\n");
+}
+
+i32 main() {
+    SyntaxVex sv = new SyntaxVex();
+
+    println("--- highlighter Vex (escapes ANSI inline) ---");
+    flush();
+
+    // Casos de prueba: keyword, tipo, numero, string, comentario, anotacion.
+    render_string(sv, "class Foo {");
+    render_string(sv, "    public i32 contador = 0;");
+    render_string(sv, "    public string name = \"hola mundo\";");
+    render_string(sv, "    // este es un comentario");
+    render_string(sv, "    public i64 hex = 0xDEAD;");
+    render_string(sv, "    @Override");
+    render_string(sv, "    public bool ok() { return true; }");
+    render_string(sv, "}");
+    flush();
+
+    println("--- fin highlighter ---");
+    return 42;
+}

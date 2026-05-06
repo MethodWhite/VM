@@ -1,0 +1,31 @@
+// Reflexion MVP en Vex.
+//
+// Demuestra dos builtins de reflexion:
+//   - forName("Animal")  -> i64 (ClassInfo*)  busca la clase por nombre
+//                                              en el ClassRegistry global.
+//   - getClass(animal)   -> i64 (ClassInfo*)  lee header.class_ptr de la
+//                                              instancia (offset 0).
+//
+// Si ambos devuelven el mismo puntero, la reflexion esta bien wireada:
+// la clase declarada en el source coincide con la que el GC asigna a
+// la instancia creada con `new Animal()`.
+//
+// Test: main() devuelve 1 si los punteros coinciden, 0 si no.
+
+class Animal {
+    public i32 edad;
+    public Animal(i32 e) { this.edad = e; }
+}
+
+i32 main() {
+    Animal a = new Animal(7);
+
+    // Reflexion: dos formas de obtener el ClassInfo* de Animal.
+    i64 cls_by_name = forName("Animal");    // lookup global por nombre
+    i64 cls_of_obj  = getClass(a);          // header.class_ptr de la instancia
+
+    if (cls_by_name == cls_of_obj) {
+        return 1;   // ambos apuntan al mismo ClassInfo
+    }
+    return 0;
+}

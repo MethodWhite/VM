@@ -1,0 +1,36 @@
+// examples_codes_vex/09_punteros_arith.vex
+//
+// Demuestra aritmetica de punteros:
+//   - p + n / p - n: el offset n se escala por sizeof(*p) automaticamente.
+//   - p[i] como expresion: equivale a *(p + i).
+//   - p[i] = v como lvalue: STORE a *(p + i).
+//   - p - q: numero de elementos entre dos punteros (no usado aqui).
+//   - Comparaciones de punteros (p == q, p < q, ...).
+//
+// Usamos un struct para tener 4 i32 contiguos en memoria (offsets 0,4,8,12);
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/09_punteros_arith.vex -o pa
+//   vm --run pa.velb --stats
+//
+// Resultado esperado: R00 == 12  (1+2+3+6)
+
+struct Buf {
+    i32 a;
+    i32 b;
+    i32 c;
+    i32 d;
+}
+
+i32 main() {
+    Buf buf;
+    buf.a = 1;
+    buf.b = 2;
+    buf.c = 3;
+    buf.d = 0;
+    // p apunta a buf.a (offset 0).  El subscript p[3] equivale a buf.d.
+    // El struct local vive en stack VM, asi que &buf.a es VirtualPtr.
+    VirtualPtr<i32> p = &buf.a;
+    p[3] = 6;
+    return p[0] + p[1] + p[2] + *(p + 3);
+}

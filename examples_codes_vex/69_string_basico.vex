@@ -1,0 +1,45 @@
+// Test integral del tipo string + builtins.
+//
+// Cubre:
+//   - Lazy promotion de literal: string s = "hola"
+//   - str_length: code points
+//   - str_bytes:  raw byte count
+//   - str_cstr:   host_ptr al buffer (para print_cstr o FFI)
+//   - str_concat: rope ROPE
+//   - str_equals: comparacion lexicografica
+//   - str_make:   crear desde (ptr, len) raw
+//
+// Resultado esperado: R0 = 42 (todas las validaciones pasan).
+
+i32 main() {
+    string s = "hola";
+    string t = " mundo";
+
+    println("=== test strings ===");
+
+    // length() en code points (4 ASCII = 4).
+    i64 n = str_length(s);
+    print("length: "); print_int(n); print("\n");
+    if (n != 4) return 1;
+
+    // bytes() raw (4 bytes para ASCII puro).
+    i64 b = str_bytes(s);
+    print("bytes:  "); print_int(b); print("\n");
+    if (b != 4) return 2;
+
+    // cstr() host pointer + print_cstr.
+    print("cstr:   "); print_cstr(str_cstr(s)); print("\n");
+
+    // concat: "hola" + " mundo" = "hola mundo" (10 bytes).
+    string u = str_concat(s, t);
+    print("concat: "); print_cstr(str_cstr(u)); print("\n");
+    if (str_length(u) != 10) return 3;
+
+    // equals: "hola" == "hola" via str_make recreando el buffer.
+    string s2 = "hola";
+    if (!str_equals(s, s2)) return 4;
+    if (str_equals(s, t)) return 5;
+
+    flush();
+    return 42;
+}

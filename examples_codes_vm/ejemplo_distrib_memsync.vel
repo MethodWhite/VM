@@ -1,0 +1,152 @@
+/*
+ * ejemplo_distrib_memsync.vel
+ *
+ * Demuestra la instruccion MEMSYNC: sincronizar una region de memoria VM
+ * con un nodo remoto usando deteccion de paginas modificadas de 3 niveles:
+ *
+ *   Nivel 1: Adler-32 rapido por pagina (~1 ns/pagina intacta)
+ *   Nivel 2: BLAKE2s-256 fuerte (solo si Adler-32 cambio)
+ *   Nivel 3: transmision solo de las paginas donde BLAKE2s difiere
+ *
+ * Instruccion:
+ *
+ *   MEMSYNC  r_params
+ *       r_params = direccion VM de la estructura MemsyncParams (44 bytes).
+ *       No produce valor de retorno directo; el future_handle dentro de
+ *       MemsyncParams se resuelve de forma asincrona cuando termine.
+ *
+ * Estructura MemsyncParams (layout en VM memory, little-endian):
+ *
+ *   +0  [8 bytes] uint64_t local_addr     dir virtual local del inicio de la region
+ *   +8  [8 bytes] uint64_t len            tamano de la region en bytes
+ *   +16 [4 bytes] uint32_t node_idx       indice del nodo destino en NodeRegistry
+ *   +20 [4 bytes] uint32_t _pad           relleno de alineacion
+ *   +24 [8 bytes] uint64_t remote_addr    dir virtual en el nodo remoto
+ *   +32 [4 bytes] uint32_t future_handle  GcHandle del future a resolver (0=ignorar)
+ *   +36 [4 bytes] uint32_t _pad2          relleno de alineacion
+ *   Total: 40 bytes
+ *
+ * Flujo de la sincronizacion (MEMSYNC_HASH/DIFF/DATA/ACK):
+ *
+ *   Local                                   Remoto
+ *   ------                                  ------
+ *   Calcular hashes (Adler-32+BLAKE2s)
+ *   --> VDP_MEMSYNC_HASH (tabla de hashes)
+ *                                           Comparar hashes con su region local
+ *                                           <-- VDP_MEMSYNC_DIFF (indices de paginas distintas)
+ *   Enviar solo las paginas indicadas
+ *   --> VDP_MEMSYNC_DATA (datos de paginas)
+ *                                           Aplicar los datos recibidos
+ *                                           <-- VDP_MEMSYNC_ACK
+ *   Actualizar baseline local
+ *
+ * PREREQUISITO: igual que rspawn, el nodo con indice 0 debe estar conectado.
+ *
+ * Compilar y ejecutar:
+ *   vesta --build ejemplo_distrib_memsync.vel -o ejemplo_distrib_memsync
+ *   vesta --run   ejemplo_distrib_memsync.velb --stats
+ *
+ * Resultado esperado:
+ *   R0 del proceso principal = GcHandle del future de la sincronizacion.
+ *   Tras AWAIT: R0 = 1 si la sincronizacion se completo con exito.
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+// -----------------------------------------------------------------------
+// Region de datos que queremos sincronizar con el nodo remoto.
+// En un uso real esta region contiene estructuras de datos compartidas.
+// Aqui ponemos un array de 8 KB (2 paginas VM de 4096 bytes cada una).
+// -----------------------------------------------------------------------
+shared_region:
+    // Pagina 0: datos iniciales (numeros 0..255 repetidos)
+    .byte 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+    .byte 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+    // (el resto de las 2 paginas = ceros; el emitter rellena con .zero)
+    .zero 8160    // 8192 - 32 = 8160 bytes de relleno
+end_shared_region:
+
+// -----------------------------------------------------------------------
+// Estructura MemsyncParams (40 bytes, inicialmente cero)
+// Se rellena en tiempo de ejecucion con MOV + MOVC antes del MEMSYNC.
+// -----------------------------------------------------------------------
+sync_params:
+    .zero 40
+end_sync_params:
+
+// -----------------------------------------------------------------------
+// Celda para el GcHandle del future de sincronizacion
+// -----------------------------------------------------------------------
+sync_future_h:
+    .qword 0
+end_sync_future_h:
+
+// -----------------------------------------------------------------------
+// PROCESO PRINCIPAL
+// -----------------------------------------------------------------------
+code:
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // ---- Paso 1: crear un FutureObject para recibir el resultado ----
+    future                                  // R0 = GcHandle del future
+    mov   r11, r0                           // r11 = handle del future
+    mov   r12, @Absolute("all.sync_future_h")
+    movc  [r12], r11                        // guardar el handle
+
+    // ---- Paso 2: rellenar la estructura MemsyncParams ----
+    // r13 = puntero base a sync_params
+    mov   r13, @Absolute("all.sync_params")
+
+    // campo +0: local_addr = direccion de shared_region
+    mov   r14, @Absolute("all.shared_region")
+    movc  [r13], r14                        // sync_params.local_addr = shared_region
+
+    // campo +8: len = 8192 bytes (2 paginas de 4096)
+    mov   r14, 8192
+    mov   r15, r13
+    add   r15, r15, 8                       // r15 = &sync_params.len
+    movc  [r15], r14
+
+    // campo +16: node_idx = 0 (primer nodo en el NodeRegistry)
+    mov   r14, 0
+    mov   r15, r13
+    add   r15, r15, 16
+    movc  [r15], r14                        // sync_params.node_idx = 0  (4 bytes)
+
+    // campo +24: remote_addr = 0x10000 (dir en el nodo remoto donde escribir)
+    mov   r14, 0x10000
+    mov   r15, r13
+    add   r15, r15, 24
+    movc  [r15], r14                        // sync_params.remote_addr = 0x10000
+
+    // campo +32: future_handle = r11 (GcHandle creado en el paso 1)
+    mov   r15, r13
+    add   r15, r15, 32
+    movc  [r15], r11                        // sync_params.future_handle = r11 (4 bytes)
+
+    // ---- Paso 3: lanzar la sincronizacion ----
+    // MEMSYNC r_params -> asincrono; el future se resuelve al terminar
+    memsync r13
+
+    // ---- Paso 4: esperar a que la sincronizacion termine ----
+    mov   r1, r11
+    await r1                                // R0 = 1 si exito, 0 o error-code si fallo
+
+    // En este punto:
+    //   R0 = 1 si la region fue sincronizada correctamente
+    //   Solo las paginas que cambiaron desde el ultimo memsync fueron transmitidas
+    hlt
+end_code:

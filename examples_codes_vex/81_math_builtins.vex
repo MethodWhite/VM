@@ -1,0 +1,64 @@
+// Math builtins delegando a stdlib/native/math/vesta_math.dll.
+// Cubre: sqrt, pow, fabs, floor, ceil, round, fmin, fmax, log, log2,
+// log10, sin, cos, tan, abs (i64), imin, imax, clamp.  El lowering los
+// detecta como nombres reservados en try_lower_builtin_call y emite
+// CALLN al simbolo vmath_<name> con los bits IEEE 754 como uint64_t
+// (BITCAST evita FTOI que convertiria el VALOR). 
+i32 main() {
+    f64 a = 16.0;
+    f64 r = sqrt(a);                  // 4.0
+    println("sqrt(16)=${r}");
+    if (r < 3.99 || r > 4.01) return 1;
+
+    f64 p = pow(2.0, 10.0);           // 1024.0
+    println("pow(2,10)=${p}");
+    if (p < 1023.5 || p > 1024.5) return 2;
+
+    f64 fl = floor(3.7);              // 3.0
+    f64 ce = ceil(3.2);               // 4.0
+    f64 ro = round(3.5);              // 4.0
+    println("floor(3.7)=${fl}");
+    println("ceil(3.2)=${ce}");
+    println("round(3.5)=${ro}");
+    if (fl < 2.99 || fl > 3.01) return 3;
+    if (ce < 3.99 || ce > 4.01) return 4;
+    if (ro < 3.99 || ro > 4.01) return 5;
+
+    f64 ab = fabs(-7.5);              // 7.5
+    println("fabs(-7.5)=${ab}");
+    if (ab < 7.49 || ab > 7.51) return 6;
+
+    f64 mx = fmax(2.5, 9.9);          // 9.9
+    f64 mn = fmin(2.5, 9.9);          // 2.5
+    println("fmax=${mx} fmin=${mn}");
+    if (mx < 9.89 || mx > 9.91) return 7;
+    if (mn < 2.49 || mn > 2.51) return 8;
+
+    // sin/cos/tan basico (pi/4 ~ 0.7853)
+    f64 c = cos(0.0);                 // 1.0
+    f64 s = sin(0.0);                 // 0.0
+    println("cos(0)=${c} sin(0)=${s}");
+    if (c < 0.99 || c > 1.01) return 9;
+    if (s < -0.01 || s > 0.01) return 10;
+
+    f64 lg = log(2.71828);            // ~1.0
+    f64 l2 = log2(8.0);               // 3.0
+    f64 l10 = log10(1000.0);          // 3.0
+    println("log(e)=${lg} log2(8)=${l2} log10(1000)=${l10}");
+    if (lg < 0.99 || lg > 1.01) return 11;
+    if (l2 < 2.99 || l2 > 3.01) return 12;
+    if (l10 < 2.99 || l10 > 3.01) return 13;
+
+    // int builtins
+    i64 av = abs(-42);                // 42
+    i64 imx = imax(7, 13);            // 13
+    i64 imn = imin(7, 13);            // 7
+    i64 cl = clamp(20, 5, 10);        // 10
+    println("abs(-42)=${av} imax=${imx} imin=${imn} clamp=${cl}");
+    if (av != 42) return 14;
+    if (imx != 13) return 15;
+    if (imn != 7) return 16;
+    if (cl != 10) return 17;
+
+    return 42;
+}

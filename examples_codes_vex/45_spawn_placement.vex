@@ -1,0 +1,40 @@
+// control de placement de spawn desde Vex.
+//
+// Tres formas de invocar spawn:
+//   spawn { body }            -> Auto: round-robin entre schedulers (default)
+//   spawn here { body }       -> Here: mismo scheduler que el padre (cooperativo)
+//   spawn on(N) { body }      -> Pinned: scheduler N % num_schedulers
+//
+// El test lanza un hijo de cada tipo, recibe un valor de cada uno via msgsend
+// al main (PID 0), y suma las contribuciones.  El resultado debe ser identico
+// con --schedulers 1 y --schedulers 4.
+
+i32 main() {
+    // Hijo 1: Auto -> round-robin.
+    i64 c1 = spawn {
+        msgsend(0, 100);
+    };
+
+    // Hijo 2: Here -> mismo scheduler que el padre.
+    i64 c2 = spawn here {
+        msgsend(0, 200);
+    };
+
+    // Hijo 3: Pinned a sched 0 (siempre valido aunque haya 1 solo scheduler).
+    i64 c3 = spawn on(0) {
+        msgsend(0, 300);
+    };
+
+    // Hijo 4: Pinned a sched 1 (con --schedulers 1 cae a sched 0 via modulo).
+    i64 c4 = spawn on(1) {
+        msgsend(0, 400);
+    };
+
+    i64 total = 0;
+    i64 n = 0;
+    while (n < 4) {
+        total = total + msgrecv();
+        n = n + 1;
+    }
+    return total;  // 100 + 200 + 300 + 400 = 1000 (0x3E8)
+}

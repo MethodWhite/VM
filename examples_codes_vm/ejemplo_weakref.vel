@@ -1,0 +1,114 @@
+/*
+ * ejemplo_weakref.vel
+ *
+ * Demuestra WEAKREF, DEREF_WEAK y FREE_WEAK: referencias debiles al GC.
+ *
+ * Una referencia debil permite observar un objeto GC sin impedir que sea
+ * recolectado.  Si el objeto muere, DEREF_WEAK devuelve 0 (GC_NULL_HANDLE).
+ *
+ * Instrucciones:
+ *
+ *   WEAKREF r_handle         ; R0 = indice opaco de la weak ref
+ *   DEREF_WEAK r_dst, r_idx  ; r_dst = handle si vivo, 0 si recolectado
+ *   FREE_WEAK r_idx          ; liberar la entrada (evitar fuga de tabla)
+ *
+ * Este ejemplo muestra dos escenarios:
+ *
+ *   Escenario A: el objeto sigue referenciado (handle en r11).
+ *     DEREF_WEAK debe devolver el handle original (distinto de 0).
+ *
+ *   Escenario B: la unica referencia fuerte al objeto se descarta (r11 = 0).
+ *     Despues de que el GC corra, DEREF_WEAK devolveria 0.
+ *     En este ejemplo no forzamos un GC; ilustramos el patron de comprobacion.
+ *
+ * NOTA: VestaVM no expone una instruccion de GC manual en bytecode.
+ * La anulacion de la weak ref ocurre automaticamente durante el major GC.
+ * En este ejemplo se puede observar el comportamiento registrando la
+ * referencia y llamando a la funcion de GC via FFI si esta disponible.
+ *
+ * Compilar y ejecutar:
+ *   vesta --build ejemplo_weakref.vel -o ejemplo_weakref
+ *   vesta --run   ejemplo_weakref.velb --stats
+ *
+ * Resultado esperado:
+ *   R0 != 0  (el objeto sigue vivo: DEREF_WEAK devuelve el handle)
+ *   R2  = 0  (la weak ref fue liberada con FREE_WEAK)
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+// -----------------------------------------------------------------------
+// Punto de entrada
+// -----------------------------------------------------------------------
+code:
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // ----------------------------------------------------------------
+    // 1. Crear un objeto GC (tamanyo minimo: solo ObjectHeader = 24 bytes)
+    //    Usar ALLOC si esta disponible; aqui se simula con newobj de clase nula.
+    //    En la practica el GcHandle se obtiene de NEWOBJ o FUTURE.
+    //
+    // Para que el ejemplo sea ejecutable en modo raw, creamos un FutureObject
+    // como objeto GC de prueba (FUTURE aloca 24+ bytes en el GC heap).
+    // ----------------------------------------------------------------
+    future                      // R0 = GcHandle de un FutureObject (objeto GC real)
+    mov   r11, r0               // r11 = referencia FUERTE al objeto
+
+    // ----------------------------------------------------------------
+    // 2. Registrar una referencia debil al objeto
+    // ----------------------------------------------------------------
+    weakref r11                 // R0 = indice opaco de la weak ref
+    mov   r10, r0               // r10 = indice opaco (guardar para usar despues)
+
+    // ----------------------------------------------------------------
+    // 3. Escenario A: el objeto sigue vivo (r11 != 0 es la ref fuerte)
+    // ----------------------------------------------------------------
+    deref_weak r5, r10          // r5 = handle del objeto si sigue vivo
+
+    // Comprobar que la weak ref devuelve el handle original
+    cmpu  r5, 0
+    jmp.je objeto_muerto_a      // no deberia saltar aqui
+
+    // El objeto esta vivo: r5 == r11
+    mov   r0, r5                // R0 = handle (resultado del escenario A)
+    jmp   continuar_a
+
+objeto_muerto_a:
+    mov   r0, 0                 // inesperado: el objeto murio prematuramente
+
+continuar_a:
+    // ----------------------------------------------------------------
+    // 4. Escenario B (ilustrativo): descartar la referencia fuerte
+    //    En produccion, si r11 es la unica raiz, el major GC recolectara
+    //    el objeto y la proxima llamada a DEREF_WEAK devolvera 0.
+    // ----------------------------------------------------------------
+    mov   r11, 0                // ya no tenemos referencia fuerte al objeto
+    // (aqui podria ejecutarse el major GC y anular la weak ref)
+
+    // Consultar de nuevo (antes de que el GC haya corrido puede seguir vivo)
+    deref_weak r6, r10          // r6 = handle o 0
+
+    // ----------------------------------------------------------------
+    // 5. Liberar la entrada de la tabla cuando ya no se necesite
+    // ----------------------------------------------------------------
+    free_weak r10               // liberar slot; no-op si ya esta libre
+
+    // Verificar que FREE_WEAK es seguro de llamar dos veces (no-op)
+    free_weak r10               // segunda llamada: debe ser silenciosa
+
+    // R0 contiene el handle del escenario A (objeto vivo en ese momento)
+    hlt
+end_code:

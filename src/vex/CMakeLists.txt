@@ -1,0 +1,39 @@
+# ============================================================================
+# vex_lib: frontend del lenguaje Vex (lexer, parser, type checker, lowering,
+# facade del compilador).  Diseno aislado segun la decision arquitectonica
+# del roadmap: el frontend es una libreria estatica separada que prefigura
+# la futura libvesta_rt y permite reutilizarla desde tests, herramientas
+# externas o un futuro servicio LSP sin arrastrar todo el binario `vm`.
+#
+# Dependencias internas:
+#  - Ninguna sobre vm/vmcore: el frontend solo conoce ir::IrModule
+#    (definido en include/ir/), y consume cabeceras de vex/.  El IR se
+#    enlaza desde el ejecutable principal porque sus .cpp se incluyen
+#    en el GLOB principal de src/.
+#
+# Dependencias externas:
+#  - Ninguna mas alla de la stdlib de C++17.
+# ============================================================================
+
+add_library(vex_lib STATIC
+    lexer.cpp
+    ast.cpp
+    parser.cpp
+    type_checker.cpp
+    lowering.cpp
+    compiler.cpp
+)
+
+# La libreria expone sus headers desde include/vex/; PUBLIC para que los
+# consumidores (vm, tests) los hereden automaticamente al linkear.
+target_include_directories(vex_lib PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# C++17 minimo (consistente con el resto del proyecto).
+target_compile_features(vex_lib PUBLIC cxx_std_17)
+
+# Avisos estrictos en builds nuestros para mantener la regla de "no warnings".
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(vex_lib PRIVATE -Wall -Wextra -Wpedantic)
+endif()

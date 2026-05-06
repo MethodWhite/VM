@@ -1,0 +1,196 @@
+/*
+ * ejemplo_monitor.vel
+ *
+ * Demuestra MONENTER, MONEXIT, MONWAIT, MONNOTI y MONNOTA:
+ * monitores reentrantes sobre objetos GC de VestaVM.
+ *
+ * Un monitor es un mecanismo de exclusion mutua (mutex) integrado en cada
+ * objeto GC.  Solo un proceso puede poseer el monitor de un objeto a la vez.
+ * El mismo proceso puede adquirirlo varias veces (lock reentrante).
+ *
+ * Instrucciones:
+ *
+ *   MONENTER r_handle
+ *     Si el monitor esta libre o ya lo posee este proceso: lo adquiere e
+ *     incrementa lock_depth en ObjectHeader.
+ *     Si lo posee otro proceso: el proceso actual se bloquea y se pondra en
+ *     la cola de espera hasta que MONEXIT lo despierte.
+ *
+ *   MONEXIT r_handle
+ *     Decrementa lock_depth.  Cuando llega a 0 el monitor queda libre y se
+ *     despierta al siguiente proceso de la cola de espera.
+ *
+ *   MONWAIT r_handle
+ *     Libera completamente el monitor (lock_depth -> 0) y suspende el proceso
+ *     en la cola de espera condicional del objeto.  El proceso debe volver a
+ *     llamar MONENTER tras ser despertado por MONNOTI/MONNOTA.
+ *
+ *   MONNOTI r_handle
+ *     Despierta exactamente un proceso de la cola de espera condicional.
+ *
+ *   MONNOTA r_handle
+ *     Despierta todos los procesos de la cola de espera condicional.
+ *
+ * Layout de ObjectHeader (24 bytes, ABI v2):
+ *   +0  class_ptr  (8B)  -- puntero a ClassInfo
+ *   +8  flags      (4B)  -- OBJ_FLAG_*
+ *   +12 hash_code  (4B)  -- identidad del objeto
+ *   +16 owner_pid  (4B)  -- local_pid del proceso propietario del monitor (0=libre)
+ *   +20 lock_depth (2B)  -- contador de locks reentrantes
+ *   +22 _mon_pad   (2B)  -- relleno de alineacion
+ *
+ * Patron basico de uso (seccion critica):
+ *
+ *   monenter r_obj          ; adquirir el monitor
+ *   ; --- seccion critica ---
+ *   monexit  r_obj          ; liberar el monitor
+ *
+ * Patron productor-consumidor con monwait/monnoti:
+ *
+ *   ; Consumidor:
+ *   monenter r_obj
+ *   monwait  r_obj          ; libera el monitor y espera notificacion
+ *   ; al despertar, el monitor ya NO se posee; llamar monenter de nuevo
+ *   monenter r_obj          ; readquirir
+ *   ; leer dato
+ *   monexit  r_obj
+ *
+ *   ; Productor:
+ *   monenter r_obj
+ *   ; escribir dato
+ *   monnoti  r_obj          ; despertar un consumidor
+ *   monexit  r_obj
+ *
+ * Este ejemplo ejecuta:
+ *
+ *   Escenario 1: lock simple (monenter + monexit).
+ *   Escenario 2: lock reentrante (monenter dos veces, monexit dos veces).
+ *   Escenario 3: monwait + monnoti (requiere un segundo proceso para despertar).
+ *
+ * Resultado esperado al llegar a hlt:
+ *   R0 = 3   (los tres escenarios superados)
+ *
+ * Compilar y ejecutar:
+ *   vesta --build ejemplo_monitor.vel -o ejemplo_monitor
+ *   vesta --run   ejemplo_monitor.velb --stats
+ *
+ * NOTA SOBRE MODO RAW:
+ *   MONENTER/MONEXIT pueden usarse directamente sobre cualquier GcHandle valido.
+ *   Aqui se usa FUTURE como objeto GC de prueba porque es la forma mas sencilla
+ *   de obtener un GcHandle en modo raw (sin loader OOP completo).
+ *   En una aplicacion real, el GcHandle vendria de NEWOBJ o GCALLOC.
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+// -----------------------------------------------------------------------
+// Punto de entrada
+// -----------------------------------------------------------------------
+code:
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // r15 = contador de escenarios superados (debe llegar a 3)
+    mov r15, 0
+
+    // ----------------------------------------------------------------
+    // Obtener un objeto GC con ObjectHeader valido.
+    // FUTURE aloca un FutureObject (con ObjectHeader) y devuelve
+    // su GcHandle en R0.  El monitor del objeto comienza libre
+    // (owner_pid = 0, lock_depth = 0).
+    // ----------------------------------------------------------------
+    future                      // R0 = GcHandle del objeto
+    mov r11, r0                 // r11 = GcHandle (preservar en toda la prueba)
+
+    // ================================================================
+    // ESCENARIO 1: lock simple
+    //   monenter -> seccion critica -> monexit
+    //   Tras monexit el monitor debe quedar libre (owner_pid = 0).
+    // ================================================================
+    monenter r11                // adquirir el monitor (lock_depth = 1)
+
+    // --- seccion critica: trabajo protegido ---
+    mov r0, 42                  // simula lectura/escritura de dato compartido
+
+    monexit  r11                // liberar el monitor (lock_depth = 0)
+
+    // escenario 1 superado
+    addu r15, 1                 // r15 = 1
+
+    // ================================================================
+    // ESCENARIO 2: lock reentrante
+    //   El mismo proceso puede llamar monenter varias veces.
+    //   Cada monenter incrementa lock_depth.
+    //   Se necesita el mismo numero de monexit para liberar.
+    // ================================================================
+    monenter r11                // primera adquisicion  (lock_depth = 1)
+    monenter r11                // reentrada            (lock_depth = 2)
+    monenter r11                // reentrada adicional  (lock_depth = 3)
+
+    // aun dentro del monitor con lock_depth = 3
+    mov r0, 99                  // trabajo protegido
+
+    monexit r11                 // lock_depth = 2
+    monexit r11                 // lock_depth = 1
+    monexit r11                 // lock_depth = 0, monitor libre
+
+    // escenario 2 superado
+    addu r15, 1                 // r15 = 2
+
+    // ================================================================
+    // ESCENARIO 3: monwait + monnoti usando dos procesos
+    //
+    // El patron completo necesita dos procesos concurrentes.
+    // Aqui se muestra la estructura sin ejecutar el camino bloqueante
+    // para que el ejemplo sea autocontenido (sin spawn).
+    //
+    // En produccion:
+    //
+    //   Proceso A (consumidor):
+    //     monenter r_obj
+    //     monwait  r_obj      ; libera el monitor y duerme
+    //     ; ... despertado por proceso B ...
+    //     monenter r_obj      ; readquirir tras despertar
+    //     monexit  r_obj
+    //
+    //   Proceso B (productor):
+    //     monenter r_obj
+    //     ; producir dato
+    //     monnoti  r_obj      ; despertar al consumidor
+    //     monexit  r_obj
+    //
+    // En este ejemplo se llama monnoti sin nadie en la cola de espera
+    // (es un no-op seguro) para probar que la instruccion no falla.
+    // ================================================================
+    monenter r11                // adquirir monitor
+    monnoti  r11                // no hay nadie esperando: no-op seguro
+    monexit  r11                // liberar
+
+    // escenario 3 superado
+    addu r15, 1                 // r15 = 3
+
+    // ================================================================
+    // ESCENARIO EXTRA: monnota
+    //   Igual que monnoti pero despierta a TODOS los procesos en cola.
+    //   Sin procesos en cola es tambien un no-op seguro.
+    // ================================================================
+    monenter r11
+    monnota  r11                // despertar todos (cola vacia: no-op)
+    monexit  r11
+
+    // R15 = 3 significa exito de los 3 escenarios principales
+    mov r0, r15
+    hlt
+end_code:

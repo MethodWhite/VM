@@ -1,0 +1,73 @@
+// =============================================================================
+// test_loadext.vex - smoke no-interactivo: cargar extension + reflexion
+// =============================================================================
+//
+// Demuestra el modelo de "plugins en runtime" que usaria el editor real.
+// podemos hacer el ciclo entero:
+//
+//   1. loadmodule(path) carga un .velb y registra sus clases.
+//   2. forName("ExtLineNo") la localiza por nombre.
+//   3. newInstance(cls) construye una instancia (sin ctor con args).
+//   4. getMethod(cls, "hello") obtiene el MethodInfo*.
+//   5. invoke(method, this) -> llamada dinamica.
+//
+// Esperado: R0 = 42 si todo el ciclo se ejecuta correctamente.
+//   - 10 puntos por loadmodule devolver != 0
+//   - 10 puntos por la clase ExtLineNo registrada
+//   - 10 puntos por hello() devolver 1234 via invoke()
+//   - 12 puntos por getField("magic") encontrar el campo
+
+i32 main() {
+    println("test_loadext: cargando ext_lineno.velb...");
+    flush();
+    i64 ret = loadmodule("ext_lineno.velb");
+    println("test_loadext: loadmodule OK, ret=0x${ret}");
+    flush();
+
+    // Verificar que la clase ExtLineNo esta registrada via reflexion.
+    i64 cls = forName("ExtLineNo");
+    if (cls == 0) {
+        println("test_loadext: FAIL - ExtLineNo no encontrada");
+        return 1;
+    }
+    println("test_loadext: ExtLineNo registrada en ClassRegistry");
+    flush();
+
+    // getField devuelve el FieldInfo* del campo `magic` (o 0 si no existe).
+    i64 fld = getField(cls, "magic");
+    if (fld == 0) {
+        println("test_loadext: FAIL - field 'magic' no encontrado");
+        return 2;
+    }
+    println("test_loadext: field 'magic' encontrado");
+    flush();
+
+    // A.34: ciclo completo de reflexion -- crear instancia + llamar hello().
+    i64 obj = newInstance(cls);
+    if (obj == 0) {
+        println("test_loadext: FAIL - newInstance devolvio 0");
+        return 3;
+    }
+    println("test_loadext: instancia creada");
+    flush();
+
+    i64 m_hello = getMethod(cls, "hello");
+    if (m_hello == 0) {
+        println("test_loadext: FAIL - getMethod('hello') no encontrado");
+        return 4;
+    }
+    println("test_loadext: getMethod('hello') OK");
+    flush();
+
+    i64 r = invoke(m_hello, obj);
+    println("test_loadext: hello() devolvio ${r}");
+    flush();
+
+    i32 acc = 0;
+    if (ret != 0)      { acc = acc + 10; }
+    if (cls != 0)      { acc = acc + 10; }
+    if (fld != 0)      { acc = acc + 12; }
+    if (r == 1234)     { acc = acc + 10; }
+    println("test_loadext: acc=${acc}");
+    return acc;   // 10 + 10 + 12 + 10 = 42
+}

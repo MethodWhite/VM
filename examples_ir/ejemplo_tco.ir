@@ -1,0 +1,140 @@
+/**
+ * ejemplo_tco.ir
+ * Tail Call Optimization (TCO): call + ret -> tailcall
+ *
+ * Conceptos demostrados:
+ *   - El pase ir_pass_tailcall detecta el patron:
+ *       %r = call.T @f(args...)
+ *       ret.T %r
+ *     y lo convierte en:
+ *       tailcall @f(args...)
+ *   - El mismo pase maneja llamadas void:
+ *       call.void @g(args...)
+ *       ret.void
+ *     -> tailcall @g(args...)
+ *   - El pase NO convierte una llamada si el resultado se usa antes de retornar:
+ *       %r = call.i64 @f(x)
+ *       %r2 = add.i64 %r, 1    <- uso intermedio
+ *       ret.i64 %r2
+ *   - TCO se activa automaticamente en O2 y superiores (ir_optimize O2+).
+ *   - Los ejemplos que siguen muestran el codigo ANTES del pase;
+ *     con --ir-opt 2 o superior, el emitter genera tailcall en lugar de call+ret.
+ *
+ * Ventajas:
+ *   - Elimina la creacion de un nuevo marco de pila (enter/leave).
+ *   - Hace posible la recursion mutua y la recursion de cola sin desbordamiento.
+ *   - Se combina con constant folding y DCE para maximizar la reduccion.
+ *
+ * Compilar sin TCO (O0):
+ *   vm --ir-file examples_ir/ejemplo_tco.ir --ir-opt 0 --ir-emit-only
+ *
+ * Compilar con TCO (O2):
+ *   vm --ir-file examples_ir/ejemplo_tco.ir --ir-opt 2 --ir-emit-only
+ */
+
+@module ejemplo_tco
+
+// Funcion identidad auxiliar para demostrar TCO intermodular
+@function identidad(n: i64) -> i64 {
+entry:
+    ret.i64 n
+}
+
+// Caso 1: tail call directa — call.i64 @identidad + ret.i64 %r -> tailcall
+@function llamada_cola_simple(n: i64) -> i64 {
+entry:
+    // Con O2 esto se convierte en: tailcall @identidad(n)
+    r = call.i64 @identidad(n)
+    ret.i64 r
+}
+
+// Caso 2: recursion de cola — fact_acc(n, acc) sin acumular marcos
+@function fact_acc(n: i64, acc: i64) -> i64 {
+entry:
+    one    = const.i64 1
+    base   = cmp.le.i64 n, one
+    br.cond base, ret_acc, recurse
+
+ret_acc:
+    ret.i64 acc                  // caso base: retornar acumulador
+
+recurse:
+    new_acc = mul.i64 acc, n     // acc * n
+    n_dec   = sub.i64 n, one     // n - 1
+    // Con O2 esto se convierte en: tailcall @fact_acc(n_dec, new_acc)
+    r = call.i64 @fact_acc(n_dec, new_acc)
+    ret.i64 r
+}
+
+// Punto de entrada publico: fact(n) = fact_acc(n, 1)
+@function fact(n: i64) -> i64 {
+entry:
+    one = const.i64 1
+    r   = call.i64 @fact_acc(n, one)
+    ret.i64 r
+}
+
+// Caso 3: recursion mutua de cola
+// even(n): n==0 ? true : odd(n-1)
+// odd(n) : n==0 ? false : even(n-1)
+@function odd(n: i64) -> bool
+
+@function even(n: i64) -> bool {
+entry:
+    zero   = const.i64 0
+    one    = const.i64 1
+    is_zero = cmp.eq.i64 n, zero
+    br.cond is_zero, ret_true, step_even
+
+ret_true:
+    one_b = const.bool 1
+    ret.bool one_b
+
+step_even:
+    n1 = sub.i64 n, one
+    r  = call.bool @odd(n1)       // Con O2: tailcall @odd(n1)
+    ret.bool r
+}
+
+@function odd(n: i64) -> bool {
+entry:
+    zero   = const.i64 0
+    one    = const.i64 1
+    is_zero = cmp.eq.i64 n, zero
+    br.cond is_zero, ret_false, step_odd
+
+ret_false:
+    zero_b = const.bool 0
+    ret.bool zero_b
+
+step_odd:
+    n1 = sub.i64 n, one
+    r  = call.bool @even(n1)      // Con O2: tailcall @even(n1)
+    ret.bool r
+}
+
+// Caso 4: call void en posicion de cola
+@function proc_void(arr: i64) -> void
+
+@function proceso_doble(arr: i64) -> void {
+entry:
+    // primera llamada: NO es tail (hay trabajo despues)
+    call.void @proc_void(arr)
+    // segunda llamada: SI es tail -> con O2 se convierte en tailcall
+    call.void @proc_void(arr)
+    ret.void
+}
+
+@function proc_void(arr: i64) -> void {
+entry:
+    ret.void
+}
+
+// Caso 5: NO convertible — el resultado del call se usa antes de ret
+@function no_tco(n: i64) -> i64 {
+entry:
+    one = const.i64 1
+    r   = call.i64 @identidad(n)
+    r2  = add.i64 r, one     // uso del resultado antes de ret: no es tail
+    ret.i64 r2
+}

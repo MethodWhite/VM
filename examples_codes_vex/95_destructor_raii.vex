@@ -1,0 +1,73 @@
+// examples_codes_vex/95_destructor_raii.vex
+//
+// Destructores `~Class()` automaticos via RAII (auto-call al exit
+// del scope para instancias locales que NO escapan).  Mismo mecanismo que
+// el auto-free de colecciones: cleanup_stack_ + emit_cleanups_all en RET.
+//
+// Patron clasico de RAII para liberar recursos: file handles, mutexes,
+// allocaciones manuales, etc.  Aqui simulamos via un counter global.
+//
+// Esperado: R00 == 42.
+
+// Counter global (static field) para contar destructores ejecutados.
+class DtorCounter {
+    public static i32 count = 0;
+}
+
+// Clase con destructor.  El destructor incrementa el counter para que el
+// test pueda observar cuantas veces fue llamado.
+class Resource {
+    public i32 value;
+
+    public Resource(i32 v) {
+        this.value = v;
+    }
+
+    public ~Resource() {
+        DtorCounter.count = DtorCounter.count + 1;
+    }
+}
+
+// Funcion que crea 3 Resource locales, todos no-escape.  Al exit:
+//   3 destructores deben dispararse (LIFO: r3, r2, r1).
+void use_resources() {
+    Resource r1 = new Resource(10);
+    Resource r2 = new Resource(20);
+    Resource r3 = new Resource(30);
+    // r1, r2, r3 viven aqui sin escapar.  Al return implicito de
+    // use_resources(), el cleanup_stack_ emite ~Resource para cada uno.
+}
+
+// Esta funcion retorna su Resource (ESCAPA): el destructor NO debe
+// llamarse aqui (caller toma posesion).
+Resource make_escaping() {
+    Resource r = new Resource(99);
+    return r;
+}
+
+i32 main() {
+    DtorCounter.count = 0;
+
+    // Caso 1: 3 destructores deben ejecutarse.
+    use_resources();
+    i32 c1 = DtorCounter.count;   // esperado: 3
+
+    // Caso 2: la instancia escapa.  Despues de make_escaping, el handle
+    // sigue vivo en `kept`; sin destructor en make_escaping.
+    DtorCounter.count = 0;
+    Resource kept = make_escaping();
+    i32 c2 = DtorCounter.count;   // esperado: 0 (no escape, no dtor todavia)
+
+    // Validaciones sumandas hacia 42:
+    //   c1 == 3        -> +20
+    //   c2 == 0        -> +12
+    //   kept.value=99  -> +10
+    i32 acc = 0;
+    if (c1 == 3)            { acc = acc + 20; }
+    if (c2 == 0)            { acc = acc + 12; }
+    if (kept.value == 99)   { acc = acc + 10; }
+    return acc;
+
+    // Al exit de main, kept tambien tiene auto-destructor.
+    // (No verificable desde aqui sin output, solo evitamos leak.)
+}

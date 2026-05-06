@@ -1,0 +1,117 @@
+/*
+ * ejemplo_nullable.vel
+ *
+ * Demuestra las instrucciones ISNULL y UNWRAP para el manejo seguro de
+ * valores nulos (nullable) en VestaVM.
+ *
+ *   ISNULL r_dst, r_src
+ *     Comprueba si r_src es cero (nulo) sin lanzar ninguna excepcion.
+ *     r_dst = 1 si r_src == 0, r_dst = 0 si r_src != 0.
+ *     Nunca modifica los flags de la VM.
+ *
+ *   UNWRAP r_dst, r_src
+ *     Desenvuelve un valor nullable:
+ *       - Si r_src != 0: r_dst = r_src (exito, valor no nulo).
+ *       - Si r_src == 0: lanza NullPointerException (el proceso pasa a DEAD).
+ *
+ * Patron tipico de uso:
+ *
+ *   ; Obtener un puntero que podria ser nulo (p.ej. resultado de alloc/gcalloc)
+ *   gcalloc r1         ; r0 = GcHandle (puede ser GC_NULL_HANDLE si falla)
+ *   mov r5, r0
+ *
+ *   ; Opcion A: comprobar y ramificar
+ *   isnull r6, r5      ; r6 = 1 si r5 es nulo
+ *   jmp.jne es_nulo
+ *   ; usar r5 de forma segura aqui
+ *
+ *   ; Opcion B: desenvolver o lanzar excepcion
+ *   unwrap r7, r5      ; r7 = r5 si no es nulo; proceso muere si es nulo
+ *   ; usar r7 de forma segura aqui
+ *
+ * Registros usados en este ejemplo:
+ *   r0  : valor a comprobar (0 = nulo, N = no nulo)
+ *   r1  : resultado de isnull (1 si nulo, 0 si no nulo)
+ *   r2  : resultado de unwrap exitoso (mismo valor que r0 si no es nulo)
+ *   r10 : contador de comprobaciones PASS
+ *
+ * Resultado esperado al llegar a hlt:
+ *   r10 == 3   (tres comprobaciones superadas: isnull con 0, isnull con N, unwrap con N)
+ *
+ * Compilar y ejecutar:
+ *   vesta --build ejemplo_nullable.vel -o ejemplo_nullable
+ *   vesta --run   ejemplo_nullable.velb --stats
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+code:
+    mov r10, 0          // contador de comprobaciones PASS
+
+    // ---------------------------------------------------------------
+    // Prueba 1: ISNULL con valor nulo (r0 = 0)
+    //   Se espera: r1 = 1
+    // ---------------------------------------------------------------
+    mov r0, 0
+    isnull r1, r0       // r1 = (r0 == 0) ? 1 : 0
+    mov r3, 1
+    cmpu r1, r3
+    jmp.jne fallo       // si r1 != 1, algo salio mal
+    addu r10, 1         // PASS: r10 = 1
+
+    // ---------------------------------------------------------------
+    // Prueba 2: ISNULL con valor no nulo (r0 = 99)
+    //   Se espera: r1 = 0
+    // ---------------------------------------------------------------
+    mov r0, 99
+    isnull r1, r0       // r1 = (r0 == 0) ? 1 : 0
+    mov r3, 0
+    cmpu r1, r3
+    jmp.jne fallo       // si r1 != 0, algo salio mal
+    addu r10, 1         // PASS: r10 = 2
+
+    // ---------------------------------------------------------------
+    // Prueba 3: UNWRAP con valor no nulo (r0 = 42)
+    //   Se espera: r2 = 42, sin excepcion
+    // ---------------------------------------------------------------
+    mov r0, 42
+    unwrap r2, r0       // r2 = r0 porque r0 != 0; si fuera 0 el proceso muere
+    mov r3, 42
+    cmpu r2, r3
+    jmp.jne fallo       // si r2 != 42, algo salio mal
+    addu r10, 1         // PASS: r10 = 3
+
+    // ---------------------------------------------------------------
+    // Todas las comprobaciones superadas
+    // ---------------------------------------------------------------
+    hlt
+
+fallo:
+    // Una comprobacion fallo; r10 tiene el ultimo valor correcto antes del fallo
+    hlt
+end_code:
+
+// -----------------------------------------------------------------------
+// Nota sobre UNWRAP con valor nulo:
+//
+// Si ejecutaras:
+//   mov r0, 0
+//   unwrap r2, r0     <- el proceso pasa a estado DEAD aqui
+//
+// El proceso no llega a la instruccion siguiente.  El scheduler registra
+// err_thread = THREAD_NULL_POINTER y el estado del proceso pasa a DEAD.
+// Para manejar el caso nulo de forma controlada, usa ISNULL + ramificacion
+// antes de llamar a UNWRAP.
+// -----------------------------------------------------------------------

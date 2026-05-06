@@ -1,0 +1,72 @@
+/**
+ * ejemplo_opt_demo.ir
+ * Demostracion de los pases de optimizacion O0-O3.
+ *
+ * Este fichero contiene intencionalmente:
+ *   - Codigo muerto (DCE lo elimina en O1)
+ *   - Constantes plegables: x + 0 = x  (const folding O2)
+ *   - Subexpresiones comunes repetidas: x*2 calculado dos veces (CSE O3)
+ *   - Un bloque inalcanzable (unreachable block elimination O2)
+ *
+ * Comparar la salida .vel con distintos niveles:
+ *   vm --ir-file ... --ir-opt 0 --ir-emit-only   // sin optimizacion: todo el codigo
+ *   vm --ir-file ... --ir-opt 1 --ir-emit-only   // DCE + copy propagation
+ *   vm --ir-file ... --ir-opt 2 --ir-emit-only   // + plegado de constantes
+ *   vm --ir-file ... --ir-opt 3 --ir-emit-only   // + CSE: x*2 calculado una vez
+ */
+
+@module opt_demo
+
+/**
+ * Funcion con codigo muerto, constante plegable y subexpresion comun:
+ *
+ *   dead  = a * b         <-- nadie usa este valor (DCE lo elimina en O1)
+ *   suma  = a + b
+ *   suma2 = suma + 0      <-- suma + 0 = suma (const folding + copy_prop en O2)
+ *   x2_a  = x * 2
+ *   x2_b  = x * 2         <-- igual que x2_a (CSE lo elimina en O3)
+ *   return suma2 + x2_a + x2_b
+ */
+@function demo_opt(a: i64, b: i64, x: i64) -> i64 {
+entry:
+    // Instruccion muerta: resultado nunca usado
+    dead     = mul.i64 a, b
+
+    // Plegado de constante: suma + 0 es igual a suma
+    zero     = const.i64 0
+    suma     = add.i64 a, b
+    suma2    = add.i64 suma, zero   // O2: copy_prop elimina esta instruccion
+
+    // CSE: x*2 se calcula dos veces con exactamente los mismos operandos.
+    // O3 detecta la subexpresion comun y reutiliza el resultado.
+    dos      = const.i64 2
+    x2_a     = mul.i64 x, dos
+    x2_b     = mul.i64 x, dos      // O3: sustituido por mov x2_b, x2_a
+
+    // Combinar resultados
+    tmp      = add.i64 suma2, x2_a
+    result   = add.i64 tmp, x2_b
+    ret.i64  result
+}
+
+/**
+ * Funcion con bloque inalcanzable.
+ * dead_block nunca se alcanza porque entry salta directamente a done.
+ * O2 elimina dead_block y la instruccion unused que contiene.
+ */
+@function with_unreachable(n: i64) -> i64 {
+entry:
+    one     = const.i64 1
+    br      done       // salto incondicional: dead_block es inalcanzable
+
+dead_block:
+    /* Este bloque nunca se ejecuta.
+       O2 (unreachable elimination) lo elimina junto con
+       la instruccion unused = n * n que contiene. */
+    unused  = mul.i64 n, n
+    br      done
+
+done:
+    result  = add.i64 n, one
+    ret.i64 result
+}

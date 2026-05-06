@@ -1,0 +1,59 @@
+/**
+ * ejemplo_bitops.ir
+ * Operaciones bit a bit y desplazamientos sobre i64.
+ *
+ * Conceptos demostrados:
+ *   - Multiples funciones en un mismo modulo
+ *   - Operaciones: and.i64, or.i64, xor.i64, shl.i64, shr.i64
+ *   - Uso de constantes (const.i64) como mascaras e importes
+ *   - Composicion de operaciones (rot16_left: SHL + SHR + OR)
+ *
+ * Funciones:
+ *   low_byte(x)     -> bits 7:0 de x (AND con 0xFF)
+ *   rot16_left(x,n) -> rotacion de los 16 bits bajos de x n posiciones a la izq
+ *   bit_test(x,n)   -> 1 si el bit n de x esta activo, 0 si no
+ *
+ * Compilar:
+ *   vm --ir-file examples_ir/ejemplo_bitops.ir --ir-opt 1 -o build/out_ir/bitops
+ */
+
+@module ejemplo_bitops
+
+/**
+ * Extrae los 8 bits mas bajos de x aplicando una mascara 0xFF.
+ * Equivale a: return (uint8_t)x;
+ */
+@function low_byte(x: i64) -> i64 {
+entry:
+    mask   = const.i64 255          // 0xFF como constante i64
+    result = and.i64 x, mask        // result = x & 0xFF
+    ret.i64 result
+}
+
+/**
+ * Rota los bits de x exactamente n posiciones a la izquierda
+ * dentro de una ventana de 16 bits.
+ * Implementacion: (x << n) | (x >> (16 - n))
+ */
+@function rot16_left(x: i64, n: i64) -> i64 {
+entry:
+    bits16   = const.i64 16
+    lpart    = shl.i64 x, n          // parte izquierda: x desplazado n a la izq
+    rshift   = sub.i64 bits16, n     // complemento: 16 - n
+    rpart    = shr.i64 x, rshift     // parte derecha: x desplazado (16-n) a la der
+    result   = or.i64 lpart, rpart   // combinar ambas mitades
+    ret.i64  result
+}
+
+/**
+ * Comprueba si el bit en la posicion n (0-indexed) de x esta a 1.
+ * Retorna 1 si activo, 0 si no.
+ * Equivale a: return (x >> n) & 1;
+ */
+@function bit_test(x: i64, n: i64) -> i64 {
+entry:
+    shifted  = shr.i64 x, n         // desplazar x n posiciones a la derecha
+    one      = const.i64 1
+    result   = and.i64 shifted, one // aislar el bit de menor peso
+    ret.i64  result
+}

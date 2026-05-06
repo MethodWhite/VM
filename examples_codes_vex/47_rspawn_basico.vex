@@ -1,0 +1,34 @@
+// rspawn basico (spawn distribuido cross-node).
+//
+// Sintaxis:
+//   i64 fut = rspawn(node) { ... return X; };
+//   i64 r = await fut;
+//
+// El body se ejecuta en el nodo remoto identificado por `node` (indice
+// en el NodeRegistry de la VM).  El runtime remoto captura R0 al hacer
+// hlt y envia ese valor al nodo origen via VDP_FUTURE_FULFILL.  El
+// caller obtiene el valor via `await`.
+//
+// MODO LOCAL FALLBACK: si el VM no tiene `dist_runtime->start()`
+// invocado o el node_idx no existe, el bytecode `rspawn` devuelve
+// handle invalido (0xFFFFFFFF) y el caller debera manejarlo.
+//
+// Este test compila y verifica que el .vel resultante contenga la
+// instruccion `rspawn` y el helper `__rspawn_0`.  La ejecucion full
+// distribuida requiere dos VMs con `--dist-port` y `--dist-add-node`,
+// que es un test de integracion separado (manual).
+
+i32 main() {
+    // node 0 = nodo local (en NodeRegistry); en una corrida real con
+    // dos VMs registradas, node 1 seria el otro nodo.
+    i64 fut = rspawn(0) {
+        // computacion remota trivial
+        i32 a = 21;
+        i32 b = 21;
+        return a + b;  // -> mov r0, 42 + hlt; runtime envia R0 via VDP
+    };
+    // En modo no-distribuido fut es 0xFFFFFFFF (handle invalido).
+    // Devolvemos fut como i32 (truncacion implicita) -> R0 = -1.
+    i32 r = fut;
+    return r;
+}

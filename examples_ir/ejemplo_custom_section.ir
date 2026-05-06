@@ -1,0 +1,49 @@
+/**
+ * ejemplo_custom_section.ir
+ * Uso de espacios de direcciones y secciones personalizadas.
+ *
+ * Conceptos demostrados:
+ *   - Directiva @format: elige el formato de salida (velb)
+ *   - Directiva @space: define un espacio de direcciones con nombre,
+ *     direccion inicial y final (en hexadecimal)
+ *   - Directiva @section: asocia una seccion a un espacio de direcciones
+ *     y define su alineacion
+ *   - Las directivas @space y @section son opcionales; si se omiten
+ *     el emisor genera el espacio "anonymous" y la seccion "code" por defecto
+ *
+ * Sintaxis de las directivas en .ir:
+ *
+ *   @format velb
+ *   @space  <nombre> <hex_ini> <hex_end>
+ *   @section <nombre_seccion> <nombre_espacio> <hex_align>
+ *
+ * Este ejemplo coloca el codigo en un espacio de usuario "user_code"
+ * que empieza en 0x0000000000400000 y termina en 0x00000000007FFFFF.
+ * La alineacion de seccion es 0x1000 (4 KiB, tipico de paginas).
+ *
+ * Compilar:
+ *   vm --ir-file examples_ir/ejemplo_custom_section.ir --ir-opt 1 -o build/out_ir/custom_section
+ */
+
+@module ejemplo_custom_section
+
+// Espacio de direcciones de usuario (tipico layout ELF de usuario)
+@format velb
+@space user_code 0x0000000000400000 0x00000000007FFFFF
+
+// Seccion de codigo mapeada al espacio user_code, alineada a 4 KiB
+@section code user_code 0x1000
+
+// Funcion de ejemplo: identidad (retorna x sin modificar)
+@function identity(x: i64) -> i64 {
+entry:
+    ret.i64 x
+}
+
+// Funcion de ejemplo: incremento (retorna x + 1)
+@function inc(x: i64) -> i64 {
+entry:
+    one    = const.i64 1
+    result = add.i64 x, one
+    ret.i64 result
+}

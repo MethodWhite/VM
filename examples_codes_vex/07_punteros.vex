@@ -1,0 +1,39 @@
+// examples_codes_vex/07_punteros.vex
+//
+// Demuestra punteros VIRTUALES (al stack VM) en Vex:
+//   - Tipo `VirtualPtr<T>` (direccion en memoria virtual de la VM).
+//   - `&x` toma direccion de una variable local; el lowering la
+//     promueve a ALLOCA automaticamente y el resultado es VirtualPtr.
+//   - `*p` desreferencia un puntero (LOAD).
+//   - `*p = v` escribe a traves del puntero (STORE).
+//   - Pasar puntero a una funcion como "out parameter".
+//
+// Para punteros HOST (resultado de malloc, str_cstr, FFI a C, fields de
+// objetos GC) se usa el tipo `T*` sin el prefijo VirtualPtr<>.  La
+// aritmetica preserva la naturaleza del puntero base.
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/07_punteros.vex -o ptrs
+//   vm --run ptrs.velb --stats
+//
+// Resultado esperado: R00 == 142  (100 + 42)
+
+void set_to(VirtualPtr<i32> out, i32 v) {
+    *out = v;
+}
+
+i32 read_ptr(VirtualPtr<i32> p) {
+    return *p;
+}
+
+i32 main() {
+    i32 a = 0;
+    i32 b = 0;
+    // Pasamos punteros virtuales (a stack VM) a funciones que escriben
+    // a traves de ellos.
+    set_to(&a, 100);
+    set_to(&b, 42);
+    // Lectura via puntero local.
+    VirtualPtr<i32> pa = &a;
+    return read_ptr(pa) + read_ptr(&b);
+}

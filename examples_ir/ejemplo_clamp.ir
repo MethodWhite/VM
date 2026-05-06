@@ -1,0 +1,44 @@
+/**
+ * ejemplo_clamp.ir
+ * Limitacion de un valor a un rango [lo, hi]: clamp(x, lo, hi) -> i64
+ *
+ * Conceptos demostrados:
+ *   - Anidamiento de condiciones en forma de bloques basicos lineales
+ *   - Patron tipico "min/max" construido con CMP + BR_COND
+ *   - Retorno desde multiples bloques sin phi node (estructura simple)
+ *
+ * Semantica:
+ *   if x < lo: return lo
+ *   if x > hi: return hi
+ *   return x
+ *
+ * A nivel O1 el emisor elimina las copias redundantes.
+ *
+ * Compilar:
+ *   vm --ir-file examples_ir/ejemplo_clamp.ir --ir-opt 1 -o build/out_ir/clamp
+ */
+
+@module ejemplo_clamp
+
+// Limita x al intervalo [lo, hi].
+// Precondicion: lo <= hi.
+@function clamp(x: i64, lo: i64, hi: i64) -> i64 {
+entry:
+    // Primera guarda: x < lo -> retornar lo (cota inferior)
+    too_low  = cmp.lt.i64 x, lo
+    br.cond  too_low, ret_lo, check_hi
+
+ret_lo:
+    ret.i64 lo          // x esta por debajo del minimo
+
+check_hi:
+    // Segunda guarda: x > hi -> retornar hi (cota superior)
+    too_high = cmp.gt.i64 x, hi
+    br.cond  too_high, ret_hi, ret_x
+
+ret_hi:
+    ret.i64 hi          // x esta por encima del maximo
+
+ret_x:
+    ret.i64 x           // x ya esta dentro del rango
+}

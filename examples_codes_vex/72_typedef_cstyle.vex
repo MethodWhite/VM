@@ -1,0 +1,13 @@
+// typedef struct estilo C.
+
+typedef struct {
+    i32 x;
+    i32 y;
+} Point;
+
+i32 main() {
+    Point p;
+    p.x = 10;
+    p.y = 32;
+    return p.x + p.y;   // 42
+}

@@ -1,0 +1,45 @@
+// Optional<T> y Result<V,E> como BUILTINS del compilador.
+//
+// Ambos tipos son nativos del frontend (no clases generadas por
+// monomorphizacion).  Layout:
+//   Optional<T>: 16 bytes en stack
+//                  +0 [i64] flag (0 = none, 1 = some)
+//                  +8 [T]   payload
+//   Result<V,E>: 24 bytes en stack
+//                  +0 [i64] tag (1 = ok, 0 = err)
+//                  +8 [V]   value
+//                  +16 [E]  error
+//
+// Builtins:
+//   Some(x) / None()        -> Optional<typeof(x)>
+//   isPresent(opt) -> i32   (1 si Some, 0 si None)
+//   unwrap(opt)             -> T  (lanza NullPointerException si None)
+//   Ok(v) / Err(e)          -> Result<V, E>
+//   isOk(r) -> i32          (1 si Ok, 0 si Err)
+//   value(r) / error(r)     -> V / E (sin tag check en MVP)
+//
+// Cero alocacion de heap, cero clases nuevas en el bytecode (a
+// diferencia de Box<T> con templates que genera Box_i32, Box_i64...).
+//
+// Test: 50 (Some unwrap) + 7 (Ok value) + 1000 (None / catch) = 1057.
+
+i32 dec_or(Optional<i32> o, i32 def) {
+    if (isPresent(o) == 1) {
+        return unwrap(o);
+    }
+    return def;
+}
+
+i32 main() {
+    Optional<i32> a = Some(50);
+    Optional<i32> b = None();
+    Result<i32, i32> r = Ok(7);
+
+    i32 acc = 0;
+    acc = acc + dec_or(a, 999);   // 50 (a esta presente)
+    acc = acc + dec_or(b, 1000);  // 1000 (b vacio -> default)
+    if (isOk(r) == 1) {
+        acc = acc + value(r);     // 7
+    }
+    return acc;                    // 50 + 1000 + 7 = 1057
+}

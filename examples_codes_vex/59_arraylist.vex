@@ -1,0 +1,101 @@
+// Estructura de datos real: IntArrayList<i32> dinamico.
+//
+// Pone a prueba:
+//   - Punteros raw (i32*) + malloc/free.
+//   - Aritmetica de punteros + indexado p[i].
+//   - Clase con campos puntero, capacidad y longitud.
+//   - Crecimiento dinamico (grow doble) y copia manual de elementos.
+//   - Encapsulacion: solo push, get, len; no expone el buffer raw.
+//
+// Validaciones (R0=42 si todas pasan, codigos 11..19 si falla alguna):
+//   1. push(0..15) -> len()=16, capacidad inicial 4 -> grew 2 veces (8, 16).
+//   2. get(i) devuelve el valor i puesto en orden.
+//   3. sum total preservada tras cada grow.
+//
+// Resultado esperado: R0 = 42
+
+class IntArrayList {
+    public i32* buf;
+    public i32  len;
+    public i32  cap;
+
+    public IntArrayList(i32 initial_cap) {
+        this.cap = initial_cap;
+        this.len = 0;
+        // 4 bytes por i32; malloc devuelve void* asignable a i32*.
+        this.buf = malloc(4 * initial_cap);
+    }
+
+    public void push(i32 v) {
+        if (this.len >= this.cap) {
+            // Grow: nueva capacidad = cap * 2; copiar elementos viejos
+            // al nuevo buffer; liberar el viejo.
+            i32  new_cap = this.cap * 2;
+            i32* new_buf = malloc(4 * new_cap);
+            i32  i = 0;
+            while (i < this.len) {
+                new_buf[i] = this.buf[i];
+                i = i + 1;
+            }
+            free(this.buf);
+            this.buf = new_buf;
+            this.cap = new_cap;
+        }
+        this.buf[this.len] = v;
+        this.len = this.len + 1;
+    }
+
+    public i32 get(i32 i) {
+        return this.buf[i];
+    }
+
+    public i32 length() {
+        return this.len;
+    }
+
+    public i32 capacity() {
+        return this.cap;
+    }
+
+    // Forzamos que el buffer raw no quede colgando (manual destroy):
+    public void destroy() {
+        free(this.buf);
+        this.buf = null;
+    }
+}
+
+i32 main() {
+    IntArrayList list = new IntArrayList(4);
+
+    // Push 16 elementos (0, 1, 2, ..., 15).  Cap empieza en 4 -> grow
+    // a 8 -> grow a 16.
+    i32 i = 0;
+    while (i < 16) {
+        list.push(i);
+        i = i + 1;
+    }
+
+    // Validacion 1: longitud == 16, capacidad >= 16.
+    if (list.length() != 16) return 11;
+    if (list.capacity() < 16) return 12;
+
+    // Validacion 2: orden y valores correctos (get(i) == i).
+    i = 0;
+    while (i < 16) {
+        if (list.get(i) != i) return 13;
+        i = i + 1;
+    }
+
+    // Validacion 3: suma == 0+1+...+15 == 120.
+    i32 sum = 0;
+    i = 0;
+    while (i < 16) {
+        sum = sum + list.get(i);
+        i = i + 1;
+    }
+    if (sum != 120) return 14;
+
+    list.destroy();
+
+    return 42;
+}

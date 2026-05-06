@@ -331,8 +331,28 @@ namespace Assembly::Bytecode {
      * lo que determina como se interpreta el inmediato (int64_t vs uint64_t).
      */
     static const std::unordered_set<std::string> signed_ops = {
-        "adds", "subs", "muls", "divs", "cmps"
+        "adds", "subs", "muls", "divs", "cmps", "mods"
     };
+
+    /**
+     * @brief Mnemonicos cuya variante SIB requiere acceder a memoria HOST en
+     *        lugar de memoria VM.  Reutiliza el bit @c _signed_instruct del
+     *        ctrl byte (bit 5): para MOV SIB, s=1 selecciona MOVH (memoria
+     *        del proceso host) y s=0 selecciona MOVC (memoria VM).
+     *        El emisor SIB consulta is_signed() OR is_host_sib() para
+     *        decidir el bit; al ser conjuntos disjuntos por construccion,
+     *        no hay colision de semanticas.
+     */
+    static const std::unordered_set<std::string> host_sib_ops = {
+        "movh"
+    };
+
+    /**
+     * @brief Indica si el mnemonico corresponde a un MOV SIB sobre memoria host.
+     */
+    static bool is_host_sib(const std::string &opcode) {
+        return host_sib_ops.count(opcode) > 0;
+    }
 
     /**
      * @brief Indica si el mnemonico corresponde a una instruccion con signo.
@@ -576,6 +596,27 @@ namespace Assembly::Bytecode {
     );
 
     /**
+     * @brief Emite instrucciones con tres registros (ej. msgsend r_pid, r_addr, r_len).
+     *
+     * Codificacion FIXED_4 de la forma [op1][op2][b2][b3]:
+     * @code
+     *   b2 = (r1 << 4) | r2
+     *   b3 = (r3 << 4)
+     * @endcode
+     *
+     * @param instruction_parser Instruccion del AST con tres operandos registro.
+     * @param code_final         Escritor de bytecode destino.
+     * @param now_instr          Descriptor de la instruccion.
+     * @param assembly_ctx       Contexto del ensamblador.
+     */
+    void emit_instr_three_reg(
+        const vm::Instruction *instruction_parser,
+        ByteWriter &           code_final,
+        const InstrInfo *      now_instr,
+        Assembler *            assembly_ctx
+    );
+
+    /**
      * @brief Emite instrucciones de lectura/escritura a memoria real via cursor.
      *
      * Cubre: readcur dest_reg, curN  y  writecur curN, src_reg.
@@ -749,6 +790,130 @@ namespace Assembly::Bytecode {
         Assembler *            assembly_ctx
     );
 
+    /**
+     * @brief Emite una instruccion de pila con inmediato (subsp / addsp).
+     *
+     * Operandos: [rsp|rbp], inmediato64.
+     * Byte ctrl: bits 7-6 = modo (siempre 3 = 64 bits), bits 1-0 = sp_bp (0=RSP,1=RBP).
+     * Formato: [0x00][opcode2][ctrl][imm64] = 11 bytes.
+     *
+     * @param instruction_parser Instruccion del AST.
+     * @param code_final         Escritor de bytecode destino.
+     * @param now_instr          Descriptor de la instruccion.
+     * @param assembly_ctx       Contexto del ensamblador.
+     */
+    void emit_instr_spimm(
+        const vm::Instruction *instruction_parser,
+        ByteWriter &           code_final,
+        const InstrInfo *      now_instr,
+        Assembler *            assembly_ctx
+    );
+
+    /**
+     * @brief Emite una instruccion de tabla de saltos (jumptable / typeswitch).
+     *
+     * Operandos: r_val, r_table, count.
+     * Formato: [0x00][opcode2][byte2][byte3] = FIXED_4.
+     *   byte2: bits 7-4 = r_val, bits 3-0 = r_table.
+     *   byte3: count (numero de entradas, uint8).
+     *
+     * @param instruction_parser Instruccion del AST.
+     * @param code_final         Escritor de bytecode destino.
+     * @param now_instr          Descriptor de la instruccion.
+     * @param assembly_ctx       Contexto del ensamblador.
+     */
+    void emit_instr_jumptable(
+        const vm::Instruction *instruction_parser,
+        ByteWriter &           code_final,
+        const InstrInfo *      now_instr,
+        Assembler *            assembly_ctx
+    );
+
+    /**
+     * @brief Emite los operandos de @c addadvice (FIXED_4, convencion B).
+     *
+     * Toma 3 operandos textuales: r_target, r_advice, kind (imm).  Empaqueta
+     * registros en byte2 = (r_advice<<4)|r_target y kind en byte3.  El opcode
+     * prefix (0x00, 0xCE) lo emite el helper estandar antes de invocar este.
+     */
+    void emit_instr_addadvice(
+        const vm::Instruction *instruction_parser,
+        ByteWriter &           code_final,
+        const InstrInfo *      now_instr,
+        Assembler *            assembly_ctx
+    );
+
+    /**
+     * @brief Emite los operandos de @c getstatic / @c setstatic (FIXED_8).
+     *
+     * 3 operandos textuales: dos registros y un offset (uint32).  Empaqueta
+     * los registros en byte2 = (r0<<4)|r1 y emite el offset uint32 en los
+     * 4 bytes finales.  El opcode prefix (0x00, 0x60 o 0x61) lo emite el
+     * helper estandar antes de invocar este emisor.
+     *
+     * Formato fisico:
+     *   [0x00][0x60|0x61][regs_byte][_pad8=0][offset_u32_LE]
+     *
+     * Convencion de operandos:
+     *   getstatic: op0=r_dst,   op1=r_class, op2=offset
+     *   setstatic: op0=r_class, op1=r_value, op2=offset
+     */
+    void emit_instr_static(
+        const vm::Instruction *instruction_parser,
+        ByteWriter &           code_final,
+        const InstrInfo *      now_instr,
+        Assembler *            assembly_ctx
+    );
+
+    /**
+     * @brief Emite los operandos de @c dlopen (FIXED_4, 3 regs).
+     *
+     * Operandos textuales: r_dst, r_path_addr, r_path_len.
+     * Encoding fisico:
+     *   [0x00][0x62][b2][b3]
+     *     b2 = (r_dst<<4) | r_path_addr
+     *     b3 = (r_path_len<<4) | 0
+     */
+    void emit_instr_dlopen(
+        const vm::Instruction *instruction_parser,
+        ByteWriter &           code_final,
+        const InstrInfo *      now_instr,
+        Assembler *            assembly_ctx
+    );
+
+    /**
+     * @brief Emite los operandos de @c dlsym (FIXED_4, 4 regs).
+     *
+     * Operandos textuales: r_dst, r_handle, r_name_addr, r_name_len.
+     * Encoding fisico:
+     *   [0x00][0x63][b2][b3]
+     *     b2 = (r_dst<<4) | r_handle
+     *     b3 = (r_name_addr<<4) | r_name_len
+     */
+    void emit_instr_dlsym(
+        const vm::Instruction *instruction_parser,
+        ByteWriter &           code_final,
+        const InstrInfo *      now_instr,
+        Assembler *            assembly_ctx
+    );
+
+    /**
+     * @brief Emite los operandos de @c callni (FIXED_4, 1 reg).
+     *
+     * Operando textual: r_fn (puntero a funcion nativa ya resuelto via dlsym).
+     * Encoding fisico:
+     *   [0x00][0x64][b2][b3]   b2 = (r_fn<<4) | 0,  b3 = 0
+     *
+     * Calling convention: argc en R15, args en R01..R12, retorno en R00
+     * (mismo que CALLN estatico).
+     */
+    void emit_instr_callni(
+        const vm::Instruction *instruction_parser,
+        ByteWriter &           code_final,
+        const InstrInfo *      now_instr,
+        Assembler *            assembly_ctx
+    );
+
     // -------------------------------------------------------------------------
     // Helpers para registros ZMM (f/xmm/ymm/zmm)
     // -------------------------------------------------------------------------
@@ -903,6 +1068,64 @@ namespace Assembly::Bytecode {
      * @param assembly_ctx       Contexto del ensamblador.
      */
     void emit_instr_fcvt(
+        const vm::Instruction *instruction_parser,
+        ByteWriter &           code_final,
+        const InstrInfo *      now_instr,
+        Assembler *            assembly_ctx
+    );
+
+    /**
+     * @brief Emite instrucciones de string con dos registros (Convention B).
+     *
+     * Formato FIXED_4: [0x00][opcode2][b2][b3=0]
+     *   b2 = (r_dst << 4) | r_src
+     *
+     * Usos: strlen, strflat, strhash, strintern, strgetenc, strgetbytes,
+     *       strgetkind, strreserve, strfinalize, strraw.
+     *
+     * @param instruction_parser Instruccion con dos operandos registro.
+     * @param code_final         Escritor de bytecode.
+     * @param now_instr          Descriptor de la instruccion.
+     * @param assembly_ctx       Contexto del ensamblador.
+     */
+    void emit_str_two_reg(
+        const vm::Instruction *instruction_parser,
+        ByteWriter &           code_final,
+        const InstrInfo *      now_instr,
+        Assembler *            assembly_ctx
+    );
+
+    /**
+     * @brief Emite STRCONV r_dst, r_src, enc_literal (Convention B + inmediato 4 bits).
+     *
+     * Formato FIXED_4: [0x00][0x4A][b2][b3]
+     *   b2 = (r_dst << 4) | r_src
+     *   b3 = (enc_literal << 4)  (nibble alto)
+     *
+     * @param instruction_parser Instruccion con dos registros y un literal numerico.
+     * @param code_final         Escritor de bytecode.
+     * @param now_instr          Descriptor de la instruccion.
+     * @param assembly_ctx       Contexto del ensamblador.
+     */
+    void emit_strconv(
+        const vm::Instruction *instruction_parser,
+        ByteWriter &           code_final,
+        const InstrInfo *      now_instr,
+        Assembler *            assembly_ctx
+    );
+
+    /**
+     * @brief Emite SETCC r_dst, cond_literal (Convention B + inmediato 4 bits).
+     *
+     * Formato FIXED_4: [0x00][0x43][b2][b3=0]
+     *   b2 = (cond_literal << 4) | r_dst
+     *
+     * @param instruction_parser Instruccion con un registro y un literal de condicion.
+     * @param code_final         Escritor de bytecode.
+     * @param now_instr          Descriptor de la instruccion.
+     * @param assembly_ctx       Contexto del ensamblador.
+     */
+    void emit_setcc(
         const vm::Instruction *instruction_parser,
         ByteWriter &           code_final,
         const InstrInfo *      now_instr,

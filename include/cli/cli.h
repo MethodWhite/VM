@@ -195,8 +195,9 @@ namespace cli {
      */
     struct Config {
         std::string history_file  = "vm_history.txt"; ///< Ruta del fichero de historial de comandos
+        std::string aliases_file  = "vm_aliases.txt"; ///< Ruta del fichero de persistencia de aliases
         size_t      history_max   = 2000;              ///< Numero maximo de entradas en el historial
-        std::string prompt        = "vm> ";            ///< Cadena mostrada como prompt del REPL
+        std::string prompt        = "vm> ";            ///< Cadena mostrada como prompt del REPL (legacy; no usado con prompt dinamico)
         std::string multiline_end = ";;";              ///< Terminador de bloque multilinea
     };
 

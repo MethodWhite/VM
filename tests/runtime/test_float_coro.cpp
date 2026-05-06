@@ -479,6 +479,179 @@ static void test_spawn(runtime::ManageVM &mgr) {
 }
 
 /* =========================================================================
+ * Tests de instrucciones nuevas: isnull, unwrap, tailcall, resume, swapctx
+ * ====================================================================== */
+
+/**
+ * @brief Prueba isnull: r1 = (r0 == 0) ? 1 : 0.
+ *
+ * Caso 1: r0 = 0  -> r1 debe ser 1.
+ * Caso 2: r0 = 42 -> r1 debe ser 0.
+ */
+static void test_isnull(runtime::ManageVM &mgr) {
+    /* caso r0 = 0 -> r1 = 1 */
+    {
+        const std::string src = std::string(VEL_HEADER) +
+            "code:\n"
+            "    mov r0, 0\n"
+            "    isnull r1, r0\n"    /* r1 = (r0==0) ? 1 : 0 */
+            "    hlt\n"
+            "end_code:\n";
+
+        auto r = run_vel(mgr, src, "isnull_null");
+        if (!r.ok) return;
+        CHECK(r.proc->registers.regs[1].qword() == 1ULL, "isnull: r0=0  -> r1=1");
+    }
+    /* caso r0 = 42 -> r1 = 0 */
+    {
+        const std::string src = std::string(VEL_HEADER) +
+            "code:\n"
+            "    mov r0, 42\n"
+            "    isnull r1, r0\n"
+            "    hlt\n"
+            "end_code:\n";
+
+        auto r = run_vel(mgr, src, "isnull_nonnull");
+        if (!r.ok) return;
+        CHECK(r.proc->registers.regs[1].qword() == 0ULL, "isnull: r0=42 -> r1=0");
+    }
+}
+
+/**
+ * @brief Prueba unwrap: r1 = r0 si r0 != 0; lanza excepcion si r0 == 0.
+ *
+ * Solo verifica el caso no nulo (r0=77 -> r1=77).
+ * El caso nulo genera EVT_ERROR; el proceso pasa a DEAD (estado esperado).
+ */
+static void test_unwrap(runtime::ManageVM &mgr) {
+    /* caso no nulo: r0=77 -> r1=77 */
+    {
+        const std::string src = std::string(VEL_HEADER) +
+            "code:\n"
+            "    mov r0, 77\n"
+            "    unwrap r1, r0\n"    /* r1 = r0 porque r0 != 0 */
+            "    hlt\n"
+            "end_code:\n";
+
+        auto r = run_vel(mgr, src, "unwrap_ok");
+        if (!r.ok) return;
+        CHECK(r.proc->registers.regs[1].qword() == 77ULL, "unwrap: r0=77 -> r1=77");
+    }
+    /* caso nulo: el proceso debe morir (DEAD) */
+    {
+        const std::string src = std::string(VEL_HEADER) +
+            "code:\n"
+            "    mov r0, 0\n"
+            "    unwrap r1, r0\n"    /* debe lanzar NullPointerException -> DEAD */
+            "    hlt\n"
+            "end_code:\n";
+
+        auto r = run_vel(mgr, src, "unwrap_null");
+        /* ok = true solo si HALT o DEAD; aqui esperamos DEAD */
+        if (r.proc) {
+            CHECK(r.proc->state == runtime::DEAD,
+                  "unwrap: r0=0 -> proceso termina en DEAD (NullPointerException)");
+        }
+    }
+}
+
+/**
+ * @brief Prueba tailcall: llamada en posicion de cola sin crecimiento de pila.
+ *
+ * El programa define una funcion 'target' que pone 42 en r0 y hace hlt.
+ * La funcion 'caller' hace tailcall a 'target'.
+ * Se verifica que r0 = 42 tras la ejecucion.
+ */
+static void test_tailcall(runtime::ManageVM &mgr) {
+    const std::string src = std::string(VEL_HEADER) +
+        "code:\n"
+        "    mov r1, @Absolute(\"all.target\")\n"
+        "    tailcall r1\n"           /* salta a target sin crecer la pila */
+        "    hlt\n"                   /* nunca se alcanza */
+        "end_code:\n"
+        "target:\n"
+        "    mov r0, 42\n"
+        "    hlt\n"
+        "end_target:\n";
+
+    auto r = run_vel(mgr, src, "tailcall");
+    if (!r.ok) return;
+    CHECK(r.proc->registers.regs[0].qword() == 42ULL, "tailcall: r0=42 tras salto en cola");
+}
+
+/**
+ * @brief Prueba resume: reactiva un proceso hijo despues de que haya cedido el quantum.
+ *
+ * El padre spawna un hijo que hace yield y luego hlt.
+ * El padre llama resume con el PID del hijo para asegurarse de que vuelve a READY.
+ * Se verifica que el padre recibio un PID valido en r0.
+ */
+static void test_resume(runtime::ManageVM &mgr) {
+    const std::string src = std::string(VEL_HEADER) +
+        "code:\n"
+        "    mov r1, @Absolute(\"all.child\")\n"
+        "    spawn r1\n"               /* r0 = PID del hijo */
+        "    resume r0\n"              /* reactivar el hijo (idempotente si ya es READY) */
+        "    hlt\n"
+        "end_code:\n"
+        "child:\n"
+        "    yield\n"                  /* ceder el quantum voluntariamente */
+        "    hlt\n"
+        "end_child:\n";
+
+    auto r = run_vel(mgr, src, "resume");
+    if (!r.ok) return;
+    CHECK(r.proc->registers.regs[0].qword() != 0ULL, "resume: padre recibio PID valido en r0");
+}
+
+/**
+ * @brief Prueba swapctx: intercambio de contexto cooperativo entre dos fibras.
+ *
+ * Allocamos dos buffers de 152 bytes en la pila VM.
+ * Rellenamos el buffer 'ctx_b' con un contexto que apunta a la funcion 'fiber_b'.
+ * swapctx guarda el contexto actual en 'ctx_a' y lo restaura desde 'ctx_b'.
+ * La ejecucion continua en 'fiber_b', donde se establece r0=55 y se hace hlt.
+ *
+ * Este test verifica que swapctx salta correctamente a la nueva funcion.
+ */
+static void test_swapctx(runtime::ManageVM &mgr) {
+    /* La VM necesita que el buffer de contexto de destino tenga un PC valido en offset 0.
+     * Usamos alloc para crear los buffers y mov SIB para escribir el PC de fiber_b en ctx_b[0].
+     * movc requiere un nombre de flag; para escritura incondicional usamos mov [base+idx*1], reg. */
+    const std::string src = std::string(VEL_HEADER) +
+        "code:\n"
+        /* alocar 304 bytes (2 x 152): ctx_a en r10, ctx_b en r11 */
+        "    mov r0, 304\n"
+        "    alloc r0\n"            /* r0 = puntero raw al bloque */
+        "    mov r10, r0\n"         /* r10 = ctx_a (offset 0) */
+        "    mov r11, r10\n"
+        "    adds r11, 152\n"       /* r11 = ctx_b (offset 152) */
+        /* r9 = 0 como indice cero para SIB incondicional */
+        "    mov r9, 0\n"
+        /* escribir el PC de fiber_b en ctx_b[0] (offset 0 del contexto = PC) */
+        "    mov r2, @Absolute(\"all.fiber_b\")\n"
+        "    mov [r11 + r9*1], r2\n" /* ctx_b.pc = fiber_b */
+        /* escribir SP valido en ctx_b[8] usando r11 desplazado */
+        "    adds r11, 8\n"
+        "    mov [r11 + r9*1], r0\n" /* ctx_b.sp = r0 (puntero valido cualquiera) */
+        "    adds r11, 8\n"
+        "    mov [r11 + r9*1], r0\n" /* ctx_b.bp = r0 */
+        "    subs r11, 16\n"         /* restaurar r11 a inicio de ctx_b */
+        /* intercambiar contexto: ir a fiber_b, guardar este en ctx_a */
+        "    swapctx r11, r10\n"    /* swapctx dst=ctx_b, src=ctx_a */
+        "    hlt\n"                 /* no se alcanza si swapctx funciona */
+        "end_code:\n"
+        "fiber_b:\n"
+        "    mov r0, 55\n"
+        "    hlt\n"
+        "end_fiber_b:\n";
+
+    auto r = run_vel(mgr, src, "swapctx");
+    if (!r.ok) return;
+    CHECK(r.proc->registers.regs[0].qword() == 55ULL, "swapctx: r0=55 tras salto a fiber_b");
+}
+
+/* =========================================================================
  * main
  * ====================================================================== */
 
@@ -518,6 +691,16 @@ int main() {
     printf(C_YELLOW "\n--- Corutinas (Modelo A) ---\n" C_RESET);
     test_yield(manager);
     test_spawn(manager);
+    test_resume(manager);
+    test_swapctx(manager);
+
+    /* --- Instrucciones nuevas: nullable y TCO --- */
+    printf(C_YELLOW "\n--- Nullable (isnull / unwrap) ---\n" C_RESET);
+    test_isnull(manager);
+    test_unwrap(manager);
+
+    printf(C_YELLOW "\n--- TCO (tailcall) ---\n" C_RESET);
+    test_tailcall(manager);
 
     /* --- Resumen --- */
     printf(C_BOLD "\n=== Resultado: %d PASS  %d FAIL ===\n" C_RESET,

@@ -1,0 +1,48 @@
+// Ejemplo: raw_asm — codigo ensamblador incrustado verbatim
+//
+// Demuestra como un HHL puede incrustar instrucciones .vel directamente
+// en el flujo SSA. El bloque raw_asm se emite sin optimizacion ni DCE.
+
+@module ejemplo_raw_asm
+
+// Funcion que usa raw_asm para implementar un intercambio atomico
+// que el compilador HHL no puede expresar con instrucciones IR normales.
+@function atomic_swap(a: i64, b: i64) -> i64 {
+entry:
+    // guardar argumentos en registros conocidos antes del bloque raw
+    %a_copy = mov.i64 %a
+    %b_copy = mov.i64 %b
+
+    // bloque de ensamblador incrustado:
+    // intercambia r1 y r2 usando xor swap sin registro temporal
+    raw_asm "mov r14, r1\nmov r1, r2\nmov r2, r14"
+
+    // el resultado queda en r1 por convencion de retorno
+    %result = mov.i64 %a_copy
+    ret.i64 %result
+}
+
+// Funcion que incrusta una secuencia de instrucciones de bajo nivel
+// para configurar un registro de control interno de la VM.
+@function setup_vm_control() -> void {
+entry:
+    // incrustar instrucciones que no tienen equivalente en el IR de alto nivel
+    raw_asm "getproc r1\ngetvm r2\ngetmgr r3"
+
+    // continuar con logica normal tras el bloque raw
+    %proc = getproc
+    ret.void
+}
+
+// Funcion simple que demuestra que raw_asm no interfiere con
+// el flujo de datos normal del SSA que lo rodea.
+@function demo_mix(x: i64) -> i64 {
+entry:
+    %doubled = add.i64 %x, %x
+
+    // instruccion raw incrustada que no afecta al valor SSA
+    raw_asm "nop1"
+
+    %result = mul.i64 %doubled, %doubled
+    ret.i64 %result
+}

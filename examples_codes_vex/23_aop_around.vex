@@ -1,0 +1,34 @@
+// AROUND advice + proceed().
+//
+// El advice @Around envuelve completamente la invocacion del target.
+// Dentro del cuerpo, `proceed()` re-invoca el metodo original (con la
+// misma calling convention), permitiendo:
+//   - Pre/post procesamiento (BEFORE+AFTER en uno solo).
+//   - Caching: decidir saltarse proceed si el resultado esta cacheado.
+//   - Modificacion del valor de retorno antes de devolverlo al caller.
+//
+// Aqui Service.run() retorna 7.  Un advice Around lo invoca (proceed())
+// y luego le suma 1000.  El caller s.run() ve 1007.
+//
+// Resultado esperado: 1007.
+
+class Service {
+    public Service() { }
+    public i32 run() { 
+        return 7; 
+    }
+}
+
+@Aspect class Logger {
+    public Logger() { }
+
+    @Around("Service.run") public i32 wrap() {
+        i32 r = proceed();   // r = 7
+        return r + 1000;     // 1007
+    }
+}
+
+i32 main() {
+    Service s = new Service();
+    return s.run();
+}

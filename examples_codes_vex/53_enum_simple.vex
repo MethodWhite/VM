@@ -1,0 +1,19 @@
+// Test minimo de enum + match: solo variantes sin payload.
+//
+// Resultado esperado: R0 = 42
+
+enum Color {
+    Red,
+    Green,
+    Blue
+}
+
+i32 main() {
+    Color c = Color.Green;
+    match c {
+        case Red   => return 10;
+        case Green => return 42;
+        case Blue  => return 99;
+    }
+    return -1;
+}

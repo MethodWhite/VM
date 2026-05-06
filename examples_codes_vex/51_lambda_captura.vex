@@ -1,0 +1,10 @@
+// Test de lambda con captura lexica.
+//
+// La lambda captura `y` del scope outer y lo usa dentro del body.
+// Resultado esperado: R0 = 30 (5 + 25).
+
+i32 main() {
+    i32 y = 25;
+    fn(i32) -> i32 add_y = (i32 x) => x + y;
+    return add_y(5);
+}

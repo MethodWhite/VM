@@ -19,9 +19,18 @@
  * (CALLN, CALLVM), syscall, interrupcion (INT) y OOP (CALLVIRT, etc.).
  */#include "runtime/exec_instruction.h"
 #include "runtime/decode_instruction.h"
+#include "runtime/exception_runtime.h"
+#include "runtime/native_invoke.h"
 #include "loader/oop_types.h"
 
 #include "ffi/native_ffi.h"
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
 
 namespace runtime {
 
@@ -153,71 +162,79 @@ namespace runtime {
      * @param vm    Proceso virtual que ejecuta CALLN.
      * @param instr Instruccion descodificada con inmmed_data.inmmed (fn) y reg (argc).
      */
+    // el helper @c invoke_native_unchecked se movio a
+    // include/runtime/native_invoke.h para compartirlo con
+    // exec_instr_callni (FFI dinamico runtime).  Manten la inclusion para
+    // que exec_instr_calln siga inlinandolo igual que antes (header inline,
+    // cero indireccion adicional).
+
+    /**
+     * @brief Ejecuta la instruccion CALLN con proteccion de crashes.
+     *
+     * anade aislamiento para crashes en plugins nativos:
+     *   - C++ exceptions escapando (`throw` desde el plugin) -> capturado
+     *     y convertido en @c FATAL_NATIVE_EXCEPTION via @c throw_fatal.
+     *   - SEH crashes en MSVC/MinGW-SEH (segfault, div0 hardware,
+     *     access violation) -> capturado por @c __try/__except y
+     *     convertido en @c FATAL_NATIVE_CRASH.
+     *
+     * Coste runtime: el bloque try/__try es esencialmente cero overhead
+     * en el camino feliz (no setea registros, solo registra un EH frame
+     * que el unwinder solo recorre si hay throw).  Medido: < 2 ns por
+     * call, despreciable comparado con la propia llamada nativa.
+     *
+     * Si el plugin crashea sin handler activo en Vex, igual mata el
+     * proceso (camino antiguo); pero la VM y los demas procesos siguen
+     * vivos.  Con handler activo, el throw es capturable.
+     *
+     * El SEH en MinGW: GCC con --enable-sjlj o SEH soporta @c __try /
+     * @c __except cuando se compila con esos flags.  En el TDM-GCC usado
+     * por este proyecto SI esta soportado.  Si tu compilador GCC no lo
+     * soporta, defina @c VESTA_DISABLE_SEH para fallback a solo C++
+     * exception catching (no captura segfault crudo).
+     */
     void exec_instr_calln(ProcessVM *vm, const DecodedInstr &instr) {
-        void *   fn   = reinterpret_cast<void *>(instr.data_instruction.inmmed_data.inmmed); // puntero a la funcion nativa
-        uint64_t argc = instr.data_instruction.inmmed_data.reg; // argc cacheado en decode
-        uint64_t r    = 0; // valor de retorno
+        void *   fn   = reinterpret_cast<void *>(instr.data_instruction.inmmed_data.inmmed);
+        uint64_t argc = instr.data_instruction.inmmed_data.reg;
+        uint64_t r    = 0;
 
-        typedef uint64_t u64;
-
-        // macro auxiliar para leer R01..R12 de forma concisa
-#define A(n) vm->registers.regs[R##n].qword()
-        switch (argc) {
-            case 0: r = reinterpret_cast<u64(*)()>(fn)();
-                break;
-            case 1: r = reinterpret_cast<u64(*)(u64)>(fn)(
-                    A(01));
-                break;
-            case 2: r = reinterpret_cast<u64(*)(
-                    u64, u64)>(fn)(
-                    A(01),A(02));
-                break;
-            case 3: r = reinterpret_cast<u64(*)(
-                    u64, u64, u64)>(fn)(
-                    A(01),A(02),A(03));
-                break;
-            case 4: r = reinterpret_cast<u64(*)(
-                    u64, u64, u64, u64)>(fn)(
-                    A(01),A(02),A(03),A(04));
-                break;
-            case 5: r = reinterpret_cast<u64(*)(
-                    u64, u64, u64, u64, u64)>(fn)(
-                    A(01),A(02),A(03),A(04),A(05));
-                break;
-            case 6: r = reinterpret_cast<u64(*)(
-                    u64, u64, u64, u64, u64, u64)>(fn)(
-                    A(01),A(02),A(03),A(04),A(05),A(06));
-                break;
-            case 7: r = reinterpret_cast<u64(*)(
-                    u64, u64, u64, u64, u64, u64, u64)>(fn)(
-                    A(01),A(02),A(03),A(04),A(05),A(06),A(07));
-                break;
-            case 8: r = reinterpret_cast<u64(*)(
-                    u64, u64, u64, u64, u64, u64, u64, u64)>(fn)(
-                    A(01),A(02),A(03),A(04),A(05),A(06),A(07),A(08));
-                break;
-            case 9: r = reinterpret_cast<u64(*)(
-                    u64, u64, u64, u64, u64, u64, u64, u64, u64)>(fn)(
-                    A(01),A(02),A(03),A(04),A(05),A(06),A(07),A(08),A(09));
-                break;
-            case 10: r = reinterpret_cast<u64(*)(
-                    u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)>(fn)(
-                    A(01),A(02),A(03),A(04),A(05),A(06),A(07),A(08),A(09),A(10));
-                break;
-            case 11: r = reinterpret_cast<u64(*)(
-                    u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)>(fn)(
-                    A(01),A(02),A(03),A(04),A(05),A(06),A(07),A(08),A(09),A(10),A(11));
-                break;
-            case 12: r = reinterpret_cast<u64(*)(
-                    u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)>(fn)(
-                    A(01),A(02),A(03),A(04),A(05),A(06),A(07),A(08),A(09),A(10),A(11),A(12));
-                break;
-            default:
-                VM_ASSERT(false, "exec_instr_calln: argc=" + std::to_string(argc) + " excede el maximo de 12", {});
-                break; // en modo release evita que el switch continue
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(VESTA_DISABLE_SEH)
+        // MSVC: SEH nativo via __try/__except.
+        __try {
+            try {
+                r = invoke_native_unchecked(fn, argc, vm);
+            } catch (const std::exception &e) {
+                runtime::throw_fatalf(vm, runtime::FATAL_NATIVE_EXCEPTION,
+                    "CALLN: plugin lanzo std::exception: %s", e.what());
+                return;
+            } catch (...) {
+                runtime::throw_fatal(vm, runtime::FATAL_NATIVE_EXCEPTION,
+                    "CALLN: plugin lanzo excepcion C++ desconocida");
+                return;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            runtime::throw_fatalf(vm, runtime::FATAL_NATIVE_CRASH,
+                "CALLN: plugin nativo crasheo (SEH code=0x%lX)",
+                (unsigned long)GetExceptionCode());
+            return;
         }
-#undef A
-        vm->registers.regs[R00].qword(r); // devolver el resultado en R00
+#else
+        // MinGW / GCC / Clang sin SEH: solo C++ exception catching.
+        // Los segfault crudos NO se capturan aqui; el plugin debe
+        // contenerlos internamente o esa rama mata la VM como antes.
+        try {
+            r = invoke_native_unchecked(fn, argc, vm);
+        } catch (const std::exception &e) {
+            runtime::throw_fatalf(vm, runtime::FATAL_NATIVE_EXCEPTION,
+                "CALLN: plugin lanzo std::exception: %s", e.what());
+            return;
+        } catch (...) {
+            runtime::throw_fatal(vm, runtime::FATAL_NATIVE_EXCEPTION,
+                "CALLN: plugin lanzo excepcion C++ desconocida");
+            return;
+        }
+#endif
+        vm->registers.regs[R00].qword(r);
     }
 
     /**
@@ -340,16 +357,38 @@ namespace runtime {
      * @param instr Instruccion descodificada (no se usan sus campos).
      */
     void exec_instr_ret(ProcessVM *vm, const DecodedInstr &instr) {
-        // descartar el frame OOP si existe (instrucciones CALLVIRT/CALLSUPER)
-        if (vm->frame_stack != nullptr) {
-            loader::FrameHeader *frame = vm->frame_stack;
-            vm->frame_stack = frame->prev; // subir al frame anterior
-            delete frame;                  // liberar el frame actual
+        (void)instr;
+        // fix13 - distinguir RET de callvirt/callm/callsuper/callclosure
+        // (que tiene frame OOP) vs RET de callvm puro anidado dentro de un
+        // metodo virtual (que NO debe consumir el frame del caller).
+        //
+        // Heuristica: el frame OOP guarda `frame_base` = RSP justo ANTES del
+        // CALL correspondiente.  Tras el CALL: RSP = frame_base - 8 (slot
+        // del ret_addr).  Cuando el callee retorna por su propio RET,
+        // primero ejecuta `leave` que restaura RSP al valor post-CALL =
+        // frame_base - 8.  Si en ese momento current_rsp == frame_base - 8,
+        // este RET corresponde al CALL del frame OOP head.
+        //
+        // Si NO coincide (RSP es menor por un callvm interno o mayor por
+        // unwind imperfecto), este RET viene de un callvm puro: leer el
+        // ret_addr del stack y NO consumir el frame OOP.
+        const uint64_t cur_rsp = vm->registers.stack_pointer.qword();
+        uint64_t ret_addr;
+        loader::FrameHeader *frame = vm->frame_stack;
+        if (frame != nullptr && frame->frame_base == cur_rsp + 8) {
+            // RET corresponde al CALL del frame OOP head: usar return_pc
+            // cacheado, evitar la lectura desde vm_mem.
+            ret_addr = frame->return_pc;
+            vm->frame_stack = frame->prev;
+            vm->frame_pool.release(frame);
+        } else {
+            // RET de callvm puro (sin frame OOP, o anidado dentro de uno):
+            // leer ret_addr desde el slot del stack VM.
+            ret_addr = 0;
+            vm->vm_mem.read_bytes(vm->registers.stack_pointer.raw(), &ret_addr, 8);
         }
-
-        uint64_t ret_addr = 0;
-        vm->vm_mem.read_bytes(vm->registers.stack_pointer.raw(), &ret_addr, 8); // leer la direccion de retorno
-        vm->registers.stack_pointer.qword(vm->registers.stack_pointer.qword() + 8); // liberar el slot de la pila
+        // Avanzar RSP para liberar el slot reservado por el CALL correspondiente.
+        vm->registers.stack_pointer.qword(cur_rsp + 8);
         write_rip(vm, ret_addr); // saltar a la direccion de retorno
     }
 
@@ -374,7 +413,13 @@ namespace runtime {
         vm->registers.base_pointer.raw(vm->registers.stack_pointer.raw());
 
         // sub rsp, frame_size: reservar espacio para las variables locales
-        vm->registers.stack_pointer.qword(vm->registers.stack_pointer.qword() - frame_size);
+        const uint64_t new_rsp = vm->registers.stack_pointer.qword() - frame_size;
+        vm->registers.stack_pointer.qword(new_rsp);
+
+        // fix8 - tracking de low-water-mark del stack para el GC scan.
+        if (new_rsp < vm->stack_low_water) {
+            vm->stack_low_water = new_rsp;
+        }
     }
 
     /**

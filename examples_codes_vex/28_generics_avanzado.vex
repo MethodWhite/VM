@@ -1,0 +1,28 @@
+// Generics avanzado: dos type params + uso cross-class.
+//
+// Verifica:
+//   - Multiples type params: Pair<K, V>.
+//   - Una clase generica que se referencia indirectamente desde otra
+//     declaracion (parametro, return).
+//   - Reutilizacion del mismo template instanciado dos veces con tipos
+//     identicos: una sola clonacion (deduplicacion en cache).
+//
+// Construye Pair<i32, i32> con (3, 4).  Suma sus componentes via dos
+// invocaciones a un getter.  Pair<i64, i64> con (10, 20).  Suma todo.
+//
+// Resultado esperado: 3 + 4 + 10 + 20 = 37.
+
+class Pair<K, V> {
+    public K first;
+    public V second;
+    public Pair(K f, V s) { this.first = f; this.second = s; }
+    public K getFirst()  { return this.first;  }
+    public V getSecond() { return this.second; }
+}
+
+i32 main() {
+    Pair<i32, i32> p1 = new Pair<i32, i32>(3, 4);
+    Pair<i64, i64> p2 = new Pair<i64, i64>(10, 20);
+    return p1.getFirst() + p1.getSecond()
+         + p2.getFirst() + p2.getSecond();
+}

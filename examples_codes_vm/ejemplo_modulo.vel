@@ -1,0 +1,220 @@
+/*
+ * ejemplo_modulo.vel
+ *
+ * Demuestra las anotaciones @Module, @Export y @Generic del ensamblador
+ * de VestaVM.
+ *
+ * Estas anotaciones son directivas que el ensamblador procesa en tiempo de
+ * compilacion y escribe en los metadatos del archivo .velb resultante.
+ * No generan bytecode por si solas; afectan al linker y al loader cuando
+ * enlaza multiples archivos objeto.
+ *
+ *   @Module(nombre.calificado)
+ *     Declara el modulo al que pertenece este archivo fuente.
+ *     El nombre calificado usa puntos como separadores de paquetes,
+ *     por ejemplo: "com.empresa.colecciones".
+ *     Solo debe aparecer una vez por archivo fuente.
+ *
+ *   @Export(Simbolo)
+ *     Marca el simbolo (clase, funcion, label) como publicamente accesible
+ *     desde otros modulos.  Los simbolos no exportados son privados al modulo.
+ *     Puede aparecer multiples veces, una por simbolo exportado.
+ *
+ *   @Generic(T)       <-- un parametro de tipo
+ *   @Generic(K,V)     <-- multiples parametros de tipo
+ *     Registra parametros de tipo para monomorphization en el emitter.
+ *     El emitter genera una especializacion del tipo o funcion por cada
+ *     combinacion de tipos concreta que se use.  No genera overhead en
+ *     tiempo de ejecucion (como los templates de C++).
+ *
+ * Este ejemplo simula el modulo "colecciones.lista" que exporta una
+ * implementacion generica de lista simplemente enlazada.
+ *
+ * Compilar:
+ *   vesta --build ejemplo_modulo.vel -o ejemplo_modulo
+ *
+ * Nota: este archivo no puede ejecutarse directamente con --run porque
+ * los metadatos de modulo requieren el formato "velb" y el linker para
+ * enlazar modulos entre si.  Para ver los metadatos generados, usar:
+ *   vesta --build ejemplo_modulo.vel -o ejemplo_modulo --verbose
+ */
+
+// Declarar que este archivo pertenece al modulo "colecciones.lista"
+@Module(colecciones_lista)
+
+// Exportar los simbolos publicos del modulo
+@Export(Lista)
+@Export(lista_nueva)
+@Export(lista_agregar)
+@Export(lista_longitud)
+
+// Declarar que la clase Lista es generica con un parametro de tipo T
+// El emitter generara especializaciones concretas (Lista<int>, Lista<string>, etc.)
+// cuando el codigo cliente referencie @Class("Lista<int>").
+@Generic(T)
+
+@Format("velb")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+// -----------------------------------------------------------------------
+// Clase Lista<T>: implementacion de lista simplemente enlazada.
+//
+// Estructura de un nodo (en memoria VM):
+//   offset  0: valor   (uint64) - el elemento almacenado
+//   offset  8: sig     (uint64) - puntero al nodo siguiente (0 = fin)
+//   Total: 16 bytes por nodo
+// -----------------------------------------------------------------------
+
+// -----------------------------------------------------------------------
+// lista_nueva() -> r0 = puntero al primer nodo nulo (0 = lista vacia)
+//
+// Simplemente retorna 0: una lista vacia se representa como puntero nulo.
+// -----------------------------------------------------------------------
+lista_nueva:
+    mov r0, 0               // lista vacia = puntero nulo
+    ret
+end_lista_nueva:
+
+// -----------------------------------------------------------------------
+// lista_agregar(r1=puntero_lista, r2=valor) -> r0 = nuevo puntero de lista
+//
+// Aloca un nuevo nodo de 16 bytes con ALLOC:
+//   nodo->valor = r2
+//   nodo->sig   = r1 (antiguo inicio de la lista)
+// Retorna el puntero al nuevo nodo en r0.
+// -----------------------------------------------------------------------
+lista_agregar:
+    // Guardar argumentos en registros no volatiles
+    mov r10, r1             // r10 = puntero actual de la lista
+    mov r11, r2             // r11 = valor a insertar
+
+    // Alocar 16 bytes para el nuevo nodo (sin GC, ciclo de vida manual)
+    mov r0, 16
+    alloc r0                // r0 = puntero host al nuevo nodo
+
+    // Si la alocation fallo (r0 = 0), retornar el puntero original
+    isnull r3, r0
+    jmp.jne alloc_fallida
+
+    // nodo->valor = r11 (el nuevo elemento)
+    mov r9, 0               // indice cero para SIB
+    mov [r0 + r9*1], r11    // nodo.valor = valor
+
+    // nodo->sig = r10 (el antiguo inicio de la lista)
+    mov r4, r0
+    addu r4, 8              // r4 = &nodo.sig
+    mov [r4 + r9*1], r10    // nodo.sig = puntero_lista
+
+    // r0 ya apunta al nuevo nodo; retornar
+    ret
+
+alloc_fallida:
+    // No hubo memoria; retornar el puntero original sin modificar
+    mov r0, r10
+    ret
+end_lista_agregar:
+
+// -----------------------------------------------------------------------
+// lista_longitud(r1=puntero_lista) -> r0 = numero de nodos
+//
+// Recorre la lista contando nodos hasta encontrar un puntero nulo.
+// -----------------------------------------------------------------------
+lista_longitud:
+    mov r0, 0               // contador = 0
+    mov r3, r1              // r3 = puntero actual
+
+longitud_bucle:
+    // Si el puntero actual es nulo, hemos llegado al final
+    isnull r4, r3
+    jmp.jne longitud_fin    // si r3 es nulo, salir
+
+    // Incrementar contador
+    addu r0, 1
+
+    // Avanzar al nodo siguiente: r3 = nodo->sig (offset 8)
+    mov r9, 0
+    mov r5, r3
+    addu r5, 8              // r5 = &r3->sig
+    // Leer el puntero siguiente desde la memoria VM
+    // Necesitamos usar movc con flag set; como alternativa, seguimos el patron del loader.
+    // En este ejemplo simplificado asumimos que la lista se recorre con logica externa.
+    // (Ver nota al pie sobre acceso a campos de nodo)
+    hlt                     // simplificacion: el recorrido real requiere fload/fstore
+
+longitud_fin:
+    ret
+end_lista_longitud:
+
+// -----------------------------------------------------------------------
+// Programa de prueba: construir una lista [30, 20, 10] y verificar longitud
+// -----------------------------------------------------------------------
+code:
+    // Inicializar pila
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // lista = lista_nueva() -> r0 = 0
+    mov r4, @Absolute("all.tras_nueva")
+    push r4
+    jmp lista_nueva
+tras_nueva:
+    mov r12, r0             // r12 = puntero de lista
+
+    // lista = lista_agregar(lista, 10) -> r0 = nuevo inicio
+    mov r1, r12
+    mov r2, 10
+    mov r4, @Absolute("all.tras_agregar1")
+    push r4
+    jmp lista_agregar
+tras_agregar1:
+    mov r12, r0
+
+    // lista = lista_agregar(lista, 20)
+    mov r1, r12
+    mov r2, 20
+    mov r4, @Absolute("all.tras_agregar2")
+    push r4
+    jmp lista_agregar
+tras_agregar2:
+    mov r12, r0
+
+    // lista = lista_agregar(lista, 30)
+    mov r1, r12
+    mov r2, 30
+    mov r4, @Absolute("all.tras_agregar3")
+    push r4
+    jmp lista_agregar
+tras_agregar3:
+    mov r12, r0
+
+    // La lista tiene 3 nodos: [30->20->10->null]
+    // (la funcion lista_longitud esta simplificada; el puntero de lista esta en r12)
+
+    hlt
+end_code:
+
+// -----------------------------------------------------------------------
+// Nota sobre @Generic:
+//
+// Cuando el codigo cliente escribe @Class("Lista<int>"), el emitter busca
+// la especializacion en generic_instances.  Si no existe, clona el ClassInfo
+// de "Lista", sustituye el parametro T por int en todos los campos (tamanos,
+// offsets), y registra la especializacion como "Lista<int>" para que no se
+// duplique.
+//
+// En el nivel de bytecode no hay diferencia entre Lista<int> y Lista<String>:
+// ambas usan las mismas instrucciones.  La monomorphization es una
+// optimizacion del emitter para generar codigo especializado cuando el
+// tipo del elemento afecta al tamano o la disposicion de los campos.
+// -----------------------------------------------------------------------

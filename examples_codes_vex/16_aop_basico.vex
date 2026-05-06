@@ -1,0 +1,31 @@
+// AOP basico: @Aspect + @After.
+//
+// Verifica que el dispatcher CALLVIRT recorre la cadena de advices y
+// ejecuta el advice AFTER tras el metodo target.  El valor de retorno
+// del CALLVIRT efectivo es el de la ULTIMA invocacion en la cadena
+// (AFTER si esta presente), por lo que main() debe ver el R0 del
+// advice post(), no el del Service.run() original.
+//
+// Sin AOP wireado:  s.run() -> 1
+// Con AOP @After:   s.run() -> 99  (AFTER pisa R0)
+// Si AOP corrompe:  cualquier otro valor o crash.
+//
+// Notas para futuras fases:
+//   - Con globals lowering / static fields se podria verificar tambien
+//     side-effects de BEFORE (no solo del valor de retorno final).
+
+class Service {
+    public Service() { }
+    public i32 run() { return 1; }
+}
+
+@Aspect class Tracer {
+    public Tracer() { }
+    @Before("Service.run") public i32 pre()  { return 7; }
+    @After("Service.run")  public i32 post() { return 99; }
+}
+
+i32 main() {
+    Service s = new Service();
+    return s.run();
+}

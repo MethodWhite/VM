@@ -1,0 +1,84 @@
+// Reflexion completa: getMethod + newInstance + invoke.
+//
+// Verifica el ciclo completo de reflexion dinamica:
+//   1. forName("Calculadora")          -> ClassInfo* via findclass
+//   2. newInstance(cls)                -> nueva instancia via NEWOBJ
+//   3. getMethod(cls, "doblar")        -> MethodInfo* via findmethod
+//   4. invoke(method, this, arg)       -> dispatch via callm (CALLM IR op)
+//
+// Todo esto sin conocer el tipo en compile time: solo a partir del nombre
+// de la clase y del metodo como strings.
+//
+// Resultado: doblar(21) = 42.
+
+class Calculadora {
+
+  public i32 base;
+
+  public Calculadora() {
+    this.base = 0;
+  }
+
+  public i32 doblar(i32 x) {
+    return x + x;
+  }
+
+  public i32 sumar(i32 x) {
+    return this.base + x;
+  }
+}
+
+i32 pruebas() {
+  Calculadora a = new Calculadora();
+  /*
+    // Localizar la clase por nombre.
+    i64 cls = forName("Calculadora");
+    if (cls == 0) return 1;
+
+    // Crear una instancia (sin ctor con args, base queda en 0).
+    i64 obj = newInstance(cls);
+    if (obj == 0) return 2;
+
+    // Localizar el metodo "doblar" por nombre.
+    i64 m = getMethod(cls, "doblar");
+    if (m == 0) return 3;
+
+    // Invocar dinamicamente: doblar(21) == 42.
+    i64 result = invoke(m, obj, 21);
+    */
+
+  return 0;
+}
+
+i32 main() {
+  // Localizar la clase por nombre.
+  i64 cls = forName("Calculadora");
+  if (cls == 0) return 1;
+
+  // Crear una instancia (sin ctor con args, base queda en 0).
+  i64 obj = newInstance(cls);
+  if (obj == 0) return 2;
+
+  // Localizar el metodo "doblar" por nombre.
+  i64 m = getMethod(cls, "doblar");
+  if (m == 0) return 3;
+
+  // Invocar dinamicamente: doblar(21) == 42.
+  i64 result = invoke(m, obj, 21);
+
+  for (i64 i = 0; i < 300_000_00; i++) {
+    i32 val = pruebas();
+    if ((i % 100_000_00) == 0) {
+      println("pruebas() = ${i}");
+      flush();
+    }
+    if (val != 0) {
+      // Error en reflexion: no se encontro clase, metodo, o no se pudo instanciar.
+      println("Error en reflexion, codigo: ${val}");
+      return val;
+    }
+  }
+
+  println("Reflexion completa exitosa: doblar(21) = ${result}");
+  return result;
+}

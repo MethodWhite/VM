@@ -1,0 +1,200 @@
+/*
+ * ejemplo_collections_list.vel
+ *
+ * Demuestra el uso de VestaList: array dinamico de GcHandle (uint32_t).
+ *
+ * Funciones usadas:
+ *   vcol_list_new(cap)           r1=cap -> r0=handle
+ *   vcol_list_push(h, elem)      r1=h, r2=elem -> r0=nuevo_size
+ *   vcol_list_get(h, idx)        r1=h, r2=idx  -> r0=elem
+ *   vcol_list_size(h)            r1=h           -> r0=size
+ *   vcol_list_pop(h)             r1=h           -> r0=elem (elimina ultimo)
+ *   vcol_list_remove_at(h, idx)  r1=h, r2=idx  -> r0=elem eliminado
+ *   vcol_list_indexof(h, elem)   r1=h, r2=elem -> r0=indice o VCOL_NOT_FOUND
+ *   vcol_list_clone(h)           r1=h           -> r0=handle nuevo
+ *   vcol_list_free(h)            r1=h           (libera memoria)
+ *
+ * Secuencia del test:
+ *   1. Crear lista con capacidad inicial 4
+ *   2. push 10, 20, 30, 40, 50  -> size debe ser 5
+ *   3. get(2) debe devolver 30
+ *   4. pop() debe devolver 50, size=4
+ *   5. indexof(20) debe devolver 1
+ *   6. remove_at(0) debe devolver 10, size=3, get(0)=20
+ *   7. clone() -> lista identica
+ *   8. free() de ambas listas
+ *
+ * Resultado esperado en registros al llegar a hlt:
+ *   r8  = 5   (size tras 5 push)
+ *   r9  = 30  (get(2))
+ *   r10 = 50  (pop)
+ *   r11 = 1   (indexof(20) = indice 1)
+ *   r12 = 10  (remove_at(0))
+ *   r13 = 20  (get(0) tras remove)
+ *   r14 = 3   (size de la clonada, identica a la original tras remove)
+ *
+ * Compilar y ejecutar:
+ *   ./vm --build ejemplo_collections_list.vel -o ejemplo_collections_list
+ *   ./vm --run   ejemplo_collections_list.velb
+ *
+ * Nota: VestaList almacena uint32_t (4 bytes). Los valores de ejemplo son
+ * enteros pequenos que caben sin truncamiento.  Para valores de 64 bits
+ * usar VestaArrayList (vcol_alist_*).
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+@Import {
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_list_new")       }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_list_push")      }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_list_get")       }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_list_size")      }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_list_pop")       }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_list_remove_at") }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_list_indexof")   }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_list_clone")     }
+    @Method { @Lib("stdlib/native/collections/vesta_collections") @Name("vcol_list_free")      }
+}
+
+code:
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // -----------------------------------------------------------------------
+    // 1. Crear VestaList con capacidad inicial 4
+    //    vcol_list_new(4) -> r0 = handle
+    // -----------------------------------------------------------------------
+    mov  r1, 4
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_new")
+    mov  r5, r0                           // r5 = handle lista principal
+
+    // -----------------------------------------------------------------------
+    // 2. push 10, 20, 30, 40, 50
+    //    vcol_list_push(handle, elem) -> r0 = nuevo_size
+    // -----------------------------------------------------------------------
+    mov  r1, r5
+    mov  r2, 10
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_push")
+
+    mov  r1, r5
+    mov  r2, 20
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_push")
+
+    mov  r1, r5
+    mov  r2, 30
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_push")
+
+    mov  r1, r5
+    mov  r2, 40
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_push")
+
+    mov  r1, r5
+    mov  r2, 50
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_push")
+
+    // size debe ser 5 -> guardar en r8
+    mov  r1, r5
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_size")
+    mov  r8, r0                           // r8 = 5
+
+    // -----------------------------------------------------------------------
+    // 3. get(2) debe devolver 30 -> guardar en r9
+    //    vcol_list_get(handle, index) -> r0 = elemento
+    // -----------------------------------------------------------------------
+    mov  r1, r5
+    mov  r2, 2
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_get")
+    mov  r9, r0                           // r9 = 30
+
+    // -----------------------------------------------------------------------
+    // 4. pop() debe devolver 50, size pasa a 4 -> guardar en r10
+    //    vcol_list_pop(handle) -> r0 = elemento eliminado
+    // -----------------------------------------------------------------------
+    mov  r1, r5
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_pop")
+    mov  r10, r0                          // r10 = 50
+
+    // -----------------------------------------------------------------------
+    // 5. indexof(20) debe devolver indice 1 -> guardar en r11
+    //    vcol_list_indexof(handle, elem) -> r0 = indice
+    // -----------------------------------------------------------------------
+    mov  r1, r5
+    mov  r2, 20
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_indexof")
+    mov  r11, r0                          // r11 = 1
+
+    // -----------------------------------------------------------------------
+    // 6. remove_at(0) debe devolver 10, size=3, get(0)=20 -> guardar en r12, r13
+    //    vcol_list_remove_at(handle, index) -> r0 = elemento eliminado
+    // -----------------------------------------------------------------------
+    mov  r1, r5
+    mov  r2, 0
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_remove_at")
+    mov  r12, r0                          // r12 = 10
+
+    // get(0) tras remove -> debe ser 20
+    mov  r1, r5
+    mov  r2, 0
+    mov  r15, 2
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_get")
+    mov  r13, r0                          // r13 = 20
+
+    // -----------------------------------------------------------------------
+    // 7. clone() -> lista identica; verificar su size
+    //    vcol_list_clone(handle) -> r0 = handle del clon
+    // -----------------------------------------------------------------------
+    mov  r1, r5
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_clone")
+    mov  r6, r0                           // r6 = handle del clon
+
+    mov  r1, r6
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_size")
+    mov  r14, r0                          // r14 = 3 (size del clon)
+
+    // -----------------------------------------------------------------------
+    // 8. Liberar ambas listas
+    //    vcol_list_free(handle)
+    // -----------------------------------------------------------------------
+    mov  r1, r5
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_free")
+
+    mov  r1, r6
+    mov  r15, 1
+    calln @Method("stdlib/native/collections/vesta_collections:vcol_list_free")
+
+    // Resultado esperado:
+    //   r8  = 5   (size tras 5 push)
+    //   r9  = 30  (get index 2)
+    //   r10 = 50  (pop ultimo)
+    //   r11 = 1   (indexof 20)
+    //   r12 = 10  (remove_at 0)
+    //   r13 = 20  (get 0 tras remove)
+    //   r14 = 3   (size del clon)
+    mov  r0, r8
+    hlt

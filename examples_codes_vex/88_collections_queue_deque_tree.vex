@@ -1,0 +1,96 @@
+// examples_codes_vex/88_collections_queue_deque_tree.vex
+//
+//  Estructuras nuevas en plugin nativo:
+//   - Queue (ring buffer FIFO)
+//   - Deque (ring buffer doble extremos)
+//   - TreeMap (Red-Black tree, ordenado, con floor/ceiling/first/last)
+//
+// Ejercita las operaciones basicas + crecimiento + ordering del tree.
+// Esperado: R00 == 42.
+
+extern "stdlib/native/collections/vesta_collections" {
+    // Queue
+    fn vcol_queue_new(i64 cap) -> i64;
+    fn vcol_queue_push(i64 h, i64 v) -> i64;
+    fn vcol_queue_pop(i64 h) -> i64;
+    fn vcol_queue_size(i64 h) -> i64;
+    fn vcol_queue_free(i64 h) -> void;
+    // Deque
+    fn vcol_deque_new(i64 cap) -> i64;
+    fn vcol_deque_push_front(i64 h, i64 v) -> i64;
+    fn vcol_deque_push_back(i64 h, i64 v) -> i64;
+    fn vcol_deque_pop_front(i64 h) -> i64;
+    fn vcol_deque_pop_back(i64 h) -> i64;
+    fn vcol_deque_free(i64 h) -> void;
+    // TreeMap
+    fn vcol_tmap_new() -> i64;
+    fn vcol_tmap_put(i64 h, i64 k, i64 v) -> void;
+    fn vcol_tmap_get(i64 h, i64 k) -> i64;
+    fn vcol_tmap_first_key(i64 h) -> i64;
+    fn vcol_tmap_last_key(i64 h) -> i64;
+    fn vcol_tmap_floor_key(i64 h, i64 k) -> i64;
+    fn vcol_tmap_ceiling_key(i64 h, i64 k) -> i64;
+    fn vcol_tmap_size(i64 h) -> i64;
+    fn vcol_tmap_remove(i64 h, i64 k) -> i64;
+    fn vcol_tmap_free(i64 h) -> void;
+}
+
+i32 main() {
+    i32 acc = 0;
+
+    // ========= Queue =========
+    // FIFO: push 1,2,3,4,5 -> pop debe sacar 1,2,3,4,5 en orden.
+    i64 q = vcol_queue_new(4);  // empieza con cap 16 (forzado al min)
+    vcol_queue_push(q, 1);
+    vcol_queue_push(q, 2);
+    vcol_queue_push(q, 3);
+    vcol_queue_push(q, 4);
+    vcol_queue_push(q, 5);
+    if (vcol_queue_size(q) == 5) { acc = acc + 5; }
+    if (vcol_queue_pop(q) == 1)  { acc = acc + 2; }
+    if (vcol_queue_pop(q) == 2)  { acc = acc + 2; }
+    if (vcol_queue_size(q) == 3) { acc = acc + 1; }
+    vcol_queue_free(q);
+
+    // ========= Deque =========
+    // push_front 10, push_back 20, push_front 5 -> orden: 5, 10, 20
+    // pop_front -> 5; pop_back -> 20; restante: 10
+    i64 d = vcol_deque_new(0);
+    vcol_deque_push_back(d, 10);
+    vcol_deque_push_back(d, 20);
+    vcol_deque_push_front(d, 5);
+    if (vcol_deque_pop_front(d) == 5)  { acc = acc + 3; }
+    if (vcol_deque_pop_back(d) == 20)  { acc = acc + 3; }
+    if (vcol_deque_pop_front(d) == 10) { acc = acc + 2; }
+    vcol_deque_free(d);
+
+    // ========= TreeMap =========
+    // Insert keys 50, 30, 70, 20, 40, 60, 80 (en BST clasico forman
+    // un arbol balanceado tras los rotates RB).  Las queries:
+    //   first_key -> 20  (minimo)
+    //   last_key  -> 80  (maximo)
+    //   get(50)   -> 100 (valor que insertamos)
+    //   floor(35) -> 30  (mayor key <= 35)
+    //   ceiling(45) -> 50  (menor key >= 45)
+    i64 t = vcol_tmap_new();
+    vcol_tmap_put(t, 50, 100);
+    vcol_tmap_put(t, 30, 200);
+    vcol_tmap_put(t, 70, 300);
+    vcol_tmap_put(t, 20, 400);
+    vcol_tmap_put(t, 40, 500);
+    vcol_tmap_put(t, 60, 600);
+    vcol_tmap_put(t, 80, 700);
+
+    if (vcol_tmap_size(t) == 7)             { acc = acc + 5; }
+    if (vcol_tmap_first_key(t) == 20)       { acc = acc + 3; }
+    if (vcol_tmap_last_key(t) == 80)        { acc = acc + 3; }
+    if (vcol_tmap_get(t, 50) == 100)        { acc = acc + 2; }
+    if (vcol_tmap_floor_key(t, 35) == 30)   { acc = acc + 2; }
+    if (vcol_tmap_ceiling_key(t, 45) == 50) { acc = acc + 2; }
+    // remove: tmap_remove debe re-balancear y mantener las queries.
+    vcol_tmap_remove(t, 50);  // ahora ceiling(45) = 60 (no 50)
+    if (vcol_tmap_ceiling_key(t, 45) == 60) { acc = acc + 7; }
+
+    vcol_tmap_free(t);
+    return acc;  // 5+2+2+1 + 3+3+2 + 5+3+3+2+2+2+7 = 42
+}

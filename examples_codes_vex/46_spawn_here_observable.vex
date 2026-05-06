@@ -1,0 +1,31 @@
+// verifica que `spawn here` coloca al hijo en el
+// mismo scheduler que el padre, comparando los scheduler_id encoded
+// en el PID devuelto por spawn.
+//
+// PID encoded = (scheduler_id << 32) | local_pid.  Para extraer
+// scheduler_id sin operadores de bit (Vex no tiene `>>`), dividimos
+// por 2^32 = 4294967296.
+//
+// Esperado:
+//   c_here.sched == 0 (padre tambien en sched 0).
+//   c_auto.sched puede ser 0..N-1 segun round-robin.
+//   diff = (c_auto.sched != c_here.sched ? 1 : 0)
+//   con --schedulers 1: ambos en 0, diff=0, return 100.
+//   con --schedulers 4: auto en 1 (round-robin), here en 0, diff=1, return 200.
+
+i32 main() {
+    i64 c_here = spawn here {
+        // hijo trivial.
+    };
+    i64 c_auto = spawn {
+        // hijo trivial.
+    };
+
+    i64 here_sched = c_here / 4294967296;
+    i64 auto_sched = c_auto / 4294967296;
+
+    if (here_sched == auto_sched) {
+        return 100;  // ambos en mismo scheduler (caso single-thread)
+    }
+    return 200;       // distintos schedulers (caso multi-thread)
+}

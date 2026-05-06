@@ -1,0 +1,37 @@
+// synchronized basico:
+//
+// El bloque synchronized(obj) { ... } envuelve el body con monenter/monexit
+// sobre el GcHandle del objeto.  Aqui validamos solo que la sintaxis se
+// parsea, type-checkea, baja a bytecode con las dos instrucciones, y se
+// ejecuta sin errores en un solo thread (no hay contention).
+//
+// Counter es una clase simple cuyo unico campo es protegido por su monitor;
+// el incremento se realiza dentro de synchronized para garantizar
+// atomicidad cuando haya concurrencia (no la testeamos aqui, pero es la
+// semantica que queremos garantizar de cara a spawn).
+
+class Counter {
+    i32 value;
+    Counter() {
+        this.value = 0;
+    }
+    i32 increment() {
+        synchronized (this) {
+            this.value = this.value + 1;
+        }
+        return this.value;
+    }
+    i32 read() {
+        return this.value;
+    }
+}
+
+i32 main() {
+    Counter c = new Counter();
+    i32 i = 0;
+    while (i < 10) {
+        c.increment();
+        i = i + 1;
+    }
+    return c.read();   // 10
+}

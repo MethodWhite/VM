@@ -235,4 +235,91 @@ namespace Assembly::Bytecode {
     // no debe hacer nada al aplicarse desde el analizador, se debe aplicar
     // en el emisor
     void apply_absolute(const vm::AnnotationNode *node, Assembler &assembler) {}
+
+    /**
+     * @brief Implementa \@Module(nombre): establece el modulo activo del fichero fuente.
+     *
+     * Crea una entrada en el mapa de modulos del contexto si aun no existe y
+     * actualiza current_module con el nombre calificado recibido.
+     */
+    void apply_module(const vm::AnnotationNode *node, Assembler &assembler) {
+        if (node->value.empty()) {
+            throw std::runtime_error(
+                "La anotacion '@Module' requiere un nombre calificado, p.ej. @Module(com.vesta.core)"
+            );
+        }
+
+        const std::string &mod_name = node->value;
+
+        // crear entrada si no existe
+        if (assembler.ctx.modules.find(mod_name) == assembler.ctx.modules.end()) {
+            ModuleEntry entry;
+            entry.qualified_name = mod_name;
+            assembler.ctx.modules[mod_name] = entry;
+        }
+
+        assembler.ctx.current_module = mod_name; // activar el modulo
+    }
+
+    /**
+     * @brief Implementa \@Export(simbolo): registra un simbolo publico del modulo activo.
+     *
+     * Si no hay modulo activo, lanza una excepcion pidiendo que se declare \@Module primero.
+     */
+    void apply_export(const vm::AnnotationNode *node, Assembler &assembler) {
+        if (node->value.empty()) {
+            throw std::runtime_error(
+                "La anotacion '@Export' requiere un nombre de simbolo, p.ej. @Export(MiClase)"
+            );
+        }
+
+        if (assembler.ctx.current_module.empty()) {
+            throw std::runtime_error(
+                "La anotacion '@Export' requiere que se declare '@Module' antes en el mismo fichero"
+            );
+        }
+
+        const std::string &sym     = node->value;
+        ModuleEntry &      entry   = assembler.ctx.modules[assembler.ctx.current_module];
+        // evitar duplicados en la lista de exports
+        for (const auto &e: entry.exports) {
+            if (e == sym) return;
+        }
+        entry.exports.push_back(sym);
+    }
+
+    /**
+     * @brief Implementa \@Generic(T) o \@Generic(K,V): registra parametros de tipo.
+     *
+     * Los parametros separados por coma se almacenan en generic_instances con el
+     * valor vacio como marcador; el emitter los interpreta durante la monomorphization.
+     * La clave es el nombre del parametro (p.ej. "T", "K", "V").
+     */
+    void apply_generic(const vm::AnnotationNode *node, Assembler &assembler) {
+        if (node->value.empty()) {
+            throw std::runtime_error(
+                "La anotacion '@Generic' requiere al menos un parametro de tipo, p.ej. @Generic(T)"
+            );
+        }
+
+        // descomponer la lista de parametros separados por comas
+        const std::string &raw = node->value;
+        std::string param;
+        for (size_t i = 0; i <= raw.size(); ++i) {
+            if (i == raw.size() || raw[i] == ',') {
+                // eliminar espacios
+                size_t s = 0, e = param.size();
+                while (s < e && param[s] == ' ') ++s;
+                while (e > s && param[e - 1] == ' ') --e;
+                std::string trimmed = param.substr(s, e - s);
+                if (!trimmed.empty()) {
+                    // registrar el parametro con valor nulo (marcador de genericidad)
+                    assembler.ctx.generic_instances[trimmed] = nullptr;
+                }
+                param.clear();
+            } else {
+                param += raw[i];
+            }
+        }
+    }
 }

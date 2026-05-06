@@ -95,7 +95,7 @@ VESTA_PLUGIN_EXPORT void vesta_init(const VestaPluginAPI *api) {
 #if VESTA_MATH_DEBUG
     if (api) api->log("[vesta_math] cargado");
 #else
-    (void)api;
+    (void) api;
 #endif
 }
 
@@ -135,8 +135,8 @@ VESTA_PLUGIN_EXPORT uint64_t vmath_pow(uint64_t base_bits, uint64_t exp_bits) {
  * @return   |n| como uint64_t.
  */
 VESTA_PLUGIN_EXPORT uint64_t vmath_abs(uint64_t n) {
-    int64_t s = (int64_t)n;
-    return (uint64_t)(s < 0 ? -s : s);
+    int64_t s = (int64_t) n;
+    return (uint64_t) (s < 0 ? -s : s);
 }
 
 /**

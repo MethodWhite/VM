@@ -1,0 +1,112 @@
+/*
+ * ejemplo_tailcall.vel
+ *
+ * Demuestra la instruccion TAILCALL (Tail Call Optimization, TCO).
+ *
+ * TAILCALL permite realizar llamadas en posicion de cola sin crecimiento de
+ * pila.  En lugar de empujar una nueva direccion de retorno y crear un nuevo
+ * frame, TAILCALL:
+ *   1. Si existe un FrameHeader OOP activo, restaura RSP al frame_base
+ *      y lo desapila.
+ *   2. Salta directamente a la funcion destino SIN empujar una nueva ret_addr.
+ *   3. La ret_addr del llamante original ya esta en la pila; la funcion
+ *      destino retornara al llamante correcto con RET.
+ *
+ * Esto permite implementar recursion profunda sin que la pila crezca.
+ *
+ * Ejemplo: factorial con acumulador (tail-recursive)
+ *
+ *   factorial_acc(n, acc):
+ *     si n <= 1: retornar acc
+ *     si no:    factorial_acc(n-1, n*acc)  <- llamada en cola -> TAILCALL
+ *
+ * Convencion de llamada usada:
+ *   r1 = n   (contador decreciente)
+ *   r2 = acc (acumulador; al terminar contiene el resultado)
+ *
+ * Patron de invocacion (sin CALLVM, de forma manual):
+ *   1. Empujar ret_addr en la pila con PUSH r4.
+ *   2. Saltar a factorial_acc con jmp.
+ *   3. factorial_acc usa TAILCALL r3 en la rama recursiva.
+ *   4. Al llegar a la base, RET usa la ret_addr que quedo en la pila.
+ *
+ * Resultado esperado al llegar a hlt:
+ *   r2 == 120  (5! = 120)
+ *
+ * Compilar y ejecutar:
+ *   vesta --build ejemplo_tailcall.vel -o ejemplo_tailcall
+ *   vesta --run   ejemplo_tailcall.velb --stats
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+// -----------------------------------------------------------------------
+// factorial_acc(r1=n, r2=acc) -> r2
+//
+// Implementacion tail-recursive: TAILCALL sustituye la llamada recursiva
+// sin empujar un nuevo frame, por lo que la pila permanece constante.
+// -----------------------------------------------------------------------
+factorial_acc:
+    // Caso base: si n <= 1, r2 ya contiene el resultado; retornar.
+    mov r0, 1
+    cmpu r1, r0             // compara n con 1 (sin signo)
+    jmp.je base_factorial   // saltar si n == 1 (caso base)
+
+    // Paso recursivo: acc = n * acc  (mulu es de dos operandos: r2 *= r1)
+    mulu r2, r1             // r2 = r2 * r1
+
+    // n = n - 1
+    subu r1, 1
+
+    // Cargar la direccion de factorial_acc para el tailcall
+    mov r3, @Absolute("all.factorial_acc")
+
+    // TAILCALL r3:
+    //   No empuja ret_addr nueva; la del llamante original ya esta en la pila.
+    //   La pila no crece con cada nivel de recursion.
+    tailcall r3             // factorial_acc(n-1, n*acc)
+
+base_factorial:
+    // r2 contiene el resultado final; regresar al llamante
+    ret
+end_factorial_acc:
+
+// -----------------------------------------------------------------------
+// Programa principal
+// -----------------------------------------------------------------------
+code:
+    // Inicializar pila (obligatorio para RET y TAILCALL)
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // Argumentos iniciales: 5! = 120
+    mov r1, 5               // n = 5
+    mov r2, 1               // acc = 1 (elemento neutro de la multiplicacion)
+
+    // Patron de invocacion manual:
+    //   1. Empujar la direccion de retorno "despues_de_factorial" con PUSH.
+    //   2. Saltar a factorial_acc.
+    //   3. Al finalizar, factorial_acc ejecuta RET y salta a "despues_de_factorial".
+    // Empujar la direccion de retorno usando PUSH
+    mov r4, @Absolute("all.despues_de_factorial")
+    push r4                  // *RSP = direccion de retorno; RSP -= 8
+
+    // Saltar a factorial_acc (sin empujar otra ret_addr; la de arriba es la unica)
+    jmp factorial_acc
+
+despues_de_factorial:
+    // r2 == 120 (5!)
+    hlt
+end_code:

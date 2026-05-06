@@ -22,6 +22,7 @@
  */
 #include "linker/velb_linker_bytecode.h"
 
+#include <cstring>
 #include "emmit/bytereader.h"
 #include "emmit/parser_to_bytecode.h"
 #include "loader/loader.h"
@@ -340,6 +341,17 @@ namespace Assembly::Bytecode::Linker {
 
 
     void Linker::apply_relocations() {
+        // limpiar la tabla de relocations capturadas (por si se llama
+        // mas de una vez en un mismo Linker).
+        applied_relocations_.clear();
+
+        // cuando se concatenan bytecodes en `merge_sections`, cada
+        // modulo se anade en orden.  Aqui llevamos un acumulador del offset
+        // de cada modulo dentro del @c final_bytecode para registrar
+        // direcciones absolutas con offsets RELATIVOS A FINAL_BYTECODE
+        // (no relativos al modulo).  El loader luego anade
+        // @c offset_real_bytecode + section.file_offset para llegar al .velb.
+        uint64_t module_base_offset = 0;
         // Recorrer todos los modulos cargados
         // Cada modulo tiene:
         // su propio bytecode
@@ -393,6 +405,14 @@ namespace Assembly::Bytecode::Linker {
                         // mov rax, [foo]   ->   se escribe la direccion absoluta de foo
                         case Type::Absolute64: {
                             std::memcpy(&mod.bytecode[rel.offset], &target_addr, sizeof(uint64_t));
+                            // capturar la relocation en la tabla persistente
+                            // para que el loader pueda re-aplicarla con un nuevo
+                            // base address (rebase transparente sin flags).
+                            entry_relocation_table e{};
+                            e.bytecode_offset = module_base_offset + rel.offset;
+                            e.target_value    = target_addr;
+                            e.type            = static_cast<uint8_t>(RelocTypeVELB::ABSOLUTE64);
+                            applied_relocations_.push_back(e);
                             break;
                         }
 
@@ -509,6 +529,10 @@ namespace Assembly::Bytecode::Linker {
 
                 report.relocations_applied++;
             }
+            // avanzar el offset acumulado al final del bytecode de este
+            // modulo, para que las relocations del proximo modulo se registren
+            // con offsets correctos relativos al final_bytecode.
+            module_base_offset += mod.bytecode.size();
         }
     }
 
@@ -578,7 +602,7 @@ namespace Assembly::Bytecode::Linker {
         // anteriores de funciones previas.
 
         final_header.magic.firma = MAGIC_NUMBER_VELB;
-        final_header.format_v    = 1;
+        final_header.format_v    = VERSION_VELB; // 0x2 (anyade tabla de relocations)
 
         final_header.max_v = 0; // 0.0.0 => compatible con futuras
         final_header.min_v = 0; // 0.0.0 => retrocompatible
@@ -903,6 +927,27 @@ namespace Assembly::Bytecode::Linker {
         // indicar el tamano de la tabla de etiquetas.
         result->emit32(final_header.size_label_table);
 
+        // campos de depuracion (añadidos al struct pero antes no se emitian, lo que desplazaba
+        // compute_sections_base_offset() 16 bytes respecto a la posicion real del blob de strings)
+        result->emit64(final_header.offset_debug_section);
+        result->emit32(final_header.size_debug_section);
+        result->emit8(final_header.debug_level);
+        result->emit8(final_header._debug_pad[0]);
+        result->emit8(final_header._debug_pad[1]);
+        result->emit8(final_header._debug_pad[2]);
+
+        // tabla de relocations.  Los valores reales se patchean DESPUES
+        // de escribir el bytecode (para conocer la posicion exacta).  Aqui
+        // emitimos placeholders 0; los reescribiremos via write64_at /
+        // write32_at una vez sepamos donde queda la tabla en el archivo.
+        const size_t header_pos_offset_reloc = result->offset; // recordar pos
+        result->emit64(final_header.offset_reloc_table); // 0 por ahora
+        const size_t header_pos_size_reloc = result->offset;
+        result->emit32(final_header.size_reloc_table);   // 0 por ahora
+        for (uint8_t pad : final_header._reloc_pad) {
+            result->emit8(pad);
+        }
+
         // el header siempre debe estar alineado a 16 bytes
         while (result->offset % 16 != 0) {
             result->emit8(0x00);
@@ -954,6 +999,45 @@ namespace Assembly::Bytecode::Linker {
             result->emit32(entry.offset_function_string);
             result->emit32(entry.offset_signature_string);
             result->emit32(entry.offset_bytecode);
+        }
+
+        // emitir la tabla de relocations al final del archivo.
+        // Cada entry son 24 bytes packed: bytecode_offset (u64) + target_value
+        // (u64) + type (u8) + pad (u8x7).  El header se patchea con el
+        // offset y size al concluir la emision.
+        //
+        // CRITICO: `result->offset` NO se actualiza al hacer
+        // `output.insert(...)` directamente con final_bytecode (vease arriba),
+        // asi que NO refleja la posicion real del cursor en el archivo.
+        // Usar `output.size()` que SI es la posicion real al final del buffer.
+        if (!applied_relocations_.empty()) {
+            // Alineacion 8 bytes para acceso eficiente.
+            while (result->output.size() % 8 != 0) {
+                result->output.push_back(0x00);
+            }
+            const uint64_t reloc_table_file_offset = result->output.size();
+            // Reservar espacio y escribir cada entry directamente al buffer
+            // (sin pasar por emit*, que actualizan offset, mantenido como
+            // contador relativo al header, no a la posicion final del file).
+            const size_t entry_bytes = 24;
+            const size_t total = entry_bytes * applied_relocations_.size();
+            result->output.reserve(result->output.size() + total);
+            for (const auto &e : applied_relocations_) {
+                const size_t base = result->output.size();
+                result->output.resize(base + entry_bytes, 0x00);
+                std::memcpy(&result->output[base + 0],  &e.bytecode_offset, 8);
+                std::memcpy(&result->output[base + 8],  &e.target_value,    8);
+                result->output[base + 16] = e.type;
+                // bytes 17..23 quedan a 0 (padding) por el resize.
+            }
+            // Patchear los campos del header con el offset y size correctos.
+            result->write64_at(reloc_table_file_offset, header_pos_offset_reloc);
+            result->write32_at(static_cast<uint32_t>(applied_relocations_.size()),
+                                header_pos_size_reloc);
+            // Tambien actualizar el final_header en memoria por consistencia
+            // (e.g. para write_map_file / dumps).
+            final_header.offset_reloc_table = reloc_table_file_offset;
+            final_header.size_reloc_table   = static_cast<uint32_t>(applied_relocations_.size());
         }
 
         return result->output;

@@ -1,0 +1,28 @@
+// Verificacion de TCO (tail call optimization).
+//
+// El optimizador `ir_pass_tailcall` (O2) detecta el patron
+// `return f(args)` y lo convierte en TAILCALL si los argumentos NO son
+// derivados de ALLOCA del caller (proteccion contra `leave` que
+// invalidaria los punteros al frame).
+//
+// Aqui los argumentos son escalares puros (suma de inmediatos), no hay
+// ALLOCA en juego, asi que el lowering DEBE emitir `tailcall` para la
+// llamada `helper(n + 1)` en wrapper, y para `wrapper(20)` en main.
+//
+// Resultado esperado: 42  (helper(21) = 21 * 2 = 42)
+//
+// Inspeccion del .vel: debe haber al menos 1 ocurrencia de `tailcall`
+// en wrapper (el cuerpo de main puede o no usarlo segun como el
+// frontend este organizado).
+
+i32 helper(i32 x) {
+    return x + x;
+}
+
+i32 wrapper(i32 n) {
+    return helper(n + 1);
+}
+
+i32 main() {
+    return wrapper(20);
+}

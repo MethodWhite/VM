@@ -1,0 +1,19 @@
+// Sync + throw mas simple posible - todo en main, sin metodos.
+class MyExc {
+    public i32 codigo;
+    public MyExc(i32 c) { this.codigo = c; }
+}
+class Lock { public Lock() {} }
+
+i32 main() {
+    Lock m = new Lock();
+    i32 acc = 0;
+    try {
+        synchronized (m) {
+            throw new MyExc(7);
+        }
+    } catch (MyExc e) {
+        acc = 1000 + e.codigo; // 1007
+    }
+    return acc;
+}

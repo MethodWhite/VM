@@ -1,0 +1,19 @@
+// Benchmark variable.
+class Foo {
+    public i32 x;
+    public Foo() { this.x = 0; }
+}
+
+i32 helper() {
+    Foo f = new Foo();
+    return 0;
+}
+
+i32 main() {
+    i32 i = 0;
+    while (i < 5000000) {
+        helper();
+        i = i + 1;
+    }
+    return i;
+}

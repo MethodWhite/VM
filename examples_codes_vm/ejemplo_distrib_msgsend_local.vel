@@ -1,0 +1,140 @@
+/*
+ * ejemplo_distrib_msgsend_local.vel
+ *
+ * Demuestra el IPC (comunicacion entre procesos) local de VestaVM usando
+ * las instrucciones MSGSEND y MSGRECV.
+ *
+ * En este patron "mismo-nodo" el mensaje viaja directamente al buzon
+ * (Mailbox) del proceso receptor sin pasar por la red.  El receptor
+ * bloqueado en MSGRECV es despertado automaticamente por el emisor.
+ *
+ * Instrucciones usadas:
+ *
+ *   MSGSEND  r_pid, r_addr, r_len
+ *       Envia un mensaje al proceso cuyo PID esta en r_pid.
+ *       r_addr = direccion VM del buffer origen.
+ *       r_len  = longitud en bytes.
+ *       R0 = 1 si el mensaje fue encolado; 0 si hubo error.
+ *
+ *   MSGRECV  r_buf, r_max
+ *       Extrae el primer mensaje del buzon del proceso actual.
+ *       r_buf = direccion VM del buffer destino.
+ *       r_max = tamano maximo del buffer en bytes.
+ *       R0 = bytes copiados (0 si bloqueo en espera de mensaje).
+ *       Si el buzon esta vacio el proceso se suspende (EVT_IO_WAIT) y
+ *       se re-ejecuta MSGRECV cuando llegue un mensaje.
+ *
+ * Codificacion del PID local (64 bits):
+ *   bit 63 = 0     (flag de PID local; los remotos tienen bit63=1)
+ *   bits 31-0 = local_pid  (el valor que devuelve SPAWN en bits bajos)
+ *
+ * Flujo:
+ *   1. Proceso padre crea un buffer con el mensaje "Hola VM".
+ *   2. Padre hace SPAWN del proceso receptor (r0 = PID del hijo).
+ *   3. Padre extrae local_pid de r0 (bits 31-0).
+ *   4. Padre ejecuta MSGSEND -> mensaje queda en el buzon del hijo.
+ *   5. Hijo ejecuta MSGRECV -> lee el mensaje del buzon.
+ *   6. Hijo comprueba que el primer byte sea 'H' (0x48) como verificacion.
+ *
+ * Compilar y ejecutar:
+ *   vesta --build ejemplo_distrib_msgsend_local.vel -o ejemplo_distrib_msgsend_local
+ *   vesta --run   ejemplo_distrib_msgsend_local.velb --stats
+ *
+ * Resultado esperado (con --stats):
+ *   R0 del hijo = 8  (bytes recibidos en MSGRECV)
+ *   R1 del hijo = 0x48 ('H', primer byte de "Hola VM\0")
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+// -----------------------------------------------------------------------
+// Datos del proceso padre
+// -----------------------------------------------------------------------
+
+// Buffer del mensaje: "Hola VM\0" (8 bytes)
+msg_data:
+    .byte 0x48, 0x6F, 0x6C, 0x61, 0x20, 0x56, 0x4D, 0x00
+end_msg_data:
+
+// Buffer de recepcion del proceso hijo (64 bytes, inicialmente cero)
+recv_buf:
+    .zero 64
+end_recv_buf:
+
+// -----------------------------------------------------------------------
+// PROCESO PADRE
+// Paso 1: hace SPAWN del receptor.
+// Paso 2: envia el mensaje al PID del hijo con MSGSEND.
+// -----------------------------------------------------------------------
+code:
+    // configurar pila del proceso padre
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // lanzar el proceso receptor y obtener su PID codificado
+    mov   r1, @Absolute("all.receptor")
+    spawn r1                              // r0 = PID codificado del hijo
+
+    // extraer el local_pid del hijo (bits 31-0 del PID codificado)
+    // para IPC local el PID que usa msgsend es simplemente local_pid
+    // (bit63 = 0 => PID local; la busqueda ignora el scheduler_id)
+    mov   r10, r0                         // r10 = PID completo del hijo
+
+    // preparar los argumentos de MSGSEND:
+    //   r2 = PID local del destino  (bits 31-0 de r0)
+    //   r3 = direccion VM del buffer del mensaje
+    //   r4 = longitud del mensaje en bytes
+    mov   r2, r10
+    mov   r3, @Absolute("all.msg_data")
+    mov   r4, 8                           // "Hola VM\0" son 8 bytes
+
+    // enviar el mensaje al buzon del receptor
+    // MSGSEND r_pid, r_addr, r_len  -> R0 = 1 si OK, 0 si error
+    msgsend r2, r3, r4
+
+    // R0 debe ser 1 (mensaje encolado con exito)
+    // el padre puede verificar r0 == 1 antes de continuar
+    hlt                                   // padre termina (hijo sigue en cola READY)
+end_code:
+
+// -----------------------------------------------------------------------
+// PROCESO RECEPTOR (hijo)
+// Se bloquea en MSGRECV hasta que llegue un mensaje.
+// Al recibir, lee el primer byte y lo deja en R1 como verificacion.
+// -----------------------------------------------------------------------
+receptor:
+    // configurar pila del proceso hijo
+    mov rsp, 0x00FE0000
+    mov rbp, 0x00FE0000
+
+    // preparar argumentos de MSGRECV:
+    //   r5 = direccion VM del buffer de destino
+    //   r6 = tamano maximo del buffer (64 bytes)
+    mov   r5, @Absolute("all.recv_buf")
+    mov   r6, 64
+
+    // esperar y recibir el mensaje (se bloquea si el buzon esta vacio)
+    // MSGRECV r_buf, r_max  -> R0 = bytes copiados al buffer
+    msgrecv r5, r6
+
+    // R0 = numero de bytes recibidos (deberia ser 8)
+
+    // leer el primer byte del buffer para verificar el contenido
+    // primer byte de "Hola VM\0" es 'H' = 0x48
+    movc  r1, [r5]                        // r1 = primer byte del mensaje recibido
+    // r1 deberia ser 0x48 ('H')
+
+    hlt                                   // receptor termina con R0=bytes, R1='H'
+end_receptor:

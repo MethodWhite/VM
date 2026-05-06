@@ -1,0 +1,388 @@
+/**
+ * ejemplo_hhl_completo.ir
+ * Demostracion integral de funcionalidades HHL: OOP, strings, arrays,
+ * excepciones y async/futures combinados en un mini-programa realista.
+ *
+ * Este fichero simula una "tabla de nombres" (NameTable): un array de
+ * StringObject handles con operaciones de insercion, busqueda y conteo.
+ * No depende de librerias nativas salvo la convencion de GC.
+ *
+ * Conceptos demostrados:
+ *
+ *   OOP / GETFIELD / SETFIELD
+ *     - Leer y escribir campos de un objeto GC a traves de offsets.
+ *     - Write barrier automatico (gcwb) para campos de tipo handle.
+ *
+ *   Strings
+ *     - strcat  : concatenar dos cadenas.
+ *     - strcmp  : comparar lexicograficamente.
+ *     - strlen  : contar code points.
+ *     - strflat : materializar ROPE/SLICE antes de comparacion.
+ *
+ *   Arrays
+ *     - array_len   : longitud del array.
+ *     - array_load  : leer un elemento por indice.
+ *     - array_store : escribir un elemento; gcwb automatico para handles.
+ *
+ *   Excepciones
+ *     - tryenter / tryleave : delimitar un bloque try.
+ *     - throw               : lanzar un objeto de excepcion.
+ *     - landingpad          : recibir el objeto lanzado en el catch.
+ *     - unwrap              : desenvuelve o lanza NullPointerException.
+ *     - isnull              : comprobar nulo sin excepcion.
+ *
+ *   Async / Futures
+ *     - future  : crear un FutureObject en estado PENDING.
+ *     - fulfill : resolver el future con un valor.
+ *     - await   : bloquear hasta que el future este resuelto.
+ *
+ *   TCO
+ *     - Funciones con recursion de cola anotadas para que el pase
+ *       ir_pass_tailcall (O2+) las convierta en tailcall.
+ *
+ *   Debug info
+ *     - Todas las instrucciones incluyen source_line para que
+ *       --emit-debug produzca comentarios "// @line N" en el .vel.
+ *
+ * Compilar (O1 preserva catch blocks; O2 activa TCO pero elimina catch blocks unreachable):
+ *   vm --ir-file examples_ir/ejemplo_hhl_completo.ir --ir-opt 1 -o build/out_ir/hhl
+ *
+ * Solo emitir .vel con info de debug:
+ *   vm --ir-file examples_ir/ejemplo_hhl_completo.ir --ir-opt 1 --ir-emit-only --emit-debug
+ */
+
+@module ejemplo_hhl_completo
+
+// Punto de entrada: demuestra el uso correcto del GC con instrucciones integradas
+// en la VM (future/fulfill/await).  FutureObject es un objeto GC gestionado
+// por el heap generacional; no requiere ninguna libreria nativa.
+//
+// Flujo:
+//   1. future          -> asigna FutureObject en estado PENDING; r0 = GcHandle
+//   2. fulfill fut, v  -> resuelve el future con v=1 (RESOLVED)
+//   3. await fut       -> bloquea hasta resolver; ya esta RESOLVED, retorna 1
+//
+// Retorna 1 si el pipeline future/fulfill/await funciono correctamente.
+@function demo_run() -> i64 {
+entry:
+    fut    = future              // FutureObject GC en estado PENDING
+    one    = const.i64 1
+    fulfill fut, one             // resolver sincrono con valor 1
+    result = await fut           // retorna 1 inmediatamente (ya RESOLVED)
+    ret.i64 result
+}
+
+// ---------------------------------------------------------------------------
+// Parte 1: OOP — layout de objeto "NameEntry"
+//
+//   offset  0..23  ObjectHeader (clase, flags, hash_code, owner_pid, ...)
+//   offset 24..31  campo "name"  : handle (GcHandle a StringObject)
+//   offset 32..39  campo "count" : i64 (numero de veces insertado)
+// ---------------------------------------------------------------------------
+
+// Obtener el nombre almacenado en un NameEntry
+@function entry_get_name(e: handle) -> handle {
+entry:
+    name = getfield.handle e, 24
+    ret.handle name
+}
+
+// Obtener el contador de un NameEntry
+@function entry_get_count(e: handle) -> i64 {
+entry:
+    cnt = getfield.i64 e, 32
+    ret.i64 cnt
+}
+
+// Incrementar el contador de un NameEntry
+@function entry_inc_count(e: handle) -> void {
+entry:
+    old = getfield.i64 e, 32
+    one = const.i64 1
+    new = add.i64 old, one
+    setfield.i64 e, 32, new
+    ret.void
+}
+
+// Asignar un nuevo nombre a un NameEntry (genera write barrier)
+@function entry_set_name(e: handle, s: handle) -> void {
+entry:
+    setfield.handle e, 24, s   // gcwb emitido automaticamente por tipo handle
+    ret.void
+}
+
+// ---------------------------------------------------------------------------
+// Parte 2: Strings — construir una clave compuesta "prefix:suffix"
+// ---------------------------------------------------------------------------
+
+// Construir la cadena "prefix:suffix" concatenando tres partes
+@function build_key(prefix: handle, suffix: handle) -> handle {
+entry:
+    colon = strcat.handle prefix, suffix   // simplificado: prefix ++ suffix
+    flat  = strflat.handle colon           // materializar si es ROPE
+    ret.handle flat
+}
+
+// Comprobar si dos cadenas son iguales (strcmp == 0)
+@function str_eq(a: handle, b: handle) -> bool {
+entry:
+    r    = strcmp.i64 a, b
+    zero = const.i64 0
+    eq   = cmp.eq.i64 r, zero
+    ret.bool eq
+}
+
+// Verificar que una cadena no esta vacia (length > 0)
+@function str_nonempty(s: handle) -> bool {
+entry:
+    n    = strlen.i64 s
+    zero = const.i64 0
+    ok   = cmp.gt.i64 n, zero
+    ret.bool ok
+}
+
+// ---------------------------------------------------------------------------
+// Parte 3: Arrays — tabla de handles de NameEntry
+//
+//   El array se modela como un handle[] de tamano fijo asignado via array_alloc
+//   (requiere stdlib nativa; aqui lo usamos como convencion).
+// ---------------------------------------------------------------------------
+
+// Buscar un handle en el array por indice e impedir acceso nulo con unwrap
+@function table_get_safe(arr: i64, idx: i64) -> handle {
+entry:
+    raw  = array_load.handle arr, idx   // cargar elemento del array
+    safe = unwrap raw                   // lanza NullPointerException si es 0
+    ret.handle safe
+}
+
+// Comprobar si la casilla en idx esta vacia (isnull, sin lanzar)
+@function table_slot_empty(arr: i64, idx: i64) -> bool {
+entry:
+    raw    = array_load.handle arr, idx
+    is_nil = isnull raw
+    ret.bool is_nil
+}
+
+// Almacenar un handle en la casilla idx
+@function table_set(arr: i64, idx: i64, e: handle) -> void {
+entry:
+    array_store.handle arr, idx, e   // gcwb emitido automaticamente
+    ret.void
+}
+
+// Contar casillas ocupadas (no nulas) en el array
+@function table_count(arr: i64) -> i64 {
+entry:
+    n    = array_len.i64 arr
+    zero = const.i64 0
+    one  = const.i64 1
+    br loop_check
+
+loop_check:
+    acc = phi.i64 [zero, entry], [acc_next, loop_next]
+    i   = phi.i64 [zero, entry], [i_next,   loop_next]
+    done = cmp.ge.i64 i, n
+    br.cond done, loop_exit, loop_body
+
+loop_body:
+    slot   = array_load.handle arr, i
+    is_nil = isnull slot
+    br.cond is_nil, skip_slot, count_slot
+
+count_slot:
+    one_i   = const.i64 1
+    acc_inc = add.i64 acc, one_i
+    br loop_next
+
+skip_slot:
+    br loop_next
+
+loop_next:
+    acc_next = phi.i64 [acc_inc, count_slot], [acc, skip_slot]
+    i_next   = add.i64 i, one
+    br loop_check
+
+loop_exit:
+    ret.i64 acc
+}
+
+// ---------------------------------------------------------------------------
+// Parte 4: Excepciones — insercion segura con manejo de errores
+// ---------------------------------------------------------------------------
+
+// Insertar una clave en la tabla; lanza exc_obj si la clave ya existe
+// Retorna el indice donde se inserto, o -1 si se captura la excepcion
+// Nota: compilar con --ir-opt 1; a O2 el unreachable-elimination elimina
+// catch_block porque no tiene predecesor CFG (es solo un handler de excepcion).
+@function table_insert_safe(arr: i64, key: handle, exc_obj: handle) -> i64 {
+entry:
+    n          = array_len.i64 arr
+    zero       = const.i64 0
+    one        = const.i64 1
+    catch_addr = const.i64 0     // placeholder: compilador HHL resuelve esto
+    class_info = const.i64 0     // catch-all
+    tryenter catch_addr, class_info
+    br search_loop
+
+search_loop:
+    i    = phi.i64 [zero, entry], [i_next, advance]
+    done = cmp.ge.i64 i, n
+    br.cond done, not_found, check_slot
+
+check_slot:
+    slot  = array_load.handle arr, i
+    empty = isnull slot
+    br.cond empty, insert_here, check_key
+
+check_key:
+    existing_entry = unwrap slot
+    existing_name  = getfield.handle existing_entry, 24
+    eq             = call.bool @str_eq(existing_name, key)
+    br.cond eq, key_exists, advance
+
+key_exists:
+    throw exc_obj
+    unreachable
+
+insert_here:
+    tryleave
+    ret.i64 i
+
+advance:
+    i_next = add.i64 i, one
+    br search_loop
+
+not_found:
+    tryleave
+    br fail_out
+
+catch_block:
+    exc = landingpad.handle
+    br fail_out
+
+fail_out:
+    minus_one_a = const.i64 -1
+    ret.i64 minus_one_a
+}
+
+// ---------------------------------------------------------------------------
+// Parte 5: Async — busqueda concurrente con future/await
+// ---------------------------------------------------------------------------
+
+// Lanzar una busqueda async de una clave en el array
+// Retorna un GcHandle al FutureObject (el resultado sera el indice o -1)
+@function table_search_async(arr: i64, key: handle) -> handle {
+entry:
+    fut   = future              // crear FutureObject en estado PENDING
+    fut_h = mov.handle fut      // guardar handle (r11 reservado al emisor; usar alias)
+    // En un caso real: spawn un proceso hijo que haga la busqueda y llame
+    // a fulfill(fut_h, resultado) cuando termine.
+    // Aqui resolvemos de forma sincronica para ilustrar la API:
+    idx   = call.i64 @table_find(arr, key)
+    fulfill fut_h, idx          // resolver el future con el indice encontrado
+    ret.handle fut_h
+}
+
+// Esperar el resultado de una busqueda async
+@function table_wait_result(fut: handle) -> i64 {
+entry:
+    result = await fut    // bloquea hasta que el future este resuelto; r0 = resultado
+    ret.i64 result
+}
+
+// ---------------------------------------------------------------------------
+// Parte 6: Busqueda lineal recursiva de cola (TCO)
+// Con --ir-opt 2, el pase ir_pass_tailcall convierte la recursion en tailcall
+// ---------------------------------------------------------------------------
+
+// Buscar la primera casilla que contenga una entrada con el nombre "key"
+// Retorna el indice o -1 si no se encuentra.
+// (n = longitud; i = indice actual)
+@function table_find_rec(arr: i64, key: handle, i: i64, n: i64) -> i64 {
+entry:
+    done = cmp.ge.i64 i, n
+    br.cond done, not_found, check
+
+check:
+    slot  = array_load.handle arr, i
+    empty = isnull slot
+    br.cond empty, next_slot, compare
+
+compare:
+    entry_h = unwrap slot
+    name    = getfield.handle entry_h, 24
+    eq      = call.bool @str_eq(name, key)
+    br.cond eq, found, next_slot
+
+found:
+    ret.i64 i
+
+next_slot:
+    one    = const.i64 1
+    i_next = add.i64 i, one
+    // Con O2 esto se convierte en: tailcall @table_find_rec(arr, key, i_next, n)
+    r = call.i64 @table_find_rec(arr, key, i_next, n)
+    ret.i64 r
+
+not_found:
+    minus_one = const.i64 -1
+    ret.i64 minus_one
+}
+
+// Punto de entrada publico: wraps table_find_rec desde indice 0
+@function table_find(arr: i64, key: handle) -> i64 {
+entry:
+    n    = array_len.i64 arr
+    zero = const.i64 0
+    r    = call.i64 @table_find_rec(arr, key, zero, n)
+    ret.i64 r
+}
+
+// ---------------------------------------------------------------------------
+// Parte 7: Programa principal de demostracion
+// (no ejecutable directamente; requiere librerias nativas para GC/IO)
+// ---------------------------------------------------------------------------
+
+// Contar entradas cuyo nombre tiene mas de min_len code points
+@function table_count_long(arr: i64, min_len: i64) -> i64 {
+entry:
+    n    = array_len.i64 arr
+    zero = const.i64 0
+    one  = const.i64 1
+    br loop_check
+
+loop_check:
+    acc = phi.i64 [zero, entry], [acc_next, loop_next]
+    i   = phi.i64 [zero, entry], [i_next,   loop_next]
+    done = cmp.ge.i64 i, n
+    br.cond done, loop_exit, loop_body
+
+loop_body:
+    slot   = array_load.handle arr, i
+    is_nil = isnull slot
+    br.cond is_nil, skip_long, check_len
+
+check_len:
+    e   = unwrap slot
+    s   = getfield.handle e, 24
+    len = strlen.i64 s
+    big = cmp.gt.i64 len, min_len
+    br.cond big, count_it, skip_long
+
+count_it:
+    one_i   = const.i64 1
+    acc_inc = add.i64 acc, one_i
+    br loop_next
+
+skip_long:
+    br loop_next
+
+loop_next:
+    acc_next = phi.i64 [acc_inc, count_it], [acc, skip_long]
+    i_next   = add.i64 i, one
+    br loop_check
+
+loop_exit:
+    ret.i64 acc
+}

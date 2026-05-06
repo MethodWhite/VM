@@ -1,0 +1,30 @@
+// try / catch / throw basico.
+//
+// Verifica el flujo completo:
+//   - throw new MyExc(7) lanza una excepcion con un objeto.
+//   - try { ... } catch (MyExc e) { ... } captura el objeto.
+//   - El catch puede leer e (binding del var en r0 al entrar al handler).
+//
+// Sin try/catch, la excepcion mata el proceso.  Aqui el handler
+// devuelve 1000 + valor, demostrando que:
+//   1. El handler se ejecuta tras la excepcion.
+//   2. La var del catch tiene el objeto thrown.
+//   3. El control fluye al merge correctamente despues del catch.
+//
+// Resultado esperado: 1007 (1000 + 7 del valor capturado).
+
+class MyExc {
+    public i32 valor;
+    public MyExc(i32 v) { this.valor = v; }
+}
+
+i32 main() {
+    i32 r = 0;
+    try {
+        throw new MyExc(7);
+        r = 999;     // dead code: no se ejecuta tras throw
+    } catch (MyExc e) {
+        r = 1000 + e.valor;
+    }
+    return r;        // 1007
+}

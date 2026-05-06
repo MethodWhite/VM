@@ -1,0 +1,46 @@
+// examples_codes_vex/83_host_ptr_indirect.vex
+//
+// Caso indirecto: i32** pp = &p; **pp = v.  Antes del fix completo,
+// el LOAD desde pp para evaluar *pp devolvia un i32* sin marca de
+// host_ptr, asi que el siguiente STORE/LOAD usando ese puntero
+// emitia mov (memoria VM) en vez de movh (memoria host) y corrompia
+// memoria VM en una direccion calculada a partir del puntero host.
+//
+// Fix (parte 2 sobre la parte 1):
+//   - IrValue gana el bit @c pointee_is_host_ptr (apunta a slot VM
+//     cuyo contenido es un host_ptr).
+//   - @c write_local marca el SSA value del slot (addr) con ese bit
+//     cuando se le escribe un valor con @c is_host_ptr=true.
+//   - @c lower_unary Deref consulta @c pointee_is_host_ptr en el
+//     puntero leido y propaga @c is_host_ptr=true al destino del LOAD.
+//
+// Esperado: R00 == 42.
+
+i32 main() {
+    // p apunta a heap host (4 i32).
+    i32* p = malloc(16);
+
+    // pp apunta al slot VM donde vive p (toma direccion = trigger
+    // de address-taken sobre p).  El bit pointee_is_host_ptr del
+    // slot se propaga a pp via lookup() en lower_unary AddrOf.
+    // Tipo: VirtualPtr<i32*> = direccion VM al slot que contiene un
+    // puntero host (resultado de malloc).
+    VirtualPtr<i32*> pp = &p;
+
+    // Acceder a memoria host VIA pp (doble indireccion).
+    // *pp = LOAD desde pp -> recupera p original con is_host_ptr=true.
+    // Luego *pp[0] hace addr=*pp + 0*4 (host_ptr propagado por aritm)
+    // y STORE 100 -> emite movh (correcto).
+    i32* q = *pp;
+    q[0] = 100;
+    q[1] = 200;
+    q[2] = 50;
+    q[3] = 32;
+
+    // Lectura via la misma ruta indirecta.
+    i32* r = *pp;
+    i32 sum = r[0] + r[1] + r[2] + r[3];   // 382
+
+    free(p);
+    return sum - 340;   // 42
+}

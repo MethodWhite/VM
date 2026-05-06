@@ -1,0 +1,48 @@
+// herencia basica + override + super
+//
+// Caso de prueba: una jerarquia Animal -> Perro.
+// Animal define el campo `edad` y dos metodos: `vivir` (no overridado)
+// y `sonido` (overridable).  Perro hereda y override `sonido`, asi que
+// la dispatch virtual debe llamar al sonido del Perro aunque la variable
+// se trate como Animal.
+//
+// Semantica esperada al ejecutar:
+//   p = new Perro(7)
+//   p.edad         -> 7   (campo heredado)
+//   p.vivir()      -> 70  (metodo heredado, retorna edad*10)
+//   p.sonido()     -> 99  (override del Perro: 99 en vez de 1 del Animal)
+//   total = 7+70+99 = 176
+
+class Animal {
+    public i32 edad;
+
+    public Animal(i32 e) {
+        this.edad = e;
+    }
+
+    public i32 vivir() {
+        return this.edad * 10;
+    }
+
+    public i32 sonido() {
+        return 1;
+    }
+}
+
+class Perro : Animal {
+    public Perro(i32 e) {
+        // asignamos al field
+        // heredado directamente (copiado en define_class del loader).
+        this.edad = e;
+    }
+
+    @Override
+    public i32 sonido() {
+        return 99;
+    }
+}
+
+i32 main() {
+    Perro p = new Perro(7);
+    return p.edad + p.vivir() + p.sonido();   // 7+70+99 = 176
+}

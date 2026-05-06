@@ -19,21 +19,145 @@
 #include <fstream>
 #include <sstream>
 #include <thread>
+#include <atomic>
+#include <csignal>
 #include <openssl/sha.h>
 
 #include "cxxopts.hpp"
 
 #include "cli/cli.h"
+#include "cli/vsh.h"
+#include "ir/ir_emitter.h"
 #include "cli/runtime_api_commands.h"
 #include "util/assembler_multiprocess.h"
+#include "vex/compiler.h"
 #include "util/sqlite_singleton.h"
 #include "util/fs_utils.h"
 #include "runtime/manager_runtime.h"
 #include "loader/loader.h"
 #include "profiler/timer.h"
+#include "distrib/dist_runtime.h"
+#include "distrib/dist_debug.h"
+#include "distrib/node_registry.h"
+#include "install/install.h"
+
 #ifdef VESTA_HAS_PREPROCESSOR
     #include "preprocessor/preprocessor.h"
 #endif
+
+// flag global para el modo --dist-server; SIGINT lo pone a false
+static std::atomic<bool> g_server_running{true};
+static void on_dist_sigint(int) { g_server_running.store(false); }
+
+/**
+ * @brief Construye la NodeAuthConfig a partir de los flags de autenticacion.
+ *
+ * Calcula SHA-256 del token en texto plano si se proporciono --dist-token.
+ * Copia las rutas TLS si se activo --dist-tls.
+ *
+ * @param token    Token en texto plano (puede estar vacio).
+ * @param use_tls  true si se activo --dist-tls.
+ * @param cert     Ruta al certificado PEM del cliente.
+ * @param key      Ruta a la clave privada PEM del cliente.
+ * @param ca       Ruta al CA bundle PEM para verificar pares.
+ * @return NodeAuthConfig relleno.
+ */
+static distrib::NodeAuthConfig build_node_auth(
+    const std::string &token,
+    bool               use_tls,
+    const std::string &cert,
+    const std::string &key,
+    const std::string &ca)
+{
+    distrib::NodeAuthConfig auth{};
+    if (!token.empty()) {
+        auth.use_token = true;
+        SHA256(reinterpret_cast<const unsigned char *>(token.c_str()),
+               token.size(), auth.token_hash);
+    }
+    if (use_tls) {
+        auth.use_tls = true;
+        std::snprintf(auth.cert_path, sizeof(auth.cert_path), "%s", cert.c_str());
+        std::snprintf(auth.key_path,  sizeof(auth.key_path),  "%s", key.c_str());
+        std::snprintf(auth.ca_path,   sizeof(auth.ca_path),   "%s", ca.c_str());
+    }
+    return auth;
+}
+
+/**
+ * @brief Aplica la configuracion distribuida a una instancia VM.
+ *
+ * Reemplaza el dist_runtime minimo creado en VM::VM() por uno completamente
+ * configurado segun los flags --dist-* de la linea de comandos.
+ * Si --dist-port > 0 o --dist-discover esta activo, llama a start() para
+ * abrir el servidor VDP y/o el hilo de descubrimiento UDP.
+ * Registra cualquier nodo estatico indicado con --dist-add-node (formato IP:PUERTO).
+ *
+ * @param vm     Instancia VM sobre la que se aplica la configuracion.
+ * @param result Resultado del parseo de cxxopts con todos los flags.
+ */
+static void apply_dist_config(runtime::VM *vm, const cxxopts::ParseResult &result)
+{
+    const std::string token   = result["dist-token"].as<std::string>();
+    const bool        use_tls = result.count("dist-tls") > 0;
+    const std::string cert    = result["dist-cert"].as<std::string>();
+    const std::string key     = result["dist-key"].as<std::string>();
+    const std::string ca      = result["dist-ca"].as<std::string>();
+
+    // construir configuracion del DistRuntime
+    distrib::DistRuntimeConfig cfg{};
+    cfg.local_node_id    = result["dist-node-id"].as<uint64_t>();
+    cfg.vdp_listen_port  = result["dist-port"].as<uint16_t>();
+    cfg.discover_port    = result["dist-discover-port"].as<uint16_t>();
+    cfg.enable_discovery = result.count("dist-discover") > 0;
+
+    std::string name = result["dist-name"].as<std::string>();
+    if (!name.empty())
+        std::snprintf(cfg.local_node_name, sizeof(cfg.local_node_name), "%s", name.c_str());
+    else
+        std::snprintf(cfg.local_node_name, sizeof(cfg.local_node_name), "vm-%llu",
+                      static_cast<unsigned long long>(vm->id));
+
+    cfg.server_auth = build_node_auth(token, use_tls, cert, key, ca);
+
+    // reemplazar el dist_runtime minimal por uno completamente configurado
+    vm->dist_runtime = std::make_unique<distrib::DistRuntime>(*vm, cfg);
+
+    // arrancar el servidor VDP y/o el descubrimiento si alguno esta habilitado
+    if (cfg.vdp_listen_port > 0 || cfg.enable_discovery) {
+        if (vm->dist_runtime->start()) {
+            std::string msg = "[dist] Servidor VDP iniciado";
+            if (cfg.vdp_listen_port)
+                msg += " en puerto " + std::to_string(cfg.vdp_listen_port);
+            if (cfg.enable_discovery)
+                msg += " con descubrimiento UDP (puerto " + std::to_string(cfg.discover_port) + ")";
+            vesta::scout() << msg << "\n";
+        } else {
+            std::cerr << "[dist] Error al iniciar el servidor VDP\n";
+        }
+    }
+
+    // registrar nodos estaticos proporcionados con --dist-add-node IP:PUERTO
+    if (result.count("dist-add-node")) {
+        distrib::NodeAuthConfig node_auth = build_node_auth(token, use_tls, cert, key, ca);
+        for (auto &spec : result["dist-add-node"].as<std::vector<std::string>>()) {
+            auto colon = spec.rfind(':');
+            if (colon == std::string::npos) {
+                std::cerr << "[dist] Formato invalido (esperado IP:PUERTO): " << spec << "\n";
+                continue;
+            }
+            std::string node_ip   = spec.substr(0, colon);
+            uint16_t    node_port = 0;
+            try { node_port = static_cast<uint16_t>(std::stoul(spec.substr(colon + 1))); }
+            catch (...) { std::cerr << "[dist] Puerto invalido en: " << spec << "\n"; continue; }
+
+            uint32_t idx = vm->dist_runtime->add_node(
+                node_ip.c_str(), node_port, node_auth, node_ip.c_str());
+            vesta::scout() << "[dist] Nodo registrado: " << node_ip << ":"
+                           << node_port << " (idx=" << idx << ")\n";
+        }
+    }
+}
 
 
 int main(int argc, char *argv[]) {
@@ -61,13 +185,75 @@ int main(int argc, char *argv[]) {
             ("run", "Ejecutar un archivo .velb en la VM", cxxopts::value<std::string>())
             ("build", "Compilar un archivo .vel a .velb", cxxopts::value<std::string>())
             ("schedulers", "Número de schedulers para el comando run", cxxopts::value<size_t>()->default_value("1"))
+            ("install",   "Ejecutar el instalador interactivo (o con flags adicionales)")
+            ("uninstall", "Desinstalar Vesta usando el manifest")
+            ("repair",    "Reparar la instalacion existente")
+            ("silent",    "Modo silencioso para install/uninstall")
+            ("per-user",  "Forzar instalacion per-user")
+            ("system-wide","Forzar instalacion system-wide")
+            ("prefix",    "Directorio destino", cxxopts::value<std::string>())
+            ("manifest",  "Ruta a install_manifest.json", cxxopts::value<std::string>())
             ("stats", "Mostrar estadísticas de ejecución al finalizar (tiempo, MIPS)")
+            // ---- opciones de runtime distribuido ----
+            ("dist-port",         "Puerto VDP del servidor distribuido (0 = sin servidor TCP)",
+                cxxopts::value<uint16_t>()->default_value("0"))
+            ("dist-discover",     "Activar descubrimiento UDP de nodos en la LAN")
+            ("dist-discover-port","Puerto UDP para descubrimiento de nodos",
+                cxxopts::value<uint16_t>()->default_value("7790"))
+            ("dist-name",         "Nombre del nodo local (cadena identificativa)",
+                cxxopts::value<std::string>()->default_value(""))
+            ("dist-node-id",      "ID de 64 bits del nodo (0 = generar automaticamente)",
+                cxxopts::value<uint64_t>()->default_value("0"))
+            ("dist-add-node",     "Nodo estatico a registrar y conectar (formato IP:PUERTO, repetible)",
+                cxxopts::value<std::vector<std::string>>())
+            ("dist-token",        "Token de autenticacion en texto plano (se almacena como SHA-256)",
+                cxxopts::value<std::string>()->default_value(""))
+            ("dist-tls",          "Usar TLS en las conexiones VDP salientes y entrantes")
+            ("dist-cert",         "Ruta al certificado TLS del nodo local (PEM)",
+                cxxopts::value<std::string>()->default_value(""))
+            ("dist-key",          "Ruta a la clave privada TLS del nodo local (PEM)",
+                cxxopts::value<std::string>()->default_value(""))
+            ("dist-ca",           "Ruta al CA bundle TLS para verificar pares (PEM)",
+                cxxopts::value<std::string>()->default_value(""))
+            ("dist-server",       "Modo servidor distribuido puro: espera conexiones VDP sin ejecutar bytecode")
+            ("dist-debug",        "Activar trazas de depuracion del subsistema distribuido (RSPAWN, HALT, FUTURE_FULFILL)")
+            ("script",            "Ejecutar un fichero VestaShell (.vsh) y salir", cxxopts::value<std::string>())
+            ("interprete",        "Abrir el interprete interactivo VestaShell (REPL .vsh)")
+            ("ir-file",           "Compilar archivo .ir (SSA IR) a .vel y opcionalmente a .velb",
+                cxxopts::value<std::string>())
+            ("ir-opt",            "Nivel de optimizacion IR: 0=O0, 1=O1, 2=O2, 3=O3 (defecto: 1)",
+                cxxopts::value<int>()->default_value("1"))
+            ("ir-emit-only",      "Solo emitir el texto .vel; no compilar a .velb")
+            ("vex",               "Compilar archivo .vex (lenguaje Vex) a .velb",
+                cxxopts::value<std::string>())
+            ("vex-emit-only",     "Solo emitir el .vel intermedio del .vex; no compilar a .velb")
+            ("vex-emit-ir",       "Emitir el SSA IR del .vex (pre y post optimizacion) en <output>.ir; util para debug del frontend")
+            ("vex-base",          "VA base address para el modulo (hex, e.g. 0x10000000). Usado para plugins cargados via loadmodule, evita solapamiento con el caller (default 0x0).",
+                cxxopts::value<std::string>()->default_value("0x0"))
 #ifdef VESTA_HAS_PREPROCESSOR
             ("preprocess-only", "Solo preprocesar un .vel y mostrar/guardar el resultado (debug)", cxxopts::value<std::string>())
 #endif
             ;
 
+
+    // BUG FIX: Args posicionales y allow_unrecognised DEBEN configurarse
+    // ANTES de @c options.parse(...).  El bug anterior registraba el
+    // option `positional` y @c parse_positional DESPUES del parse, asi
+    // que cualquier `vm --script foo.vsh arg1 arg2` perdia arg1/arg2 y
+    // ARGV del script quedaba con solo el path del script.  Se mueve
+    // toda la configuracion arriba; esto es prerequisito de @c parse.
+    options.add_options()("positional", "Argumentos posicionales",
+        cxxopts::value<std::vector<std::string>>());
+    options.parse_positional({"positional"});
+    options.positional_help("[args...]");
+    options.allow_unrecognised_options();   // para flags sin que aun hay que parsear
+
     auto result = options.parse(argc, argv);
+
+
+    // activar trazas de depuracion del subsistema distribuido si se paso --dist-debug
+    if (result.count("dist-debug"))
+        distrib::set_dist_debug(true);
 
     if (result.count("help")) {
         vesta::scout() << options.help() << std::endl;
@@ -167,6 +353,68 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
+    // -----------------------------------------------------------------------
+    // Modo servidor distribuido puro (sin ejecutar bytecode)
+    // vm.exe --dist-server --dist-port 7789 [--dist-discover] [--dist-name nodo1]
+    //        [--dist-add-node 192.168.1.100:7789] [--dist-token secreto]
+    //        [--dist-tls --dist-cert cert.pem --dist-key key.pem --dist-ca ca.pem]
+    // -----------------------------------------------------------------------
+    if (result.count("dist-server")) {
+        try {
+            runtime::ManageVM dist_mgr(nullptr, 0);
+            runtime::VM *vm = dist_mgr.loader.create_vm_instance(1);
+            if (!vm) {
+                std::cerr << "[dist-server] Error: no se pudo crear la instancia VM\n";
+                return EXIT_FAILURE;
+            }
+
+            apply_dist_config(vm, result);
+
+            // activar modo persistente para que el scheduler no termine al no haber procesos;
+            // los procesos remotos llegan via rspawn despues del arranque
+            vm->vm_persistent = true;
+            vm->start();
+
+            vesta::scout() << "[dist-server] Nodo distribuido activo. "
+                              "Pulse Ctrl+C para detener.\n";
+
+            // esperar hasta Ctrl+C
+            std::signal(SIGINT, on_dist_sigint);
+            while (g_server_running.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            vm->dist_runtime->stop();
+            vm->stop();
+            vesta::scout() << "[dist-server] Nodo detenido.\n";
+        } catch (const std::exception &e) {
+            std::cerr << "[dist-server] Error: " << e.what() << "\n";
+            return EXIT_FAILURE;
+        }
+        return EXIT_SUCCESS;
+    }
+
+    if (result.count("install") ||
+        result.count("uninstall") ||
+        result.count("repair"))
+    {
+        // Reconstruir argv "limpio" para el parser interno del instalador
+        std::vector<std::string> args;
+        if (result.count("uninstall")) args.push_back("uninstall");
+        else if (result.count("repair")) args.push_back("repair");
+        else args.push_back("install");
+
+        if (result.count("silent"))      args.push_back("--silent");
+        if (result.count("per-user"))    args.push_back("--per-user");
+        if (result.count("system-wide")) args.push_back("--system-wide");
+        if (result.count("prefix"))      args.push_back("--prefix=" + result["prefix"].as<std::string>());
+        if (result.count("manifest"))    args.push_back("--manifest=" + result["manifest"].as<std::string>());
+
+        std::vector<char*> argv2;
+        argv2.push_back(argv[0]);
+        for (auto& s : args) argv2.push_back(s.data());
+        return install::run_install_cli((int)argv2.size(), argv2.data());
+    }
+
     // Compilar un archivo como worker
     // vm.exe --worker src/main.vel -o main.velb
     if (result.count("worker")) {
@@ -220,6 +468,266 @@ int main(int argc, char *argv[]) {
                    : EXIT_FAILURE;
     }
 
+    // Compilar un archivo .ir (SSA IR) a .vel y opcionalmente a .velb
+    // vm.exe --ir-file program.ir --ir-opt 2 -o program.velb
+    if (result.count("ir-file")) {
+        const std::string &ir_path = result["ir-file"].as<std::string>();
+        int opt_n = result["ir-opt"].as<int>();
+        bool emit_only = result.count("ir-emit-only") > 0;
+
+        // Leer el archivo .ir
+        std::ifstream ifs(ir_path);
+        if (!ifs.is_open()) {
+            std::cerr << "[ir] No se puede abrir: " << ir_path << "\n";
+            return EXIT_FAILURE;
+        }
+        std::string ir_text((std::istreambuf_iterator<char>(ifs)),
+                             std::istreambuf_iterator<char>());
+
+        // Emitir .vel
+        ir::EmitOptions eopts;
+        eopts.opt_level     = ir::opt_level_from_int(opt_n);
+        eopts.emit_comments = true;
+        eopts.export_all    = true;
+
+        ir::EmitResult er = ir::ir_emit_text(ir_text, eopts);
+        if (!er.ok) {
+            std::cerr << "[ir] Error de emision: " << er.error << "\n";
+            return EXIT_FAILURE;
+        }
+
+        // Determinar nombre del archivo .vel de salida
+        std::string vel_path = out_prefix.empty() ? "out.vel" : out_prefix + ".vel";
+        {
+            std::ofstream ofs(vel_path);
+            if (!ofs.is_open()) {
+                std::cerr << "[ir] No se puede escribir: " << vel_path << "\n";
+                return EXIT_FAILURE;
+            }
+            ofs << er.vel_text;
+        }
+        vesta::scout() << "[ir] .vel generado: " << vel_path << "\n";
+
+        if (emit_only) return EXIT_SUCCESS;
+
+        // Compilar el .vel generado a .velb usando el pipeline existente
+        return asm_multi_process::run_worker(vel_path, out_prefix);
+    }
+
+    // Compilar un archivo .vex (lenguaje Vex) a .velb.
+    // Pipeline:
+    //   .vex source
+    //     -> [VPP opcional]    (metaprogramacion compartida con .vel)
+    //     -> Vex frontend      (lex + parse + tipos + lowering)
+    //     -> ir::IrModule
+    //     -> ir_emit_module    (texto .vel)
+    //     -> run_worker(.vel, skip_preprocessor=true)
+    //     -> .velb
+    //
+    // Ejemplo: vm.exe --vex src/main.vex -o main.velb
+    if (result.count("vex")) {
+        const std::string &vex_path = result["vex"].as<std::string>();
+        bool emit_only = result.count("vex-emit-only") > 0;
+        bool emit_ir   = result.count("vex-emit-ir")   > 0;
+
+        // parsear --vex-base (VA base en hex).  0x0 = comportamiento
+        // por defecto (caller).  Para plugins cargados via loadmodule usar
+        // un valor distinto (ej. 0x10000000) para evitar solapamiento con
+        // el caller cuyo code section vive en 0x0..N.
+        uint64_t vex_base_addr = 0;
+        if (result.count("vex-base")) {
+            const std::string &s = result["vex-base"].as<std::string>();
+            try {
+                vex_base_addr = std::stoull(s, nullptr, 0); // base 0 = autodetect 0x prefix
+            } catch (...) {
+                std::cerr << "[vex] --vex-base invalido: " << s << "\n";
+                return EXIT_FAILURE;
+            }
+        }
+
+        // 1 Leer el .vex.
+        std::ifstream ifs(vex_path);
+        if (!ifs.is_open()) {
+            std::cerr << "[vex] No se puede abrir: " << vex_path << "\n";
+            return EXIT_FAILURE;
+        }
+        std::string vex_source((std::istreambuf_iterator<char>(ifs)),
+                                std::istreambuf_iterator<char>());
+
+        // 2 Aplicar VPP (mismo pipeline que run_worker).  Esto es
+        // best-effort: si una macro genera sintaxis no soportada por Vex,
+        // el frontend reportara el error con la posicion preprocesada.
+#ifdef VESTA_HAS_PREPROCESSOR
+        {
+            vpp::Preprocessor pp;
+            std::string source_dir =
+                std::filesystem::path(vex_path).parent_path().string();
+            pp.options().include_paths.push_back(source_dir);
+            std::string exe_dir =
+                std::filesystem::path(fs::get_executable_path()).parent_path().string();
+            pp.options().import_paths.push_back(exe_dir + "/preprocessor/include_lib");
+            pp.options().import_paths.push_back(exe_dir + "/include_lib");
+            pp.options().import_paths.push_back(source_dir);
+#ifdef _WIN32
+            pp.options().predefines.push_back("__VPP_WINDOWS__");
+#elif defined(__linux__)
+            pp.options().predefines.push_back("__VPP_LINUX__");
+#elif defined(__APPLE__)
+            pp.options().predefines.push_back("__VPP_MACOS__");
+#endif
+            std::string processed = pp.process(vex_source, vex_path);
+            if (pp.diagnostics().has_errors()) {
+                for (const auto &d : pp.diagnostics().diagnostics()) {
+                    std::cerr << d.loc.file << ":" << d.loc.line << ": "
+                              << (d.level == vpp::DiagLevel::ERR ? "error: " : "warning: ")
+                              << d.message << "\n";
+                }
+                return EXIT_FAILURE;
+            }
+            vex_source = std::move(processed);
+        }
+#endif
+
+        // 3 Frontend Vex: source -> IR -> .vel.
+        // Sanitizar el nombre del modulo: el parser .vel rechaza identificadores
+        // que empiezan con digito o que contienen caracteres no [A-Za-z0-9_],
+        // pero los nombres de fichero pueden tener cualquier cosa.  Aplicamos
+        // dos transformaciones: (a) si empieza por digito, anteponer "m_";
+        // (b) sustituir cualquier byte no alfanumerico por '_'.
+        std::string raw_name = std::filesystem::path(vex_path).stem().string();
+        std::string mod_name; mod_name.reserve(raw_name.size() + 2);
+        if (!raw_name.empty()
+         && (raw_name[0] >= '0' && raw_name[0] <= '9')) {
+            mod_name = "m_";
+        }
+        for (char c : raw_name) {
+            const bool ok = (c >= 'a' && c <= 'z')
+                         || (c >= 'A' && c <= 'Z')
+                         || (c >= '0' && c <= '9')
+                         || c == '_';
+            mod_name.push_back(ok ? c : '_');
+        }
+        if (mod_name.empty()) mod_name = "main";
+
+        vex::CompileOptions copts;
+        copts.module_name = mod_name;
+        copts.opt_level   = 2;
+        copts.dump_ir     = emit_ir;  // habilita CompileResult::ir_text
+        vex::CompileResult cr =
+            vex::compile_vex_source(vex_source, vex_path, copts);
+        if (!cr.ok) {
+            for (const auto &d : cr.diagnostics.all()) {
+                vex::print_diagnostic(std::cerr, d);
+            }
+            return EXIT_FAILURE;
+        }
+        // Mostrar warnings (cr.ok no impide los warnings).
+        for (const auto &d : cr.diagnostics.all()) {
+            if (d.level != vex::DiagLevel::ERR) vex::print_diagnostic(std::cerr, d);
+        }
+
+        // si --vex-base fue especificado y es != 0, parchear el
+        // texto .vel para reemplazar el @IniAddress(0x0000000000000000)
+        // generado por defecto por el ir_emitter por @IniAddress(<base>).
+        // Esto desplaza todo el code section a la VA solicitada, evitando
+        // solapamiento con el caller cuando este modulo se carga via
+        // loadmodule.  Es una solucion tactica; idealmente el ir_emitter
+        // tomaria una opcion de base address directamente.
+        //
+        // ADEMAS: insertar `@InitPc(main)` antes del @Module(...) para que
+        // el linker compute start_pc = absolute_addr_of_main = base +
+        // offset(main) = base + 0 (main es siempre el primer label en
+        // codigo Vex).  Sin esto, start_pc queda en 0 y loadmodule ejecuta
+        // codigo del caller en vez del plugin.
+        if (vex_base_addr != 0) {
+            const std::string from = "@IniAddress(0x0000000000000000)";
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "@IniAddress(0x%016llX)",
+                          static_cast<unsigned long long>(vex_base_addr));
+            std::string to = buf;
+            size_t pos = cr.vel_text.find(from);
+            if (pos != std::string::npos) {
+                cr.vel_text.replace(pos, from.size(), to);
+                vesta::scout() << "[vex] @IniAddress patched -> " << to << "\n";
+            } else {
+                std::cerr << "[vex] aviso: no se encontro @IniAddress(0x0...) "
+                             "para parchear con --vex-base\n";
+            }
+            // Insertar @InitPc(<base>) NUMERICO antes del @Module(...).  El
+            // assembler procesa anotaciones single-pass y `main` no esta
+            // definido todavia cuando @InitPc se evalua, asi que usamos el
+            // valor absoluto (= base, ya que main es siempre el primer label
+            // en codigo Vex y la seccion code tiene @Align(0x1000) que se
+            // alinea con la base hex que pasa el usuario).
+            const std::string mod_marker = "@Module(";
+            size_t mod_pos = cr.vel_text.find(mod_marker);
+            if (mod_pos != std::string::npos) {
+                char ipbuf[64];
+                std::snprintf(ipbuf, sizeof(ipbuf), "@InitPc(0x%llX)\n\n",
+                              static_cast<unsigned long long>(vex_base_addr));
+                cr.vel_text.insert(mod_pos, ipbuf);
+                vesta::scout() << "[vex] @InitPc(0x" << std::hex << vex_base_addr
+                               << std::dec << ") insertado (start_pc = base address)\n";
+            } else {
+                std::cerr << "[vex] aviso: no se encontro @Module(...) para insertar @InitPc\n";
+            }
+            // Convertir el `hlt` final del main del modulo en `ret` para que
+            // sea LLAMABLE via callvm desde loadmod del caller.  Por defecto
+            // main de Vex termina con `leave\nhlt` (convencion entry-point);
+            // un plugin necesita main RET-able para que el push de return
+            // address en loadmod resulte en flujo de vuelta al caller.
+            // El standalone execution del plugin no funciona tras esta
+            // conversion (RET pop'ea garbage del stack).  Aceptamos esta
+            // limitacion: los plugins no se ejecutan standalone.
+            const std::string main_ret_marker = "main_ret:\n    leave\n    hlt\n";
+            const std::string main_ret_repl   = "main_ret:\n    leave\n    ret\n";
+            size_t hlt_pos = cr.vel_text.find(main_ret_marker);
+            if (hlt_pos != std::string::npos) {
+                cr.vel_text.replace(hlt_pos, main_ret_marker.size(), main_ret_repl);
+                vesta::scout() << "[vex] main_ret hlt -> ret (modo plugin: callable via loadmod)\n";
+            } else {
+                std::cerr << "[vex] aviso: no se encontro 'main_ret: leave hlt' para convertir a ret\n";
+            }
+        }
+
+        // Si --vex-emit-ir esta activo, escribir el dump del SSA IR
+        // (pre y post optimizacion) en <out>.ir y salir.  Util para
+        // debug del frontend sin tocar el .vel ni el linker.  No se
+        // compila a .velb en este modo.
+        if (emit_ir) {
+            std::string ir_path = out_prefix.empty()
+                                    ? (copts.module_name + ".ir")
+                                    : (out_prefix + ".ir");
+            std::ofstream ofs_ir(ir_path);
+            if (!ofs_ir.is_open()) {
+                std::cerr << "[vex] No se puede escribir: " << ir_path << "\n";
+                return EXIT_FAILURE;
+            }
+            ofs_ir << cr.ir_text;
+            vesta::scout() << "[vex] .ir generado: " << ir_path << "\n";
+            return EXIT_SUCCESS;
+        }
+
+        // 5 Escribir el .vel intermedio.
+        std::string vel_path = out_prefix.empty()
+                                 ? (copts.module_name + ".vel")
+                                 : (out_prefix + ".vel");
+        {
+            std::ofstream ofs(vel_path);
+            if (!ofs.is_open()) {
+                std::cerr << "[vex] No se puede escribir: " << vel_path << "\n";
+                return EXIT_FAILURE;
+            }
+            ofs << cr.vel_text;
+        }
+        vesta::scout() << "[vex] .vel generado: " << vel_path << "\n";
+
+        if (emit_only) return EXIT_SUCCESS;
+
+        // 6 Compilar .vel -> .velb saltando VPP (ya pre-procesado en paso 2).
+        return asm_multi_process::run_worker(vel_path, out_prefix, /*skip_preprocessor=*/true);
+    }
+
     // Compilar un archivo .vel a .velb
     // vm.exe --build src/main.vel -o main.velb
     if (result.count("build")) {
@@ -229,6 +737,53 @@ int main(int argc, char *argv[]) {
         );
     }
 
+    // Abrir el REPL interactivo VestaShell (--interprete)
+    if (result.count("interprete")) {
+        vsh::VshInterpreter interp;
+        // ARGV vacio o con [""]
+        std::vector<std::string> empty_argv = { "" };
+        interp.set_argv(empty_argv);
+        interp.run_interactive();
+        return EXIT_SUCCESS;
+    }
+
+
+    // Ejecutar un fichero VestaShell directamente sin abrir el REPL
+    // vm.exe --script mi_script.vsh [args extra para el script...]
+    if (result.count("script")) {
+        const std::string &vsh_path = result["script"].as<std::string>();
+
+        // Construir ARGV: [vsh_path, args_posicionales_extra...]
+        std::vector<std::string> script_args;
+        script_args.push_back(vsh_path);
+        if (result.count("positional")) {
+            for (const auto& a : result["positional"].as<std::vector<std::string>>()) {
+                script_args.push_back(a);
+            }
+        }
+
+        try {
+            vsh::VshInterpreter interp;     // sin callback REPL
+            interp.set_argv(script_args);   // <--- AQUI lo importante
+            interp.exec_file(vsh_path);
+        } catch (const vsh::VshRuntimeError &e) {
+            std::cerr << "[script] Error en " << vsh_path;
+            if (e.line > 0) std::cerr << ":" << e.line;
+            std::cerr << ": " << e.what() << "\n";
+            return EXIT_FAILURE;
+        } catch (const vsh::VshParseError &e) {
+            std::cerr << "[script] Error de sintaxis en " << vsh_path;
+            if (e.line > 0) std::cerr << ":" << e.line;
+            std::cerr << ": " << e.what() << "\n";
+            return EXIT_FAILURE;
+        } catch (const std::exception &e) {
+            std::cerr << "[script] " << e.what() << "\n";
+            return EXIT_FAILURE;
+        }
+        return EXIT_SUCCESS;
+    }
+
+
     // Ejecutar un archivo .velb en la VM
     // vm.exe --run program.velb
     if (result.count("run")) {
@@ -236,26 +791,60 @@ int main(int argc, char *argv[]) {
         size_t             num_schedulers = result["schedulers"].as<size_t>();
 
         try {
+            Timer t_total_run;
+            Timer t_construct;
             runtime::ManageVM mgr(nullptr, 0);
             runtime::VM *     vm = mgr.loader.create_vm_instance(num_schedulers);
             if (!vm) {
                 std::cerr << "Error: no se pudo crear la instancia de VM\n";
                 return EXIT_FAILURE;
             }
+            const long long ns_construct = t_construct.ns();
+
+            // aplicar configuracion distribuida si el usuario paso algun flag --dist-*
+            bool has_dist = result.count("dist-port")        > 0 ||
+                            result.count("dist-discover")    > 0 ||
+                            result.count("dist-add-node")    > 0 ||
+                            result.count("dist-tls")         > 0 ||
+                            result.count("dist-name")        > 0 ||
+                            result.count("dist-token")       > 0 ||
+                            result.count("dist-node-id")     > 0;
+            if (has_dist) apply_dist_config(vm, result);
+
+            Timer t_load;
             runtime::ProcessVM *proc = mgr.loader.load_executable(*vm, velb_path);
             if (!proc) {
                 std::cerr << "Error: no se pudo cargar el ejecutable\n";
                 return EXIT_FAILURE;
             }
+            const long long ns_load = t_load.ns();
+
             vm->make_ready(proc->pid);
 
             Timer t_run;
+            Timer t_start_phase;
             vm->start();
-            while (vm->has_alive_processes()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const long long ns_start = t_start_phase.ns();
+
+            Timer t_poll;
+            // en lugar de polling con sleep_for(1ms)
+            // (granularity ~15.6ms en Windows), bloquear con condition
+            // variable.  El ultimo scheduler que ponga vm_running=false
+            // notifica done_cv y main desbloquea inmediatamente.
+            {
+                std::unique_lock<std::mutex> lk(vm->done_mtx);
+                vm->done_cv.wait(lk, [&] {
+                    return !vm->vm_running.load(std::memory_order_acquire);
+                });
             }
+            const long long ns_poll = t_poll.ns();
+
             long long elapsed_ns = t_run.ns();
+
+            Timer t_stop;
             vm->stop();
+            const long long ns_stop = t_stop.ns();
+            const long long ns_total_run = t_total_run.ns();
 
             if (result.count("stats")) {
                 long long elapsed_ms = elapsed_ns / 1'000'000;
@@ -308,6 +897,13 @@ int main(int argc, char *argv[]) {
                 vesta::scout() << "Instrucciones: " << total_instrs << "\n";
                 vesta::scout() << "MIPS:          " << mips
                         << (active_time_ns > 0 ? "" : "  (wall time)") << "\n";
+                vesta::scout() << "\n=== OVERHEAD BREAKDOWN ===\n";
+                vesta::scout() << "VM construct:    " << ns_construct/1000 << " us\n";
+                vesta::scout() << "load_executable: " << ns_load/1000 << " us\n";
+                vesta::scout() << "vm.start:        " << ns_start/1000 << " us  (lanzar threads)\n";
+                vesta::scout() << "wait until done: " << ns_poll/1000 << " us  (cv wait)\n";
+                vesta::scout() << "vm.stop:         " << ns_stop/1000 << " us  (join threads)\n";
+                vesta::scout() << "Total --run:     " << ns_total_run/1000 << " us\n";
             }
         } catch (const std::exception &e) {
             std::cerr << "Error al ejecutar " << velb_path << ": " << e.what() << "\n";

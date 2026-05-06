@@ -1,0 +1,41 @@
+// examples_codes_vex/14_clases_visibilidad.vex
+//
+// Demuestra modificadores de acceso:
+//   - Campos privados solo accesibles desde la propia clase.
+//   - Acceso desde fuera mediante getters publicos.
+//   - Combinacion con expression-bodied (=> expr ;).
+//
+// Nota: el compilador RECHAZA acceso a `private` desde fuera de la
+// clase con un mensaje claro.  Aqui demostramos el patron correcto:
+// encapsular el campo y exponerlo via metodo publico.
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/14_clases_visibilidad.vex -o cv
+//   vm --run cv.velb --stats
+//
+// Resultado esperado: R00 == 100  (10 + 90)
+
+class Cuenta {
+    private i32 saldo;
+    private i32 deudas;
+
+    public Cuenta(i32 inicial) {
+        this.saldo  = inicial;
+        this.deudas = 0;
+    }
+
+    public final i32 abonar(i32 cantidad) {
+        this.saldo = this.saldo + cantidad;
+        return this.saldo;
+    }
+
+    // Expression-bodied: lectura encapsulada de campo privado.
+    public i32 leerSaldo() => this.saldo;
+    public i32 leerDeudas() => this.deudas;
+}
+
+i32 main() {
+    Cuenta c = new Cuenta(10);
+    c.abonar(90);
+    return c.leerSaldo();
+}

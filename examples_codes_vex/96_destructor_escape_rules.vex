@@ -1,0 +1,60 @@
+// examples_codes_vex/96_destructor_escape_rules.vex
+//
+// Reglas de escape para clases con destructor `~Class()`.
+//
+// Modelo: las instancias de una clase con destructor SOLO pueden vivir
+// en variables locales (RAII deterministico) o pasarse via `return`
+// (caller toma owner).  Asignarlas a fields / slots / derefs es ERROR
+// porque el destructor RAII nunca se ejecutaria.
+//
+// Este test valida CASOS LEGALES.  Ver 96b_*.vex para validar que el
+// caso ilegal produce error de compilacion.
+//
+// Esperado: R00 == 42.
+
+class DtorCounter {
+    public static i32 count = 0;
+}
+
+class Resource {
+    public i32 value;
+    public Resource(i32 v) { this.value = v; }
+    public ~Resource() {
+        DtorCounter.count = DtorCounter.count + 1;
+    }
+}
+
+// LEGAL: usar como variable local.
+i32 use_local() {
+    Resource r = new Resource(10);
+    return r.value;   // dtor corre al exit (escape via return ok porque
+                       // Resource no escapa SI el caller no lo guarda en
+                       // un campo).
+}
+
+// LEGAL: return Resource (caller toma owner).
+Resource make_resource() {
+    Resource r = new Resource(99);
+    return r;
+}
+
+i32 main() {
+    DtorCounter.count = 0;
+
+    // Caso 1: variable local + return de campo primitivo.
+    i32 v = use_local();   // dtor de r corre al exit de use_local
+    if (v == 10) {
+        // c1 contara 1 dtor (el de r en use_local).  El caller no
+        // recibio Resource, asi que el escape detection no aplica.
+    }
+
+    // Caso 2: receive Resource via return + uso local.
+    Resource kept = make_resource();
+    // dtor de make_resource NO corre alli (escape via return);
+    // dtor de kept correra al exit de main.
+
+    i32 acc = 0;
+    if (DtorCounter.count == 1) { acc = acc + 20; }  // solo el de use_local
+    if (kept.value == 99)       { acc = acc + 22; }
+    return acc;   // 20 + 22 = 42
+}

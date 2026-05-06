@@ -1,0 +1,103 @@
+/*
+ * ejemplo_closure_gc.vel
+ *
+ * Demuestra el uso conceptual de MKCLOSURE y CALLCLOSURE en el contexto
+ * del sistema OOP de VestaVM.
+ *
+ * ADVERTENCIA: MKCLOSURE requiere un puntero valido a un MethodInfo (struct
+ * del loader de VestaVM).  Este puntero solo existe despues de que el loader
+ * haya cargado y enlazado el archivo .velb con la infraestructura OOP activa.
+ * En modo "raw" (sin loader OOP), MKCLOSURE falla con segfault porque no hay
+ * ningun MethodInfo en memoria.
+ *
+ * Este archivo muestra la estructura del patron de uso correcto cuando el
+ * loader ya ha colocado el MethodInfo* en un registro (p.ej. via GETCLASS +
+ * lectura de la vtable, o via reflexion).
+ *
+ * Instrucciones:
+ *
+ *   MKCLOSURE r_method, r_env
+ *     - r_method : registro con el host-pointer (uint64) al MethodInfo del lambda.
+ *     - r_env    : registro con la direccion VM del bloque de entorno capturado.
+ *     - Resultado: R0 = GcHandle del ClosureObject creado (GC_NULL_HANDLE si falla).
+ *
+ *   CALLCLOSURE r_closure
+ *     - r_closure: registro con el GcHandle del ClosureObject.
+ *     - Empuja un FrameHeader (soporte de excepciones) y la ret_addr en la pila.
+ *     - Salta a method->code_vaddr.
+ *
+ * Patron tipico (pseudocodigo con comentarios):
+ *
+ *   ; Suponer que el loader ha puesto en r9 el MethodInfo* del lambda
+ *   mov   r_env, 0             ; sin entorno capturado
+ *   mkclosure r9, r_env        ; r0 = GcHandle del closure
+ *   mov   r_clos, r0           ; guardar handle
+ *
+ *   ; ... mas adelante, invocar el closure ...
+ *   callclosure r_clos         ; salta al lambda; ret_addr en pila
+ *   ; la ejecucion continua aqui tras el RET del lambda
+ *
+ * Diferencia con MKRAWCLOSURE:
+ *   - MKCLOSURE: objeto bajo GC, el recolector lo rastrea y mueve en minor GC.
+ *     Requiere MethodInfo* del loader.  Adecuado para lambdas OOP.
+ *   - MKRAWCLOSURE: objeto fuera del GC, ciclo de vida manual con FREE.
+ *     Solo necesita la direccion de la funcion.  Adecuado para callbacks FFI.
+ *
+ * Compilar (requiere infraestructura OOP cargada por el loader):
+ *   vesta --build ejemplo_closure_gc.vel -o ejemplo_closure_gc
+ *   vesta --run   ejemplo_closure_gc.velb
+ *
+ * Ver tambien: ejemplo_closure_raw.vel para el modelo sin GC.
+ */
+
+@Format("raw")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("all"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+// -----------------------------------------------------------------------
+// Nota: el codigo a continuacion es un esqueleto ilustrativo.
+// En produccion, r9 deberia contener un MethodInfo* valido obtenido del
+// loader (por ejemplo, leido desde la vtable de una ClassInfo cargada).
+// Ejecutar este fragmento en modo raw provocara un fallo de segmento porque
+// r9 no apunta a ninguna estructura valida.
+// -----------------------------------------------------------------------
+
+code:
+    // Inicializar pila
+    mov rsp, 0x00FF0000
+    mov rbp, 0x00FF0000
+
+    // [ESQUELETO] - En un contexto OOP real, el loader pone el MethodInfo*
+    // en un registro.  Aqui se simula con 0 (NO ejecutar en modo raw).
+    mov r9, 0              // MethodInfo* del lambda (loader lo rellena)
+    mov r8, 0              // dir VM del entorno capturado (0 = sin capturas)
+
+    // Crear el ClosureObject gestionado por GC
+    // mkclosure r_method, r_env -> R0 = GcHandle
+    mkclosure r9, r8       // r0 = GcHandle (GC_NULL_HANDLE = 0xFFFFFFFF si falla)
+
+    // Guardar el handle y verificar que no es nulo antes de llamar
+    mov r11, r0
+    mov r10, 0xFFFFFFFF    // GC_NULL_HANDLE
+    cmpu r11, r10
+    jmp.je error_closure   // saltar si la creacion fallo
+
+    // Invocar el closure: empuja FrameHeader + ret_addr, salta al lambda
+    callclosure r11        // despacha el lambda; la ejecucion sigue tras su RET
+
+    hlt
+
+error_closure:
+    // El MethodInfo era nulo o el GC no pudo alocar; el proceso se detiene
+    hlt
+end_code:

@@ -1,0 +1,50 @@
+/**
+ * ejemplo_max3.ir
+ * Maximo de tres enteros de 64 bits con signo.
+ *
+ * Conceptos demostrados:
+ *   - Multiples bloques basicos en forma de diamante
+ *   - Phi node que une dos ramas de un if-else (cmp_c)
+ *   - Retorno en distintos bloques (take_ab, take_c)
+ *   - El emisor IR elimina mov.i64 redundantes (copy propagation O1)
+ *
+ * Estructura de control:
+ *   if a >= b:  max_ab = a          if mab >= c: return mab
+ *   else:       max_ab = b          else:        return c
+ *   (phi une max_ab)
+ *
+ * Compilar:
+ *   vm --ir-file examples_ir/ejemplo_max3.ir --ir-opt 2 -o build/out_ir/max3
+ */
+
+@module ejemplo_max3
+
+// Retorna el mayor de los tres argumentos a, b, c.
+@function max3(a: i64, b: i64, c: i64) -> i64 {
+entry:
+    // Primera comparacion: determinar max(a, b)
+    ab    = cmp.ge.i64 a, b
+    br.cond ab, take_a, take_b
+
+take_a:
+    max_ab = mov.i64 a   // a >= b, el maximo parcial es a
+    br     cmp_c
+
+take_b:
+    max_ab = mov.i64 b   // b > a, el maximo parcial es b
+    br     cmp_c
+
+cmp_c:
+    /* Phi: max(a,b) llega desde take_a o take_b.
+       El valor unificado mab es el maximo de a y b. */
+    mab   = phi.i64 [max_ab, take_a], [max_ab, take_b]
+    // Segunda comparacion: max(mab, c)
+    mc    = cmp.ge.i64 mab, c
+    br.cond mc, take_ab, take_c
+
+take_ab:
+    ret.i64 mab   // mab >= c -> mab es el maximo global
+
+take_c:
+    ret.i64 c     // c > mab -> c es el maximo global
+}

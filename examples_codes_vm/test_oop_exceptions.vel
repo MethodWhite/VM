@@ -49,10 +49,10 @@ code:
     mov   r9, r0
 
 // -----------------------------------------------------------------------
-// 2. ExcObj (ObjectHeader)  -> r10
+// 2. ExcObj (ObjectHeader, 24 bytes ABI v2)  -> r10
 //    class_ptr = ExcClassInfo, flags = 2 (OBJ_FLAG_RAW_OWNED)
 // -----------------------------------------------------------------------
-    mov   r3, 16
+    mov   r3, 24
     alloc r3
     mov   r10, r0
 
@@ -157,10 +157,10 @@ code:
     writecur cur0, r5
 
 // -----------------------------------------------------------------------
-// 7. ObjectHeader receptor (16 bytes)  -> r4
+// 7. ObjectHeader receptor (24 bytes, ABI v2)  -> r4
 //    class_ptr = ClassInfo receptor, flags = 2
 // -----------------------------------------------------------------------
-    mov   r3, 16
+    mov   r3, 24
     alloc r3
     mov   r4, r0
 

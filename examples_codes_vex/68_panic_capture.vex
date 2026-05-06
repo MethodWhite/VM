@@ -1,0 +1,26 @@
+// panic + captura + stack trace con file:line.
+
+class Service {
+    public Service() {}
+    public i32 critical() {
+        panic("estado invalido detectado");
+        return 0;
+    }
+}
+
+i32 main() {
+    Service s = new Service();
+    try {
+        i32 _ = s.critical();
+        return 99;
+    } catch (FatalError e) {
+        println("=== diagnostico ===");
+        print("kind: "); print_int(e.kind); print("\n");
+        print("message: "); print_cstr(e.message); print("\n");
+        println("--- stack trace ---");
+        print_cstr(e.stack_trace);
+        println("=== fin ===");
+        flush();
+        return e.kind;
+    }
+}

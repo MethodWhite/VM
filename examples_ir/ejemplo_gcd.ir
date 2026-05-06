@@ -1,0 +1,46 @@
+/**
+ * ejemplo_gcd.ir
+ * Maximo comun divisor: gcd(a, b) -> i64  (algoritmo de Euclides iterativo)
+ *
+ * Conceptos demostrados:
+ *   - Bucle while con phi nodes que encapsulan a y b
+ *   - Operacion modulo: mod.i64 (instruccion mods del ISA VestaVM)
+ *   - Condicion de salida basada en igualdad (cmp.eq)
+ *   - Intercambio de variables con ayuda de phi (a, b = b, a%b)
+ *
+ * Algoritmo de Euclides:
+ *   while b != 0:
+ *     t = a % b
+ *     a = b
+ *     b = t
+ *   return a
+ *
+ * Compilar:
+ *   vm --ir-file examples_ir/ejemplo_gcd.ir --ir-opt 2 -o build/out_ir/gcd
+ */
+
+@module ejemplo_gcd
+
+// Retorna gcd(a, b). Ambos argumentos deben ser positivos.
+@function gcd(a: i64, b: i64) -> i64 {
+entry:
+    br    loop_check
+
+loop_check:
+    /* Phi nodes: en la primera iteracion a_cur=a, b_cur=b.
+       En las siguientes: a_cur=b anterior, b_cur=a%b anterior. */
+    a_cur = phi.i64 [a,     entry],     [b_cur, loop_body]
+    b_cur = phi.i64 [b,     entry],     [rem,   loop_body]
+    zero  = const.i64 0
+    // Condicion de salida: b == 0
+    done  = cmp.eq.i64 b_cur, zero
+    br.cond done, loop_exit, loop_body
+
+loop_body:
+    // rem = a % b  (modulo con signo; aqui a y b son positivos)
+    rem = mod.i64 a_cur, b_cur
+    br  loop_check
+
+loop_exit:
+    ret.i64 a_cur    // cuando b==0, a contiene el MCD
+}

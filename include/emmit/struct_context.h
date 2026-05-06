@@ -423,6 +423,19 @@ namespace Assembly::Bytecode {
     }
 
     /**
+     * @brief Entrada del sistema de modulos del ensamblador.
+     *
+     * Representa un modulo declarado con la anotacion \@Module.  Agrupa los
+     * simbolos que ese modulo exporta (\@Export) e importa (\@Import) para que
+     * el emitter aplique el prefijo de modulo y el linker verifique visibilidad.
+     */
+    struct ModuleEntry {
+        std::string qualified_name;            ///< nombre calificado: "com.vesta.collections"
+        std::vector<std::string> exports;      ///< simbolos publicos del modulo
+        std::vector<std::string> imports;      ///< modulos de los que depende este modulo
+    };
+
+    /**
      * @brief Entrada en la tabla de importaciones del contexto del ensamblador.
      *
      * Cada entrada representa un simbolo externo que el loader debe resolver
@@ -573,6 +586,36 @@ namespace Assembly::Bytecode {
             if (it != space_address.end()) return &it->second;
             return nullptr;
         }
+
+        // --- sistema de modulos ---
+
+        /**
+         * @brief Tabla de modulos declarados con \@Module en el fichero fuente.
+         *
+         * Clave: nombre calificado del modulo ("com.vesta.collections").
+         * Valor: ModuleEntry con sus listas de exports e imports.
+         */
+        std::unordered_map<std::string, ModuleEntry> modules;
+
+        /**
+         * @brief Nombre del modulo activo durante la emision de bytecode.
+         *
+         * Se establece al procesar la anotacion \@Module.  El emitter lo usa
+         * para prefijar los nombres de clases y simbolos globales.
+         * Cadena vacia significa que no se ha declarado modulo.
+         */
+        std::string current_module;
+
+        // --- genericos (monomorphization) ---
+
+        /**
+         * @brief Mapa de instanciaciones genericas ya generadas.
+         *
+         * Clave: firma de la instanciacion ("List<int>", "Map<String,int>").
+         * Valor: puntero opaco a la ClassInfo de la especializacion ya emitida.
+         * Evita generar dos veces el mismo codigo para la misma instanciacion.
+         */
+        std::unordered_map<std::string, void*> generic_instances;
 
         /**
          * @brief Libera todos los espacios de direcciones del contexto.

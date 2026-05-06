@@ -223,6 +223,38 @@ namespace runtime {
         vm->registers.cur[cur_idx].qword(reinterpret_cast<uint64_t>(payload));    // guardar puntero en cursor
     }
 
+    /**
+     * @brief Devuelve el PID encoded del proceso actual en r_dst.
+     *
+     * Formato: (scheduler_id << 32) | (local_pid & 0xFFFFFFFF).  Mismo
+     * encoding que SPAWN deposita en R0 al crear un hijo.  Util para
+     * que el proceso pueda enviarse a si mismo via mailbox o registrar
+     * su PID en estructuras compartidas.
+     */
+    void exec_instr_getpid(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t r_dst = instr.data_instruction.reg_data.reg1;
+        const uint64_t encoded =
+            (static_cast<uint64_t>(vm->pid.scheduler_id) << 32) |
+             static_cast<uint64_t>(vm->pid.local_pid & 0xFFFFFFFFu);
+        vm->registers.regs[r_dst].qword(encoded);
+    }
+
+    /**
+     * @brief Inverso de GCDEREF: dado un puntero host al payload, devuelve el GcHandle.
+     *
+     * Lee el host_ptr del registro reg2 (operando 2: source) y consulta el mapa
+     * inverso del GcHeap.  Escribe el resultado (GcHandle uint32, o GC_NULL_HANDLE
+     * si el puntero no corresponde a un objeto vivo) en reg1 (operando 1: dest).
+     */
+    void exec_instr_gchandle(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t  r_dst   = instr.data_instruction.reg_data.reg1;            // dest reg
+        const uint8_t  r_src   = instr.data_instruction.reg_data.reg2;            // src reg con host_ptr
+        const auto     ptr_val = static_cast<uintptr_t>(vm->registers.regs[r_src].qword());
+        const auto    *payload = reinterpret_cast<const uint8_t *>(ptr_val);
+        gc::GcHandle   h       = vm->gc_heap.handle_for_ptr(payload);
+        vm->registers.regs[r_dst].qword(static_cast<uint64_t>(h));                // GC_NULL_HANDLE si no encontrado
+    }
+
     // -------------------------------------------------------------------------
     // GC generacional - opcodes 0x00 0xA0 .. 0xA5
     // -------------------------------------------------------------------------

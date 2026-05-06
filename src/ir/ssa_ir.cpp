@@ -1,0 +1,1379 @@
+/*
+ * VestaVM - Maquina Virtual Distribuida
+ *
+ * Copyright (C) 2026 David Lopez.T (DesmonHak) (Castilla y Leon, ES)
+ * Licencia VMProject
+ *
+ * USO LIBRE NO COMERCIAL con atribucion obligatoria.
+ * PROHIBIDO lucro sin permiso escrito.
+ */
+
+/**
+ * @file ssa_ir.cpp
+ * @brief Implementacion del printer, parser y verificador de la SSA IR.
+ *
+ * Funciones implementadas:
+ *   ir_type_name()   -- nombre de texto de IrType
+ *   ir_type_parse()  -- parseo de nombre de tipo
+ *   ir_op_name()     -- nombre de texto de IrOp
+ *   ir_op_parse()    -- parseo de nombre de opcode
+ *   IrFunction::new_value()
+ *   IrFunction::new_block()
+ *   IrFunction::append()
+ *   IrModule::add_function()
+ *   ir_print()       -- serializar modulo a texto
+ *   ir_parse()       -- parsear texto a modulo
+ *   ir_verify()      -- verificar forma SSA
+ */
+
+#include "ir/ssa_ir.h"
+
+#include <sstream>
+#include <ostream>
+#include <cassert>
+#include <cstring>
+#include <algorithm>
+#include <unordered_set>
+
+namespace ir {
+
+    /* =====================================================================
+     * Tabla de tipos
+     * ===================================================================== */
+
+    /**
+     * @brief Entrada de la tabla de nombres de tipos.
+     */
+    struct TypeEntry { const char *name; IrType type; };
+
+    static const TypeEntry TYPE_TABLE[] = {
+        {"void",   IrType::VOID},
+        {"i8",     IrType::I8},
+        {"i16",    IrType::I16},
+        {"i32",    IrType::I32},
+        {"i64",    IrType::I64},
+        {"u8",     IrType::U8},
+        {"u16",    IrType::U16},
+        {"u32",    IrType::U32},
+        {"u64",    IrType::U64},
+        {"f32",    IrType::F32},
+        {"f64",    IrType::F64},
+        {"ptr",    IrType::PTR},
+        {"handle", IrType::HANDLE},
+        {"bool",   IrType::BOOL},
+        {nullptr,  IrType::VOID},
+    };
+
+    /**
+     * @brief Devuelve el nombre de texto de un IrType.
+     */
+    const char *ir_type_name(IrType t) {
+        for (const TypeEntry *e = TYPE_TABLE; e->name; ++e)
+            if (e->type == t) return e->name;
+        return "?";
+    }
+
+    /**
+     * @brief Parsea el nombre de un tipo de texto a IrType.
+     */
+    bool ir_type_parse(const char *name, IrType &out) {
+        for (const TypeEntry *e = TYPE_TABLE; e->name; ++e) {
+            if (std::strcmp(name, e->name) == 0) { out = e->type; return true; }
+        }
+        return false;
+    }
+
+    /* =====================================================================
+     * Tabla de opcodes
+     * ===================================================================== */
+
+    /**
+     * @brief Entrada de la tabla de nombres de opcodes.
+     */
+    struct OpEntry { const char *name; IrOp op; };
+
+    static const OpEntry OP_TABLE[] = {
+        // constantes y movimiento
+        {"const",        IrOp::CONST},
+        {"mov",          IrOp::MOV},
+        {"nop",          IrOp::NOP},
+        {"str_lit_addr", IrOp::STR_LIT_ADDR},
+        // aritmetica entera
+        {"add",        IrOp::ADD},
+        {"sub",        IrOp::SUB},
+        {"mul",        IrOp::MUL},
+        {"div",        IrOp::DIV},
+        {"mod",        IrOp::MOD},
+        {"neg",        IrOp::NEG},
+        // aritmetica flotante
+        {"fadd",       IrOp::FADD},
+        {"fsub",       IrOp::FSUB},
+        {"fmul",       IrOp::FMUL},
+        {"fdiv",       IrOp::FDIV},
+        {"fneg",       IrOp::FNEG},
+        {"fabs",       IrOp::FABS},
+        {"fsqrt",      IrOp::FSQRT},
+        {"fmin",       IrOp::FMIN},
+        {"fmax",       IrOp::FMAX},
+        // logica y desplazamientos
+        {"and",        IrOp::AND},
+        {"or",         IrOp::OR},
+        {"xor",        IrOp::XOR},
+        {"not",        IrOp::NOT},
+        {"shl",        IrOp::SHL},
+        {"shr",        IrOp::SHR},
+        {"sar",        IrOp::SAR},
+        // comparaciones enteras
+        {"cmp.eq",     IrOp::CMP_EQ},
+        {"cmp.ne",     IrOp::CMP_NE},
+        {"cmp.lt",     IrOp::CMP_LT},
+        {"cmp.gt",     IrOp::CMP_GT},
+        {"cmp.le",     IrOp::CMP_LE},
+        {"cmp.ge",     IrOp::CMP_GE},
+        {"cmp.ult",    IrOp::CMP_ULT},
+        {"cmp.ugt",    IrOp::CMP_UGT},
+        {"cmp.ule",    IrOp::CMP_ULE},
+        {"cmp.uge",    IrOp::CMP_UGE},
+        // comparaciones flotantes
+        {"fcmp.eq",    IrOp::FCMP_EQ},
+        {"fcmp.ne",    IrOp::FCMP_NE},
+        {"fcmp.lt",    IrOp::FCMP_LT},
+        {"fcmp.gt",    IrOp::FCMP_GT},
+        {"fcmp.le",    IrOp::FCMP_LE},
+        {"fcmp.ge",    IrOp::FCMP_GE},
+        // conversiones
+        {"cast",       IrOp::CAST},
+        {"zext",       IrOp::ZEXT},
+        {"sext",       IrOp::SEXT},
+        {"trunc",      IrOp::TRUNC},
+        {"itof",       IrOp::ITOF},
+        {"uitof",      IrOp::UITOF},
+        {"ftoi",       IrOp::FTOI},
+        {"ftoui",      IrOp::FTOUI},
+        {"f32tof64",   IrOp::F32TOF64},
+        {"f64tof32",   IrOp::F64TOF32},
+        {"bitcast",    IrOp::BITCAST},
+        // flujo de control
+        {"br",         IrOp::BR},
+        {"br.cond",    IrOp::BR_COND},
+        {"ret",        IrOp::RET},
+        {"unreachable",IrOp::UNREACHABLE},
+        // SSA
+        {"phi",        IrOp::PHI},
+        // llamadas
+        {"call",       IrOp::CALL},
+        {"callind",    IrOp::CALLIND},
+        {"tailcall",   IrOp::TAILCALL},
+        {"callvirt",   IrOp::CALLVIRT},
+        {"callm",      IrOp::CALLM},
+        {"callclosure",IrOp::CALLCLOSURE},
+        {"calln",      IrOp::CALLN},
+        // memoria
+        {"alloca",     IrOp::ALLOCA},
+        {"load",       IrOp::LOAD},
+        {"store",      IrOp::STORE},
+        {"memcpy",     IrOp::MEMCPY},
+        {"raw_alloc",  IrOp::RAW_ALLOC},
+        {"raw_free",   IrOp::RAW_FREE},
+        // OOP / GC
+        {"newobj",       IrOp::NEWOBJ},
+        {"getfield",     IrOp::GETFIELD},
+        {"setfield",     IrOp::SETFIELD},
+        {"instanceof",   IrOp::INSTANCEOF},
+        {"checkcast",    IrOp::CHECKCAST},
+        {"isnull",       IrOp::ISNULL},
+        {"unwrap",       IrOp::UNWRAP},
+        {"specialize",   IrOp::SPECIALIZE},
+        {"gep",          IrOp::GEP},
+        {"gcwb_ir",      IrOp::GCWB_IR},
+        {"array_alloc",  IrOp::ARRAY_ALLOC},
+        {"array_len",    IrOp::ARRAY_LEN},
+        {"array_load",   IrOp::ARRAY_LOAD},
+        {"array_store",  IrOp::ARRAY_STORE},
+        {"gcderef_ir",   IrOp::GCDEREF_IR},
+        // excepciones
+        {"throw",        IrOp::THROW},
+        {"tryenter",     IrOp::TRYENTER},
+        {"tryleave",     IrOp::TRYLEAVE},
+        {"landingpad",   IrOp::LANDINGPAD},
+        // cadenas
+        {"strmake",      IrOp::STRMAKE},
+        {"strlen",       IrOp::STRLEN},
+        {"strcat",       IrOp::STRCAT},
+        {"strcmp",       IrOp::STRCMP},
+        {"strslice",     IrOp::STRSLICE},
+        {"strflat",      IrOp::STRFLAT},
+        {"strhash",      IrOp::STRHASH},
+        {"strintern",    IrOp::STRINTERN},
+        {"strraw",       IrOp::STRRAW},
+        {"strconv",      IrOp::STRCONV},
+        {"strreserve",   IrOp::STRRESERVE},
+        {"strfinalize",  IrOp::STRFINALIZE},
+        // async
+        {"future",     IrOp::FUTURE},
+        {"await",      IrOp::AWAIT},
+        {"fulfill",    IrOp::FULFILL},
+        {"reject",     IrOp::REJECT},
+        // distribucion
+        {"msgsend",    IrOp::MSGSEND},
+        {"msgrecv",    IrOp::MSGRECV},
+        {"rspawn",     IrOp::RSPAWN},
+        // monitores
+        {"monenter",   IrOp::MONENTER},
+        {"monexit",    IrOp::MONEXIT},
+        {"monwait",    IrOp::MONWAIT},
+        {"monnoti",    IrOp::MONNOTI},
+        {"monnota",    IrOp::MONNOTA},
+        // intrinsics VM
+        {"getproc",    IrOp::GETPROC},
+        {"getvm",      IrOp::GETVM},
+        {"getmgr",     IrOp::GETMGR},
+        {"spawn",      IrOp::SPAWN},
+        {"resume",     IrOp::RESUME},
+        {"yield",      IrOp::YIELD},
+        {"swapctx",    IrOp::SWAPCTX},
+        // ensamblador incrustado
+        {"raw_asm",    IrOp::RAW_ASM},
+        {nullptr,      IrOp::NOP},
+    };
+
+    /**
+     * @brief Devuelve el nombre de texto de un IrOp.
+     */
+    const char *ir_op_name(IrOp op) {
+        for (const OpEntry *e = OP_TABLE; e->name; ++e)
+            if (e->op == op) return e->name;
+        return "?";
+    }
+
+    /**
+     * @brief Parsea el nombre de un opcode de texto a IrOp.
+     */
+    bool ir_op_parse(const char *name, IrOp &out) {
+        for (const OpEntry *e = OP_TABLE; e->name; ++e) {
+            if (std::strcmp(name, e->name) == 0) { out = e->op; return true; }
+        }
+        return false;
+    }
+
+    /* =====================================================================
+     * IrFunction: gestion de valores y bloques
+     * ===================================================================== */
+
+    /**
+     * @brief Crea un nuevo valor SSA en el pool de la funcion.
+     */
+    IrValueId IrFunction::new_value(IrType type, const std::string &nm) {
+        IrValue v;
+        v.id        = static_cast<IrValueId>(values.size());
+        v.type      = type;
+        v.is_param  = false;
+        v.is_const  = false;
+        v.const_val = 0;
+        v.name      = nm.empty() ? ("%" + std::to_string(v.id)) : nm;
+        values.push_back(std::move(v));
+        return values.back().id;
+    }
+
+    /**
+     * @brief Crea un nuevo bloque basico.
+     *
+     * Garantiza nombres unicos dentro de la funcion (necesario porque el
+     * emisor IR los traduce a etiquetas .vel y los .vel exigen unicidad
+     * por seccion).  Si el frontend pasa el mismo nombre logico para dos
+     * bloques (caso tipico: dos while anidados que ambos se llaman
+     * "while_header"), se anexa "_<id>" para distinguirlos.  Si pasa
+     * vacio, se genera "bbN".
+     */
+    IrBlockId IrFunction::new_block(const std::string &nm) {
+        IrBlock b;
+        b.id   = static_cast<IrBlockId>(blocks.size());
+        b.name = nm.empty()
+                   ? ("bb" + std::to_string(b.id))
+                   : (nm + "_" + std::to_string(b.id));
+        blocks.push_back(std::move(b));
+        return blocks.back().id;
+    }
+
+    /**
+     * @brief Anade una instruccion al bloque indicado.
+     */
+    void IrFunction::append(IrBlockId block_id, IrInstr instr) {
+        assert(block_id < static_cast<IrBlockId>(blocks.size()));
+        blocks[block_id].instrs.push_back(std::move(instr));
+    }
+
+    /* =====================================================================
+     * IrModule
+     * ===================================================================== */
+
+    size_t IrModule::add_function(IrFunction fn) {
+        size_t idx = functions.size();
+        functions.push_back(std::move(fn));
+        return idx;
+    }
+
+    /**
+     * @brief Registra (con deduplicacion) un blob de bytes en static_data.
+     *
+     * La deduplicacion compara contenido completo; en programas con muchos
+     * literales repetidos esto reduce el tamano del .vel emitido.
+     * Coste O(N*M) en el peor caso (N entradas, M bytes); aceptable para
+     * tamanos tipicos de modulo.  Si el coste se vuelve relevante en
+     * el futuro, sustituir por una std::unordered_map<hash, idx>.
+     */
+    uint64_t IrModule::intern_static_data(std::vector<uint8_t> bytes) {
+        for (size_t i = 0; i < static_data.size(); ++i) {
+            if (static_data[i] == bytes) return static_cast<uint64_t>(i);
+        }
+        static_data.push_back(std::move(bytes));
+        return static_cast<uint64_t>(static_data.size() - 1);
+    }
+
+    /**
+     * @brief Registra (con deduplicacion) un par (lib, name) en native_imports.
+     *
+     * Comparacion lineal sobre native_imports.  El frontend Vex puede
+     * llamar a esta funcion desde cada CALLN sin preocuparse por
+     * duplicados; el numero tipico de imports nativos por modulo es
+     * pequeno (decenas como mucho), por lo que la busqueda lineal es
+     * trivialmente mas barata que mantener una tabla hash auxiliar.
+     */
+    void IrModule::register_native_import(std::string lib, std::string name) {
+        for (const auto &ni : native_imports) {
+            if (ni.lib == lib && ni.name == name) return;
+        }
+        native_imports.push_back({std::move(lib), std::move(name)});
+    }
+
+    /* =====================================================================
+     * ir_print: serializar a texto
+     * ===================================================================== */
+
+    /**
+     * @brief Imprime un valor por su nombre.
+     */
+    static void print_val(std::ostream &o, const IrFunction &fn, IrValueId id) {
+        if (id == IR_NO_VALUE) { o << "<void>"; return; }
+        if (id < static_cast<IrValueId>(fn.values.size()))
+            o << fn.values[id].name;
+        else
+            o << "%?" << id;
+    }
+
+    /**
+     * @brief Imprime el nombre de un bloque por su id.
+     */
+    static void print_block_name(std::ostream &o, const IrFunction &fn, IrBlockId id) {
+        if (id < static_cast<IrBlockId>(fn.blocks.size()))
+            o << fn.blocks[id].name;
+        else
+            o << "?bb" << id;
+    }
+
+    /**
+     * @brief Imprime una instruccion en formato texto.
+     */
+    static void print_instr(std::ostream &o, const IrFunction &fn,
+                             const IrInstr &ins) {
+        o << "    "; // indentacion de 4 espacios
+
+        // prefijo de asignacion: %dst = op[.type] ...
+        if (ins.dst != IR_NO_VALUE) {
+            print_val(o, fn, ins.dst);
+            o << " = ";
+        }
+
+        // nombre del opcode; para comparaciones el tipo va en el nombre
+        o << ir_op_name(ins.op);
+
+        // sufijo de tipo (excepto para ops sin tipo como br/ret-void/nop)
+        bool print_type = (ins.type != IrType::VOID);
+        // BR, TRYLEAVE, NOP, UNREACHABLE, YIELD no tienen tipo
+        if (ins.op == IrOp::BR           || ins.op == IrOp::UNREACHABLE  ||
+            ins.op == IrOp::NOP          || ins.op == IrOp::TRYLEAVE     ||
+            ins.op == IrOp::YIELD        || ins.op == IrOp::MONENTER     ||
+            ins.op == IrOp::MONEXIT      || ins.op == IrOp::MONWAIT      ||
+            ins.op == IrOp::MONNOTI      || ins.op == IrOp::MONNOTA      ||
+            ins.op == IrOp::THROW        || ins.op == IrOp::FULFILL      ||
+            ins.op == IrOp::REJECT       || ins.op == IrOp::STORE        ||
+            ins.op == IrOp::SETFIELD     || ins.op == IrOp::RESUME       ||
+            ins.op == IrOp::SWAPCTX      || ins.op == IrOp::MEMCPY       ||
+            ins.op == IrOp::TRYENTER     || ins.op == IrOp::GCWB_IR      ||
+            ins.op == IrOp::GCDEREF_IR   || ins.op == IrOp::ARRAY_STORE  ||
+            ins.op == IrOp::STRFINALIZE) {
+            print_type = false;
+        }
+        if (print_type)
+            o << "." << ir_type_name(ins.type);
+
+        switch (ins.op) {
+
+            case IrOp::CONST:
+                // const.T imm
+                o << " " << ins.imm;
+                break;
+
+            case IrOp::BR:
+                // br label
+                o << " "; print_block_name(o, fn, ins.target_block);
+                break;
+
+            case IrOp::BR_COND:
+                // br.cond %cond, true_lbl, false_lbl
+                o << " ";
+                if (!ins.operands.empty()) print_val(o, fn, ins.operands[0]);
+                o << ", "; print_block_name(o, fn, ins.target_block);
+                o << ", "; print_block_name(o, fn, ins.false_block);
+                break;
+
+            case IrOp::RET:
+                // ret.T %val  o  ret.void
+                if (!ins.operands.empty()) {
+                    o << " "; print_val(o, fn, ins.operands[0]);
+                }
+                break;
+
+            case IrOp::PHI: {
+                // phi.T [%v0, lbl0], [%v1, lbl1], ...
+                for (const auto &arg : ins.phi_args) {
+                    o << " ["; print_val(o, fn, arg.value);
+                    o << ", "; print_block_name(o, fn, arg.block);
+                    o << "]";
+                }
+                break;
+            }
+
+            case IrOp::CALL:
+            case IrOp::TAILCALL:
+                // call.T @fn(args...)
+                o << " @" << ins.func_name << "(";
+                for (size_t i = 0; i < ins.operands.size(); i++) {
+                    if (i) o << ", ";
+                    print_val(o, fn, ins.operands[i]);
+                }
+                o << ")";
+                break;
+
+            case IrOp::CALLN:
+                // calln.T @lib:func(args...)
+                o << " @" << ins.func_name << "(";
+                for (size_t i = 0; i < ins.operands.size(); i++) {
+                    if (i) o << ", ";
+                    print_val(o, fn, ins.operands[i]);
+                }
+                o << ")";
+                break;
+
+            case IrOp::CALLIND:
+                // callind.T %fn_ptr(args...)
+                o << " "; print_val(o, fn, ins.func_ptr);
+                o << "(";
+                for (size_t i = 0; i < ins.operands.size(); i++) {
+                    if (i) o << ", ";
+                    print_val(o, fn, ins.operands[i]);
+                }
+                o << ")";
+                break;
+
+            case IrOp::CALLCLOSURE:
+                // A.10 closures: callclosure.T %fn_ptr, %env(args...)
+                // %fn_ptr en func_ptr, %env en operands[0], args declarados
+                // en operands[1..].  Notacion textual elegida para que sea
+                // visualmente similar a CALLIND pero exhiba el env.
+                o << " "; print_val(o, fn, ins.func_ptr);
+                o << ", ";
+                if (!ins.operands.empty()) print_val(o, fn, ins.operands[0]);
+                o << "(";
+                for (size_t i = 1; i < ins.operands.size(); i++) {
+                    if (i > 1) o << ", ";
+                    print_val(o, fn, ins.operands[i]);
+                }
+                o << ")";
+                break;
+
+            case IrOp::CALLVIRT:
+                // callvirt.T %obj, vtbl_idx(args...)
+                o << " ";
+                if (!ins.operands.empty()) print_val(o, fn, ins.operands[0]);
+                o << ", " << ins.imm << "(";
+                for (size_t i = 1; i < ins.operands.size(); i++) {
+                    if (i > 1) o << ", ";
+                    print_val(o, fn, ins.operands[i]);
+                }
+                o << ")";
+                break;
+
+            case IrOp::ALLOCA:
+                // alloca.T count
+                o << " " << ins.imm;
+                break;
+
+            case IrOp::LOAD:
+                // load.T %ptr
+                o << " "; print_val(o, fn, ins.operands[0]);
+                break;
+
+            case IrOp::STORE:
+                // store %val, %ptr
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", "; print_val(o, fn, ins.operands[1]);
+                break;
+
+            case IrOp::MEMCPY:
+                // memcpy %dst, %src, %len
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", "; print_val(o, fn, ins.operands[1]);
+                o << ", "; print_val(o, fn, ins.operands[2]);
+                break;
+
+            case IrOp::GETFIELD:
+                // getfield.T %obj, field_idx
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", " << ins.imm;
+                break;
+
+            case IrOp::SETFIELD:
+                // setfield %obj, field_idx, %val
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", " << ins.imm;
+                o << ", "; print_val(o, fn, ins.operands[1]);
+                break;
+
+            case IrOp::SPECIALIZE:
+                // specialize.T %class, %types, count
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", "; print_val(o, fn, ins.operands[1]);
+                o << ", " << ins.imm;
+                break;
+
+            case IrOp::TRYENTER:
+                // tryenter %handler_pc, %class_ptr
+                o << " "; print_val(o, fn, ins.operands[0]);
+                if (ins.operands.size() > 1) {
+                    o << ", "; print_val(o, fn, ins.operands[1]);
+                }
+                break;
+
+            case IrOp::FULFILL:
+            case IrOp::REJECT:
+                // fulfill/reject %future, %value_or_error
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", "; print_val(o, fn, ins.operands[1]);
+                break;
+
+            case IrOp::MSGSEND:
+                // msgsend %pid, %buf_addr, %len
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", "; print_val(o, fn, ins.operands[1]);
+                o << ", "; print_val(o, fn, ins.operands[2]);
+                break;
+
+            case IrOp::MSGRECV:
+                // msgrecv.T %max_len, %buf_addr
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", "; print_val(o, fn, ins.operands[1]);
+                break;
+
+            case IrOp::RSPAWN:
+                // rspawn %node_idx, %fn_addr
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", "; print_val(o, fn, ins.operands[1]);
+                break;
+
+            case IrOp::SWAPCTX:
+                // swapctx %dst_ctx, %src_ctx
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", "; print_val(o, fn, ins.operands[1]);
+                break;
+
+            case IrOp::RAW_ASM:
+                // raw_asm "texto de ensamblador verbatim"
+                o << " \"" << ins.func_name << "\"";
+                break;
+
+            case IrOp::GEP:
+                // gep.ptr %handle, byte_offset
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", " << ins.imm;
+                break;
+
+            case IrOp::GCWB_IR:
+                // gcwb_ir %handle
+                if (!ins.operands.empty()) { o << " "; print_val(o, fn, ins.operands[0]); }
+                break;
+
+            case IrOp::GCDEREF_IR:
+                // gcderef_ir %handle
+                if (!ins.operands.empty()) { o << " "; print_val(o, fn, ins.operands[0]); }
+                break;
+
+            case IrOp::ARRAY_ALLOC:
+                // array_alloc.T %len
+                if (!ins.operands.empty()) { o << " "; print_val(o, fn, ins.operands[0]); }
+                break;
+
+            case IrOp::ARRAY_LEN:
+                // array_len.i64 %arr
+                if (!ins.operands.empty()) { o << " "; print_val(o, fn, ins.operands[0]); }
+                break;
+
+            case IrOp::ARRAY_LOAD:
+                // array_load.T %arr, %idx
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", "; print_val(o, fn, ins.operands[1]);
+                break;
+
+            case IrOp::ARRAY_STORE:
+                // array_store %arr, %idx, %val
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", "; print_val(o, fn, ins.operands[1]);
+                o << ", "; print_val(o, fn, ins.operands[2]);
+                break;
+
+            case IrOp::STRMAKE:
+                // strmake.handle %buf, %len [enc=imm]
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", "; print_val(o, fn, ins.operands[1]);
+                if (ins.imm) o << ", " << ins.imm;
+                break;
+
+            case IrOp::STRCONV:
+                // strconv.handle %str, enc
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", " << ins.imm;
+                break;
+
+            case IrOp::STRFINALIZE:
+                // strfinalize %str, %new_len
+                o << " "; print_val(o, fn, ins.operands[0]);
+                o << ", "; print_val(o, fn, ins.operands[1]);
+                break;
+
+            default:
+                // instrucciones con 0..N operandos simples:
+                // NEG, NOT, FNEG, FABS, FSQRT (1 op)
+                // ADD, SUB, MUL, DIV, MOD, CMP_*, FCMP_*, AND, OR, XOR, etc. (2 ops)
+                // THROW, MONENTER, MONEXIT, MONWAIT, MONNOTI, MONNOTA (1 op)
+                // AWAIT (1 op), SPAWN (1 op), RESUME (1 op)
+                // INSTANCEOF, CHECKCAST, ISNULL, UNWRAP, CAST, ZEXT, ... (1-2 ops)
+                // GETPROC, GETVM, GETMGR, FUTURE, TRYLEAVE, YIELD (0 ops)
+                for (size_t i = 0; i < ins.operands.size(); i++) {
+                    o << (i == 0 ? " " : ", ");
+                    print_val(o, fn, ins.operands[i]);
+                }
+                break;
+        }
+        o << "\n";
+    }
+
+    /**
+     * @brief Serializa un IrModule completo al formato de texto SSA IR.
+     */
+    void ir_print(const IrModule &mod, std::ostream &o) {
+        // encabezado del modulo
+        o << "// SSA IR - VestaVM\n";
+        if (!mod.name.empty()) o << "@module " << mod.name << "\n\n";
+
+        // metadatos opcionales de compilacion
+        if (!mod.format.empty())
+            o << "@format " << mod.format << "\n\n";
+        for (const auto &sp : mod.spaces) {
+            o << "@space " << sp.name
+              << " 0x" << std::hex << sp.ini_address
+              << " 0x" << sp.end_address << std::dec << "\n";
+        }
+        if (!mod.spaces.empty()) o << "\n";
+        for (const auto &sec : mod.sections) {
+            o << "@section " << sec.name
+              << " " << sec.space_name
+              << " 0x" << std::hex << sec.align << std::dec << "\n";
+        }
+        if (!mod.sections.empty()) o << "\n";
+
+        // declaraciones de libs nativas
+        for (const auto &lib : mod.native_libs) {
+            o << "@native_lib " << lib << "\n";
+        }
+        if (!mod.native_libs.empty()) o << "\n";
+
+        // imports
+        for (const auto &imp : mod.imports) {
+            o << "@import " << imp << "\n";
+        }
+        if (!mod.imports.empty()) o << "\n";
+
+        // funciones
+        for (const auto &fn : mod.functions) {
+            // @function nombre(param: tipo, ...) -> tipo_retorno [flags] {
+            o << "@function " << fn.name << "(";
+            bool first = true;
+            for (IrValueId pid : fn.params) {
+                if (!first) o << ", ";
+                first = false;
+                if (pid < static_cast<IrValueId>(fn.values.size())) {
+                    const IrValue &pv = fn.values[pid];
+                    o << pv.name << ": " << ir_type_name(pv.type);
+                }
+            }
+            o << ") -> " << ir_type_name(fn.ret_type);
+            if (fn.is_native)   o << " [native]";
+            if (fn.is_variadic) o << " [variadic]";
+            o << " {\n";
+
+            // bloques basicos
+            for (const auto &bb : fn.blocks) {
+                o << bb.name << ":\n";
+                for (const auto &ins : bb.instrs) {
+                    print_instr(o, fn, ins);
+                }
+            }
+            o << "}\n\n";
+        }
+    }
+
+    /* =====================================================================
+     * ir_parse: deserializar desde texto
+     * ===================================================================== */
+
+    /**
+     * @brief Elimina espacios iniciales y finales de una cadena.
+     */
+    static void trim(std::string &s) {
+        size_t b = s.find_first_not_of(" \t\r\n");
+        if (b == std::string::npos) { s.clear(); return; }
+        size_t e = s.find_last_not_of(" \t\r\n");
+        s = s.substr(b, e - b + 1);
+    }
+
+    /**
+     * @brief Extrae el nombre del opcode de la parte derecha de una instruccion.
+     *
+     * El opcode puede ser "add", "cmp.eq", "br.cond", etc.  El sufijo de tipo
+     * (p.ej. ".i64") no forma parte del nombre del opcode.
+     *
+     * @param rhs   Lado derecho de la instruccion (despues del "=" o la linea completa).
+     * @param op    Opcode extraido.
+     * @param type  Tipo anotado extraido (VOID si no hay sufijo).
+     * @param rest  Resto de la cadena despues del opcode+tipo.
+     * @return true si el opcode fue reconocido.
+     */
+    static bool parse_op_and_type(const std::string &rhs,
+                                   IrOp &op, IrType &type,
+                                   std::string &rest) {
+        type = IrType::VOID;
+        rest.clear();
+
+        // separar por primer espacio para aislar "op[.type]"
+        size_t sp = rhs.find(' ');
+        std::string op_part = (sp == std::string::npos) ? rhs : rhs.substr(0, sp);
+        rest = (sp == std::string::npos) ? "" : rhs.substr(sp + 1);
+        trim(rest);
+
+        // algunos opcodes tienen puntos: "cmp.eq", "br.cond", "fcmp.lt"
+        // Los reconocemos probando nombres compuestos primero (mas largo = mas especifico)
+        // Estrategia: intentar match completo "op_part" primero (incluye ".eq" si lo tiene)
+        // Si falla, intentar separar en opcode y tipo por el ULTIMO punto.
+
+        // intento de match completo (para "cmp.eq", "br.cond", "fcmp.lt", etc.)
+        if (ir_op_parse(op_part.c_str(), op)) return true;
+
+        // no coincide completo: separar nombre y sufijo de tipo por el ultimo '.'
+        size_t last_dot = op_part.rfind('.');
+        if (last_dot == std::string::npos) return false; // sin tipo, sin match
+
+        std::string op_name  = op_part.substr(0, last_dot);
+        std::string type_str = op_part.substr(last_dot + 1);
+
+        if (!ir_op_parse(op_name.c_str(), op)) return false;
+        ir_type_parse(type_str.c_str(), type); // si no parsea, queda VOID
+        return true;
+    }
+
+    /**
+     * @brief Extrae un nombre de valor ("%nombre") del inicio de la cadena.
+     * @param s   Cadena de entrada.
+     * @param out Nombre extraido (con el '%').
+     * @return Posicion despues del nombre, o npos si no empieza por '%'.
+     */
+    static size_t extract_val_name(const std::string &s, size_t pos,
+                                   std::string &out) {
+        if (pos >= s.size() || s[pos] != '%') return std::string::npos;
+        size_t end = pos + 1;
+        while (end < s.size() && (std::isalnum((unsigned char)s[end]) ||
+                                   s[end] == '_' || s[end] == '.'))
+            end++;
+        out = s.substr(pos, end - pos);
+        return end;
+    }
+
+    /**
+     * @brief Parsea una lista de parametros "nombre: tipo, ..." y llena params/values.
+     * @param fn         Funcion destino.
+     * @param val_map    Mapa nombre->id que se actualiza con los nuevos valores.
+     * @param params_str Cadena con los parametros separados por comas.
+     */
+    static void parse_params(IrFunction &fn,
+                              std::unordered_map<std::string, IrValueId> &val_map,
+                              const std::string &params_str) {
+        std::istringstream ps(params_str);
+        std::string param;
+        while (std::getline(ps, param, ',')) {
+            trim(param);
+            if (param.empty()) continue;
+            size_t colon = param.find(':');
+            if (colon == std::string::npos) continue;
+            std::string pname = param.substr(0, colon);
+            std::string ptype = param.substr(colon + 1);
+            trim(pname); trim(ptype);
+            IrType pt = IrType::I64;
+            ir_type_parse(ptype.c_str(), pt);
+            IrValueId vid = fn.new_value(pt, pname);
+            fn.values[vid].is_param = true;
+            val_map[pname] = vid;
+            fn.params.push_back(vid);
+        }
+    }
+
+    /**
+     * @brief Parsea un archivo .ir de texto y construye un IrModule.
+     */
+    bool ir_parse(const std::string &text, IrModule &out, std::string &error) {
+        std::istringstream ss(text);
+        std::string line;
+        int lineno = 0;
+
+        // indice de la funcion activa en out.functions (-1 si ninguna)
+        int cur_fn_idx = -1;
+        IrBlockId cur_bb = IR_NO_BLOCK;
+
+        // mapas por nombre dentro de la funcion actual
+        std::unordered_map<std::string, IrValueId> val_map;
+        std::unordered_map<std::string, IrBlockId> blk_map;
+
+        // helper: puntero a la funcion activa (evita invalidacion por push_back usando indice)
+        auto cur_fn = [&]() -> IrFunction * {
+            return cur_fn_idx >= 0 ? &out.functions[static_cast<size_t>(cur_fn_idx)] : nullptr;
+        };
+
+        // helper: obtener o crear valor por nombre
+        auto get_or_create_val = [&](const std::string &name, IrType t) -> IrValueId {
+            auto it = val_map.find(name);
+            if (it != val_map.end()) return it->second;
+            IrValueId id = cur_fn()->new_value(t, name);
+            val_map[name] = id;
+            return id;
+        };
+
+        // helper: obtener o crear bloque por nombre
+        auto get_or_create_blk = [&](const std::string &name) -> IrBlockId {
+            auto it = blk_map.find(name);
+            if (it != blk_map.end()) return it->second;
+            IrBlockId id = cur_fn()->new_block(name);
+            blk_map[name] = id;
+            return id;
+        };
+
+        bool in_block_comment = false; // estado para /* ... */
+        while (std::getline(ss, line)) {
+            lineno++;
+
+            // Eliminar comentarios de bloque /* ... */ (pueden abarcar varias lineas)
+            {
+                std::string cleaned;
+                size_t i = 0;
+                while (i < line.size()) {
+                    if (in_block_comment) {
+                        if (i + 1 < line.size() && line[i] == '*' && line[i+1] == '/') {
+                            in_block_comment = false;
+                            i += 2;
+                        } else {
+                            ++i;
+                        }
+                    } else {
+                        if (i + 1 < line.size() && line[i] == '/' && line[i+1] == '*') {
+                            in_block_comment = true;
+                            i += 2;
+                        } else if (i + 1 < line.size() && line[i] == '/' && line[i+1] == '/') {
+                            break; // resto de la linea es comentario
+                        } else if (line[i] == ';') {
+                            break; // comentario estilo ensamblador
+                        } else {
+                            cleaned += line[i++];
+                        }
+                    }
+                }
+                line = cleaned;
+            }
+
+            trim(line);
+            if (line.empty()) continue;
+
+            // --- @module nombre ---
+            if (line.rfind("@module", 0) == 0) {
+                out.name = line.substr(7);
+                trim(out.name);
+                continue;
+            }
+
+            // --- @format nombre ---  (p.ej. @format velb)
+            if (line.rfind("@format", 0) == 0) {
+                out.format = line.substr(7);
+                trim(out.format);
+                continue;
+            }
+
+            // --- @space nombre ini_hex end_hex ---
+            // Ejemplo: @space anonymous 0x0000000000000000 0xFFFFFFFFFFFFFFFF
+            if (line.rfind("@space", 0) == 0) {
+                std::istringstream ss2(line.substr(6));
+                IrSpaceDef sp;
+                std::string ini_s, end_s;
+                ss2 >> sp.name >> ini_s >> end_s;
+                try {
+                    sp.ini_address = std::stoull(ini_s, nullptr, 0);
+                    sp.end_address = std::stoull(end_s, nullptr, 0);
+                } catch (...) {
+                    sp.ini_address = 0;
+                    sp.end_address = 0xFFFFFFFFFFFFFFFFULL;
+                }
+                out.spaces.push_back(sp);
+                continue;
+            }
+
+            // --- @section nombre espacio align_hex ---
+            // Ejemplo: @section code anonymous 0x1000
+            if (line.rfind("@section", 0) == 0) {
+                std::istringstream ss2(line.substr(8));
+                IrSectionDef sec;
+                std::string align_s;
+                ss2 >> sec.name >> sec.space_name >> align_s;
+                try {
+                    sec.align = std::stoull(align_s, nullptr, 0);
+                } catch (...) {
+                    sec.align = 0x1000;
+                }
+                out.sections.push_back(sec);
+                continue;
+            }
+
+            // --- @native_lib nombre ---
+            if (line.rfind("@native_lib", 0) == 0) {
+                std::string lib = line.substr(11);
+                trim(lib);
+                out.native_libs.push_back(lib);
+                continue;
+            }
+
+            // --- @import nombre ---
+            if (line.rfind("@import", 0) == 0) {
+                std::string imp = line.substr(7);
+                trim(imp);
+                out.imports.push_back(imp);
+                continue;
+            }
+
+            // --- @function nombre(...) -> tipo [flags] { ---
+            if (line.rfind("@function", 0) == 0) {
+                IrFunction fn;
+                fn.is_native   = false;
+                fn.is_variadic = false;
+                fn.ret_type    = IrType::VOID;
+
+                size_t paren = line.find('(');
+                if (paren == std::string::npos) {
+                    error = "linea " + std::to_string(lineno) + ": @function sin '('";
+                    return false;
+                }
+                fn.name = line.substr(10, paren - 10);
+                trim(fn.name);
+
+                if (line.find("[native]")   != std::string::npos) fn.is_native   = true;
+                if (line.find("[variadic]") != std::string::npos) fn.is_variadic = true;
+
+                // parsear tipo de retorno (tras "->")
+                size_t arrow = line.find("-> ");
+                if (arrow != std::string::npos) {
+                    std::string rt = line.substr(arrow + 3);
+                    size_t end = rt.find_first_of(" \t{[");
+                    if (end != std::string::npos) rt = rt.substr(0, end);
+                    IrType t;
+                    if (ir_type_parse(rt.c_str(), t)) fn.ret_type = t;
+                }
+
+                // crear el bloque de entrada antes de parsear params
+                fn.new_block("entry");
+
+                // anadir la funcion al modulo antes de parsear params
+                // (para que los lambdas get_or_create_val/blk funcionen)
+                out.functions.push_back(std::move(fn));
+                cur_fn_idx = static_cast<int>(out.functions.size()) - 1;
+                cur_bb = 0; // bloque "entry" = id 0
+                val_map.clear();
+                blk_map.clear();
+                blk_map["entry"] = 0;
+
+                // parsear parametros: nombre: tipo, ...
+                size_t close_paren = line.find(')', paren);
+                if (close_paren != std::string::npos && close_paren > paren + 1) {
+                    std::string params_str = line.substr(paren + 1,
+                                                         close_paren - paren - 1);
+                    parse_params(*cur_fn(), val_map, params_str);
+                }
+                continue;
+            }
+
+            // --- cierre de funcion "}" ---
+            if (line == "}") {
+                cur_fn_idx = -1;
+                cur_bb     = IR_NO_BLOCK;
+                val_map.clear();
+                blk_map.clear();
+                continue;
+            }
+
+            if (!cur_fn()) continue; // linea fuera de funcion
+
+            // --- etiqueta de bloque "nombre:" ---
+            if (line.back() == ':' && line.find(' ') == std::string::npos) {
+                std::string bname = line.substr(0, line.size() - 1);
+                cur_bb = get_or_create_blk(bname);
+                continue;
+            }
+
+            // --- instruccion ---
+            if (cur_bb == IR_NO_BLOCK) cur_bb = get_or_create_blk("body");
+
+            IrInstr ins;
+            ins.source_line = static_cast<uint32_t>(lineno);
+
+            // detectar asignacion: "dst = rhs" (con o sin prefijo %)
+            std::string rhs = line;
+            {
+                size_t eq = line.find(" = ");
+                if (eq != std::string::npos) {
+                    std::string dst_name = line.substr(0, eq);
+                    trim(dst_name);
+                    // nombre valido: sin espacios, no vacio, no empieza por '@'
+                    if (!dst_name.empty()
+                        && dst_name.find(' ') == std::string::npos
+                        && dst_name[0] != '@') {
+                        rhs = line.substr(eq + 3);
+                        trim(rhs);
+                        // tipo provisional; se corrige al parsear el opcode
+                        ins.dst = get_or_create_val(dst_name, IrType::I64);
+                    }
+                }
+            }
+
+            // parsear opcode y tipo anotado
+            IrOp   parsed_op   = IrOp::NOP;
+            IrType parsed_type = IrType::VOID;
+            std::string operand_str;
+            if (!parse_op_and_type(rhs, parsed_op, parsed_type, operand_str)) {
+                ins.op = IrOp::NOP; // opcode desconocido: emitir NOP
+                cur_fn()->append(cur_bb, std::move(ins));
+                continue;
+            }
+            ins.op   = parsed_op;
+            ins.type = parsed_type;
+
+            // actualizar tipo del destino si se conoce
+            if (ins.dst != IR_NO_VALUE && parsed_type != IrType::VOID)
+                cur_fn()->values[ins.dst].type = parsed_type;
+
+            // parsear operandos segun el opcode
+            switch (ins.op) {
+
+                case IrOp::CONST: {
+                    // const.T imm
+                    trim(operand_str);
+                    try { ins.imm = std::stoull(operand_str); }
+                    catch (...) { ins.imm = 0; }
+                    break;
+                }
+
+                case IrOp::BR: {
+                    // br label
+                    trim(operand_str);
+                    ins.target_block = get_or_create_blk(operand_str);
+                    break;
+                }
+
+                case IrOp::BR_COND: {
+                    // br.cond %cond, true_lbl, false_lbl
+                    std::istringstream cs(operand_str);
+                    std::string tok;
+                    int field = 0;
+                    while (std::getline(cs, tok, ',')) {
+                        trim(tok);
+                        if (field == 0) {
+                            ins.operands.push_back(get_or_create_val(tok, IrType::BOOL));
+                        } else if (field == 1) {
+                            ins.target_block = get_or_create_blk(tok);
+                        } else {
+                            ins.false_block = get_or_create_blk(tok);
+                        }
+                        field++;
+                    }
+                    break;
+                }
+
+                case IrOp::RET: {
+                    // ret.T val  o  ret.void (sin operandos)
+                    trim(operand_str);
+                    if (!operand_str.empty()) {
+                        ins.operands.push_back(get_or_create_val(operand_str, ins.type));
+                    }
+                    break;
+                }
+
+                case IrOp::PHI: {
+                    // phi.T [%v0, lbl0], [%v1, lbl1], ...
+                    std::string s = operand_str;
+                    size_t pos = 0;
+                    while (pos < s.size()) {
+                        size_t ob = s.find('[', pos);
+                        if (ob == std::string::npos) break;
+                        size_t cb = s.find(']', ob);
+                        if (cb == std::string::npos) break;
+                        std::string pair = s.substr(ob + 1, cb - ob - 1);
+                        size_t comma = pair.find(',');
+                        if (comma != std::string::npos) {
+                            std::string vname = pair.substr(0, comma);
+                            std::string bname = pair.substr(comma + 1);
+                            trim(vname); trim(bname);
+                            IrPhiArg arg;
+                            arg.value = get_or_create_val(vname, ins.type);
+                            arg.block = get_or_create_blk(bname);
+                            ins.phi_args.push_back(arg);
+                        }
+                        pos = cb + 1;
+                    }
+                    break;
+                }
+
+                case IrOp::CALL:
+                case IrOp::CALLN:
+                case IrOp::TAILCALL: {
+                    // call.T @fn(args...) o calln.T @lib:func(args...)
+                    size_t at = operand_str.find('@');
+                    if (at == std::string::npos) break;
+                    size_t lparen = operand_str.find('(', at);
+                    if (lparen == std::string::npos) {
+                        ins.func_name = operand_str.substr(at + 1);
+                    } else {
+                        ins.func_name = operand_str.substr(at + 1, lparen - at - 1);
+                        // parsear argumentos
+                        size_t rparen = operand_str.rfind(')');
+                        std::string args_str = operand_str.substr(lparen + 1,
+                            rparen == std::string::npos ? std::string::npos
+                                                        : rparen - lparen - 1);
+                        std::istringstream as(args_str);
+                        std::string arg;
+                        while (std::getline(as, arg, ',')) {
+                            trim(arg);
+                            if (!arg.empty())
+                                ins.operands.push_back(get_or_create_val(arg, IrType::I64));
+                        }
+                    }
+                    break;
+                }
+
+                case IrOp::RAW_ASM: {
+                    // raw_asm "texto..." — extraer contenido entre comillas
+                    // Soporta secuencias de escape \n \t \\ dentro del string.
+                    size_t q1 = operand_str.find('"');
+                    size_t q2 = (q1 != std::string::npos)
+                                    ? operand_str.rfind('"') : std::string::npos;
+                    if (q1 != std::string::npos && q2 != q1) {
+                        std::string raw = operand_str.substr(q1 + 1, q2 - q1 - 1);
+                        // expandir secuencias de escape basicas
+                        std::string expanded;
+                        expanded.reserve(raw.size());
+                        for (size_t i = 0; i < raw.size(); ++i) {
+                            if (raw[i] == '\\' && i + 1 < raw.size()) {
+                                ++i;
+                                switch (raw[i]) {
+                                    case 'n':  expanded += '\n'; break;
+                                    case 't':  expanded += '\t'; break;
+                                    case '\\': expanded += '\\'; break;
+                                    case '"':  expanded += '"';  break;
+                                    default:   expanded += '\\'; expanded += raw[i]; break;
+                                }
+                            } else {
+                                expanded += raw[i];
+                            }
+                        }
+                        ins.func_name = std::move(expanded);
+                    }
+                    // RAW_ASM nunca tiene dst ni operandos
+                    ins.dst = IR_NO_VALUE;
+                    ins.type = IrType::VOID;
+                    break;
+                }
+
+                case IrOp::ALLOCA: {
+                    // alloca.T count
+                    trim(operand_str);
+                    try { ins.imm = std::stoull(operand_str); }
+                    catch (...) { ins.imm = 1; }
+                    break;
+                }
+
+                case IrOp::GETFIELD:
+                case IrOp::GEP: {
+                    // getfield.T %obj, field_offset  /  gep.ptr %handle, byte_offset
+                    std::istringstream gs(operand_str);
+                    std::string tok;
+                    int field = 0;
+                    while (std::getline(gs, tok, ',')) {
+                        trim(tok);
+                        if (field == 0)
+                            ins.operands.push_back(get_or_create_val(tok, IrType::HANDLE));
+                        else
+                            try { ins.imm = std::stoull(tok); } catch (...) {}
+                        field++;
+                    }
+                    break;
+                }
+
+                case IrOp::STRMAKE:
+                case IrOp::STRCONV: {
+                    // strmake.handle %buf, %len [, enc]
+                    // strconv.handle %str, enc
+                    std::istringstream gs(operand_str);
+                    std::string tok;
+                    int field = 0;
+                    while (std::getline(gs, tok, ',')) {
+                        trim(tok);
+                        if (tok.empty()) continue;
+                        bool is_ident = (tok[0] == '%' || std::isalpha((unsigned char)tok[0]) || tok[0] == '_');
+                        if (is_ident) {
+                            ins.operands.push_back(get_or_create_val(tok, IrType::I64));
+                        } else {
+                            // ultimo campo es enc (literal numerico)
+                            try { ins.imm = std::stoull(tok); } catch (...) {}
+                        }
+                        field++;
+                    }
+                    break;
+                }
+
+                default: {
+                    // instrucciones con 0..N operandos simples separados por ','
+                    if (operand_str.empty()) break;
+                    std::istringstream ds(operand_str);
+                    std::string tok;
+                    while (std::getline(ds, tok, ',')) {
+                        trim(tok);
+                        if (tok.empty()) continue;
+                        // Aceptar nombres de valor con prefijo '%' o como identificador
+                        // simple (letra/_); ignorar literales numericos puros.
+                        bool is_ident = (tok[0] == '%'
+                                         || std::isalpha((unsigned char)tok[0])
+                                         || tok[0] == '_');
+                        if (is_ident) {
+                            ins.operands.push_back(get_or_create_val(tok, IrType::I64));
+                        }
+                    }
+                    break;
+                }
+            }
+
+            cur_fn()->append(cur_bb, std::move(ins));
+        }
+
+        return true;
+    }
+
+    /* =====================================================================
+     * ir_verify: verificador de forma SSA
+     * ===================================================================== */
+
+    /**
+     * @brief Verifica que el modulo esta en forma SSA correcta.
+     */
+    bool ir_verify(const IrModule &mod, std::vector<std::string> &errors) {
+        bool ok = true;
+
+        for (const auto &fn : mod.functions) {
+            // conjunto de valores definidos (SSA: cada uno exactamente una vez)
+            std::unordered_map<IrValueId, int> def_count;
+            for (const auto &v : fn.values) def_count[v.id] = 0;
+
+            // los parametros cuentan como definidos
+            for (IrValueId pid : fn.params) {
+                if (def_count.count(pid)) def_count[pid]++;
+            }
+
+            for (const auto &bb : fn.blocks) {
+                bool has_terminator = false;
+
+                for (const auto &ins : bb.instrs) {
+                    // contar definiciones
+                    if (ins.dst != IR_NO_VALUE) {
+                        def_count[ins.dst]++;
+                        if (def_count[ins.dst] > 1) {
+                            errors.push_back("fn '" + fn.name +
+                                "' bloque '" + bb.name +
+                                "': valor " + std::to_string(ins.dst) +
+                                " definido mas de una vez (viola SSA)");
+                            ok = false;
+                        }
+                    }
+
+                    // verificar terminadores
+                    if (ins.op == IrOp::BR   || ins.op == IrOp::BR_COND ||
+                        ins.op == IrOp::RET  || ins.op == IrOp::UNREACHABLE) {
+                        has_terminator = true;
+                    }
+
+                    // verificar que los operandos existen
+                    for (IrValueId op_id : ins.operands) {
+                        if (op_id != IR_NO_VALUE &&
+                            op_id >= static_cast<IrValueId>(fn.values.size())) {
+                            errors.push_back("fn '" + fn.name + "' bloque '" +
+                                bb.name + "': operando " + std::to_string(op_id) +
+                                " fuera del rango del pool");
+                            ok = false;
+                        }
+                    }
+                    // verificar func_ptr para CALLIND y CALLCLOSURE.
+                    if ((ins.op == IrOp::CALLIND || ins.op == IrOp::CALLCLOSURE) &&
+                        ins.func_ptr != IR_NO_VALUE &&
+                        ins.func_ptr >= static_cast<IrValueId>(fn.values.size())) {
+                        errors.push_back("fn '" + fn.name + "': callind/closure func_ptr " +
+                            std::to_string(ins.func_ptr) + " fuera del rango");
+                        ok = false;
+                    }
+                    // verificar phi args
+                    for (const auto &phi_arg : ins.phi_args) {
+                        if (phi_arg.value != IR_NO_VALUE &&
+                            phi_arg.value >= static_cast<IrValueId>(fn.values.size())) {
+                            errors.push_back("fn '" + fn.name + "': phi arg " +
+                                std::to_string(phi_arg.value) + " fuera del rango");
+                            ok = false;
+                        }
+                    }
+                }
+
+                // bloque no vacio sin terminador
+                if (!has_terminator && !bb.instrs.empty()) {
+                    // CALLN y otros pueden ser el ultimo opcode de un bloque hoja
+                    // solo reportar si el ultimo opcode no es un intrinsic terminal
+                    const IrInstr &last = bb.instrs.back();
+                    bool terminal_intrinsic = (last.op == IrOp::THROW);
+                    if (!terminal_intrinsic) {
+                        errors.push_back("fn '" + fn.name + "' bloque '" +
+                            bb.name + "': sin instruccion terminadora");
+                        ok = false;
+                    }
+                }
+            }
+        }
+
+        return ok;
+    }
+
+} // namespace ir

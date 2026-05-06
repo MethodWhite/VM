@@ -100,6 +100,11 @@
 #include "arena/VirtualMemory.h"
 #include "arena/arena_manager.h"
 
+// forward decl para no incluir el header completo (incluiria
+// gc_heap.h indirectamente).  El puntero al owner se usa en major_gc para
+// invocar scan_stack_roots con el rsp/stack_high/regs del proceso.
+namespace runtime { class ProcessVM; }
+
 namespace gc {
     /**
      * @brief Handle opaco para referenciar objetos gestionados por el GcHeap.
@@ -192,6 +197,20 @@ namespace gc {
     };
 
     /**
+     * @brief Entrada en la tabla de referencias debiles del GcHeap.
+     *
+     * Una referencia debil apunta a un objeto sin impedir su recoleccion.
+     * Durante la fase de barrido del major GC, si el objeto apuntado ha muerto,
+     * target se pone a GC_NULL_HANDLE automaticamente.
+     *
+     * Se accede mediante un indice uint32_t (WeakHandle).
+     */
+    struct WeakEntry {
+        GcHandle target; ///< handle del objeto referenciado (GC_NULL_HANDLE si recolectado)
+        bool     live;   ///< true si esta entrada esta en uso
+    };
+
+    /**
      * @brief Estadisticas acumuladas del GcHeap.
      *
      * Todos los campos son plain uint64_t sin sincronizacion. El heap es
@@ -207,15 +226,21 @@ namespace gc {
      */
     struct GcStats {
         uint64_t alloc_count    = 0; /**< Llamadas a alloc() que tuvieron exito. */
-        uint64_t alloc_bytes    = 0; /**< Bytes de payload asignados en total. */
+        uint64_t alloc_bytes    = 0; /**< Bytes utiles asignados (lo pedido por el usuario). */
         uint64_t freed_count    = 0; /**< Objetos liberados por major GC (sweep). */
-        uint64_t freed_bytes    = 0; /**< Bytes de payload liberados por sweep. */
+        uint64_t freed_bytes    = 0; /**< Bytes liberados por sweep (slot total). */
         uint64_t promoted_count = 0; /**< Objetos evacuados Nursery -> OldGen. */
         uint64_t promoted_bytes = 0; /**< Bytes de payload evacuados a OldGen. */
         uint64_t minor_gc_count = 0; /**< Ciclos de minor GC ejecutados. */
         uint64_t major_gc_count = 0; /**< Ciclos de major GC ejecutados. */
         uint64_t peak_nursery   = 0; /**< Uso maximo de Nursery en bytes. */
         uint64_t peak_old       = 0; /**< Uso maximo de OldGen en bytes. */
+        // ---- GC no-moving en OldGen: metricas de fragmentacion ----
+        uint64_t old_reserved_bytes = 0; /**< Bytes reservados por bump pointer en bloques OldGen. */
+        uint64_t old_freelist_bytes = 0; /**< Bytes acumulados en free lists tras el ultimo sweep. */
+        uint64_t old_alloc_freelist = 0; /**< alloc_in_old satisfechos via free list (rapido). */
+        uint64_t old_alloc_bump     = 0; /**< alloc_in_old satisfechos via bump pointer. */
+        uint64_t old_alloc_newblock = 0; /**< alloc_in_old que requirieron crear bloque nuevo. */
     };
 
     /**
@@ -304,6 +329,95 @@ namespace gc {
         GcHandle alloc(size_t size);
 
         /**
+         * @brief Aloca un objeto NO MOVIBLE (directo en OldGen).
+         *
+         * Variante de @c alloc que asigna el slot directamente en la
+         * generacion vieja, evitando la promocion via @c do_evacuate.
+         * El payload pointer obtenido via @c deref(h) permanece estable
+         * durante toda la vida del handle: el major_gc no recolecta
+         * objetos vivos (solo barre los DEAD), y la OldGen es non-moving.
+         *
+         * Util para objetos cuyo payload se exporta como @c host_ptr a
+         * codigo que no se actualiza tras un GC, como @c StringObject
+         * accedido via @c STRRAW para FFI / print / interpolacion.
+         *
+         * Coste: una llamada extra de overhead vs @c alloc en young (que
+         * es bump O(1)); pero @c alloc_in_old usa free lists segregadas
+         * por size class, asi que tambien es O(1) amortizado.
+         *
+         * @param size Tamano del payload en bytes (sin GcHeader).
+         * @return Handle valido o GC_NULL_HANDLE si OOM en OldGen.
+         */
+        GcHandle alloc_pinned(size_t size);
+
+        /**
+         * @brief GC stack scanning conservativo con interior scan.
+         *
+         * Escanea el stack del proceso (rango [rsp, stack_high) leido de
+         * @c vm_mem) y los GP regs R0..R15 buscando handles vivos y host_ptrs
+         * (incluso interior pointers a objetos OldGen).  Cada uint64_t
+         * encontrado pasa por filtros rapidos:
+         *
+         *   - skip si v == 0 o v < 256 (escalar pequeno, no puede ser handle)
+         *   - check si v < handles_.size() y handles_[v].live  -> GcHandle
+         *   - check si v esta en ptr_to_handle_ -> host_ptr al payload start
+         *   - check si v cae dentro de algun bloque OldGen + buscar el header
+         *     contenedor -> interior pointer (ej. STRRAW result al data[])
+         *
+         * Cada handle encontrado se marca BLACK + se anade al worklist BFS
+         * para que mark_reachable lo procese transitivamente.
+         *
+         * Se llama desde @c major_gc() y @c minor_gc() ANTES del sweep,
+         * para reemplazar el modelo "todo handle live = root" por uno
+         * preciso basado en alcance real desde stack/regs.
+         *
+         * Coste: O(stack_size_active + 16 + N_old_blocks).  Para stack
+         * tipico de 8 KB y 4 bloques OldGen: ~50-200 microsegundos por GC.
+         * Mucho mas rapido que el modelo previo cuando hay muchos handles
+         * vivos (que era O(N_handles) iterando handles_ entera).
+         *
+         * @param rsp        Stack pointer actual del proceso.
+         * @param stack_high Limite superior del stack (inmutable post-spawn).
+         * @param regs       Array de 16 GP regs (R0..R15).
+         * @param vm_mem     VirtualMemory del proceso para leer slots stack.
+         * @param worklist   Worklist BFS de mark phase; se anaden handles.
+         */
+        void scan_stack_roots(uint64_t rsp,
+                               uint64_t stack_high,
+                               const uint64_t regs[16],
+                               vm::VirtualMemory &vm_mem,
+                               std::vector<GcHandle> &worklist);
+
+        /**
+         * @brief registra un handle como root temporal "en construccion".
+         *
+         * Usado por @c alloc() entre el momento de crear el handle y el
+         * retorno al bytecode.  Si durante la construccion del objeto
+         * compuesto se dispara otro alloc que hace GC, el handle todavia
+         * NO esta en stack/regs del bytecode -> el scan no lo veria -> seria
+         * barrido prematuramente.
+         *
+         * El sweep ignora cualquier handle que coincida con @c pending_alloc_root_.
+         * El proximo alloc o cualquier instruccion VM que use el handle
+         * efectivamente lo coloca en stack/regs y permite limpiar este pin.
+         *
+         * Usado tambien para proteger string objects en construccion durante
+         * STRMAKE/STRCAT/STRSLICE/etc cuando alguno de esos puede disparar GC.
+         */
+        GcHandle pending_alloc_root_ = GC_NULL_HANDLE;
+
+        /**
+         * @brief asocia el GcHeap con su ProcessVM propietario.
+         *
+         * Llamado una vez al construir el ProcessVM para que el GC sepa
+         * de que stack y regs leer durante el major_gc.  El puntero se
+         * mantiene durante toda la vida del proceso (no cambia).  Si es
+         * nullptr (proceso especial sin stack scanning, ej. tests), el
+         * major_gc cae al modelo previo "todo handle live = root".
+         */
+        void set_owner_process(runtime::ProcessVM *p) noexcept { owner_proc_ = p; }
+
+        /**
          * @brief Devuelve un puntero al payload del objeto referenciado por @p handle.
          *
          * El puntero apunta inmediatamente despues del GcHeader del objeto.
@@ -317,6 +431,28 @@ namespace gc {
          *          Usar el handle para reconvertir si es necesario.
          */
         uint8_t *deref(GcHandle handle);
+
+        /**
+         * @brief Lookup inverso: dado un puntero host al payload, devuelve el GcHandle.
+         *
+         * Es el inverso de @c deref(): si @c deref(h) devolvio @p host_payload_ptr,
+         * entonces @c handle_for_ptr(host_payload_ptr) devuelve @p h.
+         *
+         * Usado por la instruccion bytecode @c gchandle (0x55) para que el
+         * frontend Vex pueda obtener el GcHandle de un objeto cuando solo
+         * tiene el host pointer (caso comun: tras @c gcderef en un constructor).
+         * El uso primario es @c synchronized(obj) en Vex, que necesita el handle
+         * para @c monenter / @c monexit.
+         *
+         * Coste O(1) amortizado (unordered_map lookup + bucket walk corto).
+         * El mapa se mantiene incrementalmente en @c new_handle, @c release_handle
+         * y @c do_evacuate, por lo que no hay coste adicional en @c handle_for_ptr.
+         *
+         * @param host_payload_ptr Puntero host al inicio del payload (justo tras GcHeader),
+         *                         tipicamente el resultado de un @c deref previo.
+         * @return GcHandle del objeto si lo encuentra, @c GC_NULL_HANDLE si no.
+         */
+        GcHandle handle_for_ptr(const uint8_t *host_payload_ptr) const noexcept;
 
         /**
          * @brief Registra una referencia old->young en el remembered set.
@@ -337,6 +473,48 @@ namespace gc {
         void write_barrier(GcHandle old_handle);
 
         /**
+         * @brief Incrementa el refcount externo de @p h.
+         *
+         * Llamado por estructuras de datos NATIVAS que retienen un GcHandle
+         * (ej. el plugin @c vesta_collections cuando hace push de un string
+         * en un @c ArrayList<string>).  Mientras el refcount sea >0, el GC
+         * trata el handle como root vivo durante el mark phase del
+         * major_gc, evitando que sea colectado aunque ningun root normal
+         * (HandleTable bytecode) lo referencie.
+         *
+         * Coste: O(1) amortizado (1 lookup + increment).  Sin syscalls,
+         * sin scan adicional.
+         *
+         * @param h Handle a pinnar.  Si @c h == GC_NULL_HANDLE no-op.
+         */
+        void gc_addref(GcHandle h);
+
+        /**
+         * @brief Decrementa el refcount externo de @p h.
+         *
+         * Llamado por la estructura nativa cuando deja de retener el handle
+         * (ej. al hacer pop, remove, clear o destruir el contenedor).  Si
+         * el refcount llega a 0, la entrada se elimina del map (el GC ya
+         * NO lo trata como root externo).
+         *
+         * Coste: O(1) amortizado.  No llama al GC: solo desregistra; la
+         * coleccion real ocurre en el proximo major_gc si nadie mas
+         * referencia el handle.
+         *
+         * @param h Handle a despinnar.  Si no estaba registrado, no-op.
+         */
+        void gc_release(GcHandle h);
+
+        /**
+         * @brief Numero de handles actualmente pinnados externos.
+         *        Util para debug / introspeccion.  Devuelve el size del map
+         *        external_refs_, NO la suma de refcounts.
+         */
+        size_t external_pinned_count() const noexcept {
+            return external_refs_.size();
+        }
+
+        /**
          * @brief Libera el handle indicando que el objeto ya no es alcanzable.
          *
          * Marca el slot en la HandleTable como libre (live=false, addr=nullptr)
@@ -354,6 +532,111 @@ namespace gc {
         void drop(GcHandle h) {
             release_handle(h);
         }
+
+        /**
+         * @brief Crea una referencia debil al objeto indicado por @p target.
+         *
+         * La referencia debil no impide la recoleccion del objeto.
+         * Durante el barrido del major GC, si el objeto es recolectado,
+         * la entrada se pone automaticamente a GC_NULL_HANDLE.
+         *
+         * @param target Handle del objeto a referenciar debilmente.
+         * @return Indice uint32_t de la entrada en weak_table_.
+         */
+        uint32_t alloc_weak(GcHandle target);
+
+        /**
+         * @brief Lee el handle apuntado por la referencia debil @p idx.
+         *
+         * @param idx Indice en weak_table_ obtenido de alloc_weak().
+         * @return Handle del objeto si aun esta vivo; GC_NULL_HANDLE si fue recolectado.
+         */
+        GcHandle deref_weak(uint32_t idx) const;
+
+        /**
+         * @brief Libera la entrada de referencia debil @p idx.
+         *
+         * Marca la entrada como libre para su reutilizacion.
+         *
+         * @param idx Indice en weak_table_ a liberar.
+         */
+        void free_weak(uint32_t idx);
+
+        // =====================================================================
+        //  Primitivas de monitor (sincronizacion por objeto)
+        //
+        //  Un monitor es un lock reentrante asociado a un objeto GC.  El estado
+        //  del lock (propietario y profundidad) se almacena en ObjectHeader de
+        //  cada objeto.  La cola de procesos en espera se almacena en esta clase.
+        //
+        //  Invariante:
+        //    - ObjectHeader::owner_pid == 0  <=>  monitor libre
+        //    - ObjectHeader::owner_pid != 0  <=>  monitor adquirido por ese pid
+        //    - ObjectHeader::lock_depth >= 1 cuando owner_pid != 0
+        //
+        //  Los PID codificados en las colas usan el formato:
+        //    encoded_pid = (scheduler_id << 32) | local_pid
+        // =====================================================================
+
+        /**
+         * @brief Intenta adquirir el monitor del objeto referenciado por @p h.
+         *
+         * Si el monitor esta libre, lo asigna a @p local_pid y devuelve true.
+         * Si ya lo posee @p local_pid (lock reentrante), incrementa lock_depth y
+         * devuelve true.
+         * Si lo posee otro proceso, devuelve false (el llamante debe bloquear).
+         *
+         * @param h         Handle del objeto cuyo monitor se quiere adquirir.
+         * @param local_pid PID local del proceso solicitante.
+         * @return true si el monitor fue adquirido o incrementado; false si bloqueado.
+         */
+        bool monitor_try_acquire(GcHandle h, uint32_t local_pid);
+
+        /**
+         * @brief Libera el monitor del objeto referenciado por @p h.
+         *
+         * Decrementa lock_depth.  Si llega a 0, marca el monitor como libre y
+         * extrae un proceso de la cola de espera para despertarlo.
+         *
+         * @param h         Handle del objeto cuyo monitor se libera.
+         * @param local_pid PID local del proceso propietario actual.
+         * @return PID codificado del siguiente proceso de la cola de espera
+         *         (0 si la cola estaba vacia o el monitor sigue bloqueado).
+         */
+        uint64_t monitor_release(GcHandle h, uint32_t local_pid);
+
+        /**
+         * @brief Anade un PID codificado a la cola de espera del monitor de @p h.
+         *
+         * Se llama desde exec_instr_monenter cuando el monitor esta ocupado, o
+         * desde exec_instr_monwait cuando el proceso libera el monitor para esperar.
+         *
+         * @param h           Handle del objeto cuyo monitor espera el proceso.
+         * @param encoded_pid PID codificado: (scheduler_id << 32) | local_pid.
+         */
+        void monitor_add_waiter(GcHandle h, uint64_t encoded_pid);
+
+        /**
+         * @brief Extrae y devuelve un PID codificado de la cola de espera de @p h.
+         *
+         * Devuelve 0 si la cola esta vacia.  Se usa en MONNOTI para despertar
+         * exactamente un proceso.
+         *
+         * @param h Handle del objeto cuya cola de espera se consulta.
+         * @return PID codificado del proceso despertado, o 0 si la cola estaba vacia.
+         */
+        uint64_t monitor_pop_waiter(GcHandle h);
+
+        /**
+         * @brief Extrae y devuelve todos los PID codificados de la cola de @p h.
+         *
+         * La cola queda vacia tras la llamada.  Se usa en MONNOTA para despertar
+         * a todos los procesos que esperan sobre el mismo objeto.
+         *
+         * @param h Handle del objeto cuya cola de espera se vacia.
+         * @return Vector con todos los PID codificados (puede estar vacio).
+         */
+        std::vector<uint64_t> monitor_pop_all_waiters(GcHandle h);
 
         /**
          * @brief Minor GC: evacua la Nursery copiando supervivientes a OldGen.
@@ -460,23 +743,95 @@ namespace gc {
         size_t   nursery_size_     = 0;       ///< Tamano total de la Nursery.
         uint64_t nursery_arena_id_ = 0;       ///< ID en ArenaManager para liberar al destruir.
 
-        // --- OldGen ---
+        // --- OldGen (modelo no-moving con free lists segregadas, ver gc_heap.cpp) ---
         struct OldBlock {
-            uint8_t *ptr;      ///< Inicio del bloque.
-            size_t   size;     ///< Tamano total del bloque en bytes.
-            uint64_t arena_id; ///< ID en ArenaManager para liberar al destruir.
+            uint8_t *ptr;         ///< Inicio del bloque.
+            size_t   size;        ///< Tamano total del bloque en bytes.
+            uint64_t arena_id;    ///< ID en ArenaManager para liberar al destruir.
+            size_t   bump_offset; ///< Bytes ya consumidos por bump-alloc (offset desde ptr).
+                                  ///< Si bump_offset == size: bloque lleno; reciclamos
+                                  ///< slots solo via free lists, sin compactar.
         };
 
         std::vector<OldBlock> old_blocks_;
-        size_t                old_used_      = 0; ///< Bytes contabilizados en OldGen.
+        size_t                old_used_      = 0; ///< Bytes vivos contabilizados en OldGen.
         size_t                old_threshold_ = 0; ///< Umbral para major GC automatico.
+
+        /// puntero al ProcessVM owner para acceder al stack/regs
+        /// durante el major_gc.  Set via set_owner_process() en el ctor del
+        /// ProcessVM.  Si es nullptr, major_gc cae al modelo previo.
+        runtime::ProcessVM *owner_proc_ = nullptr;
+
+        // ---- (iv) Free lists segregadas para slots OldGen liberados ----
+        // Cada slot DEAD reusa los primeros 8 bytes de su payload como
+        // puntero al siguiente DEAD del mismo size class (LIFO O(1)).
+        // Cero memoria extra por slot.  El tamano del slot esta en
+        // hdr->size del propio header (ya existe).
+        //
+        // Hay 16 size classes para slots pequenyos (<=4096 bytes total) y
+        // una free list general para slots grandes.  Los size classes
+        // se eligieron para minimizar fragmentacion interna en patrones
+        // tipicos de objetos Vesta (header 24B + N campos i32/i64).
+        struct FreeNode {
+            FreeNode *next;
+        };
+        static constexpr size_t SMALL_CLASS_COUNT = 16;
+        static constexpr size_t SMALL_CLASS_SIZES[SMALL_CLASS_COUNT] = {
+            16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 4096
+        };
+        FreeNode *small_free_lists_[SMALL_CLASS_COUNT] = {nullptr};
+
+        // Slots con total > 4096: free list general (ptr, total).  Buscamos
+        // first-fit lineal; en la practica es corta porque slots grandes
+        // son raros.  Si crece mucho, considerar ordered insertion + binary
+        // search (mejora futura, no critico en v1).
+        struct LargeFree {
+            uint8_t *ptr;
+            size_t   total;
+        };
+        std::vector<LargeFree> large_free_list_;
 
         // --- HandleTable ---
         std::vector<HandleEntry> handles_;
         std::vector<GcHandle>    free_handles_; ///< Freelist LIFO de slots reciclables.
 
+        /// Mapa inverso payload_ptr_host -> GcHandle.  Permite lookup O(1)
+        /// cuando un objeto se accede por su host pointer pero se necesita
+        /// el handle (caso: synchronized en Vex, donde @c this es host_ptr
+        /// pero @c monenter requiere GcHandle).  Se mantiene incrementalmente:
+        ///   - new_handle()    => insert(addr+sizeof(GcHeader), h)
+        ///   - release_handle() => erase
+        ///   - do_evacuate()   => erase old + insert new tras mover el objeto
+        /// El payload pointer es estable mientras el objeto no se evacue.
+        std::unordered_map<const uint8_t *, GcHandle> ptr_to_handle_;
+
+        // --- Tabla de referencias debiles ---
+        std::vector<WeakEntry> weak_table_; ///< Referencias debiles indexadas por uint32_t.
+
+        // --- Colas de espera de monitores ---
+        // Clave: GcHandle del objeto con el monitor ocupado.
+        // Valor: lista FIFO de PID codificados ((scheduler_id<<32)|local_pid) esperando.
+        std::unordered_map<GcHandle, std::vector<uint64_t>> monitor_waiters_;
+
         // --- RememberedSet ---
         std::unordered_set<GcHandle> remembered_set_; ///< Handles OLD con referencias a YOUNG.
+
+        // --- External roots (write-barrier para colecciones nativas) ---
+        /// Handles GC referenciados por estructuras nativas (ej. ArrayList<string>
+        /// en el plugin vesta_collections).  Cada @c gc_addref incrementa el
+        /// contador, @c gc_release lo decrementa.  Durante el mark phase,
+        /// cualquier handle con refcount > 0 se trata como root vivo aunque
+        /// no este referenciado por roots normales (HandleTable bytecode).
+        ///
+        /// Necesario porque el GC no escanea los slots internos del plugin
+        /// (struct opaco desde el punto de vista del runtime).  Sin este
+        /// mecanismo, un string almacenado solo en `xs.push(s)` quedaria
+        /// invalidado al primer GC tras que el local que tenia s salga de
+        /// scope.
+        ///
+        /// La entrada se elimina cuando el counter llega a 0 (lazy cleanup
+        /// para evitar fragmentar el bucket de la hashmap).
+        std::unordered_map<GcHandle, uint32_t> external_refs_;
 
         // --- Estadisticas ---
         GcStats stats_;
@@ -494,17 +849,34 @@ namespace gc {
         void release_handle(GcHandle h);
 
         /**
-         * @brief Asigna @p total_bytes en OldGen via ArenaManager.
-         *
-         * Orden de busqueda:
-         *   1. Slots DEAD en bloques existentes cuyo tamano sea suficiente.
-         *   2. Espacio libre al final del ultimo bloque (bump).
-         *   3. Nuevo bloque pedido al ArenaManager.
+         * @brief Asigna @p total_bytes en OldGen.  Wrapper compatible que
+         *        descarta el slot_total real (lo usa @c do_evacuate que ya
+         *        copia exactamente el tamano original via @c hdr->size).
          *
          * @param total_bytes Tamano total incluyendo GcHeader y padding.
          * @return Puntero al inicio del slot, o nullptr si OOM.
          */
         uint8_t *alloc_in_old(size_t total_bytes);
+
+        /**
+         * @brief Variante de @c alloc_in_old que reporta el tamano real del slot.
+         *
+         * (iv) GC no-moving: el slot devuelto puede ser MAYOR que @p total_bytes
+         * cuando se redondea al size class.  El llamante (alloc()) necesita
+         * el tamano real para escribirlo en @c hdr->size, asi al re-free
+         * el slot encaja exactamente en su size class.
+         *
+         * Orden de busqueda (todas O(1) excepto large freelist):
+         *   1. Free list segregada del size class >= total_bytes.
+         *   2. Free list large (slots >4096) con first-fit.
+         *   3. Bump pointer en algun OldBlock con espacio.
+         *   4. Crear bloque nuevo via ArenaManager.
+         *
+         * @param total_bytes      Tamano minimo requerido (header + payload + pad).
+         * @param out_actual_total [out] Tamano real del slot devuelto (>= total_bytes).
+         * @return Puntero al inicio del slot, o nullptr si OOM.
+         */
+        uint8_t *alloc_in_old_with_total(size_t total_bytes, size_t &out_actual_total);
 
         /**
          * @brief Evacua el objeto referenciado por @p h de Nursery a OldGen.
@@ -543,6 +915,40 @@ namespace gc {
          * BLACK y lo anade al worklist para propagacion.
          */
         void mark_reachable(GcHandle h, std::vector<GcHandle> &worklist);
+
+        // ---- (iv) Helpers de free list segregada ----
+
+        /**
+         * @brief Devuelve el indice del size class cuyo SIZE >= @p total.
+         *
+         * Para alloc: redondeo HACIA ARRIBA al primer class capaz de
+         * contener @p total bytes.  Devuelve @c SMALL_CLASS_COUNT si
+         * @p total > 4096 (slot grande, va a la free list general).
+         */
+        static size_t size_class_ceil(size_t total) noexcept;
+
+        /**
+         * @brief Inserta un slot DEAD en la free list correspondiente.
+         *
+         * Si total esta en rango small, usa el size class exacto (que
+         * encaja con el slot porque alloc_in_old siempre redondea al class).
+         * Si es grande, va a @c large_free_list_.  El slot se identifica
+         * por el puntero al GcHeader y su total (header + payload + pad).
+         *
+         * Asume que @p hdr->size ya refleja el tamano completo del payload
+         * del slot (no el pedido por el usuario).
+         */
+        void freelist_push(uint8_t *raw_header, size_t total);
+
+        /**
+         * @brief Vacia las free lists.  Se llama al inicio de cada sweep
+         *        para reconstruirlas desde scratch (los slots DEAD se
+         *        reinsertan al recorrer los bloques).
+         *
+         * No libera memoria; solo limpia los heads.  Los nodos viven
+         * embebidos en los slots y se sobrescribiran al re-push.
+         */
+        void freelist_clear() noexcept;
     };
 } // namespace gc
 

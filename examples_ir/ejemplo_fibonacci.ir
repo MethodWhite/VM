@@ -1,0 +1,65 @@
+/**
+ * ejemplo_fibonacci.ir
+ * Numero de Fibonacci iterativo: fib(n) -> i64
+ *
+ * Conceptos demostrados:
+ *   - Bucle con phi nodes: las instrucciones phi.i64 unifican valores
+ *     que llegan desde distintos bloques predecesores (SSA form).
+ *   - Patron tipico de bucle:
+ *       loop_init -> loop_check -> loop_body -> loop_check -> ... -> loop_exit
+ *   - Phi node: "a_cur = phi [a, loop_init], [a_next, loop_body]"
+ *     significa: a_cur = a   si venimos de loop_init
+ *                a_cur = a_next si venimos de loop_body
+ *
+ * Algoritmo:
+ *   a=0, b=1, i=1
+ *   while i < n: a, b, i = b, a+b, i+1
+ *   return b
+ *
+ * Compilar:
+ *   vm --ir-file examples_ir/ejemplo_fibonacci.ir --ir-opt 2 -o build/out_ir/fib
+ */
+
+@module ejemplo_fibonacci
+
+// Retorna el n-esimo numero de Fibonacci (base 0: fib(0)=0, fib(1)=1).
+// Para n <= 1 retorna n directamente (caso base).
+@function fib(n: i64) -> i64 {
+entry:
+    // Caso base: si n <= 1 devolver n sin iteraciones
+    one   = const.i64 1
+    cond  = cmp.le.i64 n, one
+    br.cond cond, base_case, loop_init
+
+base_case:
+    ret.i64 n                       // fib(0)=0, fib(1)=1
+
+loop_init:
+    // Estado inicial del bucle: a=0, b=1, contador i=1
+    a     = const.i64 0
+    b     = const.i64 1
+    i     = const.i64 1
+    br    loop_check
+
+loop_check:
+    /* Phi nodes: unen el estado inicial (loop_init)
+       con el estado actualizado (loop_body) en cada iteracion. */
+    a_cur = phi.i64 [a, loop_init], [a_next, loop_body]
+    b_cur = phi.i64 [b, loop_init], [b_next, loop_body]
+    i_cur = phi.i64 [i, loop_init], [i_next, loop_body]
+    done  = cmp.ge.i64 i_cur, n   // condicion de salida: i >= n
+    br.cond done, loop_exit, loop_body
+
+loop_body:
+    // Paso de Fibonacci: a, b = b, a+b
+    a_next = mov.i64 b_cur
+    tmp    = add.i64 a_cur, b_cur
+    b_next = mov.i64 tmp
+    // Incrementar contador
+    step   = const.i64 1
+    i_next = add.i64 i_cur, step
+    br     loop_check
+
+loop_exit:
+    ret.i64 b_cur    // b contiene fib(n) al salir del bucle
+}

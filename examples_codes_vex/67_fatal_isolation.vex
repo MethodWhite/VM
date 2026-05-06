@@ -1,0 +1,43 @@
+// Test exhaustivo: PHI en variables compartidas + capture
+// FatalError + panic.  Resultado esperado: R0 = 142.
+
+class Box {
+    public i32 valor;
+    public Box(i32 v) { this.valor = v; }
+    public i32 get() { return this.valor; }
+}
+
+i32 main() {
+    // Caso 1: body alcanza, catch no.
+    Box b = new Box(100);
+    i32 v1 = 0;
+    try {
+        v1 = b.get();
+    } catch (FatalError e) {
+        v1 = 99;
+    }
+    if (v1 != 100) return 1;
+
+    // Caso 2: body crashea, catch toma el control.
+    Box nul = null;
+    i32 v2 = 0;
+    try {
+        v2 = nul.get();        // FATAL_NULL_POINTER
+    } catch (FatalError e) {
+        v2 = e.kind;            // 1 = NPE
+    }
+    if (v2 != 1) return 2;
+
+    // Caso 3: panic + captura.
+    i32 v3 = 0;
+    try {
+        panic("usuario aborto");
+    } catch (FatalError e) {
+        v3 = e.kind;            // 11 = USER_ABORT
+    }
+    if (v3 != 11) return 3;
+
+    // R0 = v1 + v2*30 + v3 = 100 + 30 + 12 = 142
+    // Mejor: 100 + 1 + 11 + 30 = 142
+    return v1 + v2 + v3 + 30;
+}

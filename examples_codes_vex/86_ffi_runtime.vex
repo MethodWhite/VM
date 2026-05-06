@@ -1,0 +1,40 @@
+// examples_codes_vex/86_ffi_runtime.vex
+//
+// FFI runtime dinamico (A.24): ffi_open / ffi_sym / ffi_call.
+//
+// Estilo VSH: el usuario decide en RUNTIME que DLL cargar y que funcion
+// llamar.  Usa los nuevos opcodes:
+//   dlopen  r_dst, r_path_addr, r_path_len            (extended 0x62)
+//   dlsym   r_dst, r_handle, r_name_addr, r_name_len  (extended 0x63)
+//   callni  r_fn                                       (extended 0x64)
+//
+// Misma calling convention que CALLN estatico (argc en R15, args R01..R12,
+// retorno en R00) y mismo backend (LoadLibraryA / GetProcAddress).  Cubre
+// el caso donde el usuario no conoce la DLL o el simbolo en compile-time
+// (plugins, configurables, scripting).
+//
+// Esperado: R00 == 42.
+//   - Carga kernel32.dll, resuelve GetCurrentProcessId y GetTickCount.
+//   - Invoca via ffi_call.
+//   - Verifica pid != 0 (1) + tick != 0 (1) + 40 = 42.
+
+i32 main() {
+    // Carga DLL.  Devuelve handle host (i64 opaco).
+    i64 lib = ffi_open("kernel32.dll");
+
+    // Resuelve simbolos.  Cada uno cachea via GetProcAddress.
+    i64 fn_pid  = ffi_sym(lib, "GetCurrentProcessId");
+    i64 fn_tick = ffi_sym(lib, "GetTickCount");
+
+    // Invocacion variadic.  Ambas son 0-args + retorno i32 (lo capturamos
+    // como i64 -- el upper 32 es basura predecible para esta API que solo
+    // escribe RAX bytes bajos; truncate implicito al asignar a i32 si
+    // necesario).
+    i64 pid  = ffi_call(fn_pid);
+    i64 tick = ffi_call(fn_tick);
+
+    i32 acc = 40;
+    if (pid  != 0) { acc = acc + 1; }
+    if (tick != 0) { acc = acc + 1; }
+    return acc;
+}

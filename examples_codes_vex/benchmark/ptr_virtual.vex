@@ -4,12 +4,11 @@ void dump_mem(u64 size) {
     u8 init = 0;
     VirtualPtr<u8> address_init = &init;
     
-    // bug al usar size aqui:
-    for (u64 i = 0; i < size/*256*/; i++) {
+    for (u64 i = 0; i < size; i++) {
         VirtualPtr<u8> addr = address_init + i;
 
         if (i % 8 == 0) {println("");}
-        print(" ${*addr} ");
+        print(" ${*addr:hex} ");
 
     }
     println("");
@@ -36,19 +35,15 @@ void main() {
     VirtualPtr<i64> p = &val;
     *p = 42;
     VirtualPtr<i64> a = p + 10;
-    println("Valor a traves de puntero virtual: ${*p}");
+    println("Valor a traves de puntero virtual: ${p} -> ${*p}");
 
     // no se puede hacer aun:
-    // VirtualPtr<u8> byte_ptr = (VirtualPtr<u8>)p;
-    // VirtualPtr<VirtualPtr<i64>> byte_ptr = &a;
+    VirtualPtr<u8> byte_ptr = (VirtualPtr<u8>)p;
+    VirtualPtr<VirtualPtr<i64>> byte_ptr2 = &a;
 
-    // bug por algun motivo
     dump_mem(256);
 
-    // falla, no se puede hacer:
     // u64 arr[4] = {10, 20, 30, 40};
-    // deberia ser posible hacer esto, y ser memoria virtual,
-    // por tanto &arr o &arr[0] deberia ser un VirtualPtr<u64>:
     
     u8 size = 4;
     u64* arr = malloc(size * 8);
@@ -60,30 +55,30 @@ void main() {
     println("Array a traves de puntero virtual:");
     for (i64 i = 0; i < size; i++) {
         u64* elem_ptr = *arr_ptr + i;
-        println("  Elemento ${i}: ${*elem_ptr}");
+        println("  Elemento ${i}: ${elem_ptr} -> ${*elem_ptr}");
         flush();
     }
 
-    //try {
-    // aun no se puede imprimir punteros virtuales ni punteros de host
-    // aqui esto explota:
-    i64 sum = 1 + 2;
-    VirtualPtr<i64> sum_ptr = &sum;
-    PruebasPtr pruebas = new PruebasPtr(sum_ptr);
-    VirtualPtr<i64> sum_ptr2 = pruebas.get_sum_ptr();
-    println("Suma a traves de puntero virtual: ${*sum_ptr2}");
-    flush();
-    println("Suma a traves de puntero virtual: ${pruebas.get_sum()}");
-    flush();
-    println("Suma a traves de puntero virtual: ${*pruebas.sum}");
-    flush();
-    // aun no se puede hacer catching de errores fatales, asi que si 
-    // algo explota, explota todo:
-    // } catch (FatalError e) {
-    //} catch () {
-    //    println("Error al usar punteros virtuales");
-    //    flush();
-    //}
+    try {
+        // aun no se puede imprimir punteros virtuales ni punteros de host
+        // aqui esto explota:
+        i64 sum = 1 + 2;
+        VirtualPtr<i64> sum_ptr = &sum;
+        PruebasPtr pruebas = new PruebasPtr(sum_ptr);
+        VirtualPtr<i64> sum_ptr2 = pruebas.get_sum_ptr();
+        println("Suma a traves de puntero virtual: ${sum_ptr2} -> ${*sum_ptr2}");
+        flush();
+        println("Suma a traves de puntero virtual: ${pruebas.get_sum()}");
+        flush();
+        println("Suma a traves de puntero virtual: ${pruebas.sum} -> ${*pruebas.sum}");
+        flush();
+        // aun no se puede hacer catching de errores fatales, asi que si 
+        // algo explota, explota todo:
+        // } catch (FatalError e) {
+    } catch () {
+        println("Error al usar punteros virtuales");
+        flush();
+    }
 
     u64 end = now_ms();
     println("Tiempo total: ${end - start} ms");

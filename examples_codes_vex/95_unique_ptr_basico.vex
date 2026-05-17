@@ -1,0 +1,11 @@
+// Test basico de unique<T>:
+//   - unique_box(value) crea un slot stack + host_ptr al recurso
+//   - ptr_of(p) extrae el ptr raw para acceder al recurso
+//   - Cleanup automatico al exit del scope (libera la memoria host)
+
+i32 main() {
+    unique<i32> p = unique_box(42);
+    i32* raw = ptr_of(p);
+    i32 v = *raw;
+    return v;
+}

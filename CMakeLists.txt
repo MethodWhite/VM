@@ -148,6 +148,9 @@ file(GLOB_RECURSE VM_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/libs/SourceCode/DistanciaLevenshtein/Levenshtein.cpp
 )
 list(FILTER VM_SOURCES EXCLUDE REGEX "/src/vex/")
+# Port transpiler IR -> codigo (C, futuro Java/JS) vive en vex_lib (ver
+# src/vex/CMakeLists.txt).  Excluir para evitar definicion duplicada.
+list(FILTER VM_SOURCES EXCLUDE REGEX "/src/port/")
 # main.cpp se agrega explicitamente (GLOB_RECURSE con "main.cpp" encontraria
 # tambien preprocessor/src/main.cpp y causaria definicion multiple de main)
 list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
@@ -337,6 +340,131 @@ if (WIN32)
 else ()
     target_link_libraries(vmcore PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 endif ()
+
+# ---------------------------------------------------------------------------
+# Mejora III: libvesta_rt como libreria independiente.
+#
+# Subset estricto de @c vmcore que contiene SOLO los componentes del runtime
+# puro (GC, scheduler, mailbox, futures, monitores, FFI, class_registry,
+# arena, distribucion VDP).  No incluye:
+#   - frontend del lenguaje (vex, ir, lexer, parser, emmit)
+#   - linker / loader principal del .velb (solo class_registry)
+#   - CLI / VSH / REPL
+#   - jit, optimizer, profiler, install
+#
+# Objetivo: el codigo JIT-eado o AOT-compilado en fases futuras 
+# podra enlazar contra vesta_rt sin arrastrar el frontend.  Mismo binary
+# layout y misma calling convention que las funciones de runtime que el
+# bytecode invoca via CALLN.
+#
+# Estado: MVP -- la libreria compila independientemente y expone los
+# simbolos del runtime.  El target @c vm sigue compilando monoliticamente
+# todo (sin regresion).  Una integracion mas profunda (vm enlazado contra
+# vesta_rt + romper circular loader.h <-> runtime.h) queda para Phase C
+# del roadmap, donde se desacople tambien el loader.
+# ---------------------------------------------------------------------------
+set(VESTA_RT_SOURCES
+        # GC - heap generacional + raw allocator
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gc/gc_heap.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gc/raw_allocator.cpp
+
+        # Arena manager - VirtualMemory + TLB + ArenaManager
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/arena/VirtualMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/arena/TLB.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/arena/arena_manager.cpp
+
+        # Runtime core - ProcessVM + Scheduler + ManageVM + decoder/exec
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/proceso_runtime.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/runtime.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/scheduler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/manager_runtime.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/decode_instruction.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/decode_table.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exception_runtime.cpp
+
+        # Runtime - exec instructions (todas las familias del set)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_alu.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_gc.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_oop.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_closure.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_pattern.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_async.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_spimm.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_weak.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_sync.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_generic.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_distrib.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_exc.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_string.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_meta.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_coro.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_float.cpp
+
+        # Distribucion - VDP protocol + mailbox + dirty tracker
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/mailbox.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/dirty_tracker.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/node_registry.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/vdp_session.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/dist_runtime.cpp
+
+        # FFI - puente plugins nativos
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ffi/native_ffi.cpp
+
+        # Class registry (POO dinamica + reflexion + AOP)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/loader/class_registry.cpp
+
+        # Net (TCP server / TLS) - usado por dist_runtime para VDP
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/net/connection.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/net/net.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/net/tcp_server.cpp
+
+        # Util compartido necesario por runtime
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/util/ThreadPool.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/util/sqlite_singleton.cpp
+
+        # Controller TLS (usado por VDP)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/controller/tls_connection.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/controller/tls_context.cpp
+
+        # Phase C/D.0 (snapshot 2026-05-13): C ABI estable + ABI checks +
+        # infraestructura JIT inicial (code cache, runtime entries, bridge).
+        # vesta_rt incluye estos archivos para que el binario JIT-eado
+        # pueda enlazarse contra la libreria sin arrastrar el frontend.
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/vesta_rt/public_wrapper.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/vesta_rt/abi_checks.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/code_cache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/runtime_entries.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/x86_encoder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/jit_registry.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/stack_scan.cpp
+
+        # Opcion W Fase 3b: serializer IR.  Necesario para que el Loader
+        # (en vesta_rt) deserialize la seccion @ir del .velb v3.
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ir/ssa_ir.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ir/ssa_ir_serialize.cpp
+)
+
+add_library(vesta_rt STATIC ${VESTA_RT_SOURCES})
+target_include_directories(vesta_rt PUBLIC ${VM_INCLUDES})
+target_link_libraries(vesta_rt
+        PUBLIC sqlite3
+)
+if (WIN32)
+    target_include_directories(vesta_rt PUBLIC ${OPENSSL_INCLUDE_DIR})
+    target_link_directories(vesta_rt PUBLIC ${OPENSSL_LIB_DIR})
+    target_link_libraries(vesta_rt PUBLIC libssl libcrypto ws2_32 synchronization applink)
+else ()
+    target_link_libraries(vesta_rt PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif ()
+target_compile_options(vesta_rt PRIVATE
+        -D__STDC_LIMIT_MACROS
+        -D__STDC_CONSTANT_MACROS
+        $<$<CONFIG:Release>:-O3 -march=x86-64 -mtune=native -ffast-math
+                            -fstrict-aliasing -fno-plt -fomit-frame-pointer
+                            -fvisibility=hidden -ffunction-sections
+                            -fdata-sections -DNDEBUG>
+)
 
 # Anadir subdirectorio de tests
 add_subdirectory(tests)

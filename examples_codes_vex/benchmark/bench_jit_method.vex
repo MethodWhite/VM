@@ -1,0 +1,28 @@
+// Benchmark del JIT C1: pone el HOT LOOP dentro de un metodo virtual.
+// El metodo es lo que se JIT-compila; el loop interno corre en codigo
+// nativo emitido por el Selector.  Compara contra interp puro corriendo
+// el mismo loop dentro de main.
+class Worker {
+    public i32 dummy;
+    public Worker() { this.dummy = 0; }
+    public i32 run_hot_loop(i32 n) {
+        i32 i = 0;
+        i32 sum = 0;
+        while (i < n) {
+            sum = sum + i;
+            i = i + 1;
+        }
+        return sum;
+    }
+}
+
+i32 main() {
+    Worker w = new Worker();
+    // Tres invocaciones del metodo hot.  Con --jit-threshold 1, la
+    // primera dispara compilacion, las dos siguientes ejecutan codigo
+    // nativo via el hook MethodInfo::jit_code.
+    i32 a = w.run_hot_loop(10000000);
+    i32 b = w.run_hot_loop(10000000);
+    i32 c = w.run_hot_loop(10000000);
+    return a + b + c;
+}

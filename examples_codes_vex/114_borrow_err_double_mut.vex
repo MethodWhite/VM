@@ -1,0 +1,8 @@
+// Test NEGATIVO: R1 - dos borrow_mut simultaneos = ERROR.
+
+i32 main() {
+    unique<i32> owner = unique_box(42);
+    borrow_mut<i32> m1 = lend_mut(owner);
+    borrow_mut<i32> m2 = lend_mut(owner);   // ERROR esperado
+    return 0;
+}

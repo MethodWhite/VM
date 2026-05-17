@@ -23,9 +23,11 @@
 #include "linker/velb_linker_bytecode.h"
 
 #include <cstring>
+#include <unordered_map>
 #include "emmit/bytereader.h"
 #include "emmit/parser_to_bytecode.h"
 #include "loader/loader.h"
+#include "debug/debug_info.h"
 
 namespace Assembly::Bytecode::Linker {
     // cambiar en un futuro, por ahora para pruebas me vale
@@ -416,6 +418,34 @@ namespace Assembly::Bytecode::Linker {
                             break;
                         }
 
+                        // Direccion absoluta truncada a 32 bits.  Usada por
+                        // cmpjmp/cmpjmpu/decjnz (encoding FIXED_8 con target
+                        // u32).  Si el target excede 2^32 lanza error claro.
+                        case Type::Absolute32: {
+                            if (target_addr > 0xFFFFFFFFULL) {
+                                add_errorf(report, LinkerError::Type::RelocationError,
+                                    ("Reloc ABS32 fuera de rango (target VA > 4GB) "
+                                     "para simbolo " + rel.symbol).c_str());
+                                continue;
+                            }
+                            uint32_t addr32 = static_cast<uint32_t>(target_addr);
+                            if (rel.offset + sizeof(uint32_t) > mod.bytecode.size()) {
+                                add_errorf(report, LinkerError::Type::RelocationError,
+                                    ("Reloc ABS32 fuera de rango en modulo " + mod.name).c_str());
+                                continue;
+                            }
+                            std::memcpy(&mod.bytecode[rel.offset], &addr32, sizeof(uint32_t));
+                            // Capturar para la tabla persistente.  El loader
+                            // usa el mismo mecanismo de rebase para ABS32:
+                            // re-trunca al nuevo base address.
+                            entry_relocation_table e{};
+                            e.bytecode_offset = module_base_offset + rel.offset;
+                            e.target_value    = target_addr;
+                            e.type            = static_cast<uint8_t>(RelocTypeVELB::ABSOLUTE32);
+                            applied_relocations_.push_back(e);
+                            break;
+                        }
+
                         // Esto es un PC-relative displacement, tipico de:
                         // call foo; jmp bar
                         // El +4 es porque la instruccion ya habra avanzado 4 bytes cuando se evalua el PC.
@@ -724,11 +754,18 @@ namespace Assembly::Bytecode::Linker {
             }
         }
 
-        // Recoger strings de labels
-        for (const auto &[spaceName, space]: spaces_address) {
-            for (const auto &[secName, sec]: space.table_section) {
-                for (const auto &[labName, lab]: sec.table_label) {
-                    string_pool.push_back(labName);
+        // Recoger strings de labels SOLO si no estamos en modo strip.
+        // Los nombres de label no los referencia ningun campo del .velb
+        // post-resolucion (el loader no los lee), asi que omitirlos
+        // reduce el ejecutable ~9% en programas grandes.  El .velb-map
+        // sigue mostrandolos porque usa la tabla interna del linker, no
+        // el string_blob.
+        if (!options.strip_labels) {
+            for (const auto &[spaceName, space]: spaces_address) {
+                for (const auto &[secName, sec]: space.table_section) {
+                    for (const auto &[labName, lab]: sec.table_label) {
+                        string_pool.push_back(labName);
+                    }
                 }
             }
         }
@@ -929,9 +966,12 @@ namespace Assembly::Bytecode::Linker {
 
         // campos de depuracion (añadidos al struct pero antes no se emitian, lo que desplazaba
         // compute_sections_base_offset() 16 bytes respecto a la posicion real del blob de strings)
-        result->emit64(final_header.offset_debug_section);
-        result->emit32(final_header.size_debug_section);
-        result->emit8(final_header.debug_level);
+        const size_t header_pos_offset_debug = result->offset;
+        result->emit64(final_header.offset_debug_section); // 0 por ahora; patcheado al final
+        const size_t header_pos_size_debug = result->offset;
+        result->emit32(final_header.size_debug_section);   // 0 por ahora; patcheado al final
+        const size_t header_pos_debug_level = result->offset;
+        result->emit8(final_header.debug_level);           // 0 por ahora; patcheado al final
         result->emit8(final_header._debug_pad[0]);
         result->emit8(final_header._debug_pad[1]);
         result->emit8(final_header._debug_pad[2]);
@@ -944,9 +984,13 @@ namespace Assembly::Bytecode::Linker {
         result->emit64(final_header.offset_reloc_table); // 0 por ahora
         const size_t header_pos_size_reloc = result->offset;
         result->emit32(final_header.size_reloc_table);   // 0 por ahora
-        for (uint8_t pad : final_header._reloc_pad) {
-            result->emit8(pad);
-        }
+        /* placeholder para offset_ir_section + size_ir_section.
+         * Los actualizamos al final via write64_at/write32_at una vez
+         * conocemos la posicion exacta en el output buffer. */
+        const size_t header_pos_offset_ir = result->offset;
+        result->emit64(final_header.offset_ir_section); // 0 por ahora
+        const size_t header_pos_size_ir = result->offset;
+        result->emit32(final_header.size_ir_section);   // 0 por ahora
 
         // el header siempre debe estar alineado a 16 bytes
         while (result->offset % 16 != 0) {
@@ -1038,6 +1082,216 @@ namespace Assembly::Bytecode::Linker {
             // (e.g. para write_map_file / dumps).
             final_header.offset_reloc_table = reloc_table_file_offset;
             final_header.size_reloc_table   = static_cast<uint32_t>(applied_relocations_.size());
+        }
+
+        // === SECCION DEBUG ===
+        // Acumulamos todas las DebugLineRec de todos los modulos con sus
+        // offsets ABSOLUTOS dentro del .velb (sumando module_base_offset
+        // que se acumulo durante apply_relocations + offset_real_bytecode
+        // que es la posicion del code section dentro del file).
+        //
+        // Layout binario emitido (matchea include/debug/debug_info.h):
+        //   [DebugSectionHeader (24 B)]
+        //   [DebugLineEntry[]   (line_count * 12 B)]
+        //   [strings blob       (paths de archivos fuente, 0-terminados)]
+        //
+        // Patchea offset_debug_section + size_debug_section + debug_level
+        // en el header del .velb.  Si no hay info de debug recolectada
+        // (compilacion sin --vex-debug), no escribimos nada y los campos
+        // quedan a 0 (loader detecta size==0 y omite la carga).
+        {
+            // Recolectar todas las entradas de todos los modulos.
+            // Mismo loop que apply_relocations: module_base_offset se
+            // incrementa por mod.bytecode.size() en orden.
+            uint64_t bc_base = 0;
+            std::vector<debug::DebugLineEntry> all_entries;
+            // Strings blob + interning de paths.  Cada path unico aparece
+            // 1 sola vez; los DebugLineEntry referencian su offset.
+            std::vector<uint8_t> strings_blob;
+            std::unordered_map<std::string, uint32_t> string_pool;
+            auto intern_string = [&](const std::string &s) -> uint32_t {
+                auto it = string_pool.find(s);
+                if (it != string_pool.end()) return it->second;
+                uint32_t off = static_cast<uint32_t>(strings_blob.size());
+                strings_blob.insert(strings_blob.end(), s.begin(), s.end());
+                strings_blob.push_back(0); // null terminator
+                string_pool[s] = off;
+                return off;
+            };
+
+            for (const auto &mod : modules) {
+                if (!mod.ctx.debug_lines.empty()) {
+                    const std::string fname = mod.ctx.debug_source_file.empty()
+                        ? mod.name
+                        : mod.ctx.debug_source_file;
+                    const uint32_t file_off = intern_string(fname);
+                    for (const auto &rec : mod.ctx.debug_lines) {
+                        debug::DebugLineEntry e{};
+                        // offset ABSOLUTO dentro del .velb: hay que
+                        // sumar el offset del code section dentro del
+                        // file (offset_real_bytecode), no solo el
+                        // module_base_offset.  El runtime resuelve PCs
+                        // contra el inicio del code section, no contra
+                        // el inicio del file -- por eso usamos solo el
+                        // offset interno al code (bc_base + rec.offset).
+                        e.bytecode_offset =
+                            static_cast<uint32_t>(bc_base + rec.byte_offset);
+                        e.line_number = rec.source_line;
+                        e.file_offset = file_off;
+                        all_entries.push_back(e);
+                    }
+                }
+                bc_base += mod.bytecode.size();
+            }
+
+            if (!all_entries.empty()) {
+                // Ordenar por bytecode_offset para que lookup_line use
+                // busqueda binaria correctamente.
+                std::sort(all_entries.begin(), all_entries.end(),
+                    [](const debug::DebugLineEntry &a,
+                       const debug::DebugLineEntry &b){
+                        return a.bytecode_offset < b.bytecode_offset;
+                    });
+
+                // Alineacion 8 bytes para el header.
+                while (result->output.size() % 8 != 0) {
+                    result->output.push_back(0x00);
+                }
+                const uint64_t debug_section_offset = result->output.size();
+
+                // Emitir DebugSectionHeader (24 B).
+                debug::DebugSectionHeader hdr{};
+                hdr.magic        = debug::DEBUG_SECTION_MAGIC;
+                hdr.version      = debug::DEBUG_FORMAT_VERSION;
+                hdr.level        = debug::DEBUG_LEVEL_LINES;
+                hdr._pad         = 0;
+                hdr.line_count   = static_cast<uint32_t>(all_entries.size());
+                hdr.var_count    = 0;
+                hdr.scope_count  = 0;
+                hdr.strings_size = static_cast<uint32_t>(strings_blob.size());
+                const size_t hdr_off = result->output.size();
+                result->output.resize(hdr_off + sizeof(hdr), 0x00);
+                std::memcpy(&result->output[hdr_off], &hdr, sizeof(hdr));
+
+                // Emitir DebugLineEntry[].
+                for (const auto &e : all_entries) {
+                    const size_t base = result->output.size();
+                    result->output.resize(base + sizeof(e), 0x00);
+                    std::memcpy(&result->output[base], &e, sizeof(e));
+                }
+
+                // Emitir strings blob.
+                if (!strings_blob.empty()) {
+                    result->output.insert(result->output.end(),
+                                          strings_blob.begin(),
+                                          strings_blob.end());
+                }
+
+                const uint64_t debug_section_total =
+                    result->output.size() - debug_section_offset;
+
+                // Patchear el header.
+                result->write64_at(debug_section_offset, header_pos_offset_debug);
+                result->write32_at(static_cast<uint32_t>(debug_section_total),
+                                    header_pos_size_debug);
+                // Escribir debug_level (1 byte) directamente en el buffer.
+                if (header_pos_debug_level < result->output.size()) {
+                    result->output[header_pos_debug_level] =
+                        static_cast<uint8_t>(debug::DEBUG_LEVEL_LINES);
+                }
+
+                final_header.offset_debug_section = debug_section_offset;
+                final_header.size_debug_section   =
+                    static_cast<uint32_t>(debug_section_total);
+                final_header.debug_level          = debug::DEBUG_LEVEL_LINES;
+            }
+        }
+
+        /* emitir seccion @c @ir si el caller la proporciono.
+         * Los bytes vienen pre-serializados (magic + header + funciones)
+         * via @c ir::emit_ir_section.  El linker simplemente los
+         * appendea al final y patchea offset/size en el header. */
+        if (!ir_section_bytes.empty()) {
+            const uint64_t ir_offset = result->output.size();
+            result->output.insert(result->output.end(),
+                                   ir_section_bytes.begin(),
+                                   ir_section_bytes.end());
+
+            /* appendear @sym section justo despues del @ir.
+             * Layout:
+             *   +0 [4]  magic "VSYM"
+             *   +4 [2]  version = 1
+             *   +6 [2]  reserved = 0
+             *   +8 [4]  entry_count
+             *   +12 [..] entries: name_len u16 + name bytes + addr u64
+             *
+             * Backward compat: el loader parsea @ir; si quedan bytes
+             * tras @ir + size_ir_section, intenta leer "VSYM".  Si no
+             * matcha, simplemente ignora.  No requiere nuevos campos
+             * en el header. */
+            std::vector<uint8_t> sym_bytes;
+            sym_bytes.reserve(4 + 2 + 2 + 4 + 256);
+            auto put32 = [&sym_bytes](uint32_t v) {
+                for (int i = 0; i < 4; ++i)
+                    sym_bytes.push_back(static_cast<uint8_t>(v >> (i * 8)));
+            };
+            auto put16 = [&sym_bytes](uint16_t v) {
+                sym_bytes.push_back(static_cast<uint8_t>(v & 0xFF));
+                sym_bytes.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+            };
+            auto put64 = [&sym_bytes](uint64_t v) {
+                for (int i = 0; i < 8; ++i)
+                    sym_bytes.push_back(static_cast<uint8_t>(v >> (i * 8)));
+            };
+            /* Magic "VSYM". */
+            sym_bytes.push_back('V');
+            sym_bytes.push_back('S');
+            sym_bytes.push_back('Y');
+            sym_bytes.push_back('M');
+            put16(1);  /* version */
+            put16(0);  /* reserved */
+
+            /* Recolectar TODOS los labels resueltos con su address final. */
+            uint32_t count = 0;
+            const size_t count_pos = sym_bytes.size();
+            put32(0);  /* placeholder, patcheamos al final */
+            for (const auto &[spaceName, space]: spaces_address) {
+                for (const auto &[secName, sec]: space.table_section) {
+                    for (const auto &[labName, lab]: sec.table_label) {
+                        if (labName.empty()) continue;
+                        /* emitimos el nombre QUALIFIED
+                         * "section.label" porque eso es lo que las
+                         * referencias `@Absolute("section.label")` usan
+                         * para resolverse (ver emmit_decl.cpp:1423). */
+                        std::string qname = secName + "." + labName;
+                        if (qname.size() > 0xFFFF) continue;
+                        put16(static_cast<uint16_t>(qname.size()));
+                        for (char c : qname) sym_bytes.push_back(static_cast<uint8_t>(c));
+                        /* Address absoluto post-link. */
+                        put64(lab.address);
+                        ++count;
+                    }
+                }
+            }
+            /* Patchear count en su placeholder. */
+            for (int i = 0; i < 4; ++i)
+                sym_bytes[count_pos + i] = static_cast<uint8_t>(count >> (i * 8));
+
+            /* Appendear los bytes del symbol section. */
+            result->output.insert(result->output.end(),
+                                   sym_bytes.begin(), sym_bytes.end());
+
+            /* size_ir_section incluye AHORA los bytes del @ir + @sym
+             * para que el loader sepa donde termina la region "metadata". */
+            const uint32_t total_size =
+                static_cast<uint32_t>(ir_section_bytes.size() + sym_bytes.size());
+
+            /* Patchear header in-place. */
+            result->write64_at(ir_offset, header_pos_offset_ir);
+            result->write32_at(total_size, header_pos_size_ir);
+
+            final_header.offset_ir_section = ir_offset;
+            final_header.size_ir_section   = total_size;
         }
 
         return result->output;

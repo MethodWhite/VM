@@ -85,6 +85,98 @@ namespace vm {
         {"dlsym",  {"dlsym",  OpArity::FOUR}},
         {"callni", {"callni", OpArity::ONE}},
 
+        // Mejora I optimizada (extended 0x65, FIXED_4, REG, 2 regs):
+        //   gcallocp r_dst, r_size
+        //
+        // Aloca @c r_size bytes en el GcHeap y deja el host_ptr al payload
+        // directo en @c r_dst (1 instruccion VM en lugar de 3).  Equivale
+        // a la secuencia:
+        //   gcalloc r_size       ; R0 = handle
+        //   gcderef cur0, r0     ; cur0 = host_ptr
+        //   xchg cur0, r_dst     ; r_dst = host_ptr
+        // pero fusionada en 1 instruccion: ahorra 2 instr VM + reduce el
+        // bytecode emitido por env block heap de closures (3x speedup en
+        // creacion de closures que escapan).
+        {"gcallocp", {"gcallocp", OpArity::TWO}},
+
+        // Mejora II optimizada (extended 0x66, FIXED_4, REG, 1 reg):
+        //   spawnargs r_pc       ; R15 = argc, R1..R[argc] = args
+        //
+        // Variante de @c spawn que copia R1..R[R15] del padre al child antes
+        // de make_ready.  Calling convention identica a CALLVM: argc en R15,
+        // args en R1..R12.  El child encuentra los params ya en sus regs
+        // (sin necesidad de msgrecv + deserializar buffer).  Usado por
+        // lower_async_function para eliminar la serializacion via msgsend.
+        // Devuelve PID encoded del child en R0.
+        {"spawnargs", {"spawnargs", OpArity::ONE}},
+
+        // Optimizacion @Async helper (extended 0x67, FIXED_4, REG, 2 regs):
+        //   fulfillhlt r_fut, r_value
+        //
+        // Combina @c fulfill r_fut, r_value (resolver future con valor) y
+        // @c hlt (terminar proceso) en 1 instruccion atomic.  Usado en el
+        // path critico del helper sintetico de @Async: cada `return X` del
+        // body se traduce a un solo `fulfillhlt` en lugar de dos instruccions.
+        {"fulfillhlt", {"fulfillhlt", OpArity::TWO}},
+
+        // Optimizacion hot loops: cmpjmp / cmpjmpu (extended 0x68 / 0x69)
+        //   cmpjmp.cc r_a, r_b, label    (cmps + jmp.cc fusionados)
+        //   cmpjmpu.cc r_a, r_b, label   (cmpu + jmp.cc fusionados)
+        //
+        // Cada variante codifica la condicion en byte3 (igual set que jmp.j*).
+        // Encoding FIXED_8: [0x00][0x68|0x69][b2][cond][target_u32_LE].
+        // Reduce 2 instr (cmp + jcc) a 1 por comparacion condicional.
+        {"cmpjmp.je",   {"cmpjmp.je",   OpArity::THREE}},
+        {"cmpjmp.jz",   {"cmpjmp.jz",   OpArity::THREE}},
+        {"cmpjmp.jne",  {"cmpjmp.jne",  OpArity::THREE}},
+        {"cmpjmp.jnz",  {"cmpjmp.jnz",  OpArity::THREE}},
+        {"cmpjmp.jcs",  {"cmpjmp.jcs",  OpArity::THREE}},
+        {"cmpjmp.jb",   {"cmpjmp.jb",   OpArity::THREE}},
+        {"cmpjmp.jcc",  {"cmpjmp.jcc",  OpArity::THREE}},
+        {"cmpjmp.jae",  {"cmpjmp.jae",  OpArity::THREE}},
+        {"cmpjmp.jmi",  {"cmpjmp.jmi",  OpArity::THREE}},
+        {"cmpjmp.jpl",  {"cmpjmp.jpl",  OpArity::THREE}},
+        {"cmpjmp.jvs",  {"cmpjmp.jvs",  OpArity::THREE}},
+        {"cmpjmp.jvc",  {"cmpjmp.jvc",  OpArity::THREE}},
+        {"cmpjmp.jhi",  {"cmpjmp.jhi",  OpArity::THREE}},
+        {"cmpjmp.jls",  {"cmpjmp.jls",  OpArity::THREE}},
+        {"cmpjmp.jge",  {"cmpjmp.jge",  OpArity::THREE}},
+        {"cmpjmp.jlt",  {"cmpjmp.jlt",  OpArity::THREE}},
+        {"cmpjmp.jgt",  {"cmpjmp.jgt",  OpArity::THREE}},
+        {"cmpjmp.jle",  {"cmpjmp.jle",  OpArity::THREE}},
+        {"cmpjmpu.je",  {"cmpjmpu.je",  OpArity::THREE}},
+        {"cmpjmpu.jz",  {"cmpjmpu.jz",  OpArity::THREE}},
+        {"cmpjmpu.jne", {"cmpjmpu.jne", OpArity::THREE}},
+        {"cmpjmpu.jnz", {"cmpjmpu.jnz", OpArity::THREE}},
+        {"cmpjmpu.jcs", {"cmpjmpu.jcs", OpArity::THREE}},
+        {"cmpjmpu.jb",  {"cmpjmpu.jb",  OpArity::THREE}},
+        {"cmpjmpu.jcc", {"cmpjmpu.jcc", OpArity::THREE}},
+        {"cmpjmpu.jae", {"cmpjmpu.jae", OpArity::THREE}},
+        {"cmpjmpu.jmi", {"cmpjmpu.jmi", OpArity::THREE}},
+        {"cmpjmpu.jpl", {"cmpjmpu.jpl", OpArity::THREE}},
+        {"cmpjmpu.jvs", {"cmpjmpu.jvs", OpArity::THREE}},
+        {"cmpjmpu.jvc", {"cmpjmpu.jvc", OpArity::THREE}},
+        {"cmpjmpu.jhi", {"cmpjmpu.jhi", OpArity::THREE}},
+        {"cmpjmpu.jls", {"cmpjmpu.jls", OpArity::THREE}},
+        {"cmpjmpu.jge", {"cmpjmpu.jge", OpArity::THREE}},
+        {"cmpjmpu.jlt", {"cmpjmpu.jlt", OpArity::THREE}},
+        {"cmpjmpu.jgt", {"cmpjmpu.jgt", OpArity::THREE}},
+        {"cmpjmpu.jle", {"cmpjmpu.jle", OpArity::THREE}},
+
+        // decjnz r_counter, label  (extended 0x6A, FIXED_8):
+        //   r_counter -= 1; if (r_counter != 0) jmp target
+        // Combina decremento + branch en 1 instr (ahorra 2 instr por iter
+        // en loops contadores estilo `for (i = N; i > 0; i--)`).
+        {"decjnz", {"decjnz", OpArity::TWO}},
+
+        // fastpush <mask16>, fastpop <mask16>  (extended 0x6B / 0x6C, FIXED_4):
+        //   Empuja/desempila N registros en una sola instruccion segun el
+        //   bitmask (bit r = r0..r15).  Reemplaza N x push/pop por 1 instr
+        //   con 1 syscall de aritmetica sobre RSP + N memcpy lineales.
+        //   Ascendente: r0 primero pushed, r0 ultimo popped.
+        {"fastpush", {"fastpush", OpArity::ONE}},
+        {"fastpop",  {"fastpop",  OpArity::ONE}},
+
         // CERO operandos
         {"gcrun", {"gcrun", OpArity::ZERO}},
 
@@ -102,10 +194,33 @@ namespace vm {
         {"cmps", {"cmps", OpArity::TWO}},
         {"mods", {"mods", OpArity::TWO}},
 
+        // Super-instrucciones ALU 3-operandos.  Combinan el patron
+        // `mov rd, rs1; OP rd, rs2` (2-address codegen cuando regalloc no
+        // pudo coalescer) en una sola instruccion VM.  Reduce dispatch +
+        // tiempo de decode.  Encoding FIXED_4 con un opcode extendido por
+        // variante (signed/unsigned x 6 ops).
+        {"adds3", {"adds3", OpArity::THREE}},
+        {"subs3", {"subs3", OpArity::THREE}},
+        {"muls3", {"muls3", OpArity::THREE}},
+        {"addu3", {"addu3", OpArity::THREE}},
+        {"subu3", {"subu3", OpArity::THREE}},
+        {"mulu3", {"mulu3", OpArity::THREE}},
+        {"and3",  {"and3",  OpArity::THREE}},
+        {"or3",   {"or3",   OpArity::THREE}},
+        {"xor3",  {"xor3",  OpArity::THREE}},
+
+        // Super-instruccion LOAD con zero-extend (1 instr en vez de 2).
+        // Sintaxis: loadz r_dst, r_src (arity TWO).  El size (8/16/32/64-bit)
+        // se selecciona por sufijo de tamano del registro destino igual que mov.
+        // loadz = memoria VM, loadzh = memoria HOST (host_ptr).
+        {"loadz",  {"loadz",  OpArity::TWO}},
+        {"loadzh", {"loadzh", OpArity::TWO}},
+
         {"setcc",    {"setcc",    OpArity::TWO}},
         {"tryenter", {"tryenter", OpArity::TWO}},
         {"tryleave", {"tryleave", OpArity::ZERO}},
         {"strmake",  {"strmake",  OpArity::THREE}},
+        {"strmake_h",{"strmake_h",OpArity::THREE}},
         {"strlen",   {"strlen",   OpArity::TWO}},
         {"strcat",   {"strcat",   OpArity::THREE}},
         {"strcmp",   {"strcmp",   OpArity::THREE}},
@@ -335,6 +450,20 @@ namespace vm {
 
         /* --- PID del proceso actual --- */
         {"getpid",    {"getpid",    OpArity::ONE}},
+
+        /* --- argv del script (builtins args_count / args_get) --- */
+        {"getargc",   {"getargc",   OpArity::ONE}},
+        {"getarg",    {"getarg",    OpArity::TWO}},
+
+        /* --- Move-and-take (primitivo de smart pointers unique<T> / shared<T>) --- */
+        {"mvtake",    {"mvtake",    OpArity::TWO}},
+
+        /* --- descarga dinamica de modulos (builtin unloadmodule) --- */
+        {"unloadmod", {"unloadmod", OpArity::TWO}},
+
+        /* --- introspeccion runtime: getMethodAt / getFieldAt --- */
+        {"getmethat", {"getmethat", OpArity::TWO}},
+        {"getfldat",  {"getfldat",  OpArity::TWO}},
 
         /* --- Monitor / sincronizacion --- */
         {"monenter",  {"monenter",  OpArity::ONE}},
@@ -803,7 +932,13 @@ namespace vm {
         }
 
         // Usa pattern.opcode para codegen
-        return std::make_unique<Instruction>(pattern.opcode, std::move(operands));
+        auto instr = std::make_unique<Instruction>(pattern.opcode, std::move(operands));
+        // Captura la linea fuente Vex del marcador `// @line N` mas
+        // reciente (rellenado por el lexer en skip_whitespace).  Esto
+        // se usa luego por el bytecode emitter para registrar el par
+        // (byte_offset, source_line) en la tabla debug del linker.
+        instr->source_line = lexer.last_src_line;
+        return instr;
     }
 
     std::unique_ptr<ASTNode> Parser::parse_import() {

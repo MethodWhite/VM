@@ -21,7 +21,16 @@ add_library(vex_lib STATIC
     parser.cpp
     type_checker.cpp
     lowering.cpp
+    borrow_checker.cpp
     compiler.cpp
+    mermaid_diagrams.cpp
+    graphviz_diagrams.cpp
+    # Transpiler IR -> codigo fuente (C inicial; Java/JS/etc futuro).
+    # Vive aqui porque compiler.cpp lo invoca como ultimo paso opcional.
+    # Si en el futuro se quiere usar el transpiler standalone, se extrae
+    # a su propia libreria port_lib en CMakeLists del root.
+    ${CMAKE_SOURCE_DIR}/src/port/transpiler_base.cpp
+    ${CMAKE_SOURCE_DIR}/src/port/c/c_backend.cpp
 )
 
 # La libreria expone sus headers desde include/vex/; PUBLIC para que los

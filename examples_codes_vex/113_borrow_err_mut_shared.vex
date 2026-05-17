@@ -1,0 +1,9 @@
+// Test NEGATIVO: R1 - shared borrow tras mutable borrow activo = ERROR.
+// El borrow checker debe emitir un diagnostico al ver la 2da llamada.
+
+i32 main() {
+    unique<i32> owner = unique_box(42);
+    borrow_mut<i32> m  = lend_mut(owner);
+    borrow<i32>     r  = lend(owner);     // ERROR esperado
+    return 0;
+}

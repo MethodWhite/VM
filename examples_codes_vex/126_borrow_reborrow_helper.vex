@@ -1,0 +1,40 @@
+// Patron Rust idiomatic: una funcion auxiliar acepta &mut T y dentro
+// hace reborrow al llamar a otra funcion, todo sin perder el ownership
+// original.  Imita:
+//
+//   fn outer(p: &mut i64) {
+//       inner(&mut *p);   // reborrow MUT: p suspendido durante la llamada
+//   }                     // tras inner: p vuelve a ser activo
+//
+//   fn inner(q: &mut i64) {
+//       *q = *q + 1;
+//   }
+//
+// El borrow checker prueba que outer y inner no pueden tener acceso
+// mutable concurrente: outer suspende durante la duracion de inner.
+
+void inner(borrow_mut<i64> q) {
+    i64 v = read_borrow(q);
+    write_borrow(q, v + 1);
+}
+
+void outer(borrow_mut<i64> p) {
+    // Reborrow mut: p queda suspendido mientras viva el reborrow.
+    borrow_mut<i64> rb = lend_mut(p);
+    inner(rb);                          // muta a traves del reborrow (+1)
+    // <- rb dropea aqui (NLL); p vuelve a ser activo.
+    // Podemos seguir usando p directamente sin error:
+    i64 cur = read_borrow(p);
+    write_borrow(p, cur + 10);          // p directo (+10)
+}
+
+i32 main() {
+    unique<i64> total = unique_box(20);
+    borrow_mut<i64> bm = lend_mut(total);
+
+    // Cada outer suma 11 (1 via inner reborrow + 10 directo).
+    outer(bm);          // 20 -> 31
+    outer(bm);          // 31 -> 42
+
+    return (i32)read_borrow(bm);
+}

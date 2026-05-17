@@ -142,17 +142,17 @@ namespace runtime {
                             + static_cast<uint64_t>(instr.flags_info.size_instr); // PC post-instruccion
 
         // empujar FrameHeader para soporte de excepciones
+        const uint64_t cur_rsp = vm->registers.stack_pointer.qword();
         auto *frame       = vm->frame_pool.acquire(); // A.34.fix13
         frame->prev       = vm->frame_stack;
         frame->method     = method;
         frame->return_pc  = ret_addr;
-        frame->frame_base = vm->registers.stack_pointer.qword();
+        frame->frame_base = cur_rsp;
         frame->proceed_target = nullptr;
         vm->frame_stack   = frame;
 
-        vm->registers.stack_pointer.qword(vm->registers.stack_pointer.qword() - 8);
-        // Mantener write para callvm anidado.
-        vm->vm_mem.write_bytes(vm->registers.stack_pointer.raw(), &ret_addr, 8);
+        // RSP -= 8 sin write: RET usa frame->return_pc directo.
+        vm->registers.stack_pointer.qword(cur_rsp - 8);
 
         vm->registers.rip.qword(method->code_vaddr); // saltar al lambda
         vm->decoded_ptr->flags_info.did_jump = true;

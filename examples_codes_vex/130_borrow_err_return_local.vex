@@ -1,0 +1,17 @@
+// Test negativo realista: devolver un borrow a un LOCAL es el bug mas
+// clasico de Rust (E0515 "cannot return reference to local variable").
+//
+// El owner local muere al RET de la funcion -> el borrow apuntaria a
+// memoria invalida.  rustc lo rechaza; nuestro borrow_checker tambien
+// (regla R4 via on_borrow_escape con owner_kind = Local).
+
+borrow<i32> bad_make() {
+    unique<i32> local = unique_box(42);  // owner LOCAL
+    borrow<i32> r = lend(local);
+    return r;  // ERROR R4: el borrow no puede sobrevivir a su origen
+}
+
+i32 main() {
+    borrow<i32> r = bad_make();
+    return read_borrow(r);
+}

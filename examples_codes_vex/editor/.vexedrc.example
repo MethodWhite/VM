@@ -1,0 +1,25 @@
+# =============================================================================
+# .vexedrc - Configuracion del editor VEXED
+# =============================================================================
+#
+# Renombrar este archivo a `.vexedrc` y colocarlo en el directorio donde
+# se ejecuta el editor.  El editor lo carga automaticamente al arrancar.
+# Lineas vacias y comentarios (#) se ignoran.  Formato: key=value
+# (sin espacios alrededor del =, valor entero).
+#
+# Para regenerar este archivo desde dentro del editor con los valores
+# actuales: invocar Editor.config.save() (binding TODO).
+
+# Ancho del tab en espacios (rango: 1..16, default 4)
+tab_width=4
+
+# Syntax highlighting activo al arrancar (1 = on, 0 = off).
+# F2 dentro del editor lo toggle en runtime sin afectar este valor.
+syntax_on=1
+
+# Ancho del panel lateral en columnas (rango: 10..80, default 25).
+# El sidebar se toggle con Ctrl+B.
+sidebar_width=25
+
+# Mostrar gutter de numeros de linea via ExtLineNo (1 = on, 0 = off).
+show_line_numbers=1

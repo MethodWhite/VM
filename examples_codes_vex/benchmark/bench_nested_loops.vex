@@ -1,0 +1,17 @@
+// Bench: nested loops (matrix-like).
+// 1000 * 1000 = 1M iter del inner loop.
+// Mide loop overhead + arithmetic en bucle anidado.
+
+i32 main() {
+    i32 sum = 0;
+    i32 i = 0;
+    while (i < 1000) {
+        i32 j = 0;
+        while (j < 1000) {
+            sum = sum + i * j;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return sum;
+}

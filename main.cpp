@@ -28,17 +28,21 @@
 #include "cli/cli.h"
 #include "cli/vsh.h"
 #include "ir/ir_emitter.h"
+#include "jit/auto_jit.h"
+#include "runtime/proceso_runtime.h"
 #include "cli/runtime_api_commands.h"
 #include "util/assembler_multiprocess.h"
 #include "vex/compiler.h"
 #include "util/sqlite_singleton.h"
 #include "util/fs_utils.h"
 #include "runtime/manager_runtime.h"
+#include "gc/gc_heap.h"
 #include "loader/loader.h"
 #include "profiler/timer.h"
 #include "distrib/dist_runtime.h"
 #include "distrib/dist_debug.h"
 #include "distrib/node_registry.h"
+#include "debug/debugger.h"
 #include "install/install.h"
 
 #ifdef VESTA_HAS_PREPROCESSOR
@@ -165,6 +169,14 @@ int main(int argc, char *argv[]) {
     asm_multi_process::run_and_capture("chcp 65001");
 #endif
 
+    /* registrar el hook auto-JIT en el runtime.
+     * El runtime (vesta_rt) tiene un function pointer nulo por defecto;
+     * el main aqui lo apunta al JIT trigger.  Si el env var
+     * VESTA_JIT_THRESHOLD esta presente, el trigger compila funciones
+     * hot a codigo nativo.  Sin env var, el
+     * threshold queda en UINT32_MAX y el hook es no-op aunque se llame. */
+    runtime::g_callvirt_post_hook = &jit::maybe_compile_method;
+
     cxxopts::Options options("VMProject", "Virtual Machine Example");
 
     options.add_options()
@@ -194,6 +206,12 @@ int main(int argc, char *argv[]) {
             ("prefix",    "Directorio destino", cxxopts::value<std::string>())
             ("manifest",  "Ruta a install_manifest.json", cxxopts::value<std::string>())
             ("stats", "Mostrar estadísticas de ejecución al finalizar (tiempo, MIPS)")
+            // ---- opciones de JIT ----
+            ("jit-threshold", "Umbral de invocaciones de un metodo para disparar JIT (default: UINT32_MAX = JIT off; sugerido para test: 1)",
+                cxxopts::value<uint32_t>())
+            ("jit-warn",      "Imprimir warnings cada vez que el Selector encuentra una IR op no soportada (dedup por op+linea)")
+            ("jit-stats",     "Imprimir snapshot final de counters del JIT: compiled/unsupported/no_ir + threshold")
+            ("jit-disasm",    "Volcar hex bytes + disasm (Capstone) de cada funcion JIT-compilada a stderr")
             // ---- opciones de runtime distribuido ----
             ("dist-port",         "Puerto VDP del servidor distribuido (0 = sin servidor TCP)",
                 cxxopts::value<uint16_t>()->default_value("0"))
@@ -230,9 +248,51 @@ int main(int argc, char *argv[]) {
             ("vex-emit-ir",       "Emitir el SSA IR del .vex (pre y post optimizacion) en <output>.ir; util para debug del frontend")
             ("vex-base",          "VA base address para el modulo (hex, e.g. 0x10000000). Usado para plugins cargados via loadmodule, evita solapamiento con el caller (default 0x0).",
                 cxxopts::value<std::string>()->default_value("0x0"))
+            // Diagramas para debug y traceo del pipeline Vex.  Soportan dos
+            // formatos seleccionables via --diagram-format:
+            //   mermaid (default): escribe .mmd con bloque ```mermaid```;
+            //                      listo para VS Code / GitHub / mermaid.live.
+            //   graphviz:          escribe .dot con `digraph G { ... }`;
+            //                      listo para `dot -Tsvg foo.dot -o foo.svg`.
+            //   both:              escribe AMBOS formatos.
+            // El contenido es paralelo entre formatos: misma topologia, misma
+            // info por nodo (Graphviz lleva extra via tooltips/atributos DOT).
+            // --diagram-all genera los 4 diagramas (AST, IR pre, IR post, VEL)
+            // en el formato escogido.
+            ("diagram-vex",     "Generar diagrama del AST Vex post type-check (.ast.<ext>)")
+            ("diagram-ir",      "Generar diagrama del SSA IR pre-optimizacion (.ir.pre.<ext>)")
+            ("diagram-ir-opt",  "Generar diagrama del SSA IR post-optimizacion (.ir.post.<ext>)")
+            ("diagram-vel",     "Generar diagrama del bytecode .vel final (.vel.<ext>)")
+            ("diagram-all",     "Generar los 4 diagramas (vex, ir pre, ir post, vel) con sufijos correspondientes")
+            ("diagram-format",  "Formato de salida: mermaid | graphviz | both (default: mermaid). graphviz produce .dot listo para Graphviz; mermaid produce .mmd.",
+                cxxopts::value<std::string>()->default_value("mermaid"))
+            ("gc-debug",        "Activar trazas de debug del Garbage Collector a stderr (minor_gc, major_gc, sweep, release_handle, evacuate). Util para diagnosticar use-after-free o objetos colectados prematuramente. Alt: env VESTA_GC_DEBUG=1.")
+            ("gc-debug-buffered","Activar modo BUFFERED del GC debug: ~100x mas rapido (buffer thread-local de 64KB) pero pierde las ultimas trazas en crash. Implica --gc-debug. Alt: env VESTA_GC_DEBUG_BUFFERED=1.")
+            ("debug-port",      "Activar el servidor de depuracion TCP en el puerto N (default 9229 si N=0). Soporta multiples clientes simultaneos y JSON via length-prefix framing. El servidor permanece disponible mientras la VM ejecuta; los clientes (e.g. tools/dbg_client.vsh) se conectan via tcp_connect, envian comandos JSON y reciben eventos asincronos (break/exit/exception/spawned). Sin este flag, el debugger NO se instancia y el coste runtime es exactamente cero. Cuando esta presente, el proceso main arranca PAUSADO en su primera instruccion para dar tiempo al cliente a conectarse y poner breakpoints; el cliente debe enviar 'continue 0' para arrancar la ejecucion.",
+                cxxopts::value<uint16_t>()->default_value("0"))
+            ("vex-debug",       "Emitir comentarios `// @line N` en el .vel intermedio del compilador Vex y, cuando se integre la pipeline completa de debug section (Phase 2), embeber la tabla bytecode_offset -> (file, line) en el .velb final.  Sin este flag, el .vel/.velb no contienen info de debug -> el ejecutable es mas pequeno y el frontend NO genera datos extra.  Con el flag, el cliente del debugger puede setear breakpoints por linea Vex (`b file.vex:42`) en lugar de solo por addr.")
+            ("port",            "Transpilar el IR a codigo fuente del lenguaje destino y escribir a <output>.<ext> (e.g. .c).  Valores actuales: 'c'.  Futuro: 'java', 'js', 'rust'.  Con --port=c se genera codigo C99 portable listo para compilar con gcc/clang -O3 -std=c11 SIN dependencias de VestaVM (a menos que --port-gc=vesta).  Implica --vex (se aplica al pipeline Vex post-optimizacion).",
+                cxxopts::value<std::string>())
+            ("port-gc",         "Modelo de memoria del codigo portado: none|vesta|boehm.  none (default): malloc/free + sin GC.  Las IR ops de objetos GC (NEWOBJ/strings) emiten stub.  vesta: enlazar contra vesta_rt.lib.  boehm: enlazar contra libgc (placeholder).",
+                cxxopts::value<std::string>()->default_value("none"))
+            ("port-exc",        "Manejo de excepciones del codigo portado: none|setjmp|returncode.  none: throw -> abort.  setjmp (default): longjmp portable.  returncode: codigo de retorno + propagacion explicita (no impl v1).",
+                cxxopts::value<std::string>()->default_value("setjmp"))
+            ("port-types",      "Estilo de tipos del codigo portado: stdint (default) usa int8_t/uint64_t/etc de stdint.h.  builtin usa char/int/long del C clasico (menos portable).",
+                cxxopts::value<std::string>()->default_value("stdint"))
+            ("port-strings",    "Modelo de strings: raw (const char* solo literales) | managed (default: VexString con tracking per-thread).",
+                cxxopts::value<std::string>()->default_value("managed"))
+            ("port-freestanding", "Generar C freestanding (sin includes automaticos de stdio/stdlib/math).  El usuario debe proveer vex_throw + vex_panic_with_str.  Para bootloaders, kernels, firmware.")
+            ("port-stdlib-dir", "Path al directorio stdlib/port/c con los snippets .v.c (autodetect si vacio).",
+                cxxopts::value<std::string>()->default_value(""))
+            ("port-arch", "Target CPU: '' (portable, default) | native | x86-64-v2 | x86-64-v3 | x86-64-v4.  Emite #pragma GCC target con flags agresivas (AVX2/FMA/BMI2 segun nivel).",
+                cxxopts::value<std::string>()->default_value(""))
+            ("port-no-aggressive", "Desactivar atributos agresivos (const/cold/restrict/always_inline + __builtin_expect/unreachable).  Default: activado.")
+            ("instrument", "Instrumentacion en el IR Vex (heredada por bytecode VM, JIT, port C, port futuros): none (default) | trace (calls a vex_trace:enter/exit por funcion) | profile (timing per-funcion).",
+                cxxopts::value<std::string>()->default_value("none"))
 #ifdef VESTA_HAS_PREPROCESSOR
             ("preprocess-only", "Solo preprocesar un .vel y mostrar/guardar el resultado (debug)", cxxopts::value<std::string>())
 #endif
+            ("keep-labels", "Mantener los nombres de label en el .velb (por defecto se eliminan: el loader no los usa y reducen ~9% el tamano)")
             ;
 
 
@@ -254,6 +314,51 @@ int main(int argc, char *argv[]) {
     // activar trazas de depuracion del subsistema distribuido si se paso --dist-debug
     if (result.count("dist-debug"))
         distrib::set_dist_debug(true);
+
+    // activar trazas del GC si se paso --gc-debug.  Tambien respeta env
+    // VESTA_GC_DEBUG=1 (la inicializacion estatica corre antes de main,
+    // no se pierde si el flag CLI esta o no).
+    if (result.count("gc-debug"))
+        gc::set_gc_debug(true);
+    // --gc-debug-buffered implica --gc-debug ademas de buffered mode.
+    if (result.count("gc-debug-buffered")) {
+        gc::set_gc_debug(true);
+        gc::set_gc_debug_buffered(true);
+    }
+
+    // ---- Configuracion del JIT ----
+    //
+    // Orden de prioridad (mayor primero):
+    //   1. --jit-threshold N   (CLI explicito)
+    //   2. -m jit              (preset = threshold 1, util para tests)
+    //   3. VESTA_JIT_THRESHOLD env var (default ya lazy-leida en auto_jit)
+    //
+    // --jit-warn activa el output detallado de IR ops no soportadas.
+    // --jit-stats imprime el snapshot final al RET de main (independiente).
+    if (result.count("jit-threshold")) {
+        jit::set_jit_threshold(result["jit-threshold"].as<uint32_t>());
+    } else if (result.count("mode")) {
+        const std::string m = result["mode"].as<std::string>();
+        if (m == "jit") {
+            /* Preset: threshold=1 => cada metodo se JIT-compila a la
+             * primera invocacion.  Equivalente a la opcion explicita
+             * --jit-threshold 1.  Si el usuario quiere otro threshold,
+             * que use --jit-threshold N directamente. */
+            jit::set_jit_threshold(1);
+        } else if (m == "vm" || m == "interp") {
+            /* Desactiva el JIT explicitamente sobreescribiendo cualquier
+             * env var.  UINT32_MAX = JIT off, hook devuelve sin compilar
+             * en el fast path. */
+            jit::set_jit_threshold(UINT32_MAX);
+        }
+    }
+    if (result.count("jit-warn")) {
+        jit::g_jit_warn_unsupported = true;
+    }
+    if (result.count("jit-disasm")) {
+        jit::g_jit_disasm = true;
+    }
+    const bool jit_stats_requested = result.count("jit-stats") > 0;
 
     if (result.count("help")) {
         vesta::scout() << options.help() << std::endl;
@@ -420,7 +525,9 @@ int main(int argc, char *argv[]) {
     if (result.count("worker")) {
         return asm_multi_process::run_worker(
             result["worker"].as<std::string>(),
-            out_prefix
+            out_prefix,
+            /*skip_preprocessor=*/false,
+            /*keep_labels=*/(result.count("keep-labels") > 0)
         );
     }
 
@@ -511,7 +618,10 @@ int main(int argc, char *argv[]) {
         if (emit_only) return EXIT_SUCCESS;
 
         // Compilar el .vel generado a .velb usando el pipeline existente
-        return asm_multi_process::run_worker(vel_path, out_prefix);
+        return asm_multi_process::run_worker(
+            vel_path, out_prefix,
+            /*skip_preprocessor=*/false,
+            /*keep_labels=*/(result.count("keep-labels") > 0));
     }
 
     // Compilar un archivo .vex (lenguaje Vex) a .velb.
@@ -529,6 +639,28 @@ int main(int argc, char *argv[]) {
         const std::string &vex_path = result["vex"].as<std::string>();
         bool emit_only = result.count("vex-emit-only") > 0;
         bool emit_ir   = result.count("vex-emit-ir")   > 0;
+
+        // Flags de diagramas (Mermaid y/o Graphviz).  --diagram-all activa
+        // los 4 diagramas; --diagram-format elige el formato de salida.
+        const bool diag_all      = result.count("diagram-all")     > 0;
+        const bool diag_vex      = diag_all || result.count("diagram-vex")    > 0;
+        const bool diag_ir_pre   = diag_all || result.count("diagram-ir")     > 0;
+        const bool diag_ir_post  = diag_all || result.count("diagram-ir-opt") > 0;
+        const bool diag_vel      = diag_all || result.count("diagram-vel")    > 0;
+
+        // Parsear --diagram-format: mermaid | graphviz | both.
+        // Lower-case para tolerar "Mermaid", "GraphViz", "BOTH", etc.
+        std::string diag_fmt = result.count("diagram-format") > 0
+                                ? result["diagram-format"].as<std::string>()
+                                : std::string("mermaid");
+        for (auto &c : diag_fmt) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        bool emit_mermaid  = (diag_fmt == "mermaid"  || diag_fmt == "both");
+        bool emit_graphviz = (diag_fmt == "graphviz" || diag_fmt == "dot" || diag_fmt == "both");
+        if (!emit_mermaid && !emit_graphviz) {
+            std::cerr << "[diagram] Formato desconocido: '" << diag_fmt
+                      << "' (usar mermaid | graphviz | both). Defaulting a mermaid.\n";
+            emit_mermaid = true;
+        }
 
         // parsear --vex-base (VA base en hex).  0x0 = comportamiento
         // por defecto (caller).  Para plugins cargados via loadmodule usar
@@ -613,6 +745,81 @@ int main(int argc, char *argv[]) {
         copts.module_name = mod_name;
         copts.opt_level   = 2;
         copts.dump_ir     = emit_ir;  // habilita CompileResult::ir_text
+        // Instrumentacion: aplica al IR independientemente del target
+        // (bytecode VM, JIT, port C, etc.).  Validar valor aqui mismo.
+        copts.instrument_mode = result["instrument"].as<std::string>();
+        if (copts.instrument_mode != "none"
+         && copts.instrument_mode != "trace"
+         && copts.instrument_mode != "profile") {
+            std::cerr << "[vex] --instrument invalido: "
+                      << copts.instrument_mode
+                      << " (valores: none|trace|profile)\n";
+            return 2;
+        }
+        // --vex-debug: emite `// @line N` en el .vel y genera la
+        // seccion debug en el .velb final.  Por defecto OFF: el ejecutable
+        // queda mas pequeno y la compilacion mas rapida.
+        copts.emit_debug  = (result.count("vex-debug") > 0);
+        // Flags de diagramas: cada uno habilita la generacion del diagrama
+        // correspondiente en CompileResult, segun el formato elegido por
+        // --diagram-format.  Se escriben a archivos al final del bloque.
+        copts.dump_mermaid_ast       = emit_mermaid  && diag_vex;
+        copts.dump_mermaid_ir_pre    = emit_mermaid  && diag_ir_pre;
+        copts.dump_mermaid_ir_post   = emit_mermaid  && diag_ir_post;
+        copts.dump_mermaid_vel       = emit_mermaid  && diag_vel;
+        copts.dump_graphviz_ast      = emit_graphviz && diag_vex;
+        copts.dump_graphviz_ir_pre   = emit_graphviz && diag_ir_pre;
+        copts.dump_graphviz_ir_post  = emit_graphviz && diag_ir_post;
+        copts.dump_graphviz_vel      = emit_graphviz && diag_vel;
+
+        // Flag --port=<lang>: si presente, configurar el transpiler IR -> codigo.
+        // El frontend Vex llama al port::Transpiler tras la fase de optimizacion
+        // del IR; el resultado queda en cr.port_text para que aqui lo escribamos
+        // a archivo con la extension correspondiente.
+        if (result.count("port")) {
+            copts.port_target = result["port"].as<std::string>();
+            // Validacion temprana del target: solo 'c' en v1.
+            if (copts.port_target != "c") {
+                std::cerr << "[port] Target desconocido: '" << copts.port_target
+                          << "'.  Soportados: c.\n";
+                return EXIT_FAILURE;
+            }
+            // Parsear los flags --port-gc / --port-exc / --port-types.
+            const std::string &gc_s = result["port-gc"].as<std::string>();
+            if (!port::parse_gc_mode(gc_s, copts.port_options.gc)) {
+                std::cerr << "[port] --port-gc invalido: " << gc_s
+                          << " (valores: none|vesta|boehm)\n";
+                return EXIT_FAILURE;
+            }
+            const std::string &exc_s = result["port-exc"].as<std::string>();
+            if (!port::parse_exc_mode(exc_s, copts.port_options.exc)) {
+                std::cerr << "[port] --port-exc invalido: " << exc_s
+                          << " (valores: none|setjmp|returncode)\n";
+                return EXIT_FAILURE;
+            }
+            const std::string &str_s = result["port-strings"].as<std::string>();
+            if (!port::parse_string_mode(str_s, copts.port_options.strings)) {
+                std::cerr << "[port] --port-strings invalido: " << str_s
+                          << " (valores: raw|managed)\n";
+                return 2;
+            }
+            const std::string &ty_s = result["port-types"].as<std::string>();
+            if (!port::parse_type_style(ty_s, copts.port_options.types)) {
+                std::cerr << "[port] --port-types invalido: " << ty_s
+                          << " (valores: stdint|builtin)\n";
+                return EXIT_FAILURE;
+            }
+            copts.port_options.freestanding = result.count("port-freestanding") > 0;
+            copts.port_options.stdlib_port_c_dir =
+                result["port-stdlib-dir"].as<std::string>();
+            copts.port_options.arch_target =
+                result["port-arch"].as<std::string>();
+            copts.port_options.aggressive_opt =
+                (result.count("port-no-aggressive") == 0);
+            copts.port_options.module_name = mod_name;
+            copts.port_options.source_path = vex_path;
+        }
+
         vex::CompileResult cr =
             vex::compile_vex_source(vex_source, vex_path, copts);
         if (!cr.ok) {
@@ -690,6 +897,38 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        // Diagramas: cada flag activo produce un archivo .mmd o .dot segun
+        // el formato escogido.  Mermaid reconocido por VS Code / GitHub /
+        // mermaid.live.  Graphviz se renderiza con `dot -Tsvg foo.dot -o foo.svg`.
+        auto write_diagram = [&](const std::string &content,
+                                  const std::string &suffix) -> bool {
+            if (content.empty()) return true; // no se solicito; no es error
+            std::string base = out_prefix.empty()
+                                 ? copts.module_name
+                                 : out_prefix;
+            std::string path = base + suffix;
+            std::ofstream ofs(path);
+            if (!ofs.is_open()) {
+                std::cerr << "[diagram] No se puede escribir: " << path << "\n";
+                return false;
+            }
+            ofs << content;
+            vesta::scout() << "[diagram] generado: " << path << "\n";
+            return true;
+        };
+        if (emit_mermaid) {
+            if (diag_vex     && !write_diagram(cr.mermaid_ast,      ".ast.mmd"))     return EXIT_FAILURE;
+            if (diag_ir_pre  && !write_diagram(cr.mermaid_ir_pre,   ".ir.pre.mmd"))  return EXIT_FAILURE;
+            if (diag_ir_post && !write_diagram(cr.mermaid_ir_post,  ".ir.post.mmd")) return EXIT_FAILURE;
+            if (diag_vel     && !write_diagram(cr.mermaid_vel,      ".vel.mmd"))     return EXIT_FAILURE;
+        }
+        if (emit_graphviz) {
+            if (diag_vex     && !write_diagram(cr.graphviz_ast,     ".ast.dot"))     return EXIT_FAILURE;
+            if (diag_ir_pre  && !write_diagram(cr.graphviz_ir_pre,  ".ir.pre.dot"))  return EXIT_FAILURE;
+            if (diag_ir_post && !write_diagram(cr.graphviz_ir_post, ".ir.post.dot")) return EXIT_FAILURE;
+            if (diag_vel     && !write_diagram(cr.graphviz_vel,     ".vel.dot"))     return EXIT_FAILURE;
+        }
+
         // Si --vex-emit-ir esta activo, escribir el dump del SSA IR
         // (pre y post optimizacion) en <out>.ir y salir.  Util para
         // debug del frontend sin tocar el .vel ni el linker.  No se
@@ -708,6 +947,32 @@ int main(int argc, char *argv[]) {
             return EXIT_SUCCESS;
         }
 
+        // Si --port=<lang> esta activo, escribir el codigo fuente generado
+        // y terminar (no compilar a .velb).  El usuario lo compila con su
+        // toolchain nativa (gcc/clang/javac/node/etc).  La extension se
+        // deriva del target.
+        if (!copts.port_target.empty()) {
+            std::string ext = ".c";  // default; futuros: .java, .js
+            if (copts.port_target == "c")    ext = ".c";
+            // (mas casos cuando agreguemos backends)
+            std::string port_path = out_prefix.empty()
+                                      ? (copts.module_name + ext)
+                                      : (out_prefix + ext);
+            std::ofstream ofs_port(port_path);
+            if (!ofs_port.is_open()) {
+                std::cerr << "[port] No se puede escribir: " << port_path << "\n";
+                return EXIT_FAILURE;
+            }
+            ofs_port << cr.port_text;
+            vesta::scout() << "[port] " << copts.port_target
+                           << " generado: " << port_path
+                           << " (" << cr.port_text.size() << " bytes)\n";
+            for (const auto &w : cr.port_warnings) {
+                std::cerr << "[port] warning: " << w << "\n";
+            }
+            return EXIT_SUCCESS;
+        }
+
         // 5 Escribir el .vel intermedio.
         std::string vel_path = out_prefix.empty()
                                  ? (copts.module_name + ".vel")
@@ -718,14 +983,26 @@ int main(int argc, char *argv[]) {
                 std::cerr << "[vex] No se puede escribir: " << vel_path << "\n";
                 return EXIT_FAILURE;
             }
+            // Si --vex-debug esta activo, prepend `// @file <vex_path>`
+            // al .vel para que el lexer del .vel-to-.velb pase la info
+            // al linker (Context::debug_source_file).
+            if (copts.emit_debug) {
+                ofs << "// @file " << vex_path << "\n";
+            }
             ofs << cr.vel_text;
         }
         vesta::scout() << "[vex] .vel generado: " << vel_path << "\n";
 
         if (emit_only) return EXIT_SUCCESS;
 
-        // 6 Compilar .vel -> .velb saltando VPP (ya pre-procesado en paso 2).
-        return asm_multi_process::run_worker(vel_path, out_prefix, /*skip_preprocessor=*/true);
+        // Compilar .vel -> .velb saltando VPP
+        // Opcion W: pasar el IR pre-serializado al linker via run_worker
+        // para que se embeba en la seccion @c @ir del .velb v3.
+        return asm_multi_process::run_worker(
+            vel_path, out_prefix,
+            /*skip_preprocessor=*/true,
+            /*keep_labels=*/(result.count("keep-labels") > 0),
+            /*ir_section_bytes=*/&cr.ir_section_bytes);
     }
 
     // Compilar un archivo .vel a .velb
@@ -733,7 +1010,9 @@ int main(int argc, char *argv[]) {
     if (result.count("build")) {
         return asm_multi_process::run_worker(
             result["build"].as<std::string>(),
-            out_prefix
+            out_prefix,
+            /*skip_preprocessor=*/false,
+            /*keep_labels=*/(result.count("keep-labels") > 0)
         );
     }
 
@@ -819,7 +1098,61 @@ int main(int argc, char *argv[]) {
             }
             const long long ns_load = t_load.ns();
 
+            // Argumentos del script Vex.  Convencion: el path del .velb es
+            // el "argv[0]" implicito del programa; los positionals que el
+            // usuario pasa tras `--run prog.velb` son args[0..N-1] desde el
+            // punto de vista del programa Vex (mismo modelo que VSH).  Los
+            // builtins Vex `args_count()` y `args_get(i)` los exponen via
+            // los opcodes getargc/getarg.
+            if (result.count("positional")) {
+                vm->script_args =
+                    result["positional"].as<std::vector<std::string>>();
+            }
+
             vm->make_ready(proc->pid);
+
+            // Servidor de depuracion opcional (--debug-port).  Se
+            // instancia ANTES de vm.start() para que los clientes ya
+            // puedan conectarse antes de que el primer proceso comience.
+            // El Debugger es heap-allocado y se libera al exit del scope
+            // (RAII via unique_ptr).  Pone has_hooks=true en cada
+            // scheduler para activar el slow path con FSM completa que
+            // invoca on_before_exec antes de cada instruccion.
+            //
+            // Sin --debug-port, el unique_ptr queda vacio y el coste
+            // runtime es exactamente cero: ningun scheduler tiene
+            // has_hooks activo y el fast path se ejecuta sin checks.
+            std::unique_ptr<debug::Debugger> dbg;
+            if (result.count("debug-port")) {
+                uint16_t dbg_port = result["debug-port"].as<uint16_t>();
+                if (dbg_port == 0) dbg_port = debug::DBG_DEFAULT_PORT;
+                dbg = std::make_unique<debug::Debugger>(*vm);
+                if (!dbg->start(dbg_port)) {
+                    std::cerr << "Warning: no se pudo iniciar el servidor "
+                                 "de depuracion en puerto " << dbg_port
+                              << "; continuando sin debugger.\n";
+                    dbg.reset();
+                } else {
+                    vm->debugger = dbg.get();
+                    for (auto &sched : vm->schedulers) {
+                        sched->has_hooks = true;
+                    }
+                    // Pausa el proceso main ANTES de su primera
+                    // instruccion: sin esto, programas cortos podrian
+                    // terminar antes de que el cliente conecte.  El
+                    // usuario tipicamente conecta el cliente VSH, hace
+                    // `attach 0`, pone breakpoints (si los necesita), y
+                    // emite `continue 0` para arrancar la ejecucion.
+                    dbg->pause_at_start(proc->pid.local_pid);
+                    vesta::scout() << "[debugger] servidor TCP escuchando en "
+                                   << "puerto " << dbg_port << "\n";
+                    vesta::scout() << "[debugger] proceso main pausado al "
+                                   << "inicio (pid=" << proc->pid.local_pid
+                                   << "); conecta el cliente y emite "
+                                   << "'continue " << proc->pid.local_pid
+                                   << "' para arrancar.\n";
+                }
+            }
 
             Timer t_run;
             Timer t_start_phase;
@@ -904,6 +1237,14 @@ int main(int argc, char *argv[]) {
                 vesta::scout() << "wait until done: " << ns_poll/1000 << " us  (cv wait)\n";
                 vesta::scout() << "vm.stop:         " << ns_stop/1000 << " us  (join threads)\n";
                 vesta::scout() << "Total --run:     " << ns_total_run/1000 << " us\n";
+            }
+
+            /* --jit-stats: imprimir contadores del JIT al final.
+             * Independiente de --stats; util para auditar % de funciones
+             * JIT-eatables en programas reales. */
+            if (jit_stats_requested) {
+                vesta::scout() << "\n=== JIT STATS ===\n";
+                vesta::scout() << jit::get_jit_stats_summary() << "\n";
             }
         } catch (const std::exception &e) {
             std::cerr << "Error al ejecutar " << velb_path << ": " << e.what() << "\n";

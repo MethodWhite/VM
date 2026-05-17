@@ -1,0 +1,20 @@
+// Test: factory que usa unique_with con tracking deleter.
+
+class C {
+    public static i64 releases;
+}
+
+void track_release(i64 p) {
+    C.releases = C.releases + 1;
+}
+
+unique<i64> make_tracked(i64 v) {
+    unique<i64> p = unique_with(v, track_release);
+    return p;
+}
+
+i32 main() {
+    C.releases = 0;
+    unique<i64> a = make_tracked(111);
+    return 42;
+}

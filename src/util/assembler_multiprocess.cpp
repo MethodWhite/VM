@@ -29,7 +29,9 @@
 namespace asm_multi_process {
     int run_worker(const std::string &file_name,
                    const std::string &output_prefix,
-                   bool skip_preprocessor) {
+                   bool skip_preprocessor,
+                   bool keep_labels,
+                   const std::vector<uint8_t> *ir_section_bytes) {
         //if (arch.empty()) {
         //    std::cerr << "--arch es requerido en modo --worker\n";
         //    return EXIT_FAILURE;
@@ -133,6 +135,14 @@ namespace asm_multi_process {
 
         // Ensamblar
         Assembler asmblr;
+        // Propagar el path del archivo fuente Vex (capturado por el
+        // lexer del marcador `// @file <path>` al inicio del .vel) al
+        // Context para que el linker lo emita en la seccion debug del
+        // .velb.  Si no hay marcador (compilacion sin --vex-debug),
+        // queda vacio y el linker simplemente no emite la seccion.
+        if (!lexer.last_src_file.empty()) {
+            asmblr.ctx.debug_source_file = lexer.last_src_file;
+        }
         Timer t_asm;
         std::vector<uint8_t> bytecode;
         try {
@@ -148,6 +158,7 @@ namespace asm_multi_process {
         Assembly::Bytecode::Linker::LinkerOptions opts;
         opts.optimize_bytecode = true;
         opts.generate_map_file = true;
+        opts.strip_labels      = !keep_labels;  // por defecto strip
         opts.output_path = output_prefix + ".velb";
         opts.map_file_path = output_prefix + ".velb-map";
         opts.verbose = true;
@@ -161,6 +172,13 @@ namespace asm_multi_process {
         // anadir objetos externos
         // linker.add_object_file("libmath.velo");
         // linker.add_static_library("stdlib.vela");
+
+        // pasar IR section bytes pre-serializados al linker.
+        // El frontend Vex los produjo via @c ir::emit_ir_section.
+        // El linker los appendea a la seccion @c @ir del .velb v3.
+        if (ir_section_bytes && !ir_section_bytes->empty()) {
+            linker.set_ir_section_bytes(*ir_section_bytes);
+        }
 
         // Construir ejecutable
         linker.write_to_file(opts.output_path);

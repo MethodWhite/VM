@@ -48,6 +48,9 @@
 
 namespace loader {
     class Loader; ///< Cargador de archivos .velb (declaracion adelantada)
+} // namespace runtime
+namespace debug { class Debugger; } ///< Servidor de debug TCP (declaracion adelantada)
+namespace runtime {
 }
 
 namespace distrib {
@@ -123,6 +126,16 @@ namespace runtime {
         // objetos GC normales).  Mejora futura: free list + reciclaje.
         std::vector<loader::FutureObject> shared_futures;
         std::mutex                        shared_futures_mtx;
+
+        // ---------------------------------------------------------------------
+        // Argumentos de linea de comandos del programa Vex (argv).
+        // ---------------------------------------------------------------------
+        // Se pueblan desde main.cpp cuando se invoca `vm --run prog.velb arg1 arg2 ...`.
+        // El programa los consulta via los builtins Vex `args_count()` y
+        // `args_get(i)`, que bajan a los opcodes bytecode `getargc` (0x6B) y
+        // `getarg` (0x6C) respectivamente.  El opcode `getarg` aloca un
+        // StringObject GC-managed con el contenido del arg solicitado.
+        std::vector<std::string> script_args;
 
         // ---------------------------------------------------------------------
         // condition variable para que el hilo principal
@@ -255,6 +268,17 @@ namespace runtime {
         size_t num_schedulers; ///< Numero de schedulers creados al inicializar la VM
 
         std::unique_ptr<distrib::DistRuntime> dist_runtime; ///< Coordinador del sistema de programacion distribuida (puede ser nullptr si no se arranco)
+
+        // Servidor de debug TCP opcional.  Si es nullptr, el coste runtime
+        // del path de depuracion es exactamente cero (los schedulers tienen
+        // has_hooks=false y el fast path no llama a on_before_exec).
+        // Cuando esta != nullptr, los schedulers ejecutan el slow path que
+        // invoca debugger->on_before_exec() antes de cada instruccion;
+        // dentro de on_before_exec, dos atomic loads (any_bp_, any_step_)
+        // + 1 branch resuelven el caso "sin breakpoints ni step" en ~1 ns.
+        // El puntero NO es propietario: el dueno es el caller (main.cpp via
+        // unique_ptr local que vive durante toda la ejecucion).
+        debug::Debugger *debugger = nullptr;
 
     private:
         std::mutex state_lock; ///< Mutex para serializar cambios de estado de la instancia

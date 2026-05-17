@@ -1,0 +1,44 @@
+// Patron Rust: agregar/computar sobre multiples valores via shared borrows
+// pasados como argumentos a una funcion read-only.  El borrow checker
+// prueba que ningun argumento es mutable mientras los shared estan vivos
+// y que no hay aliasing entre sus owners.
+//
+//   fn weighted_sum(a: &i32, b: &i32, c: &i32, weight: i32) -> i32 { ... }
+//
+// Cualquier mutacion paralela seria error de compilacion.
+
+i32 weighted_sum(borrow<i32> a, borrow<i32> b, borrow<i32> c, i32 weight) {
+    return read_borrow(a) * weight
+         + read_borrow(b) * weight
+         + read_borrow(c) * weight;
+}
+
+i32 minimum3(borrow<i32> a, borrow<i32> b, borrow<i32> c) {
+    i32 va = read_borrow(a);
+    i32 vb = read_borrow(b);
+    i32 vc = read_borrow(c);
+    i32 m = va;
+    if (vb < m) m = vb;
+    if (vc < m) m = vc;
+    return m;
+}
+
+i32 main() {
+    unique<i32> x = unique_box(3);
+    unique<i32> y = unique_box(4);
+    unique<i32> z = unique_box(7);
+
+    // Multiples shared coexisten sobre cada owner.  Una sola lectura
+    // por owner es trivial; aqui creamos N shared para mostrar que
+    // R2 (shared compatibles) no rechaza el patron.
+    borrow<i32> ra1 = lend(x);
+    borrow<i32> ra2 = lend(x);
+    borrow<i32> rb  = lend(y);
+    borrow<i32> rc  = lend(z);
+
+    i32 ws  = weighted_sum(ra1, rb, rc, 3);  // (3+4+7)*3 = 42
+    i32 mn  = minimum3(ra2, rb, rc);         // min(3,4,7) = 3
+
+    if (mn != 3) return 99;
+    return ws;
+}

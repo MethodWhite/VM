@@ -1,0 +1,12 @@
+// Test minimal: una sola funcion devuelve unique<i32>.
+
+unique<i32> make_unique() {
+    unique<i32> p = unique_box(42);
+    return p;
+}
+
+i32 main() {
+    unique<i32> q = make_unique();
+    i32* raw = ptr_of(q);
+    return *raw;
+}

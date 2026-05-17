@@ -1,0 +1,21 @@
+// Test borrow checker: mutable borrow exclusivo.
+// Despues de un lend_mut, podemos escribir a traves del borrow.
+// El owner mismo no es accesible directamente mientras esta prestado.
+
+i32 main() {
+    unique<i32> owner = unique_box(10);
+
+    // Mutable borrow exclusivo.
+    borrow_mut<i32> m = lend_mut(owner);
+
+    // Escribir a traves del mut borrow.
+    write_borrow(m, 99);
+
+    // Leer a traves del mismo borrow para verificar.
+    i32 v = read_borrow(m);
+    if (v != 99) {
+        return 100 + v;
+    }
+
+    return 42;
+}

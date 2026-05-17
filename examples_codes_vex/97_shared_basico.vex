@@ -1,0 +1,16 @@
+// Test basico de shared<T>:
+//   - shared_box(value) crea un control block GC-managed con refcount=1
+//   - ptr_of(s) devuelve un puntero al payload (ctrl + 16)
+//   - use_count(s) devuelve el refcount actual
+//   - El control block vive en el GcHeap (gcallocp); se libera cuando
+//     no hay roots Y el refcount llega a 0.
+
+i32 main() {
+    shared<i32> s = shared_box(77);
+    i32* raw = ptr_of(s);
+    i32 v = *raw;
+    i64 rc = use_count(s);
+    // expected: rc=1, v=77.  Devolvemos v + rc para verificar ambos:
+    //   77 + 1 = 78
+    return v + rc;
+}

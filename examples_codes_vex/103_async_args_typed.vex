@@ -1,0 +1,74 @@
+// Mejora II: @Async con argumentos y Future<T> tipado.
+//
+// Antes: @Async solo soportaba funciones SIN argumentos
+// y return type i64 (handle).  Esto era muy restrictivo:
+//   @Async i64 fetch_data() { return 42; }   // OK
+//   @Async i64 fetch(string url) { ... }     // ERROR: no params
+//   @Async string get_text() { ... }         // ERROR: must return i64
+//
+// Ahora (Mejora II):
+//   - Cualquier numero de parametros (cada uno <= 8 bytes).
+//   - Cualquier tipo de retorno T <= 8 bytes (i32, i64, f64, bool, etc).
+//   - El wrapper devuelve Future<T> (visible al callsite).
+//   - El frontend hace coercion T <-> i64 al fulfill/await preservando bits.
+//
+// Implementacion:
+//   - Wrapper aloca buffer 8 + 8*N en stack, slot 0 = handle, slots 1..N = args.
+//   - msgsend(child, buf, 8 + 8*N).
+//   - Helper recibe el buffer, deserializa y bindea params.
+//   - return X dentro del helper: coerce T -> i64 + fulfill + hlt.
+//   - await fut: extrae i64 raw y casta al T del Future<T>.
+//
+// Resultado esperado: R00 = 42
+
+// Caso 1: dos args i32, retorno i32.
+@Async
+i32 sum_i32(i32 a, i32 b) {
+    return a + b;
+}
+
+// Caso 2: tres args i64, retorno i64.
+@Async
+i64 sum_three(i64 a, i64 b, i64 c) {
+    return a + b + c;
+}
+
+// Caso 3: arg con coercion (mezcla de tipos).
+@Async
+i32 combine(i32 base, i32 mult) {
+    i32 r = base * mult;
+    return r + 1;
+}
+
+// Caso 4: retorno bool.
+@Async
+bool is_even(i32 n) {
+    return n % 2 == 0;
+}
+
+i32 main() {
+    // Caso 1: 10 + 15 = 25
+    Future<i32> f1 = sum_i32(10, 15);
+    i32 r1 = await f1;
+    if (r1 != 25) return 100 + r1;
+
+    // Caso 2: 100 + 200 + 300 = 600
+    Future<i64> f2 = sum_three(100, 200, 300);
+    i64 r2 = await f2;
+    if (r2 != 600) return 200;
+
+    // Caso 3: 4 * 3 + 1 = 13
+    Future<i32> f3 = combine(4, 3);
+    i32 r3 = await f3;
+    if (r3 != 13) return 300 + r3;
+
+    // Caso 4: is_even(8) -> true
+    Future<bool> f4 = is_even(8);
+    bool r4 = await f4;
+    if (!r4) return 400;
+
+    // 25 + 600 (cast a i32 = 600) + 13 + 1 (true) - 597 = 42
+    i32 total = r1 + 13 + 1;       // 25 + 13 + 1 = 39
+    if (r4) total = total + 3;     // 39 + 3 = 42
+    return total;
+}

@@ -18,6 +18,9 @@
  * tri-color mark-and-sweep (blanco/gris/negro).
  */
 #include "gc/gc_heap.h"
+
+#include "jit/jit_registry.h"
+#include "jit/stack_scan.h"
 // acceso al ProcessVM owner para leer stack/regs durante GC.
 // Solo en el .cpp (no en gc_heap.h) para evitar incluir gc_heap.h en
 // proceso_runtime.h (gc_heap.h ya esta en proceso_runtime.h).
@@ -26,8 +29,203 @@
 
 #include <cstring>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdarg>
+#ifdef _WIN32
+#  include <io.h>      // _write, _fileno
+#  define GC_DBG_WRITE _write
+#  define GC_DBG_FILENO _fileno
+#else
+#  include <unistd.h>  // write
+#  define GC_DBG_WRITE ::write
+#  define GC_DBG_FILENO fileno
+#endif
 
 namespace gc {
+
+    // -------------------------------------------------------------------------
+    // Sistema de debug runtime del GC.
+    //
+    // Diseno orientado a CERO overhead en builds release con debug OFF:
+    //
+    //   1. Inicializacion via STATIC INITIALIZER (una vez antes de main).
+    //      Nada de lazy-init en cada call -- el env var se lee una vez al
+    //      cargar la libreria y `g_gc_debug` queda con su valor final.
+    //      `set_gc_debug()` desde CLI sobreescribe el valor (mismo global,
+    //      sin race porque GC es per-process single-threaded).
+    //
+    //   2. Macros LEEN EL GLOBAL DIRECTAMENTE (sin function call).  El
+    //      compilador ve un simple `if (variable) { ... }` y aplica todas
+    //      las optimizaciones posibles: hoisting fuera de loops, branch
+    //      layout con cold path, etc.
+    //
+    //   3. Hint de branch via `__builtin_expect(..., 0)` indica al compilador
+    //      que el path de log es FRIO (debug usualmente off).  GCC/Clang
+    //      colocan el codigo de fprintf en una pagina separada del hot path,
+    //      mejorando cache de instrucciones.
+    //
+    //   4. Compile-time disable: -DVESTA_GC_DEBUG_DISABLE convierte las
+    //      macros en no-op total.  Para builds donde se quiere CERO bytes
+    //      de codigo del subsistema de debug.  Default (sin define) deja
+    //      el sistema activable en runtime.
+    //
+    // Coste cuando debug esta OFF (default):
+    //   - 1 load de g_gc_debug (cacheable en L1, ~1 ciclo)
+    //   - 1 compare + branch predicho (~1 ciclo)
+    //   - Total: ~2 ciclos por trace point, fuera del hot path del programa
+    //     porque las macros solo viven en codigo del GC, no en bytecode exec.
+    //
+    // Coste cuando debug esta ON: dominado por fprintf+fflush (~10 us/linea
+    // en SSD, mucho mas lento que el branch).  Dominio de I/O, no overhead
+    // del sistema de debug en si.
+    // -------------------------------------------------------------------------
+
+    namespace {
+        // Inicializacion via lambda en static initializer: corre UNA vez
+        // antes de main(), lee VESTA_GC_DEBUG, y deja el global con valor
+        // final.  No hay lazy check en hot path.
+        bool g_gc_debug = []() noexcept -> bool {
+            const char *env = std::getenv("VESTA_GC_DEBUG");
+            return (env != nullptr && env[0] != '\0' && env[0] != '0');
+        }();
+
+        // Modo BUFFERED: acumula trazas en un buffer thread-local de 64 KB
+        // y las escribe en bulk cuando el buffer se llena.  Activable via
+        // env VESTA_GC_DEBUG_BUFFERED=1 o via gc::set_gc_debug_buffered().
+        // Coste: ~100x mas rapido que el modo unbuffered (default) cuando
+        // el GC dispara muchas veces.  Tradeoff: si el VM crashea, los
+        // ultimos 64 KB de trazas se pierden (no estan en disco).
+        // Para crash-survival pleno, dejar buffered=false (default).
+        bool g_gc_debug_buffered = []() noexcept -> bool {
+            const char *env = std::getenv("VESTA_GC_DEBUG_BUFFERED");
+            return (env != nullptr && env[0] != '\0' && env[0] != '0');
+        }();
+
+        // Buffer thread-local: cada scheduler thread tiene su propio buffer
+        // para evitar mutex contention.  64 KB amortiza syscalls de write
+        // sobre miles de trazas pequenias (~50 bytes c/u).
+        constexpr size_t GC_DBG_BUF_SIZE = 64 * 1024;
+        thread_local char   g_gc_dbg_buf[GC_DBG_BUF_SIZE];
+        thread_local size_t g_gc_dbg_pos = 0;
+
+        // File descriptor de stderr cacheado.  Lazy: el primer trace lo
+        // resuelve.  Asi no pagamos lookup por linea.
+        int g_gc_dbg_fd = -1;
+
+        inline int gc_dbg_get_fd() noexcept {
+            if (g_gc_dbg_fd < 0) {
+                g_gc_dbg_fd = GC_DBG_FILENO(stderr);
+            }
+            return g_gc_dbg_fd;
+        }
+
+        // Flush del buffer thread-local al fd de stderr (un solo write
+        // syscall por flush, amortizando coste sobre N trazas).
+        inline void gc_dbg_flush_tls() noexcept {
+            if (g_gc_dbg_pos == 0) return;
+            const int fd = gc_dbg_get_fd();
+            if (fd >= 0) {
+                GC_DBG_WRITE(fd, g_gc_dbg_buf, (unsigned)g_gc_dbg_pos);
+            }
+            g_gc_dbg_pos = 0;
+        }
+
+        // Emite una linea formateada al sink correcto segun modo.
+        //
+        // Modo unbuffered (default):
+        //   - vsnprintf a stack buffer (rapido, ~200ns)
+        //   - write() syscall directo al fd de stderr (~2us en SSD)
+        //   - Total: ~2us/linea, vs ~10us/linea de fprintf+fflush.
+        //   - Crash-safe: cada linea esta en disco antes de retornar.
+        //
+        // Modo buffered (VESTA_GC_DEBUG_BUFFERED=1):
+        //   - vsnprintf a stack buffer
+        //   - memcpy al buffer thread-local (~50ns)
+        //   - Si buffer lleno: write() en bulk (~10us para 64KB = ~10ns/linea)
+        //   - Total: ~100ns/linea amortizado.  100x mas rapido que unbuffered.
+        //   - NO crash-safe: ultimas N lineas pueden perderse en crash.
+        inline void gc_dbg_emit(const char *fmt, ...) noexcept {
+            char tmp[256];
+            va_list ap;
+            va_start(ap, fmt);
+            int n = std::vsnprintf(tmp, sizeof(tmp), fmt, ap);
+            va_end(ap);
+            if (n <= 0) return;
+            const size_t nlen = static_cast<size_t>(
+                n < static_cast<int>(sizeof(tmp) - 1) ? n
+                                                     : static_cast<int>(sizeof(tmp) - 1));
+            if (g_gc_debug_buffered) {
+                if (g_gc_dbg_pos + nlen > GC_DBG_BUF_SIZE) {
+                    gc_dbg_flush_tls();
+                }
+                if (nlen > GC_DBG_BUF_SIZE) {
+                    // Linea inusualmente grande: escribir directo.
+                    const int fd = gc_dbg_get_fd();
+                    if (fd >= 0) GC_DBG_WRITE(fd, tmp, (unsigned)nlen);
+                    return;
+                }
+                std::memcpy(g_gc_dbg_buf + g_gc_dbg_pos, tmp, nlen);
+                g_gc_dbg_pos += nlen;
+            } else {
+                // Unbuffered: write directo, crash-safe.
+                const int fd = gc_dbg_get_fd();
+                if (fd >= 0) GC_DBG_WRITE(fd, tmp, (unsigned)nlen);
+            }
+        }
+
+        // Atexit handler: flush del buffer al salir del programa para no
+        // perder las ultimas trazas en modo buffered.
+        struct GcDebugAtExit {
+            ~GcDebugAtExit() {
+                if (g_gc_debug_buffered) gc_dbg_flush_tls();
+            }
+        };
+        thread_local GcDebugAtExit g_gc_debug_at_exit;
+    } // namespace anonimo
+
+    void set_gc_debug(bool enabled) noexcept {
+        g_gc_debug = enabled;
+    }
+
+    bool gc_debug_enabled() noexcept {
+        return g_gc_debug;
+    }
+
+    void set_gc_debug_buffered(bool enabled) noexcept {
+        if (g_gc_debug_buffered && !enabled) gc_dbg_flush_tls();
+        g_gc_debug_buffered = enabled;
+    }
+
+    bool gc_debug_buffered_enabled() noexcept {
+        return g_gc_debug_buffered;
+    }
+
+    void gc_debug_flush() noexcept {
+        gc_dbg_flush_tls();
+        std::fflush(stderr);
+    }
+
+    // Macros con hint de branch (cold path) y opcion de compile-time disable.
+    #ifdef VESTA_GC_DEBUG_DISABLE
+        #define GC_LOG(msg)        ((void)0)
+        #define GC_LOGF(fmt, ...)  ((void)0)
+    #else
+        // __builtin_expect convierte `if (g_gc_debug)` en hint de branch
+        // frio: el compilador coloca el codigo de log en una pagina aparte
+        // del hot path.  Sin debug, solo se ejecuta load + branch predicho
+        // (~2 ciclos), nunca el emit.
+        #define GC_LOG(msg) do { \
+            if (__builtin_expect(g_gc_debug, 0)) { \
+                gc_dbg_emit("[GC] " msg "\n"); \
+            } \
+        } while (0)
+        #define GC_LOGF(fmt, ...) do { \
+            if (__builtin_expect(g_gc_debug, 0)) { \
+                gc_dbg_emit("[GC] " fmt "\n", __VA_ARGS__); \
+            } \
+        } while (0)
+    #endif
 
     // -------------------------------------------------------------------------
     // Constructor / destructor
@@ -83,13 +281,14 @@ namespace gc {
         // mapa inverso.  Permite handle_for_ptr O(1) sin escanear handles_.
         if (addr != nullptr) {
             const uint8_t *payload = addr + sizeof(GcHeader);
-            ptr_to_handle_[payload] = h;
+            ptr_to_handle_.insert_or_assign(payload, h);
         }
         return h;
     }
 
     void GcHeap::release_handle(GcHandle h) {
         if (h >= handles_.size()) return;
+        GC_LOGF("release_handle h=%u", (unsigned)h);
         // si el handle esta pinnado externamente (external_refs > 0),
         // NO liberamos: alguien tiene una referencia externa (ej. ArrayList
         // <string> del plugin) y necesita el objeto vivo.  El mismo handle
@@ -115,14 +314,115 @@ namespace gc {
         // new_handle/release_handle/do_evacuate, asi que aqui no hay
         // escaneo lineal: una sola sonda en la tabla hash.
         if (host_payload_ptr == nullptr) return GC_NULL_HANDLE;
-        auto it = ptr_to_handle_.find(host_payload_ptr);
-        if (it == ptr_to_handle_.end()) return GC_NULL_HANDLE;
-        return it->second;
+        return ptr_to_handle_.find(host_payload_ptr);
     }
 
     // -------------------------------------------------------------------------
     // alloc
     // -------------------------------------------------------------------------
+
+    /* ===================================================================== */
+    /* PtrHandleMap: hash table flat para ptr->handle.                        */
+    /* ===================================================================== */
+
+    PtrHandleMap::PtrHandleMap() {
+        /* Capacidad inicial 64 (load < 0.5 => grow_at = 32). */
+        table_.resize(64, Entry{nullptr, GC_NULL_HANDLE});
+        mask_ = 63;
+        grow_at_ = 32;
+    }
+
+    void PtrHandleMap::clear() {
+        for (auto &e : table_) {
+            e.key   = nullptr;
+            e.value = GC_NULL_HANDLE;
+        }
+        live_count_ = 0;
+        used_       = 0;
+    }
+
+    void PtrHandleMap::reserve(size_t n) {
+        /* Crecer hasta que grow_at_ >= n. */
+        while (grow_at_ < n) grow();
+    }
+
+    void PtrHandleMap::grow() {
+        const size_t new_cap = (table_.size() == 0) ? 64 : table_.size() * 2;
+        std::vector<Entry> old_table = std::move(table_);
+        table_.assign(new_cap, Entry{nullptr, GC_NULL_HANDLE});
+        mask_ = new_cap - 1;
+        grow_at_ = new_cap / 2;
+        live_count_ = 0;
+        used_ = 0;
+        for (auto &e : old_table) {
+            if (is_live(e.key)) {
+                insert_or_assign(e.key, e.value);
+            }
+        }
+    }
+
+    bool PtrHandleMap::insert_or_assign(const uint8_t *key, GcHandle h) {
+        if (used_ + 1 > grow_at_) grow();
+        size_t idx = hash_ptr(key) & mask_;
+        size_t first_tomb = SIZE_MAX;
+        while (true) {
+            const uint8_t *k = table_[idx].key;
+            if (is_empty(k)) {
+                /* Si vimos un tombstone antes, usamos ese para mejor
+                 * locality + reuso.  Si no, este slot vacio. */
+                if (first_tomb != SIZE_MAX) {
+                    table_[first_tomb].key   = key;
+                    table_[first_tomb].value = h;
+                } else {
+                    table_[idx].key   = key;
+                    table_[idx].value = h;
+                    ++used_;
+                }
+                ++live_count_;
+                return true;
+            }
+            if (is_tomb(k)) {
+                if (first_tomb == SIZE_MAX) first_tomb = idx;
+            } else if (k == key) {
+                table_[idx].value = h;
+                return false;
+            }
+            idx = (idx + 1) & mask_;
+        }
+    }
+
+    GcHandle PtrHandleMap::find(const uint8_t *key) const noexcept {
+        if (table_.empty()) return GC_NULL_HANDLE;
+        size_t idx = hash_ptr(key) & mask_;
+        while (true) {
+            const uint8_t *k = table_[idx].key;
+            if (is_empty(k)) return GC_NULL_HANDLE;
+            if (k == key) return table_[idx].value;
+            idx = (idx + 1) & mask_;
+        }
+    }
+
+    bool PtrHandleMap::erase(const uint8_t *key) {
+        if (table_.empty()) return false;
+        size_t idx = hash_ptr(key) & mask_;
+        while (true) {
+            const uint8_t *k = table_[idx].key;
+            if (is_empty(k)) return false;
+            if (k == key) {
+                table_[idx].key   = tombstone();
+                table_[idx].value = GC_NULL_HANDLE;
+                --live_count_;
+                /* Mantenemos used_ contando este tombstone hasta el
+                 * proximo grow (compactara). */
+                return true;
+            }
+            idx = (idx + 1) & mask_;
+        }
+    }
+
+    /* ===================================================================== */
+    /* GcHeap::alloc                                                          */
+    /* ===================================================================== */
 
     GcHandle GcHeap::alloc(size_t size) {
         constexpr size_t ALIGN = 8;
@@ -259,12 +559,24 @@ namespace gc {
                                    std::vector<GcHandle> &worklist)
     {
         // Helper local para procesar un uint64_t candidato a referencia.
-        // Filtros rapidos primero, lookup despues.  Marca BLACK + worklist
-        // si encuentra un handle vivo correspondiente.
+        // Lookups orden: handles primero (cheap), ptr_to_handle_ despues.
         auto process_value = [&](uint64_t v) {
-            // Filtros rapidos: descartan >90% de slots sin hash lookup.
+            // Solo descartamos NULL.  ANTES filtrabamos `v < 256` para
+            // optimizar (escalares pequenos, loop counters), pero ese
+            // filtro era un BUG critico: handles pequenos (1..255) se
+            // generan tempranamente para clases del programa (e.g. el
+            // Editor TUI tiene handle ~5).  El conservative scan los
+            // saltaba -> Editor quedaba fuera del root set -> sweep
+            // marcaba handles_[5].live=false -> gcderef post-strmake
+            // devolvia addr para un handle muerto -> AV en el siguiente
+            // CALLVIRT con r1 corrupto.  Sintoma: editor crasheaba justo
+            // despues del primer render() al entrar al run loop.
+            //
+            // El check de handle (1) es O(1) cheap (comparar size +
+            // array access), perfectamente aceptable hacerlo siempre.
+            // El ptr_to_handle_.find (2) es hash lookup pero solo se
+            // ejecuta si v NO es un handle valido.
             if (v == 0) return;
-            if (v < 256) return;        // escalar pequeno (loop counters, flags)
 
             // 1. Es un GcHandle directo?  Marcamos BLACK tanto YOUNG como
             //    OLD: minor_gc usa el flag para decidir que evacuar; major_gc
@@ -282,21 +594,29 @@ namespace gc {
                 }
             }
 
+            // Para el ptr_to_handle_.find lookup, solo procesar valores
+            // que pueden ser real host_ptrs.  En Windows 64-bit los heap
+            // ptrs estan en upper canonical (>> 16-bit).  Filtrar valores
+            // pequenos no triviales aqui ahorra hash lookups innecesarios
+            // sin perder cobertura.
+            if (v < 65536) return;
+
             // 2. Es un host_ptr al payload start de un objeto GC?
             //    (resultado de gcderef en CLASS instances o de strraw cuando
             //    apunta al inicio del StringObject).
             auto *ptr = reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(v));
-            auto it = ptr_to_handle_.find(ptr);
-            if (it != ptr_to_handle_.end()) {
-                const GcHandle h = it->second;
-                if (h < handles_.size() && handles_[h].live && handles_[h].addr) {
-                    auto *hdr = reinterpret_cast<GcHeader *>(handles_[h].addr);
-                    if (hdr->color == GcColor::WHITE) {
-                        hdr->color = GcColor::BLACK;
-                        worklist.push_back(h);
+            {
+                const GcHandle h = ptr_to_handle_.find(ptr);
+                if (h != GC_NULL_HANDLE) {
+                    if (h < handles_.size() && handles_[h].live && handles_[h].addr) {
+                        auto *hdr = reinterpret_cast<GcHeader *>(handles_[h].addr);
+                        if (hdr->color == GcColor::WHITE) {
+                            hdr->color = GcColor::BLACK;
+                            worklist.push_back(h);
+                        }
                     }
+                    return;
                 }
-                return;
             }
 
             // 3a. Interior scan en OldGen: el ptr puede caer DENTRO del
@@ -314,9 +634,8 @@ namespace gc {
                 if (hdr->color != GcColor::WHITE) return; // ya BLACK o DEAD
                 // Buscar el handle correspondiente al header.
                 uint8_t *payload = reinterpret_cast<uint8_t *>(hdr) + sizeof(GcHeader);
-                auto it2 = ptr_to_handle_.find(payload);
-                if (it2 == ptr_to_handle_.end()) return;
-                const GcHandle h = it2->second;
+                const GcHandle h = ptr_to_handle_.find(payload);
+                if (h == GC_NULL_HANDLE) return;
                 if (h >= handles_.size() || !handles_[h].live) return;
                 hdr->color = GcColor::BLACK;
                 worklist.push_back(h);
@@ -337,9 +656,8 @@ namespace gc {
                     if (ptr >= cursor && ptr < slot_end) {
                         if (hdr->color != GcColor::WHITE) return;
                         uint8_t *payload = cursor + sizeof(GcHeader);
-                        auto it3 = ptr_to_handle_.find(payload);
-                        if (it3 == ptr_to_handle_.end()) return;
-                        const GcHandle h = it3->second;
+                        const GcHandle h = ptr_to_handle_.find(payload);
+                        if (h == GC_NULL_HANDLE) return;
                         if (h >= handles_.size() || !handles_[h].live) return;
                         hdr->color = GcColor::BLACK;
                         worklist.push_back(h);
@@ -382,6 +700,141 @@ namespace gc {
             if (hdr->gen == GcGen::OLD && hdr->color == GcColor::WHITE) {
                 hdr->color = GcColor::BLACK;
                 worklist.push_back(pending_alloc_root_);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    //  precise scan de JIT frames + integracion con major_gc.
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief Helper: marca un handle como BLACK root precise si es
+     *        valido + vivo + actualmente WHITE.
+     */
+    bool GcHeap::try_mark_precise_handle(GcHandle h,
+                                        std::vector<GcHandle> &worklist) {
+        if (h == GC_NULL_HANDLE) return false;
+        if (h >= handles_.size()) return false;
+        if (!handles_[h].live || !handles_[h].addr) return false;
+        auto *hdr = reinterpret_cast<GcHeader *>(handles_[h].addr);
+        if (hdr->gen != GcGen::OLD) return false;  /* young se cubre via minor_gc */
+        if (hdr->color != GcColor::WHITE) return false;
+        hdr->color = GcColor::BLACK;
+        worklist.push_back(h);
+        return true;
+    }
+
+    namespace {
+        /**
+         * @brief Contexto pasado al callback de @c scan_jit_frames durante
+         *        el precise scan iniciado desde major_gc.
+         */
+        struct JitPreciseCtx {
+            gc::GcHeap *heap;
+            std::vector<gc::GcHandle> *worklist;
+            uint64_t roots_marked;
+        };
+
+        /**
+         * @brief Callback C-style invocado por @c scan_jit_frames para
+         *        cada slot GC encontrado en un JIT frame.
+         *
+         * Para slots @c HANDLE: el valor es directamente un GcHandle.
+         * Para slots @c HOSTPTR / @c STRING: el valor es un host_ptr al
+         * payload; usamos @c handle_for_ptr para mapear inverso al handle.
+         */
+        void jit_precise_root_cb(void *ctx,
+                                  uint64_t value,
+                                  jit::StackmapGcKind kind,
+                                  const uint8_t * /*slot_addr*/) {
+            auto *c = static_cast<JitPreciseCtx *>(ctx);
+            switch (kind) {
+                case jit::StackmapGcKind::HANDLE: {
+                    const auto h = static_cast<gc::GcHandle>(value);
+                    if (c->heap->try_mark_precise_handle(h, *c->worklist)) {
+                        ++c->roots_marked;
+                    }
+                    break;
+                }
+                case jit::StackmapGcKind::HOSTPTR:
+                case jit::StackmapGcKind::STRING: {
+                    if (value == 0) break;
+                    const auto *ptr = reinterpret_cast<const uint8_t *>(value);
+                    const gc::GcHandle h = c->heap->handle_for_ptr(ptr);
+                    if (h != gc::GC_NULL_HANDLE
+                     && c->heap->try_mark_precise_handle(h, *c->worklist)) {
+                        ++c->roots_marked;
+                    }
+                    break;
+                }
+            }
+        }
+    } // namespace anonymous
+
+    void GcHeap::scan_jit_roots_precise(std::vector<GcHandle> &worklist) {
+        /* Optimizacion clave: si no hay JIT funcs registradas, la
+         * funcion sale inmediatamente sin walk.  Pre-D.3 (no hay JIT
+         * code real) este es el camino del 100% de los major_gc. */
+        if (jit::JitRegistry::instance().size() == 0) return;
+
+        JitPreciseCtx ctx{this, &worklist, 0};
+
+        /* RBP del frame actual (major_gc).  Iniciamos la walk aqui;
+         * el walker sigue la cadena hasta el bottom del stack. */
+        const uint8_t *gc_rbp =
+            static_cast<const uint8_t *>(__builtin_frame_address(0));
+
+        /* Bounds: pasamos nullptr porque no conocemos los limites del
+         * stack NATIVO del host (distinto del stack VM del proceso).
+         * El walker tiene proteccion intrinseca: max 256 frames + check
+         * de alineacion + saved_rbp chain validation. */
+        const jit::JitScanStats stats =
+            jit::scan_jit_frames(&jit_precise_root_cb,
+                                  &ctx,
+                                  gc_rbp,
+                                  /*low=*/nullptr,
+                                  /*high=*/nullptr);
+
+        stats_.precise_roots_marked   += ctx.roots_marked;
+        stats_.precise_frames_scanned += stats.jit_frames;
+    }
+
+    // -------------------------------------------------------------------------
+    // update_stack_forwards - actualiza host_ptrs en stack/regs tras evacuar
+    // -------------------------------------------------------------------------
+
+    void GcHeap::update_stack_forwards(uint64_t rsp_lo,
+                                        uint64_t stack_high,
+                                        uint64_t regs[16],
+                                        vm::VirtualMemory &vm_mem)
+    {
+        // Si no hubo evacuaciones, no hay nada que actualizar.
+        if (forward_table_.empty()) return;
+
+        // 1. Walk stack: para cada slot 8-byte aligned, si el valor coincide
+        //    con un forward source, reemplazar por el destino.
+        if (rsp_lo < stack_high && (stack_high - rsp_lo) < (16 * 1024 * 1024)) {
+            for (uint64_t addr = rsp_lo; addr + 8 <= stack_high; addr += 8) {
+                const uint64_t v = vm_mem.read_u64(addr);
+                if (v == 0 || v < 256) continue;
+                auto *p = reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(v));
+                auto it = forward_table_.find(p);
+                if (it != forward_table_.end()) {
+                    const uint64_t new_v = reinterpret_cast<uint64_t>(it->second);
+                    vm_mem.write_bytes(addr, &new_v, 8);
+                }
+            }
+        }
+
+        // 2. Walk GP regs R0..R15: misma logica.
+        for (int i = 0; i < 16; ++i) {
+            const uint64_t v = regs[i];
+            if (v == 0 || v < 256) continue;
+            auto *p = reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(v));
+            auto it = forward_table_.find(p);
+            if (it != forward_table_.end()) {
+                regs[i] = reinterpret_cast<uint64_t>(it->second);
             }
         }
     }
@@ -490,12 +943,19 @@ namespace gc {
         // Mover la entrada del mapa inverso payload_ptr -> handle.  El
         // payload anterior se marcara como forward pointer y dejara de
         // ser un puntero valido a un objeto vivo, asi que lo retiramos.
-        ptr_to_handle_.erase(src_raw + sizeof(GcHeader));
-        ptr_to_handle_[dst_raw + sizeof(GcHeader)] = h;
-
-        // Forward pointer en payload original para detectar doble evacuacion
         uint8_t *src_payload = src_raw + sizeof(GcHeader);
-        std::memcpy(src_payload, &dst_raw, sizeof(void *));
+        uint8_t *dst_payload = dst_raw + sizeof(GcHeader);
+        ptr_to_handle_.erase(src_payload);
+        ptr_to_handle_.insert_or_assign(dst_payload, h);
+
+        // Forward pointer en payload original para detectar doble evacuacion.
+        // Tambien registramos en forward_table_ para que update_stack_forwards
+        // pueda actualizar host_ptrs en stack/regs tras la evacuacion completa.
+        // El forward apunta al PAYLOAD destino (no al header) porque los
+        // host_ptrs en bytecode siempre son ptrs a payload start (resultado
+        // de gcderef tras NEWOBJ).
+        std::memcpy(src_payload, &dst_payload, sizeof(void *));
+        forward_table_[src_payload] = dst_payload;
         hdr->color = GcColor::BLACK;
 
         stats_.promoted_count++;
@@ -572,6 +1032,9 @@ namespace gc {
 
     void GcHeap::minor_gc() {
         stats_.minor_gc_count++;
+        GC_LOGF("minor_gc start (count=%llu, nursery_used=%llu)",
+                (unsigned long long)stats_.minor_gc_count,
+                (unsigned long long)(nursery_bump_ - nursery_base_));
 
         // usar scan_stack_roots tambien en minor_gc para
         // evitar evacuar objetos YOUNG que NO son alcanzables desde stack
@@ -675,12 +1138,37 @@ namespace gc {
             auto *hdr = reinterpret_cast<GcHeader *>(raw);
             if (hdr->gen == GcGen::YOUNG && hdr->color == GcColor::WHITE) {
                 // No evacuado: el objeto muere con el reset del nursery.
+                GC_LOGF("minor_gc sweep killed YOUNG h=%u (size=%u)",
+                        (unsigned)h, (unsigned)hdr->size);
                 ptr_to_handle_.erase(raw + sizeof(GcHeader));
                 handles_[h].addr = nullptr;
                 handles_[h].live = false;
                 free_handles_.push_back(h);
             }
         }
+
+        // Stack write-back: actualizar host_ptrs en stack y GP regs cuyo
+        // valor sea un payload de YoungGen evacuada.  Sin esto, los
+        // locales del bytecode que mantenian host_ptrs a objetos CLASS
+        // recien movidos a OldGen quedaban dangling -> SEGFAULT al field
+        // access siguiente.  Ver `forward_table_` y comentario de la
+        // declaracion en gc_heap.h.
+        if (owner_proc_ != nullptr && !forward_table_.empty()) {
+            const uint64_t rsp_lo     = owner_proc_->stack_low_water != 0
+                                      ? owner_proc_->stack_low_water
+                                      : owner_proc_->registers.stack_pointer.qword();
+            const uint64_t stack_high = owner_proc_->stack_high;
+            uint64_t regs[16];
+            for (int i = 0; i < 16; ++i) {
+                regs[i] = owner_proc_->registers.regs[i].qword();
+            }
+            update_stack_forwards(rsp_lo, stack_high, regs, owner_proc_->vm_mem);
+            // Escribir de vuelta los regs actualizados.
+            for (int i = 0; i < 16; ++i) {
+                owner_proc_->registers.regs[i].qword(regs[i]);
+            }
+        }
+        forward_table_.clear();
 
         // Reset BLACK -> WHITE para los YOUNG no procesados (ninguno tras
         // el sweep arriba) y para mantener invariante post-minor.
@@ -699,6 +1187,9 @@ namespace gc {
 
     void GcHeap::major_gc() {
         stats_.major_gc_count++;
+        GC_LOGF("major_gc start (count=%llu, n_old_blocks=%zu)",
+                (unsigned long long)stats_.major_gc_count,
+                old_blocks_.size());
 
         // PRE-MARK: todos los objetos OldGen vivos (no DEAD) -> WHITE
         for (auto &block : old_blocks_) {
@@ -768,6 +1259,16 @@ namespace gc {
             // en external_refs_ tampoco -- ver minor_gc adaptado abajo).
         }
 
+        // precise scan de JIT frames (additive con
+        // conservativo).  (no hay JIT funcs) la funcion sale
+        // de inmediato.  Cuando lance JIT real, anyade roots que
+        // el conservativo posiblemente cubrio por aproximacion.
+        // Tracking conservativo: snapshot del tamano antes para
+        // calcular cuantos roots vinieron de cada source.
+        const size_t worklist_before_precise = worklist.size();
+        stats_.conservative_roots_marked += worklist_before_precise;
+        scan_jit_roots_precise(worklist);
+
         // BFS transitivo: seguir handles VIVOS embebidos en payloads
         for (size_t i = 0; i < worklist.size(); ++i)
             mark_reachable(worklist[i], worklist);
@@ -796,6 +1297,8 @@ namespace gc {
                 const size_t total = (sizeof(GcHeader) + hdr->size + 7) & ~7ULL;
 
                 if (hdr->color == GcColor::WHITE) {
+                    GC_LOGF("major_gc sweep killed OLD obj cursor=%p size=%u",
+                            (void*)cursor, (unsigned)hdr->size);
                     stats_.freed_count++;
                     stats_.freed_bytes += total;          // total slot, no payload
                     old_used_ -= total;

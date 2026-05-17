@@ -1,0 +1,27 @@
+// Benchmark de loop reverse-counter para validar fusion decjnz.
+//
+// El patron clasico `do { ... } while (--i != 0);` o `do {...} while (i != 0);`
+// con i-- justo antes del while baja al IR con SUB+CMP+BR consecutivos
+// al final del body block.  El IR emitter detecta el patron y emite:
+//   decjnz r_i, @loop_top
+//   jmp @loop_exit
+// en lugar de:
+//   mov r14, 1
+//   subs r_i, r14
+//   cmps r_i, r_zero
+//   jmp.jne @loop_top
+//   jmp @loop_exit
+// (5 instr -> 2 instr en el bottom del loop = 60% reduccion).
+//
+// Para 10M iter, son ~30M instr ahorradas.  Resultado esperado: R0 = 42.
+
+i32 main() {
+    i32 sum = 0;
+    i32 i = 10000000;
+    do {
+        sum = sum + 1;
+        i = i - 1;
+    } while (i != 0);
+    if (sum != 10000000) return 100;
+    return 42;
+}

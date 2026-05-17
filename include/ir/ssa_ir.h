@@ -237,6 +237,58 @@ namespace ir {
                             ///< Lowering en exec: @c lower_lambda_expr emite el helper
                             ///< sintetico __lambda_<N> y el call site usa este opcode.)
 
+        MAKE_VARIANT = 0x88, ///< make_variant @"Enum.Variant", tag=imm, payload=[%p0, %p1, ...]
+                            ///<Marker semantico para construccion de un valor
+                            ///< de tipo ADT (enum variant).  Emitido por
+                            ///< @c lower_enum_constructor ANTES de la secuencia explicita
+                            ///< de ALLOCA + STORE tag + STOREs payload.  Permite que C2 haga
+                            ///< case-splitting eficiente sobre el match downstream + posible
+                            ///< escape analysis (promover slot a regs si no escapa).
+                            ///<
+                            ///< Campos:
+                            ///<   @c func_name = "<EnumName>.<VariantName>" (ej. "Color.Green")
+                            ///<   @c imm = tag de la variante (indice 0..N-1)
+                            ///<   @c operands = SSA values de los M payloads (M >= 0)
+                            ///<   @c dst = IR_NO_VALUE (marker puro)
+                            ///<
+                            ///< El IR emitter actual lo trata como no-op.
+
+        MATCH_VARIANT = 0x89, ///< match_variant %scrutinee, @EnumName, n_arms=imm
+                            ///<Marker semantico para el inicio de un @c match.
+                            ///< Emitido por @c lower_match_expr ANTES de la cadena de
+                            ///< cmp_eq + br_cond sobre el tag del scrutinee.  Permite que C2
+                            ///< reconozca el patron y emita dispatch eficiente (jumptable
+                            ///< si N grande + tags densos, switch tree balanceado si dispersos).
+                            ///<
+                            ///< Campos:
+                            ///<   @c func_name = nombre del enum (ej. "Color")
+                            ///<   @c imm = numero de arms con variantes concretas (no default)
+                            ///<   @c operands[0] = SSA value PTR al slot del scrutinee
+                            ///<   @c dst = IR_NO_VALUE (marker puro)
+                            ///<
+                            ///< El IR emitter actual lo trata como no-op.
+
+        MAKE_CLOSURE = 0x87, ///< make_closure @helper, env_kind=imm, captures=[%c0, %c1, ...]
+                            ///<  Marker semantico que identifica la construccion
+                            ///< completa de una closure.  Emitido por @c lower_lambda_expr
+                            ///< ANTES de la secuencia explicita de ALLOCA env + STOREs +
+                            ///< ALLOCA fv + STORE fn_addr + STORE env_addr.  Permite que el
+                            ///< C2 JIT haga escape analysis sobre el closure
+                            ///< sin pattern-matching de 14 instrucciones individuales.
+                            ///<
+                            ///< Campos:
+                            ///<   @c func_name = nombre del helper sintetico (__lambda_<N>)
+                            ///<   @c imm = bit 0: env_kind (0=STACK ALLOCA, 1=GC_HEAP).
+                            ///<            bits 1..16: mutable_mask (bit i+1 = capture i es by-ref).
+                            ///<   @c operands = SSA values de las N capturas (en orden de declaracion)
+                            ///<   @c dst = IR_NO_VALUE (marker puro; la closure se construye via
+                            ///<            las siguientes instrucciones)
+                            ///<
+                            ///< El IR emitter actual trata MAKE_CLOSURE como no-op:
+                            ///< las instrucciones reales de construccion siguen produciendo
+                            ///< el bytecode.  El C2 lo usa para identificar y posiblemente
+                            ///< eliminar/promover la alocacion del env block.
+
         // ---- memoria (0x90-0x9F) ----
         ALLOCA   = 0x90, ///< %dst = alloca.T count       (reservar en pila local)
         LOAD     = 0x91, ///< %dst = load.T  %ptr         (leer; movh si is_host_ptr, mov si no)
@@ -244,6 +296,10 @@ namespace ir {
         MEMCPY   = 0x93, ///< memcpy %dst_ptr, %src_ptr, %len
         RAW_ALLOC = 0x94, ///< %dst = raw_alloc.ptr %size  (rawalloc; dst es puntero host)
         RAW_FREE  = 0x95, ///< raw_free %ptr               (rawfree)
+        GC_ALLOC  = 0x96, ///< %dst = gc_alloc.ptr %size   (alloc en heap GC, dst es host_ptr al payload).
+                          ///< El bloque queda en HandleTable y participa del mark/sweep.
+                          ///< Si nada lo referencia (stack/regs/external_refs), se libera en major_gc.
+                          ///< Usado por @c lower_lambda_expr cuando @c env_in_heap=true (closures que escapan).
 
         // ---- OOP / GC (0xA0-0xAF) ----
         NEWOBJ      = 0xA0, ///< %dst = newobj  %class_ptr          (allojar objeto GC)
@@ -307,6 +363,11 @@ namespace ir {
         RESUME    = 0xF4, ///< resume          %pid         (despertar proceso)
         YIELD     = 0xF5, ///< yield                        (ceder quantum al scheduler)
         SWAPCTX   = 0xF6, ///< swapctx %dst_ctx, %src_ctx  (cambio de contexto cooperativo)
+        SPAWN_ARGS = 0xF7, ///< %dst = spawn_args %fn_ptr, %arg1, %arg2, ...
+                            ///<   (Mejora II): crear proceso hijo + copiar R1..R[N] del padre
+                            ///<   al child (calling convention CALLVM).  Devuelve PID encoded
+                            ///<   en %dst.  Usa parallel-move correcto del regalloc para evitar
+                            ///<   conflictos al colocar args en sus regs destino.
 
         // ---- codigo ensamblador incrustado (0xFF) ----
         RAW_ASM   = 0xFF, ///< raw_asm "texto"  (ensamblador .vel verbatim; nunca optimizado)
@@ -397,6 +458,15 @@ namespace ir {
         /// @c this.field = new Inner(x)) ven @c this como host_ptr stale
         /// tras un minor GC -> escritura en memoria liberada -> segfault.
         bool        is_gc_object = false;
+        /// Optimizacion: si true, el resultado de un LOAD i8/i16/i32 NO necesita
+        /// sign-extension manual porque todos sus usos transitivos son operaciones
+        /// que preservan correctamente los bits bajos (ADD/SUB/MUL/AND/OR/XOR) y
+        /// terminan en STORE/RET del mismo ancho.  Lo marca @c ir_pass_load_narrow.
+        /// El emisor IR (case LOAD) consulta el flag para saltar el patron
+        /// @c shl/sar de 64-N bits, ahorrando 3 instrucciones VM por LOAD.
+        /// Bench struct_field: ~9 instr/iter menos = 270M instr ahorradas en 30M
+        /// iter del loop principal.
+        bool        narrow_only = false;
         uint64_t    const_val = 0;           ///< valor si is_const == true
     };
 
@@ -506,6 +576,15 @@ namespace ir {
         /// del linear scan (ver lower_for / lower_while).
         bool     preserve = false;
 
+        /// Si true para una RAW_ASM, el emitter envuelve el bloque con
+        /// emit_save_live_regs / emit_restore_live_regs.  Necesario cuando
+        /// el RAW_ASM internamente dispara una llamada que clobreara los
+        /// registros caller-saved (e.g. `loadmod`, que ejecuta el main del
+        /// plugin antes de retornar).  Sin esto, el regalloc no sabe que
+        /// el RAW_ASM es un "call site" y los locales vivos quedan
+        /// invalidados cuando la callee corre.
+        bool     is_call_site = false;
+
         IrInstr() : op(IrOp::NOP), type(IrType::VOID), dst(IR_NO_VALUE),
                     imm(0), func_ptr(IR_NO_VALUE),
                     target_block(IR_NO_BLOCK), false_block(IR_NO_BLOCK),
@@ -549,6 +628,43 @@ namespace ir {
         std::vector<IrBlock>     blocks;          ///< bloques basicos (bloques[0] = entry)
         bool                     is_native   = false; ///< true si es stub para funcion nativa
         bool                     is_variadic = false; ///< true si acepta argc variable
+
+        /**
+         * @brief Contract de monomorphizacion: provenance de
+         *        funciones generadas a partir de una clase / funcion
+         *        generica.
+         *
+         * Para una funcion que es una instanciacion concreta de un
+         * template generico, estos campos identifican:
+         *   - @c generic_template_name: nombre del template original
+         *     (e.g., "Box", "List", "Pair").  Vacio si NO es una
+         *     monomorphizacion (funcion normal o template raw).
+         *   - @c generic_type_args: nombres legibles de los tipos
+         *     concretos sustituidos (e.g., ["i32"], ["i64", "string"]).
+         *     Paralelo a los @c type_params del template original.
+         *
+         * Usado por:
+         *   - C2 JIT: identifica especializaciones para
+         *     dedup/sharing across modules.
+         *   - AOT cache: invalidar selectivamente solo
+         *     las instanciaciones afectadas cuando el template cambia,
+         *     en vez de recompilar todo.
+         *   - Tools (debuggers, profilers): mostrar el nombre legible
+         *     del template + tipos en stack traces ("Box<i32>" en vez
+         *     de "Box_i32").
+         *   - PGO: agrupar metricas de instanciaciones del mismo
+         *     template para decisiones de inlining cross-instantiation.
+         *
+         * Para funciones que NO son instanciaciones, ambos campos
+         * quedan vacios.  En Phase A esto es metadata pura (no afecta
+         * compilacion); en Phase D+ los pases del JIT/AOT lo consumen.
+         *
+         * El printer del IR emite @c "@template_of <Name>" y
+         * @c "@type_args [t1, t2, ...]" como anotaciones de la
+         * funcion; el parser las acepta para round-trip.
+         */
+        std::string              generic_template_name; ///< vacio si no es monomorphizacion
+        std::vector<std::string> generic_type_args;     ///< concretos sustituidos (paralelo a type_params)
 
         /**
          * @brief Crea un nuevo valor SSA en el pool.
@@ -621,12 +737,102 @@ namespace ir {
         std::string name;  ///< Nombre de la funcion nativa (p.ej. "vio_println")
     };
 
+    // =========================================================================
+    //  Metadata de POO (clases, interfaces, fields, metodos)
+    //
+    //  Estos tipos hacen al @c IrModule auto-suficiente para que el port
+    //  transpiler (C, Java, JS, ...) emita codigo POO eficiente sin tener
+    //  que parsear @c __module_init (defclass/deffield/defmethod runtime
+    //  calls).
+    //
+    //  El @c IR emitter convencional NO consume esta info -- la deja pasar
+    //  para el transpiler.  Mantiene compatibilidad backwards: modulos sin
+    //  classes (e.g. solo funciones libres) tienen los vectores vacios.
+    //
+    //  Origen: el frontend Vex (TypeChecker::class_layouts_) lo llena
+    //  durante el lowering.  Otros frontends pueden hacer lo mismo.
+    // =========================================================================
+
+    /**
+     * @brief Campo de instancia (o estatico) de una clase Vex.
+     */
+    struct IrField {
+        std::string name;        ///< Nombre del campo.
+        IrType      type;        ///< Tipo del campo.
+        uint32_t    offset = 0;  ///< Offset en bytes desde el inicio del payload
+                                  ///< (excluye @c ObjectHeader; el lowering lo suma).
+        uint32_t    size_bytes = 0; ///< Tamano en bytes del campo (sizeof).
+        bool        is_static = false;  ///< Field estatico (compartido a nivel de clase).
+        /// Field es tipo CLASS de una clase nombrada (string vacio si no).
+        /// Util para el transpiler: emite punteros a struct anidados o
+        /// inline el struct completo segun escape analysis.
+        std::string class_type_name;
+    };
+
+    /**
+     * @brief Metodo de una clase Vex (incluyendo ctor/dtor).
+     */
+    struct IrMethod {
+        std::string name;        ///< Nombre legible del metodo ("inc", "ctor", "dtor").
+        std::string ir_fn_name;  ///< Nombre cualificado de la @c IrFunction asociada
+                                  ///< (e.g. "Counter__inc"; vacio para metodos abstractos).
+        IrType      return_type = IrType::VOID;
+        std::vector<IrType> param_types;  ///< Sin contar @c this.
+        int32_t     vtable_index = -1;    ///< Indice en la vtable; -1 si static o no virtual.
+        bool        is_static      = false;
+        bool        is_final       = false; ///< No puede ser overrideado.
+        bool        is_constructor = false;
+        bool        is_destructor  = false;
+        bool        is_inline      = false; ///< Marcado @c @Inline; lowering inlinea.
+        /// Nombre de la clase donde este metodo esta DEFINIDO realmente.
+        /// Para metodos heredados sin override, @c defining_class apunta a
+        /// la superclase original.  El transpiler usa esto para decidir
+        /// si emitir el metodo o reusar la definicion del padre.
+        std::string defining_class;
+    };
+
+    /**
+     * @brief Descriptor completo de una clase / interface Vex.
+     */
+    struct IrClass {
+        std::string              name;          ///< Nombre simple ("Counter", "Animal").
+        std::string              super_name;    ///< "" si no hay super (o == "Object").
+        std::vector<std::string> interfaces;    ///< Nombres de interfaces implementadas.
+        std::vector<IrField>     fields;        ///< Campos de instancia (incluye heredados).
+        std::vector<IrField>     static_fields; ///< Campos estaticos.
+        std::vector<IrMethod>    methods;       ///< Todos los metodos (incl. heredados).
+
+        uint32_t                 size_bytes  = 0; ///< Tamano del payload (sin ObjectHeader).
+        uint32_t                 align_bytes = 8; ///< Alineamiento requerido del struct.
+
+        bool is_final     = false; ///< No puede ser heredada.  Permite mode TRIVIAL.
+        bool is_interface = false; ///< Sin fields ni cuerpos; solo metodos abstractos.
+        bool is_aspect    = false; ///< @Aspect class: el modulo USA AOP.  El pase
+                                    ///< @c ir_pass_devirt_monomorphic debe skip-ear
+                                    ///< porque CALLVIRTs disparan advice chains.
+        bool has_destructor = false; ///< Declara @c ~ClassName().
+        /// El destructor (auto-sintetizado o explicito) tiene que recorrer
+        /// fields tipo CLASS para llamar sus destructores tambien.  Set
+        /// por el frontend tras analisis de fields transitivo.
+        bool has_destructible_field = false;
+        /// La clase ya esta registrada en el runtime (FatalError, etc.).
+        /// El transpiler NO emite struct ni vtable; usa los del runtime.
+        bool is_runtime_predefined = false;
+    };
+
     struct IrModule {
         std::string                              name;       ///< nombre del modulo (@module)
         std::vector<IrFunction>                  functions;  ///< funciones definidas
         std::vector<std::string>                 imports;    ///< nombres de funciones importadas (@import)
         std::unordered_map<std::string, IrValueId> globals;  ///< variables globales
         std::vector<std::string>                 native_libs; ///< libs nativas (@native_lib)
+
+        /// Metadata de clases + interfaces declaradas en el modulo.  Llena
+        /// por el frontend (Vex TypeChecker) en lowering.  Consumida por
+        /// el port transpiler (C/Java/JS) para emitir POO eficiente.
+        /// Vacio en modulos sin POO -- el transpiler entonces opera solo
+        /// sobre funciones libres.  El IR emitter (a .vel) la ignora.
+        std::vector<IrClass> classes;
 
         /**
          * @brief Datos estaticos del modulo: cada entrada es la imagen de bytes

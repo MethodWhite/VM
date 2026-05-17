@@ -1,0 +1,58 @@
+// Test integral de smart pointers:
+//   - unique_box (deleter por defecto = free): aloca un i32 con value 42.
+//   - unique_with (deleter Vesta custom): aloca FILE* virtual con cleanup
+//     personalizado que incrementa un contador.
+//   - move semantics: transferencia entre vars.
+//   - escape via return: una funcion devuelve unique<T> -> NO se libera localmente.
+//   - reutilizacion: tras escape, el caller puede consumirlo o pasarlo.
+//
+// Verificaciones:
+//   1. Valor 42 leido correctamente desde unique_box.
+//   2. Cleanup ejecutado N veces tras N invocaciones.
+//   3. Move chain preserva el valor.
+
+class C {
+    public static i64 releases;
+}
+
+void track_release(i64 p) {
+    C.releases = C.releases + 1;
+}
+
+// Helper que produce y mueve un unique<i32>.
+i32 read_value() {
+    unique<i32> p = unique_box(42);
+    i32* raw = ptr_of(p);
+    return *raw;
+}
+
+// 3 unique con tracking: verificamos 3 releases tras N exits.
+void multi_release() {
+    unique<i64> a = unique_with(111, track_release);
+    unique<i64> b = unique_with(222, track_release);
+    unique<i64> c = unique_with(333, track_release);
+}
+
+i32 main() {
+    C.releases = 0;
+
+    // Caso 1: unique_box + ptr_of valor recuperado correctamente.
+    i32 v = read_value();
+    if (v != 42) {
+        return 100 + v;
+    }
+
+    // Caso 2: multi-release LIFO -> contador suma 3.
+    multi_release();
+    if (C.releases != 3) {
+        return 200 + C.releases;
+    }
+
+    // Caso 3: multi-release otra vez -> contador acumulado = 6.
+    multi_release();
+    if (C.releases != 6) {
+        return 300 + C.releases;
+    }
+
+    return 42;
+}

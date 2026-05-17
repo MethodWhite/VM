@@ -1,0 +1,37 @@
+// Test F2 + F4: param borrow + lifetime elision rule 1.
+//
+// F2: el parametro `p` se registra como Param -> su borrow puede
+// retornarse via on_borrow_escape sin error.
+//
+// F4: la funcion `identity_borrow` devuelve un borrow<i32> y tiene
+// exactamente 1 borrow param.  El borrow checker aplica la regla de
+// elision: el lifetime del retorno = lifetime de p.  En el callsite
+// el borrow resultante tiene como owner el argumento original.
+
+// Identidad: devuelve el mismo borrow recibido.
+borrow<i32> identity_borrow(borrow<i32> p) {
+    return p;
+}
+
+// Read-through via borrow: cualquier funcion que recibe un borrow y
+// devuelve un valor (no un borrow) NO necesita elision.
+i32 deref_borrow(borrow<i32> p) {
+    return read_borrow(p);
+}
+
+i32 main() {
+    unique<i32> myvec = unique_box(77);
+
+    borrow<i32> r1 = lend(myvec);
+    borrow<i32> r2 = identity_borrow(r1);  // F4: r2 hereda owner=myvec
+    i32 v1 = deref_borrow(r2);             // OK: r2 es shared
+
+    if (v1 != 77) return 100;
+
+    // Aun podemos crear mas shared (R2):
+    borrow<i32> r3 = lend(myvec);
+    i32 v2 = read_borrow(r3);
+    if (v2 != 77) return 200;
+
+    return 42;
+}

@@ -29,6 +29,10 @@
 #include "gc/raw_allocator.h"
 #include "loader/oop_types.h"
 
+/* hook JIT en CALLVIRT fast path. */
+#include "jit/interp_jit_bridge.h"
+#include "vesta_rt/public.h"
+
 namespace runtime {
 
     // =========================================================================
@@ -96,6 +100,15 @@ namespace runtime {
                 uint64_t saved_rsp      = ef->saved_rsp;
                 uint64_t saved_rbp      = ef->saved_rbp;
                 auto    *saved_fs       = (loader::FrameHeader *)(uintptr_t)ef->saved_frame_stack;
+                // Snapshot de R0..R15 que el tryenter capturo.  Restauramos
+                // antes de saltar al handler para que las variables vivas
+                // del catch (incluido `this` y parametros del metodo) tengan
+                // los valores correctos -- mismo estado que el try entry.
+                // Sin esto, los regs corruptos por el try-body dejaban
+                // las vars con valores stale (caso clasico: catch que
+                // hace `this.foo()` -> CALLVIRT null porque r1 era stale).
+                uint64_t saved_regs[16];
+                for (int i = 0; i < 16; ++i) saved_regs[i] = ef->saved_regs[i];
 
                 // desapilar todos los frames TRYENTER hasta el handler encontrado
                 while (vm->exc_frame_stack != nullptr && vm->exc_frame_stack != ef) {
@@ -120,6 +133,12 @@ namespace runtime {
                     loader::FrameHeader *tmp = vm->frame_stack;
                     vm->frame_stack = tmp->prev;
                     vm->frame_pool.release(tmp); // fix13
+                }
+                // Restaurar R1..R15 (R0 lo sobreescribimos con la
+                // excepcion abajo).  Esto es el cambio CRITICO que hace
+                // que las vars del catch vean valores correctos.
+                for (int i = 1; i < 16; ++i) {
+                    vm->registers.regs[i].qword(saved_regs[i]);
                 }
 
                 // convencion: R00 contiene el puntero al objeto excepcion
@@ -244,8 +263,8 @@ namespace runtime {
         const uint8_t r_obj    = instr.data_instruction.reg_data.reg1; // registro con el puntero al objeto
         const uint8_t vtbl_idx = instr.data_instruction.reg_data.reg2; // indice en la vtable
 
-        uint64_t obj_ptr = vm->registers.regs[r_obj].qword();
-        if (obj_ptr == 0) {
+        const uint64_t obj_ptr = vm->registers.regs[r_obj].qword();
+        if (__builtin_expect(obj_ptr == 0, 0)) {
             // throw_fatal capturable con try/catch.  Si no hay
             // handler activo, ruta antigua (mata el proceso).
             runtime::throw_fatalf(vm, runtime::FATAL_NULL_POINTER,
@@ -257,23 +276,39 @@ namespace runtime {
         auto *hdr = reinterpret_cast<loader::ObjectHeader *>(obj_ptr);
         loader::ClassInfo *cls = hdr->class_ptr; // obtener la clase del objeto
 
-        if (cls == nullptr || vtbl_idx >= cls->vtable_size || cls->vtable == nullptr) {
-            runtime::throw_fatalf(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
-                "CALLVIRT: clase invalida o vtable_idx fuera de rango (idx=%u, size=%u)",
-                (unsigned)vtbl_idx,
-                cls ? (unsigned)cls->vtable_size : 0u);
-            return;
+        // ---------- Inline cache (monomorphic) ----------
+        // En la mayoria de programas, el call site siempre ve la MISMA clase.
+        // Cacheamos (cls -> method) en el icache entry.  Cache hit = saltar
+        // bounds check + indirect load de la vtable.
+        loader::MethodInfo *method;
+        if (__builtin_expect(cls == instr.cached_class
+                              && instr.cached_method != nullptr, 1)) {
+            method = static_cast<loader::MethodInfo *>(instr.cached_method);
+        } else {
+            // Cache miss: resolver via vtable y actualizar.  La primera
+            // invocacion de cada call site cae aqui; las siguientes son hits.
+            if (__builtin_expect(cls == nullptr
+                                  || vtbl_idx >= cls->vtable_size
+                                  || cls->vtable == nullptr, 0)) {
+                runtime::throw_fatalf(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                    "CALLVIRT: clase invalida o vtable_idx fuera de rango (idx=%u, size=%u)",
+                    (unsigned)vtbl_idx,
+                    cls ? (unsigned)cls->vtable_size : 0u);
+                return;
+            }
+            method = cls->vtable[vtbl_idx];
+            if (__builtin_expect(method == nullptr || method->code_vaddr == 0, 0)) {
+                runtime::throw_fatalf(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                    "CALLVIRT: metodo abstracto o sin implementacion (vtbl_idx=%u)",
+                    (unsigned)vtbl_idx);
+                return;
+            }
+            // Cachear para la proxima invocacion (mutable: const-correct).
+            instr.cached_class  = cls;
+            instr.cached_method = method;
         }
 
-        loader::MethodInfo *method = cls->vtable[vtbl_idx]; // resolver el metodo en la vtable
-        if (method == nullptr || method->code_vaddr == 0) {
-            runtime::throw_fatalf(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
-                "CALLVIRT: metodo abstracto o sin implementacion (vtbl_idx=%u)",
-                (unsigned)vtbl_idx);
-            return;
-        }
-
-        uint64_t ret_addr = vm->registers.rip.raw()
+        const uint64_t ret_addr = vm->registers.rip.raw()
                             + static_cast<uint64_t>(instr.flags_info.size_instr); // PC de retorno
 
         // -----------------------------------------------------------------
@@ -290,29 +325,60 @@ namespace runtime {
         // invoca varias veces consecutivas para construir la cadena AOP.
         // El parametro opcional @c around_target marca el frame como un
         // advice AROUND con un target a invocar via @c proceed (A.5.4 ext).
+        //
+        // NOTA: NO escribimos ret_to al stack VM.  El slot reservado por
+        // `rsp -= 8` queda sin inicializar, lo cual es seguro porque:
+        //  (a) RET de este callvirt usa frame->return_pc directo (detectado
+        //      por RSP == frame_base - 8), nunca lee del slot.
+        //  (b) Si el method body hace un callvm anidado, ese callvm
+        //      sobreescribe su propio slot (rsp -= 8 de nuevo + write).  El
+        //      RET de ese callvm anidado lee de su slot, no del nuestro.
+        // El write_bytes que estaba aqui (~30 ns) era trabajo desperdiciado.
         auto push_step = [&](loader::MethodInfo *m, uint64_t ret_to,
                              loader::MethodInfo *around_target = nullptr) {
-            // A.34.fix13 - acquire del pool en lugar de heap C++ new.
+            const uint64_t cur_rsp = vm->registers.stack_pointer.qword();
             auto *frame            = vm->frame_pool.acquire();
             frame->prev            = vm->frame_stack;
             frame->method          = m;
             frame->return_pc       = ret_to;
-            frame->frame_base      = vm->registers.stack_pointer.qword();
+            frame->frame_base      = cur_rsp;
             frame->proceed_target  = around_target;
             vm->frame_stack        = frame;
-            vm->registers.stack_pointer.qword(
-                vm->registers.stack_pointer.qword() - 8);
-            // El ret_addr se escribe al stack VM para soportar callvm puro
-            // anidado dentro del metodo virtual: ese callvm hace push de su
-            // propio ret_addr y el RET correspondiente lo lee del stack.
-            // En el RET del callvirt mismo, usamos frame->return_pc directo
-            // (evita la read), detectando el caso por RSP == frame_base - 8.
-            vm->vm_mem.write_bytes(vm->registers.stack_pointer.raw(),
-                                    &ret_to, 8);
+            vm->registers.stack_pointer.qword(cur_rsp - 8);
         };
 
         if (method->advice_chain == nullptr) {
             // Fast path: dispatch directo sin advices, overhead cero.
+            //
+            // HOT PATH OPT:  si method->jit_code ya esta
+            // seteado, salt directo al JIT SIN incrementar counter ni
+            // llamar al hook.  Esto ahorra ~2-3 ns por callvirt en hot
+            // loops (de los ~10ns totales del fast path).  El counter
+            // ya sirvio para disparar la compilacion; tras compile no
+            // tiene utilidad (futuras phases podrian usarlo para PGO
+            // pero hoy no se consulta).  El hook es no-op cuando
+            // jit_code != null, asi que skip es seguro.
+            if (__builtin_expect(method->jit_code != nullptr, 1)) {
+                jit::JitFn fn = reinterpret_cast<jit::JitFn>(method->jit_code);
+                (void)jit::enter_jit(fn, reinterpret_cast<vrt_proc *>(vm));
+                vm->registers.rip.qword(ret_addr);
+                vm->decoded_ptr->flags_info.did_jump = true;
+                return;
+            }
+            // Slow path: jit_code no seteado.  Incrementar counter y
+            // disparar auto-JIT si procede.  Tras compile exitoso,
+            // siguientes callvirts iran por el fast path.
+            ++method->invocation_count;
+            if (g_callvirt_post_hook != nullptr) {
+                g_callvirt_post_hook(vm, method);
+            }
+            if (method->jit_code != nullptr) {
+                jit::JitFn fn = reinterpret_cast<jit::JitFn>(method->jit_code);
+                (void)jit::enter_jit(fn, reinterpret_cast<vrt_proc *>(vm));
+                vm->registers.rip.qword(ret_addr);
+                vm->decoded_ptr->flags_info.did_jump = true;
+                return;
+            }
             push_step(method, ret_addr);
             vm->registers.rip.qword(method->code_vaddr);
             vm->decoded_ptr->flags_info.did_jump = true;
@@ -447,14 +513,14 @@ namespace runtime {
         const uint8_t r_method = instr.data_instruction.reg_data.reg2;
 
         const uint64_t obj_ptr = vm->registers.regs[r_obj].qword();
-        if (obj_ptr == 0) {
+        if (__builtin_expect(obj_ptr == 0, 0)) {
             runtime::throw_fatal(vm, runtime::FATAL_NULL_POINTER,
                 "CALLM: deref de objeto null");
             return;
         }
         auto *method = reinterpret_cast<loader::MethodInfo *>(
             vm->registers.regs[r_method].qword());
-        if (method == nullptr || method->code_vaddr == 0) {
+        if (__builtin_expect(method == nullptr || method->code_vaddr == 0, 0)) {
             runtime::throw_fatal(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
                 "CALLM: MethodInfo nulo o sin codigo");
             return;
@@ -463,19 +529,18 @@ namespace runtime {
                                 + static_cast<uint64_t>(instr.flags_info.size_instr);
 
         // Helper local: empuja frame + return_pc (mismo patron que CALLVIRT).
+        // Sin write a stack: RET usa frame->return_pc directo (matching por
+        // frame_base).  Ver explicacion extendida en CALLVIRT::push_step.
         auto push_step = [&](loader::MethodInfo *m, uint64_t ret_to) {
+            const uint64_t cur_rsp = vm->registers.stack_pointer.qword();
             auto *frame       = vm->frame_pool.acquire(); // A.34.fix13
             frame->prev       = vm->frame_stack;
             frame->method     = m;
             frame->return_pc  = ret_to;
-            frame->frame_base = vm->registers.stack_pointer.qword();
+            frame->frame_base = cur_rsp;
             frame->proceed_target = nullptr;
             vm->frame_stack   = frame;
-            vm->registers.stack_pointer.qword(
-                vm->registers.stack_pointer.qword() - 8);
-            // Mantener write para callvm anidado (ver push_step de CALLVIRT).
-            vm->vm_mem.write_bytes(vm->registers.stack_pointer.raw(),
-                                    &ret_to, 8);
+            vm->registers.stack_pointer.qword(cur_rsp - 8);
         };
 
         // Fast path: sin advices, dispatch directo.
@@ -552,17 +617,18 @@ namespace runtime {
                             + static_cast<uint64_t>(instr.flags_info.size_instr);
 
         // crear FrameHeader para soporte de excepciones
+        const uint64_t cur_rsp = vm->registers.stack_pointer.qword();
         auto *frame       = vm->frame_pool.acquire(); // A.34.fix13
         frame->prev       = vm->frame_stack;
         frame->method     = method;
         frame->return_pc  = ret_addr;
-        frame->frame_base = vm->registers.stack_pointer.qword();
+        frame->frame_base = cur_rsp;
         frame->proceed_target = nullptr;
         vm->frame_stack   = frame;
 
-        vm->registers.stack_pointer.qword(vm->registers.stack_pointer.qword() - 8);
-        // Mantener write para callvm anidado.
-        vm->vm_mem.write_bytes(vm->registers.stack_pointer.raw(), &ret_addr, 8);
+        // RSP -= 8 (reserva slot).  No escribimos ret_addr: RET de este
+        // callsuper usa frame->return_pc directo (mismo patron que callvirt).
+        vm->registers.stack_pointer.qword(cur_rsp - 8);
 
         // saltar al metodo de la superclase
         vm->registers.rip.qword(method->code_vaddr);

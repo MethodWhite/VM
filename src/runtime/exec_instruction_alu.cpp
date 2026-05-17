@@ -1282,4 +1282,334 @@ void exec_instr_setcc(ProcessVM *vm, const DecodedInstr &instr) {
     vm->registers.regs[dst_reg].qword(taken ? 1 : 0); // escribir resultado booleano en el registro
 }
 
+// =========================================================================
+// CMPJMP / CMPJMPU / DECJNZ -- fusion de cmp+jcc / dec+jnz (mejora hot loops)
+// =========================================================================
+
+/**
+ * @brief Helper interno: evalua el cond_byte (0x00..0x0D) contra los flags.
+ *
+ * Usa el mismo set que @c exec_instr_jmp y @c jmp.j*.  cond_byte > 0x0D
+ * cae al default = true (incondicional).  Sin syscalls; pure CPU work.
+ */
+// El tipo del campo flags::bits es interno; declaramos el helper como
+// template para deducir el tipo automaticamente sin requerir -fconcepts-ts.
+template<typename FlagsBits>
+static inline bool eval_jmp_cond(uint8_t cond, const FlagsBits &fl) noexcept {
+    switch (cond) {
+        case 0x00: return COND_EQ(fl); // ZF==1
+        case 0x01: return COND_NE(fl); // ZF==0
+        case 0x02: return COND_CS(fl); // CF==1
+        case 0x03: return COND_CC(fl); // CF==0
+        case 0x04: return COND_MI(fl); // SF==1
+        case 0x05: return COND_PL(fl); // SF==0
+        case 0x06: return COND_VS(fl); // OF==1
+        case 0x07: return COND_VC(fl); // OF==0
+        case 0x08: return COND_HI(fl); // CF==0 && ZF==0
+        case 0x09: return COND_LS(fl); // CF==1 || ZF==1
+        case 0x0A: return COND_GE(fl); // SF==OF
+        case 0x0B: return COND_LT(fl); // SF!=OF
+        case 0x0C: return (fl.ZF == 0 && fl.SF == fl.OF); // GT
+        case 0x0D: return (fl.ZF == 1 || fl.SF != fl.OF); // LE
+        default:   return true;
+    }
+}
+
+/**
+ * @brief Helper interno: hace cmp (a-b) + setea flags ZF/SF/CF/OF segun
+ *        signo, sin escribir resultado.  Reusa @c compute_with_flags +
+ *        @c CmpOp para mantener exactamente la misma semantica que las
+ *        instrucciones @c cmps / @c cmpu separadas.
+ */
+static inline void cmpjmp_set_flags(ProcessVM *vm,
+                                     uint64_t a,
+                                     uint64_t b,
+                                     bool is_signed) {
+    (void)compute_with_flags<uint64_t, CmpOp>(vm, a, b, is_signed);
+}
+
+/**
+ * @brief Implementacion de @c cmpjmp r_a, r_b, target (signed).
+ *
+ * Equivalente atomic a:
+ *   cmps r_a, r_b
+ *   jmp.cond target
+ * en una sola instruccion VM (reduce 2 instr -> 1 por comparacion).
+ */
+void exec_instr_cmpjmp(ProcessVM *vm, const DecodedInstr &instr) {
+    const auto &sd = instr.data_instruction.static_data;
+    const uint64_t a = vm->registers.regs[sd.r0].qword();
+    const uint64_t b = vm->registers.regs[sd.r1].qword();
+    cmpjmp_set_flags(vm, a, b, /*is_signed=*/true);
+    if (eval_jmp_cond(static_cast<uint8_t>(sd._pad), vm->registers.flags.bits)) {
+        write_rip(vm, static_cast<uint64_t>(sd.offset)); // salto absoluto u32
+    }
+}
+
+/**
+ * @brief Implementacion de @c cmpjmpu r_a, r_b, target (unsigned).
+ *
+ * Identica a @c exec_instr_cmpjmp pero con semantica unsigned (CmpOp con
+ * is_signed=false: CF se setea segun a<b unsigned, OF queda en 0).
+ */
+void exec_instr_cmpjmpu(ProcessVM *vm, const DecodedInstr &instr) {
+    const auto &sd = instr.data_instruction.static_data;
+    const uint64_t a = vm->registers.regs[sd.r0].qword();
+    const uint64_t b = vm->registers.regs[sd.r1].qword();
+    cmpjmp_set_flags(vm, a, b, /*is_signed=*/false);
+    if (eval_jmp_cond(static_cast<uint8_t>(sd._pad), vm->registers.flags.bits)) {
+        write_rip(vm, static_cast<uint64_t>(sd.offset));
+    }
+}
+
+/**
+ * @brief Implementacion de @c decjnz r_counter, target.
+ *
+ * Equivalente atomic a:
+ *   subs r_counter, 1   ; r_counter -= 1, setea flags
+ *   jmp.jne target      ; salta si ZF==0 (resultado != 0)
+ * en una sola instruccion VM.  Reduce 2-3 instr -> 1 por iteracion en
+ * loops contadores.  Tambien ahorra el `mov r14, 1` necesario para subs
+ * (que requiere reg, no imm).
+ */
+void exec_instr_decjnz(ProcessVM *vm, const DecodedInstr &instr) {
+    const auto &sd = instr.data_instruction.static_data;
+    const int reg_idx = sd.r0;
+    const uint64_t old_val = vm->registers.regs[reg_idx].qword();
+    // dec = a - 1.  Reusa SubOp para flags consistentes con `subs r, 1`.
+    const uint64_t new_val = compute_with_flags<uint64_t, SubOp>(
+        vm, old_val, /*b=*/1ULL, /*is_signed=*/true);
+    vm->registers.regs[reg_idx].qword(new_val);
+    // Saltar si new_val != 0 (equivale a jmp.jne post-subs).
+    if (new_val != 0ULL) {
+        write_rip(vm, static_cast<uint64_t>(sd.offset));
+    }
+}
+
+/**
+ * @brief Ejecuta @c fastpush <mask16>: empuja a la pila N registros marcados
+ *        en el bitmask en una sola instruccion.
+ *
+ * Estrategia hardware-aware:
+ *   1. @c __builtin_popcount calcula N en 1 ciclo (POPCNT instr en x86-64).
+ *   2. Decrementa RSP por (N*8) en una sola escritura al registro.
+ *   3. @c __builtin_ctz extrae el indice del bit set mas bajo en O(1) por
+ *      iteracion (TZCNT/BSF), evitando un loop de 16 iteraciones con if.
+ *   4. @c mask &= mask - 1 limpia el bit set mas bajo en 1 ciclo.
+ *   5. Las escrituras se hacen lineales en memoria, lo que la CPU prefetch
+ *      detecta y optimiza con write-combining + cache line filling.
+ *
+ * Convencion: r0 es el PRIMER push (mayor offset relativo a rsp final),
+ * r_max_set es el ULTIMO push (rsp final).  Esto permite que @c fastpop
+ * con el mismo mask restaure los valores exactamente.
+ */
+void exec_instr_fastpush(ProcessVM *vm, const DecodedInstr &instr) {
+    uint16_t mask = instr.data_instruction.mask_data.mask;
+    if (mask == 0) return;  // no-op: ningun bit puesto
+
+    const int count = __builtin_popcount(static_cast<unsigned int>(mask));
+    const uint64_t old_rsp = vm->registers.stack_pointer.qword();
+    const uint64_t new_rsp = old_rsp - static_cast<uint64_t>(count) * 8ULL;
+    vm->registers.stack_pointer.qword(new_rsp);
+
+    // r0 se empuja primero (queda en el offset MAS alto del nuevo frame).
+    // Iteramos los bits ascendentes y escribimos a offsets descendentes.
+    uint64_t slot = new_rsp + static_cast<uint64_t>(count - 1) * 8ULL;
+    while (mask) {
+        const int r = __builtin_ctz(static_cast<unsigned int>(mask));
+        const uint64_t val = vm->registers.regs[r].qword();
+        vm->vm_mem.write_u64(slot, val);
+        slot -= 8;
+        mask &= static_cast<uint16_t>(mask - 1);  // limpiar bit mas bajo
+    }
+}
+
+/**
+ * @brief Ejecuta @c fastpop <mask16>: desempila N registros del bitmask en
+ *        orden simetrico a @c fastpush.
+ *
+ * Misma estrategia hardware (POPCNT + TZCNT + bit clearing).  Las lecturas
+ * son lineales en memoria, optimas para prefetch.
+ *
+ * Para un mismo mask, @c fastpop revierte exactamente el efecto de
+ * @c fastpush: lee del slot de cada registro y avanza RSP por N*8 al final.
+ */
+void exec_instr_fastpop(ProcessVM *vm, const DecodedInstr &instr) {
+    uint16_t mask = instr.data_instruction.mask_data.mask;
+    if (mask == 0) return;
+
+    const int count = __builtin_popcount(static_cast<unsigned int>(mask));
+    const uint64_t rsp = vm->registers.stack_pointer.qword();
+
+    // Mismo orden de iteracion que fastpush, lectura desde offsets
+    // descendentes -> los valores se restauran a los registros correctos.
+    uint64_t slot = rsp + static_cast<uint64_t>(count - 1) * 8ULL;
+    while (mask) {
+        const int r = __builtin_ctz(static_cast<unsigned int>(mask));
+        const uint64_t val = vm->vm_mem.read_u64(slot);
+        vm->registers.regs[r].qword(val);
+        slot -= 8;
+        mask &= static_cast<uint16_t>(mask - 1);
+    }
+
+    vm->registers.stack_pointer.qword(rsp + static_cast<uint64_t>(count) * 8ULL);
+}
+
+// =========================================================================
+// SUPER-INSTRUCCIONES ALU 3-OPERANDOS (0x73-0x7B)
+//
+// Combinan el patron `mov rd, rs1; OP rd, rs2` en una sola instruccion VM.
+// Eliminacion del MOV intermedio cuando el regalloc no puede coalescer dst
+// con src1 (caso comun del 2-address codegen del IR emitter).
+//
+// Encoding FIXED_4: [0x00][opcode2][byte2][byte3]
+//   byte2 = (r_src1 << 4) | r_dst       (Convention B: decode_instr_raw_bytes
+//                                         deja byte2 en reg1, byte3 en reg2)
+//   byte3 = (r_src2 << 4) | flags_low   (flags reservados, low nibble = 0)
+//
+// La operacion se identifica por @c flags_info.opcode_index:
+//   0x73 adds3, 0x74 subs3, 0x75 muls3,
+//   0x76 addu3, 0x77 subu3, 0x78 mulu3,
+//   0x79 and3,  0x7A or3,   0x7B xor3.
+//
+// Flags actualizados igual que las variantes 2-op tradicionales (ZF/SF/CF/OF).
+// =========================================================================
+
+/**
+ * @brief Ejecuta una super-instruccion ALU 3-operandos.
+ *
+ * Lee r_src1 y r_src2 (de byte2 y byte3 respectivamente, despues de
+ * decode_instr_raw_bytes), realiza la operacion identificada por opcode_index,
+ * y almacena el resultado en r_dst.  Actualiza flags ZF/SF/CF/OF segun la
+ * semantica de la operacion (signed vs unsigned).
+ *
+ * @param vm    Puntero a la maquina virtual.
+ * @param instr Instruccion descodificada con byte2 en reg1, byte3 en reg2.
+ */
+void exec_instr_alu3(ProcessVM *vm, const DecodedInstr &instr) {
+    const uint8_t b2     = instr.data_instruction.reg_data.reg1;
+    const uint8_t b3     = instr.data_instruction.reg_data.reg2;
+    const uint8_t r_dst  = b2 & 0x0F;
+    const uint8_t r_src1 = (b2 >> 4) & 0x0F;
+    const uint8_t r_src2 = (b3 >> 4) & 0x0F;
+    const uint8_t opc    = instr.flags_info.opcode_index;
+
+    auto &regs = vm->registers.regs;
+    auto &fl   = vm->registers.flags.bits;
+    const uint64_t a = regs[r_src1].qword();
+    const uint64_t b = regs[r_src2].qword();
+    uint64_t res = 0;
+
+    switch (opc) {
+        case 0x73: case 0x76: // adds3 / addu3
+            res = a + b;
+            regs[r_dst].qword(res);
+            fl.ZF = (res == 0);
+            fl.SF = static_cast<int64_t>(res) < 0;
+            if (opc == 0x73) {
+                fl.OF = ((static_cast<int64_t>(a) ^ static_cast<int64_t>(res)) &
+                         (static_cast<int64_t>(b) ^ static_cast<int64_t>(res))) < 0;
+                fl.CF = 0;
+            } else {
+                fl.CF = res < a;
+                fl.OF = 0;
+            }
+            break;
+        case 0x74: case 0x77: // subs3 / subu3
+            res = a - b;
+            regs[r_dst].qword(res);
+            fl.ZF = (res == 0);
+            fl.SF = static_cast<int64_t>(res) < 0;
+            if (opc == 0x74) {
+                fl.OF = ((static_cast<int64_t>(a) ^ static_cast<int64_t>(b)) &
+                         (static_cast<int64_t>(a) ^ static_cast<int64_t>(res))) < 0;
+                fl.CF = 0;
+            } else {
+                fl.CF = a < b;
+                fl.OF = 0;
+            }
+            break;
+        case 0x75: // muls3
+            res = static_cast<uint64_t>(static_cast<int64_t>(a) * static_cast<int64_t>(b));
+            regs[r_dst].qword(res);
+            fl.ZF = (res == 0);
+            fl.SF = static_cast<int64_t>(res) < 0;
+            fl.CF = 0; fl.OF = 0;
+            break;
+        case 0x78: // mulu3
+            res = a * b;
+            regs[r_dst].qword(res);
+            fl.ZF = (res == 0);
+            fl.SF = static_cast<int64_t>(res) < 0;
+            fl.CF = 0; fl.OF = 0;
+            break;
+        case 0x79: // and3
+            res = a & b;
+            regs[r_dst].qword(res);
+            fl.ZF = (res == 0);
+            fl.SF = static_cast<int64_t>(res) < 0;
+            fl.CF = 0; fl.OF = 0;
+            break;
+        case 0x7A: // or3
+            res = a | b;
+            regs[r_dst].qword(res);
+            fl.ZF = (res == 0);
+            fl.SF = static_cast<int64_t>(res) < 0;
+            fl.CF = 0; fl.OF = 0;
+            break;
+        case 0x7B: // xor3
+            res = a ^ b;
+            regs[r_dst].qword(res);
+            fl.ZF = (res == 0);
+            fl.SF = static_cast<int64_t>(res) < 0;
+            fl.CF = 0; fl.OF = 0;
+            break;
+        default:
+            break;
+    }
+}
+
+// =========================================================================
+// LOADZ / LOADZH (0x7C / 0x7D): super-instr LOAD con zero-extend a 64-bit
+//
+// Combina @c mov rd,0 + @c mov rd_sized,[rs] en una sola instruccion VM.
+// La VM no zero-extiende implicitamente al escribir bytes parciales en un
+// reg (a diferencia de x86-64); por eso el IR emitter tipicamente emite el
+// @c mov rd,0 previo cuando carga i8/i16/i32 desde memoria.  loadz/loadzh
+// elimina esa instruccion adicional cargando el valor con zero-extend en
+// un solo paso.
+//
+// Encoding (FIXED_4, ya decoded por decode_instr_simple_mov):
+//   ctrl bits 7-6 = mode (0=8b, 1=16b, 2=32b, 3=64b)  -> @c flags_info.mode
+//   ctrl bit  5   = is_host  -> @c flags_info._signed_instruct
+//   regs:  reg1 (low nibble)  = r_dst
+//          reg2 (high nibble) = r_src (puntero base 64-bit)
+// =========================================================================
+void exec_instr_loadz(ProcessVM *vm, const DecodedInstr &instr) {
+    const uint8_t r_dst = instr.data_instruction.reg_data.reg1;
+    const uint8_t r_src = instr.data_instruction.reg_data.reg2;
+    const uint8_t mode  = instr.flags_info.mode;
+    const bool   is_host = (instr.flags_info._signed_instruct != 0);
+    const uint64_t addr = vm->registers.regs[r_src].qword();
+
+    uint64_t val;
+    if (is_host) {
+        const uint8_t *p = reinterpret_cast<const uint8_t*>(addr);
+        switch (mode) {
+            case 0: val = *p; break;
+            case 1: val = *reinterpret_cast<const uint16_t*>(p); break;
+            case 2: val = *reinterpret_cast<const uint32_t*>(p); break;
+            default: val = *reinterpret_cast<const uint64_t*>(p); break;
+        }
+    } else {
+        switch (mode) {
+            case 0: val = vm->vm_mem.read_u8(addr);  break;
+            case 1: val = vm->vm_mem.read_u16(addr); break;
+            case 2: val = vm->vm_mem.read_u32(addr); break;
+            default: val = vm->vm_mem.read_u64(addr); break;
+        }
+    }
+    vm->registers.regs[r_dst].qword(val); // qword() escribe 64 bits = zero-extend implicito
+}
+
 } // namespace runtime

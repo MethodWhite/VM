@@ -1,0 +1,43 @@
+class Foo {
+    i32 x;
+    Foo(i32 x) { this.x = x; }
+}
+
+void main() {
+    i64 n = 42;
+    i64* p = malloc(8);
+    *p = 99;
+    Foo f = new Foo(123);
+
+    println("=== Kinds ===");
+    println("dec    : ${n}");
+    println("hex    : ${n:hex}");
+    println("bin    : ${n:bin}");
+    println("oct    : ${n:oct}");
+    println("ptr    : ${p:ptr}");
+    println("auto p : ${p}");        // PTR auto -> ptr format
+    println("auto f : ${f}");        // CLASS auto -> gc format
+    println("explicit gc f : ${f:gc}");
+
+    println("");
+    println("=== Alignment ===");
+    println("[${n:>10}]");           // right-align width 10, pad spaces
+    println("[${n:<10}]");           // left-align width 10
+    println("[${n:>10.}]");          // right-align width 10, pad dots
+    println("[${n:<10*}]");          // left-align width 10, pad asterisks
+
+    println("");
+    println("=== Combined ===");
+    println("[${n:hex:>20}]");       // hex + right-align width 20
+    println("[${n:bin:>16=}]");      // bin + right-align width 16, pad with '='
+
+    println("");
+    println("=== Tabular use ===");
+    println("name  count    hex");
+    for (i32 i = 1; i <= 3; i++) {
+        println("item${i:<2} ${i*100:<8} ${i*100:hex:>18}");
+    }
+
+    free(p);
+    println("ok");
+}

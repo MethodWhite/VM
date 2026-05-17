@@ -14,8 +14,54 @@
 #include <algorithm>
 #include <set>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace ir {
+
+// =========================================================================
+//  Register hints para cadenas de binops
+// =========================================================================
+// Para una secuencia tipica como:
+//    %a = mul %x, %y
+//    %b = add %z, %a
+//    %c = xor %b, %k
+// El emit_binop produce `mov rd, rs1; op rd, rs2` que costa 2 instr VM por
+// op.  Si el regalloc coloca `%b` en el mismo reg que `%a` (ya que `%a` muere
+// al consumirse en el add), `mov rd, rs1` desaparece (`emit_mov_if_needed`
+// detecta rd==rs1).  Esto AHORRA 1 instr VM por op encadenada.
+//
+// Estrategia: pre-pasada que para cada binop/unop computa un "hint" del
+// registro que el dst PREFIERE: el reg del primer operando IFF ese operando
+// muere en esta instruccion (su intervalo termina aqui Y no es param/usado
+// en otros bloques via phi).
+//
+// El linear scan, al expirar el intervalo del operando, comprueba si hay un
+// valor que lo este "esperando" via hint.  Si si, ese reg se prioriza para
+// el siguiente alloc (en lugar de un reg arbitrario).
+struct RegHint {
+    IrValueId pref_via_value = IR_NO_VALUE; // %dst quiere el reg de pref_via_value
+};
+
+// Devuelve true si el `op` es un binop/unop two-address donde el primer
+// operando se "consume" en rd (es decir, el emit hace `mov rd, src1; op rd, src2`
+// o `mov rd, src; op rd`).  Estos son los candidatos a hinting porque el
+// MOV se elimina si rd == src1's reg.
+static bool is_two_address_op(IrOp op) {
+    switch (op) {
+        case IrOp::ADD: case IrOp::SUB: case IrOp::MUL:
+        case IrOp::DIV: case IrOp::MOD:
+        case IrOp::AND: case IrOp::OR:  case IrOp::XOR:
+        case IrOp::SHL: case IrOp::SHR: case IrOp::SAR:
+        case IrOp::NEG: case IrOp::NOT:
+        case IrOp::MOV:
+        case IrOp::SEXT: case IrOp::ZEXT: case IrOp::TRUNC:
+        case IrOp::CAST: case IrOp::BITCAST:
+            return true;
+        default:
+            return false;
+    }
+}
 
 // --- tabla de nombres de registros ---
 static const char *REG_NAMES[16] = {
@@ -38,6 +84,45 @@ AllocResult allocate_regs(const IrFunction &fn, const LivenessResult &liveness) 
     result.ok          = true;
 
     if (liveness.intervals.empty()) return result;
+
+    // ---- Computar register hints para cadenas de binops ----
+    // hint_for[dst_vid] = src1_vid si el binop al definir dst tiene src1
+    // que muere en esa misma instruccion (single use, no usado en otro
+    // bloque, no es param).  El alloc preferira el reg de src1 cuando
+    // este disponible (que lo estara, recien expirado).
+    std::unordered_map<IrValueId, IrValueId> hint_for;
+    {
+        // Mapa rapido vid -> interval.end
+        std::unordered_map<IrValueId, uint32_t> end_of;
+        for (const auto &li : liveness.intervals) end_of[li.id] = li.end;
+
+        // Set de params (no hintear sobre params; sus regs son fijos)
+        std::unordered_set<IrValueId> param_set(fn.params.begin(), fn.params.end());
+
+        // Walk linealizado paralelo a liveness.  Mismo orden que el liveness.
+        uint32_t pos = 0;
+        for (size_t bi = 0; bi < fn.blocks.size(); ++bi) {
+            const auto &bb = fn.blocks[bi];
+            const size_t span = bb.instrs.empty() ? 1 : bb.instrs.size();
+            for (size_t ii = 0; ii < bb.instrs.size(); ++ii) {
+                const auto &ins = bb.instrs[ii];
+                const uint32_t cur_pos = pos + static_cast<uint32_t>(ii);
+                if (ins.dst == IR_NO_VALUE) continue;
+                if (!is_two_address_op(ins.op)) continue;
+                if (ins.operands.empty()) continue;
+                IrValueId src1 = ins.operands[0];
+                if (src1 == IR_NO_VALUE) continue;
+                if (param_set.count(src1)) continue;
+                auto it = end_of.find(src1);
+                if (it == end_of.end()) continue;
+                // src1 muere exactamente aqui (su ultimo uso es cur_pos)
+                if (it->second != cur_pos) continue;
+                hint_for[ins.dst] = src1;
+            }
+            pos += static_cast<uint32_t>(span);
+        }
+    }
+    // ---- Fin hints ----
 
     // Conjunto de registros libres (r0-r13).
     // Usamos r1-r13 como pool principal; r0 se reserva para retorno pero
@@ -121,6 +206,14 @@ AllocResult allocate_regs(const IrFunction &fn, const LivenessResult &liveness) 
                 ActiveEntry spilled = *it_max;
                 active.erase(it_max);
                 result.spill_map[spilled.id] = result.spill_count++;
+                // CRITICAL Bug C fix: borrar reg_map[spilled.id] porque
+                // el reg pasa a `li.id`.  Sin esto, el desalojado quedaria
+                // en ambos reg_map (apuntando a reg ya reusado) y
+                // spill_map.  load_src/dst_of priorizan reg_map (lookup
+                // primero) y retornarian un reg con valor de OTRO IrValueId
+                // tras la reasignacion -> linked list / PHI nodes con
+                // punteros stale tras un CALL.
+                result.reg_map.erase(spilled.id);
                 // reusar el registro del desalojado para li
                 result.reg_map[li.id] = spilled.reg;
                 active.insert({li.end, li.id, spilled.reg});
@@ -129,9 +222,50 @@ AllocResult allocate_regs(const IrFunction &fn, const LivenessResult &liveness) 
                 result.spill_map[li.id] = result.spill_count++;
             }
         } else {
-            // Asignar el ultimo registro disponible del pool
-            int reg = free_pool.back();
-            free_pool.pop_back();
+            // Asignar registro: si hay hint, intentar reusar el reg del
+            // operando que muere en esta instruccion.  Dos casos:
+            //   (a) hinted vid ya esta en free_pool (expirado en pasada
+            //       previa por otra razon).
+            //   (b) hinted vid sigue en `active` pero su .end == li.def
+            //       -- es decir, esta instruccion es su ultimo uso.  Es
+            //       seguro robarle el reg AHORA porque el flujo es:
+            //       op rd, rs (lee rs, escribe rd).  Si rd == rs's reg,
+            //       primero se lee rs, luego se escribe el resultado en
+            //       el mismo reg.  El emitter ve rd == rs1 y elide el
+            //       MOV intermedio.  Coalesce gratis.
+            int reg = -1;
+            auto hit = hint_for.find(li.id);
+            if (hit != hint_for.end()) {
+                auto rm = result.reg_map.find(hit->second);
+                if (rm != result.reg_map.end()) {
+                    int pref = rm->second;
+                    auto pit = std::find(free_pool.begin(), free_pool.end(), pref);
+                    if (pit != free_pool.end()) {
+                        reg = pref;
+                        free_pool.erase(pit);
+                    } else {
+                        // Buscar en active si el hinted vid sigue ahi con
+                        // end == li.def (= termina justo en este uso).
+                        auto ait = active.end();
+                        for (auto a = active.begin(); a != active.end(); ++a) {
+                            if (a->id == hit->second && a->end == li.def) {
+                                ait = a;
+                                break;
+                            }
+                        }
+                        if (ait != active.end()) {
+                            // Steal: extraer y reusar.  No devolver al free_pool
+                            // (lo entregamos directamente a li.id).
+                            reg = ait->reg;
+                            active.erase(ait);
+                        }
+                    }
+                }
+            }
+            if (reg < 0) {
+                reg = free_pool.back();
+                free_pool.pop_back();
+            }
             result.reg_map[li.id] = reg;
             active.insert({li.end, li.id, reg});
         }

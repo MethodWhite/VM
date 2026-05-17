@@ -1,0 +1,553 @@
+/*
+ * VestaVM - Maquina Virtual Distribuida
+ *
+ * Copyright (C) 2026 David Lopez.T (DesmonHak) (Castilla y Leon, ES)
+ * Licencia VMProject
+ *
+ * USO LIBRE NO COMERCIAL con atribucion obligatoria.
+ * PROHIBIDO lucro sin permiso escrito.
+ *
+ * Descargo: Autor no responsable por modificaciones.
+ */
+
+/**
+ * @file vesta_rt/public.h
+ * @brief API estable C ABI de @c libvesta_rt para codigo generado (JIT/AOT).
+ *
+ * Este header expone los runtime entries necesarios para que codigo
+ * generado por el JIT (Phase D) o el AOT (Phase F) pueda llamar al
+ * runtime sin depender del frontend del lenguaje ni de las cabeceras
+ * C++ internas.  Toda la API es @c extern "C" con punteros opacos
+ * para que sea linkable desde cualquier toolchain (Cranelift, MachineIR
+ * propio, ensamblador a mano, plugins de terceros, etc.).
+ *
+ * = Diseno (snapshot 2026-05-13) =
+ *
+ * - Los tipos @c vrt_proc / @c vrt_vm / @c vrt_class son punteros opacos
+ *   (forward decls).  El consumidor jamas debe asumir layout interno;
+ *   en su lugar usa @c vesta_rt/abi.h para offsets explicitos.
+ *
+ * - Los handles GC son @c uint32_t crudos (mismo modelo que el bytecode
+ *   usa hoy).  El sentinela @c VRT_NULL_HANDLE = UINT32_MAX representa
+ *   nulo/invalido.
+ *
+ * - Errores fatales no se propagan via codigo de retorno: invocan
+ *   @c vrt_throw_fatal que aborta la ejecucion o salta al handler
+ *   activo (@c tryenter del bytecode).  El codigo generado nunca
+ *   necesita verificar retornos de error.
+ *
+ * - Ningun simbolo aqui puede cambiar de signatura sin bumpear el
+ *   @c VRT_API_VERSION_MAJOR.  Bumps minor permiten ANYADIR funciones
+ *   nuevas al final, jamas mutar las existentes.
+ *
+ * = Uso desde el JIT =
+ *
+ * El emisor de codigo nativo resuelve las direcciones de estas
+ * funciones via la tabla en @c jit/runtime_entries.h al inicio de cada
+ * compile job y las emite como @c call rel32 (PC-relative) o como
+ * indirect call via slot fijo del code cache.  Cero overhead vs llamar
+ * a C++ directamente (es C++ por dentro, solo el wrapper externo es C).
+ */
+
+#ifndef VESTA_RT_PUBLIC_H
+#define VESTA_RT_PUBLIC_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ========================================================================= */
+/* Version                                                                    */
+/* ========================================================================= */
+
+#define VRT_API_VERSION_MAJOR 0
+#define VRT_API_VERSION_MINOR 1
+#define VRT_API_VERSION_PATCH 0
+
+/* ========================================================================= */
+/* Tipos opacos                                                               */
+/* ========================================================================= */
+
+/** @brief Puntero opaco a un ProcessVM (un proceso del runtime). */
+typedef struct vrt_proc vrt_proc;
+
+/** @brief Puntero opaco a una VM (contenedor de procesos / scheduler). */
+typedef struct vrt_vm vrt_vm;
+
+/** @brief Puntero opaco a un ClassInfo (metadatos de clase OOP). */
+typedef struct vrt_class vrt_class;
+
+/** @brief Puntero opaco a un MethodInfo (metadatos de metodo OOP). */
+typedef struct vrt_method vrt_method;
+
+/** @brief Handle GC opaco (indice en HandleTable per-process). */
+typedef uint32_t vrt_handle;
+
+/** @brief Sentinela: handle invalido o nulo. */
+#define VRT_NULL_HANDLE UINT32_MAX
+
+/* ========================================================================= */
+/* GC                                                                         */
+/* ========================================================================= */
+
+/**
+ * @brief Aloca un objeto en el heap del proceso (Nursery por defecto).
+ * @param proc proceso destino; su GcHeap es donde se aloca.
+ * @param size tamano total en bytes (incluye ObjectHeader).
+ * @return handle al objeto; @c VRT_NULL_HANDLE si OOM.
+ *
+ * El objeto sale con header zero-init.  El consumidor debe escribir
+ * @c class_ptr antes de exponerlo al GC (la siguiente alocacion podria
+ * disparar minor_gc y escanear stack roots).
+ */
+vrt_handle vrt_gc_alloc(vrt_proc *proc, size_t size);
+
+/**
+ * @brief Aloca un objeto NO-MOVING directamente en OldGen.
+ * @return handle estable: @c vrt_gc_deref devuelve siempre la misma
+ *         direccion host hasta @c vrt_gc_drop.
+ *
+ * Usado por strings inmutables, buffers FFI y cualquier caso que
+ * necesite estabilidad de @c host_ptr a traves del ciclo GC.
+ */
+vrt_handle vrt_gc_alloc_pinned(vrt_proc *proc, size_t size);
+
+/**
+ * @brief Resuelve un handle a su puntero host actual.
+ * @return @c NULL si el handle es invalido o ya colectado.
+ *
+ * @warning El puntero es valido solo hasta la siguiente operacion que
+ *          pueda mover objetos (alloc, llamada al runtime, safepoint).
+ *          Codigo generado debe re-deref tras cualquier safepoint.
+ */
+uint8_t *vrt_gc_deref(vrt_proc *proc, vrt_handle h);
+
+/**
+ * @brief Lookup inverso: payload host_ptr -> handle.
+ * @return @c VRT_NULL_HANDLE si el puntero no es payload-start de un
+ *         objeto vivo en este heap.
+ */
+vrt_handle vrt_gc_handle_for_ptr(vrt_proc *proc, const uint8_t *payload);
+
+/**
+ * @brief Libera explicitamente un handle (drop manual).
+ *
+ * El objeto fisico permanece hasta el siguiente GC.  Hace el slot
+ * disponible para reciclar (free_handles_).  Cero overhead vs el GC
+ * automatico; es solo un hint deterministico.
+ */
+void vrt_gc_drop(vrt_proc *proc, vrt_handle h);
+
+/**
+ * @brief Pin externo del handle (refcount externo).
+ *
+ * Usado por colecciones nativas que retienen GcHandles fuera del heap
+ * (e.g. plugin de colecciones).  Mientras refcount > 0, el GC NO
+ * colectara el objeto aunque no haya referencias en el bytecode.
+ */
+void vrt_gc_addref(vrt_proc *proc, vrt_handle h);
+
+/** @brief Unpin externo (decrementa refcount). */
+void vrt_gc_release(vrt_proc *proc, vrt_handle h);
+
+/**
+ * @brief Write barrier para referencia old -> young.
+ *
+ * Debe llamarse DESPUES de escribir un campo de un objeto OLD que
+ * apunta a un objeto YOUNG.  Sin esto, el minor_gc puede liberar el
+ * young aunque haya una referencia viva desde old.
+ */
+void vrt_gc_write_barrier(vrt_proc *proc, vrt_handle old_handle);
+
+/* ========================================================================= */
+/* Monitores (synchronized / wait / notify)                                   */
+/* ========================================================================= */
+
+/**
+ * @brief Adquiere monitor reentrant del objeto.
+ * @return 1 si adquirido inmediatamente, 0 si esta en espera (la VM
+ *         registra el proceso en la cola del monitor; cuando se libere,
+ *         el scheduler lo despierta).
+ */
+int32_t vrt_monitor_enter(vrt_proc *proc, vrt_handle obj);
+
+/**
+ * @brief Libera el monitor (decrementa lock_depth).
+ *
+ * Cuando lock_depth llega a 0, se publica el next waiter de la cola
+ * via vm.make_ready (despierta otro proceso esperando).
+ */
+void vrt_monitor_exit(vrt_proc *proc, vrt_handle obj);
+
+/**
+ * @brief Suspende el proceso liberando el monitor por completo.
+ *
+ * Equivalente a Object.wait() de Java.  El proceso queda en WAIT_IO
+ * hasta que otro hilo invoque @c vrt_monitor_notify o @c vrt_monitor_notify_all.
+ * Tras el wake debe re-adquirir el monitor.
+ */
+void vrt_monitor_wait(vrt_proc *proc, vrt_handle obj);
+
+/** @brief Despierta UN proceso de la cola de espera del monitor. */
+void vrt_monitor_notify(vrt_proc *proc, vrt_handle obj);
+
+/** @brief Despierta TODOS los procesos de la cola de espera. */
+void vrt_monitor_notify_all(vrt_proc *proc, vrt_handle obj);
+
+/* ========================================================================= */
+/* Excepciones (FatalError + tryenter/tryleave)                              */
+/* ========================================================================= */
+
+/**
+ * @brief Lanza un FatalError capturable o aborta.
+ * @param kind codigo de error (FATAL_NULL_POINTER=1, FATAL_OOM=2,
+ *             FATAL_ILLEGAL_INSTRUCTION=3, FATAL_USER_ABORT=11,
+ *             FATAL_SEGMENTATION_FAULT=7, FATAL_NATIVE_EXCEPTION=8,
+ *             FATAL_NATIVE_CRASH=9, etc.).
+ * @param message string C-style (puede ser NULL).
+ *
+ * Si hay un @c tryenter activo (cadena @c ExceptionFrame), salta al
+ * handler.  Si no, marca el proceso como muerto y dispara EVT_ERROR.
+ * Nunca retorna en codigo normal; el caller no debe asumir retorno.
+ */
+void vrt_throw_fatal(vrt_proc *proc, uint32_t kind, const char *message);
+
+/**
+ * @brief Push de un frame de manejo de excepciones.
+ *
+ * El handler_pc es la direccion absoluta del catch block (en bytecode
+ * para codigo interpretado, o en code cache para JIT-eado).  El
+ * type_class es el ClassInfo* a matchear; NULL = catch-all.  El RSP/
+ * RBP/frame_stack actuales se snapshotean para que el throw los
+ * restaure al saltar.
+ */
+void vrt_tryenter(vrt_proc *proc, uint64_t handler_pc, vrt_class *type_class);
+
+/** @brief Pop del tope del exc_frame_stack (salida normal del try). */
+void vrt_tryleave(vrt_proc *proc);
+
+/* ========================================================================= */
+/* FFI nativo                                                                */
+/* ========================================================================= */
+
+/**
+ * @brief Invoca una funcion nativa con N argumentos (0..12).
+ * @param fn puntero a la funcion nativa (resuelto via dlsym o estatico).
+ * @param argc numero de args (max 12).  Cada arg se toma de R1..R12.
+ * @param proc proceso actual (para acceder a registers / vm_mem).
+ * @return valor retornado por la nativa (0 si void).
+ *
+ * Misma calling convention que CALLN bytecode.  Cero overhead vs llamar
+ * la nativa directamente.  El caller debe garantizar argc <= 12.
+ */
+uint64_t vrt_invoke_native(void *fn, uint64_t argc, vrt_proc *proc);
+
+/* ========================================================================= */
+/* Dispatch dinamico (CALLVIRT desde codigo JIT)                              */
+/* ========================================================================= */
+
+/**
+ * @brief Dispatch dinamico de un metodo virtual desde codigo JIT.
+ *
+ * Equivalente runtime del opcode bytecode @c callvirt: dado un objeto
+ * (host_ptr al payload) y un indice de vtable, resuelve el MethodInfo
+ * via @c obj->class_ptr->vtable[idx] y dispatcha:
+ *   - Si @c method->jit_code != nullptr -> @c enter_jit() directo
+ *     (codigo nativo, calling convention VM_ABI).
+ *   - Si no -> setea @c proc->registers.rip al entry bytecode del
+ *     metodo y deja que el interprete lo ejecute.  Para JIT que ya
+ *     esta en native, esto implica suspender la ejecucion JIT actual
+ *     y volver al scheduler.  Para v1, este path retorna 0 y deja
+ *     el dispatch al interpreter via el flag de blocking.
+ *
+ * Calling convention de la METHOD invocada (igual que CALLVIRT):
+ *   - R1 = obj_host_ptr (this).
+ *   - R2..R12 = argumentos (max 11 args).
+ *   - R15 = argc + 1.
+ *   - Resultado en R0 al retornar.
+ *
+ * @param proc proceso actual.
+ * @param obj_payload host_ptr al payload del objeto receiver.
+ * @param vtbl_idx indice del slot en @c ClassInfo::vtable.
+ * @return valor de retorno del metodo (leido de @c proc->registers.regs[0]).
+ *         O 0 si fallo el dispatch (e.g. obj nulo, clase nula, idx fuera de rango).
+ *
+ * Throws @c FATAL_NULL_POINTER si @c obj_payload es nullptr, o
+ * @c FATAL_ILLEGAL_INSTRUCTION si vtbl_idx es invalido / metodo abstracto.
+ */
+uint64_t vrt_callvirt(vrt_proc *proc, uint8_t *obj_payload, uint32_t vtbl_idx);
+
+/**
+ * @brief CALLVIRT con Inline Cache.  Igual que @c vrt_callvirt pero al final
+ *        actualiza el slot de cache pasado en @p ic_slot_addr con
+ *        (cls, jit_code) para que llamadas futuras al mismo call site
+ *        hagan dispatch directo sin pasar por esta funcion.
+ *
+ * El slot tiene 16 bytes:
+ *   - offset 0: cached_class_ptr
+ *   - offset 8: cached_jit_code
+ *
+ * Cuando ic_slot_addr == 0 o el metodo no es JIT-able (advice_chain,
+ * raw_asm complejo), NO actualiza el slot -> proximas llamadas seguiran
+ * yendo por miss path.
+ */
+uint64_t vrt_callvirt_ic(vrt_proc *proc, uint8_t *obj_payload,
+                          uint32_t vtbl_idx, uint64_t ic_slot_addr);
+
+/**
+ * @brief Dispatch dinamico via MethodInfo* (CALLM desde JIT).
+ *
+ * Equivalente runtime del opcode bytecode @c callm: dado un objeto
+ * (host_ptr al payload) y un puntero a @c MethodInfo, dispatcha
+ * directo sin usar vtable.  Usado por interfaces y
+ * reflexion runtime (Method.invoke).
+ *
+ * El metodo recibe la misma calling convention que CALLVIRT (R1=this,
+ * R2..R12=args, R15=argc+1).  El caller debe staged los args en
+ * @c proc->registers.regs[1..N+1] antes de invocar este wrapper.
+ *
+ * @param proc proceso actual.
+ * @param obj_payload host_ptr al payload del objeto receiver.
+ * @param method puntero al @c MethodInfo a invocar.
+ * @return valor de retorno del metodo (de @c proc->registers.regs[0]).
+ */
+uint64_t vrt_callm(vrt_proc *proc, uint8_t *obj_payload, void *method);
+
+/**
+ * @brief Invocacion de closure (CALLCLOSURE desde JIT).
+ *
+ * Equivalente runtime de @c callclosure / @c callrawclosure: invoca
+ * una closure dada como (fn_addr, env_addr).  Identica calling
+ * convention que CALLVM (args en R1..R12, argc en R15, env en R14).
+ *
+ * @param proc proceso actual.
+ * @param fn_addr direccion del codigo del cuerpo del closure (en bytecode VM).
+ * @param env_addr direccion del env block (VM o host, segun closure kind).
+ * @return valor de retorno (de @c proc->registers.regs[0]).
+ */
+uint64_t vrt_callclosure(vrt_proc *proc, uint64_t fn_addr, uint64_t env_addr);
+
+/**
+ * @brief CALLN nativo desde JIT (FFI estatico resuelto en runtime).
+ *
+ * Equivalente runtime de @c calln @Method("lib:fn"): resuelve el
+ * simbolo via Loader::resolve_native_symbol (cached por LibHandle*),
+ * setea los args desde @c proc->registers.regs[1..argc] y los pasa
+ * al wrapper invoke_native_unchecked.
+ *
+ * El caller debe colocar los args en @c proc->registers.regs[1..argc]
+ * y @c argc en R15 antes de invocar.
+ *
+ * @param proc proceso actual.
+ * @param lib_name nombre de la libreria (sin extension; ASCII).
+ * @param fn_name  nombre del simbolo a resolver.
+ * @return valor de retorno del wrapper nativo.
+ */
+uint64_t vrt_calln(vrt_proc *proc, const char *lib_name, const char *fn_name);
+
+/* ========================================================================= */
+/* Acceso a memoria VM (Phase D.3-G: vm_addr -> host_ptr translator)         */
+/* ========================================================================= */
+
+/**
+ * @brief Lectura de 8 bytes desde memoria VM virtual.
+ *
+ * Equivalente runtime del bytecode `mov rN, [rM]` cuando la direccion
+ * en rM es una VM addr (memoria virtual del proceso, no host).
+ * Delega a @c VirtualMemory::read_u64_fast que usa el page cache
+ * interno para hits secuenciales (~5 ns hit, ~50 ns miss).
+ *
+ * @param proc proceso actual.
+ * @param vaddr direccion virtual VM (no host).
+ * @return los 8 bytes leidos como uint64.
+ */
+uint64_t vrt_vm_read_u64(vrt_proc *proc, uint64_t vaddr);
+
+/**
+ * @brief Escritura de 8 bytes a memoria VM virtual.
+ *
+ * Equivalente runtime del bytecode `mov [rM], val` cuando la direccion
+ * en rM es una VM addr.  Delega a @c VirtualMemory::write_u64_fast.
+ *
+ * @param proc proceso actual.
+ * @param vaddr direccion virtual VM.
+ * @param value valor de 8 bytes a escribir.
+ */
+void vrt_vm_write_u64(vrt_proc *proc, uint64_t vaddr, uint64_t value);
+
+/* ========================================================================= */
+/* Class registry runtime entries (defclass/findclass/newobj/etc)            */
+/* ========================================================================= */
+
+/**
+ * @brief Lookup de clase por nombre (FindClassParams en vm_addr).
+ *
+ * @c FindClassParams ABI: 16 bytes en VM memory:
+ *   +0  [8] name_addr (VM addr)
+ *   +8  [4] name_len
+ *   +12 [4] _pad
+ *
+ * @return ClassInfo* o nullptr si no encontrada.
+ */
+vrt_class *vrt_findclass(vrt_proc *proc, uint64_t params_vaddr);
+
+/**
+ * @brief Crea instancia de una clase (newobj bytecode).
+ *
+ * Alloca un objeto del tamano de la clase via @c gc_heap.alloc,
+ * inicializa el header con @c class_ptr = cls.  Devuelve host_ptr
+ * al payload (post-header).
+ *
+ * @param proc proceso actual.
+ * @param cls puntero a la clase a instanciar.
+ * @return host_ptr al payload del objeto recien creado, o nullptr si OOM.
+ */
+uint8_t *vrt_newobj(vrt_proc *proc, vrt_class *cls);
+
+/**
+ * @brief Aloca un nuevo objeto y devuelve directamente el GcHandle.
+ *
+ * Combina @c vrt_newobj + @c vrt_gc_handle_for_ptr en una sola llamada,
+ * ahorrando una runtime entry call (~30-50 ns por @c new X()).  Util
+ * para JIT que necesita el handle (no el host_ptr) para luego pasar a
+ * @c gcderef.  Reduce la cadena `newobj + gc_handle_for_ptr` (2 calls)
+ * a una sola.
+ *
+ * @return GcHandle del objeto creado, o @c VRT_NULL_HANDLE si OOM.
+ */
+vrt_handle vrt_newobj_handle(vrt_proc *proc, vrt_class *cls);
+
+/**
+ * @brief Phase D.7.opt: registra un handle para un raw_ptr de objeto ya
+ *        alocado por bump-pointer inline en JIT.
+ *
+ * El JIT-eated codigo emite el bump-pointer + init de @c GcHeader +
+ * @c ObjectHeader inline.  Luego llama esta funcion para crear el
+ * handle.  Solo hace @c handles_.push_back + @c PtrHandleMap.insert.
+ * Coste medido: ~7 ns vs ~25 ns de @c vrt_newobj completo.
+ *
+ * @param proc ProcessVM cuyo gc_heap se actualiza.
+ * @param raw  Puntero host al GcHeader (no al payload) del objeto
+ *             recien alocado inline.
+ * @return Handle creado.  El JIT generalmente lo descarta porque ya
+ *         tiene el host_ptr; el handle se mantiene en la HandleTable
+ *         para que @c ptr_to_handle_ + conservative scan funcionen.
+ */
+uint64_t vrt_register_alloc(vrt_proc *proc, uint8_t *raw);
+
+/**
+ * @brief Define una nueva clase via DefClassParams (defclass bytecode).
+ *
+ * Llama a @c ClassRegistry::define_class con los params en VM memory.
+ * @return ClassInfo* recien creado (registrado en el registry).
+ */
+vrt_class *vrt_defclass(vrt_proc *proc, uint64_t params_vaddr);
+
+/**
+ * @brief Anyade un field a una clase (deffield bytecode).
+ *
+ * @return 1 si OK, 0 si fallo.
+ */
+int32_t vrt_deffield(vrt_proc *proc, vrt_class *cls, uint64_t params_vaddr);
+
+/**
+ * @brief Anyade un metodo a una clase (defmethod bytecode).
+ *
+ * @return vtable_index del metodo recien anadido, o UINT32_MAX si fallo.
+ */
+uint32_t vrt_defmethod(vrt_proc *proc, vrt_class *cls, uint64_t params_vaddr);
+
+/**
+ * @brief Anyade un advice a un metodo (addadvice bytecode).
+ *
+ * @return 1 si OK, 0 si fallo.
+ */
+int32_t vrt_addadvice(vrt_proc *proc, void *target_method, void *advice_method, uint8_t kind);
+
+/**
+ * @brief Lookup de metodo por nombre dentro de clase (findmethod).
+ *
+ * @return MethodInfo* o nullptr.
+ */
+void *vrt_findmethod(vrt_proc *proc, uint64_t params_vaddr);
+
+/**
+ * @brief Lookup de field por nombre dentro de clase (findfield).
+ *
+ * @return FieldInfo* o nullptr.
+ */
+void *vrt_findfield(vrt_proc *proc, uint64_t params_vaddr);
+
+/**
+ * @brief Registra debug info (file:line) para un metodo (setmethdbg).
+ *        Lee @c SetMethDebugParams de vm_mem[params_vaddr].
+ */
+void vrt_setmethdbg(vrt_proc *proc, uint64_t params_vaddr);
+
+/* ========================================================================= */
+/* Safepoint (Phase E - infrastructure stub)                                  */
+/* ========================================================================= */
+
+/**
+ * @brief Check de safepoint: si el flag global esta activo, bloquea
+ *        hasta que el GC complete su fase.
+ *
+ * Codigo JIT emite un @c vrt_safepoint_poll en cada loop back-edge y
+ * cada call site para garantizar que el GC pueda pausar el thread en
+ * tiempo limitado.  Coste fast path: ~2ns (cmp byte + jne).
+ *
+ * @note Stub en v1: la implementacion real llega en Phase E (D.2).
+ *       Hoy es no-op para no romper builds.
+ */
+void vrt_safepoint_poll(vrt_proc *proc);
+
+/**
+ * @brief Handler de safepoint invocado por codigo JIT-eado cuando
+ *        @c proc->safepoint_flag != 0.
+ *
+ * Es la rama lenta del poll.  El JIT emite:
+ *
+ *     cmp byte [rbx + 0], 0     ; safepoint_flag offset 0
+ *     je   continue
+ *     mov  rdi, rbx              ; (SysV) proc en rdi
+ *     call vrt_safepoint_handler
+ *   continue:
+ *
+ * Esta funcion:
+ *   1. Captura RBP del thread (frame pointer).
+ *   2. Marca el proceso como SAFEPOINT_ENTERED para que el GC sepa
+ *      que esta thread esta pausado en un punto seguro.
+ *   3. Wait sobre la condvar hasta que el GC termine y limpie el flag.
+ *   4. Retorna; el codigo JIT continua su ejecucion normal.
+ *
+ * Cero overhead en fast path (flag=0).  Coste solo cuando el GC
+ * realmente quiere pausar (typically 1 GC cycle de varios cientos
+ * de microsegundos).
+ *
+ * @note En Phase D.2-foundation es stub: solo limpia el flag y retorna
+ *       (sin coordinacion real con GC).  La integracion completa con
+ *       gc_heap.cpp::major_gc llega en D.2-integration.
+ */
+void vrt_safepoint_handler(vrt_proc *proc);
+
+/* ========================================================================= */
+/* Introspeccion / debug                                                      */
+/* ========================================================================= */
+
+/** @brief Version actual de la API (para checks runtime). */
+uint32_t vrt_api_version(void);
+
+/** @brief Obtiene la VM owner del proceso. */
+vrt_vm *vrt_proc_vm(vrt_proc *proc);
+
+/** @brief Obtiene el PID encoded del proceso (scheduler_id<<32 | local_pid). */
+uint64_t vrt_proc_pid(vrt_proc *proc);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* VESTA_RT_PUBLIC_H */

@@ -192,4 +192,56 @@ namespace runtime {
      */
     size_t build_stack_trace(ProcessVM *vm, char *out, size_t out_size);
 
+    // ---------------------------------------------------------------------
+    // OS-level access violation -> FatalError capturable.
+    //
+    // Cuando el bytecode dereferencia un puntero host invalido (el caso
+    // mas comun: `*null_host_ptr`, deref de un host_ptr stale tras free,
+    // o aritmetica que sale del bloque malloc'eado), el OS dispara un
+    // EXCEPTION_ACCESS_VIOLATION (Windows) o SIGSEGV (POSIX).  Sin la
+    // infraestructura de abajo, la VM entera crashea sin que el `try`
+    // del usuario lo atrape.
+    //
+    // El plan:
+    //   - install_host_av_handler() registra UN VEH global (Windows) /
+    //     SIGSEGV handler (POSIX) la primera vez que se llama.  Idempotente.
+    //   - El scheduler hace setjmp(proc->av_recovery_jmpbuf) antes de
+    //     cada batch de instrucciones y marca av_recovery_active=true.
+    //   - Define el thread-local @c g_executing_proc al inicio del batch.
+    //   - Si ocurre un AV durante la ejecucion: el handler lee el TLS,
+    //     verifica av_recovery_active y exc_frame_stack, guarda la
+    //     direccion del AV en proc->pending_av_addr, y dispara longjmp
+    //     (POSIX directamente; Windows via redireccion de RIP a un stub
+    //     que llama longjmp).
+    //   - Tras el longjmp, el scheduler llama throw_fatal con
+    //     FATAL_SEGMENTATION_FAULT.  El flujo normal de do_throw saltara
+    //     al handler `catch (FatalError e)` del usuario.
+    // ---------------------------------------------------------------------
+
+    /**
+     * @brief Instala el handler global de access violations.  Idempotente
+     *        (registra solo la primera llamada via std::once).
+     *
+     * Se llama desde el constructor de VM, tras init_exception_classes.
+     */
+    void install_host_av_handler() noexcept;
+
+    /**
+     * @brief Setea (o limpia con nullptr) el ProcessVM cuyo bytecode
+     *        esta corriendo en el thread actual.  Lo llama el scheduler
+     *        antes y despues de cada batch de instrucciones.
+     *
+     * El handler de AV consulta este TLS para identificar a quien
+     * enviar el longjmp.  Si esta a nullptr cuando ocurre un AV, el
+     * handler delega a la cadena de SEH normal (la VM crashea como
+     * antes).
+     */
+    void set_current_executing_process(ProcessVM *proc) noexcept;
+
+    /**
+     * @brief Devuelve el ProcessVM actualmente en ejecucion en este
+     *        thread, o nullptr si no hay ninguno.
+     */
+    ProcessVM *get_current_executing_process() noexcept;
+
 } // namespace runtime

@@ -56,6 +56,7 @@ namespace vex {
             case TokenKind::ISTR_BEGIN:      return "ISTR_BEGIN";
             case TokenKind::ISTR_TEXT:       return "ISTR_TEXT";
             case TokenKind::ISTR_EXPR_BEGIN: return "ISTR_EXPR_BEGIN";
+            case TokenKind::ISTR_EXPR_FMT:   return "ISTR_EXPR_FMT";
             case TokenKind::ISTR_EXPR_END:   return "ISTR_EXPR_END";
             case TokenKind::ISTR_END:        return "ISTR_END";
             case TokenKind::IDENTIFIER:      return "IDENTIFIER";
@@ -91,6 +92,10 @@ namespace vex {
             case TokenKind::KW_TREEMAP:      return "TreeMap";
             case TokenKind::KW_TREESET:      return "TreeSet";
             case TokenKind::KW_STACK:        return "Stack";
+            case TokenKind::KW_UNIQUE:       return "unique";
+            case TokenKind::KW_SHARED:       return "shared";
+            case TokenKind::KW_BORROW:       return "borrow";
+            case TokenKind::KW_BORROW_MUT:   return "borrow_mut";
             case TokenKind::KW_CONST:        return "const";
             case TokenKind::KW_STATIC:       return "static";
             case TokenKind::KW_FINAL:        return "final";
@@ -248,8 +253,10 @@ namespace vex {
                 VEX_KW_EXACT("asm",   TokenKind::KW_ASM);
                 break;
             case 'b':
-                VEX_KW_EXACT("bool",  TokenKind::KW_BOOL);
-                VEX_KW_EXACT("break", TokenKind::KW_BREAK);
+                VEX_KW_EXACT("bool",       TokenKind::KW_BOOL);
+                VEX_KW_EXACT("break",      TokenKind::KW_BREAK);
+                VEX_KW_EXACT("borrow_mut", TokenKind::KW_BORROW_MUT);
+                VEX_KW_EXACT("borrow",     TokenKind::KW_BORROW);
                 break;
             case 'c':
                 VEX_KW_EXACT("char",     TokenKind::KW_CHAR);
@@ -326,6 +333,7 @@ namespace vex {
                 VEX_KW_EXACT("super",        TokenKind::KW_SUPER);
                 VEX_KW_EXACT("spawn",        TokenKind::KW_SPAWN);
                 VEX_KW_EXACT("synchronized", TokenKind::KW_SYNCHRONIZED);
+                VEX_KW_EXACT("shared",       TokenKind::KW_SHARED);
                 break;
             case 't':
                 VEX_KW_EXACT("this",    TokenKind::KW_THIS);
@@ -344,6 +352,7 @@ namespace vex {
                 VEX_KW_EXACT("uint32_t", TokenKind::KW_UINT32_T);
                 VEX_KW_EXACT("uint64_t", TokenKind::KW_UINT64_T);
                 VEX_KW_EXACT("using",    TokenKind::KW_USING);
+                VEX_KW_EXACT("unique",   TokenKind::KW_UNIQUE);
                 break;
             case 'v':
                 VEX_KW_EXACT("void", TokenKind::KW_VOID);
@@ -912,6 +921,50 @@ namespace vex {
                                 string_emit_queue_.push_back(std::move(tend));
                                 break;
                             }
+                        } else if (inner.kind == TokenKind::COLON && depth == 1) {
+                            // Format spec: tras `:` capturamos texto raw
+                            // hasta el `}` de cierre, sin tokenizar.  El
+                            // formato se almacena en @c str_val del
+                            // token ISTR_EXPR_FMT.  No permitimos `:`
+                            // como operador ternario dentro de la expr
+                            // (Vex no tiene ternario).  Si se necesita
+                            // un `:` dentro del formato (improbable),
+                            // habria que usar paren-balanced sub-spec.
+                            std::string fmt;
+                            const SourceLoc fmt_loc = inner.loc;
+                            // Saltar trivia inicial (espacios entre `:` y la
+                            // primera spec).
+                            while (pos_ < source_.size()) {
+                                const char fc = source_[pos_];
+                                if (fc == '}') {
+                                    Token tfmt = make_token(
+                                        TokenKind::ISTR_EXPR_FMT, "", fmt_loc);
+                                    tfmt.str_val = std::move(fmt);
+                                    string_emit_queue_.push_back(std::move(tfmt));
+                                    // Consumir `}` y emitir ISTR_EXPR_END.
+                                    SourceLoc rb_loc{filename_, line_, column_,
+                                                     (uint32_t)pos_, 1};
+                                    advance(); // consumir '}'
+                                    Token tend = make_token(
+                                        TokenKind::ISTR_EXPR_END, "", rb_loc);
+                                    string_emit_queue_.push_back(std::move(tend));
+                                    depth = 0;
+                                    break;
+                                }
+                                if (fc == '\n') {
+                                    error_at(fmt_loc,
+                                        "salto de linea dentro del formato ${...:fmt}");
+                                    break;
+                                }
+                                fmt.push_back(fc);
+                                advance();
+                            }
+                            if (depth != 0) {
+                                error_at(fmt_loc,
+                                    "interpolacion ${...:fmt} sin '}' de cierre");
+                                depth = 0;
+                            }
+                            break;
                         }
                         string_emit_queue_.push_back(std::move(inner));
                     }

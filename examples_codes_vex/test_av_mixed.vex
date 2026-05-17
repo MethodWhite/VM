@@ -1,0 +1,43 @@
+void main() {
+    println("=== mix: panic + AV + null en mismo try ===");
+
+    // Test 1: panic dentro de try.
+    try {
+        panic("manual panic");
+    } catch (FatalError e) {
+        println("panic caught kind=${e.kind}");
+        print_cstr(e.message);
+        println("");
+    }
+
+    // Test 2: AV dentro de try anidado (try inside try).
+    try {
+        try {
+            i64* bad = (i64*)0xCAFEBABE;
+            i64 v = *bad;
+            println("nunca: ${v}");
+        } catch (FatalError inner) {
+            println("inner caught: kind=${inner.kind}");
+            // re-throw via panic
+            panic("rethrow desde inner");
+        }
+        println("nunca: tras inner");
+    } catch (FatalError outer) {
+        println("outer caught: kind=${outer.kind}");
+        print_cstr(outer.message);
+        println("");
+    }
+
+    // Test 3: AV despues de operaciones normales en el mismo try.
+    try {
+        i64 ok = 100;
+        println("antes del AV: ${ok}");
+        i64* bad = (i64*)0;
+        *bad = 99;     // write AV
+        println("nunca");
+    } catch (FatalError e) {
+        println("write AV caught: kind=${e.kind}");
+    }
+
+    println("=== fin ===");
+}

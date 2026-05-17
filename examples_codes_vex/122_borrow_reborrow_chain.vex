@@ -1,0 +1,21 @@
+// Test F3 ext - Cadena de reborrows mut (3 niveles):
+//   m1 -> m2 -> m3.  Cada reborrow suspende al anterior.
+//   Al dropear m3 (NLL), m2 se restaura como activo; al dropear m2,
+//   m1 vuelve.  Stack de suspensiones funciona correctamente.
+
+i32 main() {
+    unique<i32> owner = unique_box(10);
+
+    borrow_mut<i32> m1 = lend_mut(owner);     // owner -> Mut(m1)
+    borrow_mut<i32> m2 = lend_mut(m1);        // push m1, owner -> Mut(m2)
+    borrow_mut<i32> m3 = lend_mut(m2);        // push m2, owner -> Mut(m3)
+
+    write_borrow(m3, 32);                     // muta via m3
+    i32 v3 = read_borrow(m3);                 // ultimo uso m3
+    // <- NLL drop m3: pop m2 -> owner = Mut(m2)
+    // (no podemos verificar m2/m1 sin re-usarlos; los validamos solo
+    // mediante que NO hay errores de compilacion.)
+
+    if (v3 != 32) return 99;
+    return 42;
+}

@@ -162,9 +162,15 @@ namespace Assembly::Bytecode {
 
         // si este caso se da, quiere decir que el operando usa un inmediato que se mueve a memoria, por ejemplo:
         // adds [r0], 0x1000
+        // tambien cubre anotaciones @Absolute/@Relative/@Method como inmediatos (el linker
+        // sobreescribe el placeholder al resolver el simbolo).
         if (mode == AddressingMode::MEM) {
             if (auto s = dynamic_cast<vm::NumberOperand *>(ops[1].get())) {
                 mode = AddressingMode::INMED;
+            } else if (auto s = dynamic_cast<vm::AnnotationNode *>(ops[1].get())) {
+                if (s->key == "Method" || s->key == "Relative" || s->key == "Absolute") {
+                    mode = AddressingMode::INMED;
+                }
             }
         }
 
@@ -201,6 +207,18 @@ namespace Assembly::Bytecode {
 
     void Assembler::emit_instruction(const vm::Instruction *instr) {
         const auto &info = select_variant(instr->opcode, instr->operands);
+
+        // Si la instruccion tiene linea fuente Vex registrada por el
+        // parser (capturada del marcador `// @line N` del lexer),
+        // anadirla a la tabla debug del Context.  El offset que
+        // guardamos es el del INICIO de la instruccion en el bytecode
+        // del modulo.  El linker convierte mas tarde a offset absoluto
+        // dentro del .velb sumando module_base_offset.
+        if (instr->source_line > 0) {
+            ctx.debug_lines.push_back(
+                {static_cast<uint32_t>(output.offset),
+                 static_cast<uint32_t>(instr->source_line)});
+        }
 
         // 1 opcode1
         output.emit8(info.opcode1);

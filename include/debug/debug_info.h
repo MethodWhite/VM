@@ -260,6 +260,25 @@ namespace debug {
         std::vector<VarInfo> lookup_vars(uint32_t bytecode_offset) const;
 
         /**
+         * @brief Traduce (file, line) -> bytecode_offset (busqueda inversa).
+         *
+         * Util para resolver breakpoints emitidos por el cliente como
+         * "file.vex:42" a un offset concreto que el server pueda usar
+         * con SET_BREAK.  El match del file es por sufijo: "foo.vex"
+         * matchea cualquier path que termine en "foo.vex".  Si
+         * @p line_target es 0 devuelve el primer offset del file.  Si
+         * la linea exacta no esta en la tabla, devuelve el offset de
+         * la siguiente linea conocida (>= target).  Devuelve UINT32_MAX
+         * si no hay match.
+         *
+         * @param file_target Nombre o sufijo del archivo fuente.
+         * @param line_target Numero de linea (1-based).  0 = primera linea.
+         * @return bytecode_offset o UINT32_MAX si no se encuentra.
+         */
+        uint32_t lookup_offset_for_line(const std::string &file_target,
+                                         uint32_t           line_target) const;
+
+        /**
          * @brief Devuelve el nombre del scope que contiene el offset de bytecode.
          *
          * Solo disponible para nivel 3.  Devuelve el nombre del scope mas interno

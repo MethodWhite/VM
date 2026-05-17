@@ -125,6 +125,149 @@ namespace gc {
     static constexpr GcHandle GC_NULL_HANDLE = UINT32_MAX;
 
     /**
+     * @class PtrHandleMap
+     * @brief Hash table flat open-addressing optimizada para
+     *        @c uint8_t* -> @c GcHandle.
+     *
+     * Reemplaza @c std::unordered_map<const uint8_t*, GcHandle> para el
+     * hot path del GC: inserts en @c new_handle, erases en
+     * @c release_handle / minor_gc sweep, finds en @c scan_stack_roots.
+     * std::unordered_map usa node-based allocation (1 malloc por insert
+     * ~10-15 ns).  Esta variante usa un solo @c std::vector<Entry>
+     * contiguo (cache-friendly + cero allocs por insert despues del
+     * grow inicial).
+     *
+     * = Algoritmo =
+     * - Buckets potencia de 2 (mask = capacity - 1).
+     * - Hash: @c (ptr >> 3) (los punteros host son 8-aligned).
+     * - Linear probing.
+     * - Tombstones para erase (key == reinterpret_cast<uint8_t*>(1)).
+     * - Resize a 2x cuando load > 0.5.
+     *
+     * Coste medio por operacion: ~5 ns vs ~20-30 ns de @c unordered_map.
+     */
+    class PtrHandleMap {
+    public:
+        struct Entry {
+            const uint8_t *key;
+            GcHandle       value;
+        };
+
+        PtrHandleMap();
+        ~PtrHandleMap() = default;
+
+        /** @brief Inserta o sobreescribe.  Retorna true si era nuevo. */
+        bool insert_or_assign(const uint8_t *key, GcHandle h);
+
+        /** @brief Busca el handle.  Retorna @c GC_NULL_HANDLE si no existe. */
+        GcHandle find(const uint8_t *key) const noexcept;
+
+        /** @brief Elimina la entrada.  Retorna true si existia. */
+        bool erase(const uint8_t *key);
+
+        /** @brief Tamano actual (numero de entradas vivas). */
+        size_t size() const noexcept { return live_count_; }
+
+        /** @brief True si vacio. */
+        bool empty() const noexcept { return live_count_ == 0; }
+
+        /** @brief Limpia todas las entradas (mantiene la capacidad). */
+        void clear();
+
+        /** @brief Reserva capacidad para al menos @p n entries. */
+        void reserve(size_t n);
+
+    private:
+        /// Sentinelas en el campo @c key.
+        static constexpr const uint8_t *EMPTY     = nullptr;
+        static constexpr uintptr_t      TOMB_RAW  = 1;
+
+        static inline const uint8_t *tombstone() {
+            return reinterpret_cast<const uint8_t *>(TOMB_RAW);
+        }
+        static inline bool is_empty(const uint8_t *k) {
+            return k == EMPTY;
+        }
+        static inline bool is_tomb(const uint8_t *k) {
+            return reinterpret_cast<uintptr_t>(k) == TOMB_RAW;
+        }
+        static inline bool is_live(const uint8_t *k) {
+            return !is_empty(k) && !is_tomb(k);
+        }
+        static inline size_t hash_ptr(const uint8_t *k) noexcept {
+            const uintptr_t p = reinterpret_cast<uintptr_t>(k);
+            /* Pointers son 8-aligned -> shift 3 bits removes redundancia. */
+            return static_cast<size_t>(p >> 3);
+        }
+
+        void grow();
+
+        std::vector<Entry> table_;     ///< buckets (capacity = potencia de 2)
+        size_t             mask_       = 0;  ///< capacity - 1
+        size_t             live_count_ = 0;  ///< entradas vivas (no tombstones)
+        size_t             used_       = 0;  ///< slots ocupados (live + tombstones)
+        size_t             grow_at_    = 0;  ///< trigger grow cuando used > grow_at_
+    };
+
+    /**
+     * @brief Activa/desactiva el debug del GC en runtime.
+     *
+     * Cuando esta activado, las operaciones del GC (major_gc, minor_gc,
+     * release_handle, scan_stack_roots, evacuate, etc.) emiten trazas a
+     * stderr con prefijo @c [GC] indicando: que operacion, conteos, IDs de
+     * handles afectados, y valores relevantes para diagnostico.
+     *
+     * Activacion via:
+     *   - CLI: @c --gc-debug (afecta a todos los procesos de la VM)
+     *   - Env: @c VESTA_GC_DEBUG=1 (mismo efecto, alternativa para scripts)
+     *   - API: @c gc::set_gc_debug(true) desde codigo C++ o tests
+     *
+     * En modo debug: cada GC fire imprime `[GC] minor_gc count=N`,
+     * `[GC] major_gc count=N`, `[GC] sweep killed h=N`, etc.  Los traces
+     * usan @c fflush(stderr) por linea para sobrevivir a un crash.
+     *
+     * Default: false (silencioso).  Coste cuando esta apagado: cero
+     * (un branch predicho por instruccion clave).
+     */
+    void set_gc_debug(bool enabled) noexcept;
+    bool gc_debug_enabled() noexcept;
+
+    /**
+     * @brief Modo BUFFERED del debug GC.  Acumula trazas en buffer
+     *        thread-local de 64 KB y las flushea en bulk.
+     *
+     * Performance:
+     *   - Modo default (unbuffered):  ~2 us / linea (write syscall directo).
+     *   - Modo buffered:              ~100 ns / linea amortizado (memcpy +
+     *                                 1 write syscall por 64 KB de trazas).
+     *
+     * Tradeoff: en modo buffered los ULTIMOS 64 KB de trazas pueden perderse
+     * si el VM crashea (no estan flushed a disco).  El atexit handler hace
+     * flush al salir limpio; gc_debug_flush() puede invocarse desde signal
+     * handlers o pre-crash hooks para forzar flush.
+     *
+     * Activacion:
+     *   - CLI: @c --gc-debug-buffered
+     *   - Env: @c VESTA_GC_DEBUG_BUFFERED=1
+     *   - API: @c set_gc_debug_buffered(true)
+     *
+     * Uso recomendado: BUFFERED para diagnosticos largos (millones de trazas)
+     * en programas estables.  UNBUFFERED para diagnosticos de crash donde
+     * cada linea importa.
+     */
+    void set_gc_debug_buffered(bool enabled) noexcept;
+    bool gc_debug_buffered_enabled() noexcept;
+
+    /**
+     * @brief Flush manual del buffer del GC debug.  Util para signal
+     *        handlers o pre-crash hooks: garantiza que las trazas
+     *        acumuladas en buffer vayan a disco antes de un posible crash.
+     *
+     * En modo unbuffered es no-op (las trazas ya estan en disco).
+     */
+    void gc_debug_flush() noexcept;
+
+    /**
      * @brief Estado del objeto dentro del algoritmo de marcado tri-color.
      *
      * Los valores estan codificados en 2 bits dentro de GcHeader para minimizar
@@ -241,6 +384,26 @@ namespace gc {
         uint64_t old_alloc_freelist = 0; /**< alloc_in_old satisfechos via free list (rapido). */
         uint64_t old_alloc_bump     = 0; /**< alloc_in_old satisfechos via bump pointer. */
         uint64_t old_alloc_newblock = 0; /**< alloc_in_old que requirieron crear bloque nuevo. */
+
+        /* ---- metricas de precise vs conservative scan ---- */
+        /**
+         * @brief Numero de roots GC marcados por el precise scan de JIT
+         *        frames durante el ultimo major_gc.  Acumula a traves de
+         *        multiples GC cycles.
+         *
+         * En coexistencia con el conservativo:
+         *   - precise_roots_marked: handles encontrados en stackmaps de
+         *     JIT frames.  Cero si no hay JIT frames activos.
+         *   - conservative_roots_marked: handles encontrados por el scan
+         *     conservativo (incluye los precise + otros del interp).
+         *
+         * Comparacion empirica: si `precise_roots_marked > 0` y
+         * `conservative_roots_marked - precise_roots_marked` es razonable
+         * (los del interp), la integracion es correcta.
+         */
+        uint64_t precise_roots_marked     = 0;
+        uint64_t conservative_roots_marked = 0;
+        uint64_t precise_frames_scanned   = 0; /**< JIT frames walked en total. */
     };
 
     /**
@@ -389,6 +552,68 @@ namespace gc {
                                std::vector<GcHandle> &worklist);
 
         /**
+         * @brief precise scan de JIT frames.
+         *
+         * Camina la cadena RBP nativa desde @c __builtin_frame_address(0)
+         * de @c major_gc.  Por cada JIT frame (identificado via
+         * @c jit::JitRegistry::lookup), busca su stackmap y marca los
+         * slots GC como roots vivos.
+         *
+         * Coexistencia con conservativo:
+         *   - Ambos scans corren ADDITIVE: precise anade roots que el
+         *     conservativo accidentalmente pudo no marcar (estabilidad
+         *     adicional) y viceversa.
+         *   - Cuando los stackmaps esten battle-tested, Fase 2-lean
+         *     excluira rangos JIT del conservativo para eliminar false
+         *     positives.
+         *
+         * Si @c jit::JitRegistry esta vacio (no hay JIT funcs cargadas)
+         * la funcion retorna inmediatamente sin walk -- coste cero pre-D.3.
+         *
+         * @param worklist worklist BFS donde se anaden los handles
+         *                 precise marcados como BLACK.
+         */
+        void scan_jit_roots_precise(std::vector<GcHandle> &worklist);
+
+        /**
+         * @brief Intenta marcar un handle como root precise (BLACK + push
+         *        worklist) si es valido + vivo + actualmente WHITE.
+         * @return true si lo marco, false si no era root valido.
+         */
+        bool try_mark_precise_handle(GcHandle h,
+                                     std::vector<GcHandle> &worklist);
+
+        /**
+         * @brief Recorre stack y GP regs reescribiendo host_ptrs de objetos YoungGen
+         *        evacuados a sus nuevas addresses en OldGen.
+         *
+         * Llamado al final de @c minor_gc(), DESPUES de @c do_evacuate.  Para
+         * cada slot 8-bytes-aligned del stack y para cada GP reg (R0..R15),
+         * comprueba si el valor es un host_ptr en @c forward_table_; si si,
+         * escribe la nueva address.
+         *
+         * Esto elimina la limitacion historica "host_ptrs locales pueden
+         * invalidarse tras GC": las locales CLASS del bytecode (cuyo valor
+         * es el host_ptr al payload tras gcderef) quedan automaticamente
+         * actualizados al evacuarse el objeto.  Sin esto, el bytecode
+         * tenia que volver a llamar gcderef tras cada call que pudiera
+         * disparar GC -> overhead inaceptable.
+         *
+         * Coste: O(stack_size_bytes/8) lookups en hashmap (typ. ~100 us)
+         * + O(num_regs) (16 lookups).  Solo se llama si `forward_table_`
+         * tiene entries (caso comun: pocos objetos sobrevivieron al minor).
+         *
+         * @param rsp_lo     RSP minimo visto desde el ultimo GC.  Limita el rango.
+         * @param stack_high Top del stack (inmutable, configurado al spawn).
+         * @param regs       Array de los 16 GP regs (R0..R15) modificable.
+         * @param vm_mem     VirtualMemory del proceso para read/write 64-bit.
+         */
+        void update_stack_forwards(uint64_t rsp_lo,
+                                    uint64_t stack_high,
+                                    uint64_t regs[16],
+                                    vm::VirtualMemory &vm_mem);
+
+        /**
          * @brief registra un handle como root temporal "en construccion".
          *
          * Usado por @c alloc() entre el momento de crear el handle y el
@@ -431,6 +656,63 @@ namespace gc {
          *          Usar el handle para reconvertir si es necesario.
          */
         uint8_t *deref(GcHandle handle);
+
+        /**
+         * @brief Numero total de slots de la HandleTable (incluye libres).
+         *
+         * Para iterar handles vivos:
+         * @code
+         *   for (size_t i = 0; i < heap.handle_table_size(); ++i) {
+         *       if (heap.is_handle_live(static_cast<GcHandle>(i))) {
+         *           uint8_t *p = heap.deref(static_cast<GcHandle>(i));
+         *           ...
+         *       }
+         *   }
+         * @endcode
+         *
+         * Coste O(1).  Util principalmente para el debugger TCP que
+         * expone la lista de handles vivos al cliente VSH.
+         */
+        size_t handle_table_size() const noexcept { return handles_.size(); }
+
+        /**
+         * @brief @c true si el handle apunta a un objeto vivo.
+         *
+         * Usado por el debugger para iterar la HandleTable sin acceso
+         * directo a los campos privados.  Coste O(1).
+         */
+        bool is_handle_live(GcHandle handle) const noexcept {
+            return handle < handles_.size() && handles_[handle].live;
+        }
+
+        /**
+         * @brief Tamano del payload del objeto referenciado por handle.
+         *
+         * Lee el campo @c size del @c GcHeader inmediatamente antes del
+         * payload.  Devuelve 0 si el handle es invalido o muerto.
+         */
+        uint32_t handle_payload_size(GcHandle handle) const noexcept {
+            if (handle >= handles_.size() || !handles_[handle].live
+             || !handles_[handle].addr) {
+                return 0;
+            }
+            const auto *h = reinterpret_cast<const GcHeader *>(
+                handles_[handle].addr);
+            return h->size;
+        }
+
+        /**
+         * @brief Generacion del objeto (YOUNG/OLD).
+         */
+        GcGen handle_generation(GcHandle handle) const noexcept {
+            if (handle >= handles_.size() || !handles_[handle].live
+             || !handles_[handle].addr) {
+                return GcGen::OLD;
+            }
+            const auto *h = reinterpret_cast<const GcHeader *>(
+                handles_[handle].addr);
+            return h->gen;
+        }
 
         /**
          * @brief Lookup inverso: dado un puntero host al payload, devuelve el GcHandle.
@@ -733,13 +1015,32 @@ namespace gc {
             return stats_;
         }
 
-    private:
-        vm::ArenaManager &arena_mgr_;
+        /**
+         * @brief Phase D.7.opt: wrapper publico de @c new_handle para que
+         *        @c vrt_register_alloc lo invoque tras inlinear bump-pointer.
+         *
+         * Solo debe usarse cuando el caller YA hizo bump-pointer + init de
+         * @c GcHeader + @c ObjectHeader.  Esta funcion SOLO crea el handle.
+         */
+        GcHandle register_alloc(uint8_t *raw) {
+            return new_handle(raw);
+        }
 
-        // --- Nursery ---
+    public:
+        // --- Nursery (publicos para inline bump-pointer en JIT) ---
+        //
+        // Phase D.7.opt: el JIT inlinea el fast path de alloc emitiendo
+        // accesos directos a @c nursery_bump_ y @c nursery_end_ via
+        // offset compile-time desde @c ProcessVM* (rbx en VM_ABI).
+        // Esto elimina la llamada a @c vrt_newobj para el caso comun
+        // (~5 ns inline vs ~20 ns runtime call).  Los demas usuarios
+        // siguen usando @c alloc() para preservar invariantes.
         uint8_t *nursery_base_     = nullptr; ///< Inicio del bloque Nursery.
         uint8_t *nursery_bump_     = nullptr; ///< Proximo byte libre (bump pointer).
         uint8_t *nursery_end_      = nullptr; ///< Fin del bloque Nursery.
+
+    private:
+        vm::ArenaManager &arena_mgr_;
         size_t   nursery_size_     = 0;       ///< Tamano total de la Nursery.
         uint64_t nursery_arena_id_ = 0;       ///< ID en ArenaManager para liberar al destruir.
 
@@ -803,7 +1104,10 @@ namespace gc {
         ///   - release_handle() => erase
         ///   - do_evacuate()   => erase old + insert new tras mover el objeto
         /// El payload pointer es estable mientras el objeto no se evacue.
-        std::unordered_map<const uint8_t *, GcHandle> ptr_to_handle_;
+        /* Phase D.7.opt: reemplazado @c std::unordered_map por un flat
+         * hash map open-addressing para el hot path del GC (new_handle/
+         * release_handle ~20-30 ns -> ~5 ns por op). */
+        PtrHandleMap ptr_to_handle_;
 
         // --- Tabla de referencias debiles ---
         std::vector<WeakEntry> weak_table_; ///< Referencias debiles indexadas por uint32_t.
@@ -815,6 +1119,24 @@ namespace gc {
 
         // --- RememberedSet ---
         std::unordered_set<GcHandle> remembered_set_; ///< Handles OLD con referencias a YOUNG.
+
+        // --- Tabla de forwarding pointers (Cheney-style) ---
+        /// Mapa <young_payload_addr, old_payload_addr> poblado por do_evacuate
+        /// cuando un objeto YoungGen se mueve a OldGen.  Sirve para que
+        /// `update_stack_forwards` (llamado al final de minor_gc) recorra
+        /// el stack del proceso y los GP regs, y reemplace cada slot que
+        /// contenga un host_ptr a YoungGen evacuada por su nuevo address
+        /// en OldGen (estable, non-moving).
+        ///
+        /// Sin esto, los locales del bytecode que mantienen host_ptrs a
+        /// objetos CLASS (resultado de `gcderef` tras NEWOBJ) quedan
+        /// dangling tras un minor_gc que evacua sus objetos -> SEGFAULT
+        /// al siguiente field access.  La alternativa (mantener handles
+        /// en lugar de host_ptrs) costaria 1 gcderef por field access.
+        ///
+        /// Se vacia al final de cada minor_gc.  Coste por GC:
+        /// O(num_evacuated_objects) inserts + O(stack_size_bytes/8) lookups.
+        std::unordered_map<const uint8_t *, const uint8_t *> forward_table_;
 
         // --- External roots (write-barrier para colecciones nativas) ---
         /// Handles GC referenciados por estructuras nativas (ej. ArrayList<string>

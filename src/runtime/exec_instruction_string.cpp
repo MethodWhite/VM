@@ -60,6 +60,8 @@
 
 #include "runtime/exec_instruction.h"
 #include "runtime/proceso_runtime.h"
+#include "runtime/runtime.h"           // para acceder a vm->scheduler.vm_reference.script_args
+#include "runtime/scheduler.h"
 #include "runtime/string_intern.h"
 #include "gc/gc_heap.h"
 #include "loader/oop_types.h"
@@ -559,6 +561,58 @@ void exec_instr_strmake(ProcessVM *vm, const DecodedInstr &instr) {
     }
 
     h = auto_intern(vm, h, final_data, final_byte_len, final_enc); // internado automatico
+    vm->registers.regs[r_dst].qword(static_cast<uint64_t>(h));
+}
+
+// =========================================================================
+// 0x55  STRMAKE_H r_dst, r_src, r_len
+// Encoding FIXED_4: ctrl=(r_dst<<4)|r_src, byte3=(enc<<4)|r_len
+// =========================================================================
+
+/**
+ * @brief Ejecuta STRMAKE_H: crea un StringObject FLAT desde un buffer HOST.
+ *
+ * Variante de STRMAKE (0x46) que lee directamente desde la memoria del
+ * proceso host (puntero crudo, no direccion VM).  Util cuando el buffer
+ * fuente proviene de @c malloc, @c gcallocp, @c str_cstr, etc.
+ *
+ * Aplica las mismas reglas que STRMAKE: compactacion HotSpot, internado
+ * automatico, encoding por defecto UTF-8.
+ */
+void exec_instr_strmake_h(ProcessVM *vm, const DecodedInstr &instr) {
+    const uint8_t r_dst = (instr.data_instruction.reg_data.reg1 >> 4) & 0xF;
+    const uint8_t r_src =  instr.data_instruction.reg_data.reg1       & 0xF;
+    const uint8_t r_len = (instr.data_instruction.reg_data.reg2 >> 4) & 0xF;
+
+    uint64_t host_addr = vm->registers.regs[r_src].qword();
+    uint32_t byte_len  = static_cast<uint32_t>(vm->registers.regs[r_len].qword());
+    auto enc = loader::StringEncoding::UTF8;
+
+    // leer bytes desde memoria HOST (puntero crudo).  El usuario es responsable
+    // de garantizar que [host_addr, host_addr+byte_len) sea memoria valida y
+    // accesible; si no lo es, el deref disparara un AV capturable via try/catch
+    // (FATAL_SEGMENTATION_FAULT en la instalacion del VEH/sigaction).
+    std::vector<uint8_t> buf(byte_len);
+    const uint8_t *src = reinterpret_cast<const uint8_t *>(host_addr);
+    for (uint32_t i = 0; i < byte_len; ++i)
+        buf[i] = src[i];
+
+    loader::StringEncoding final_enc = enc;
+    std::vector<uint8_t>   compact_buf;
+    uint32_t compact_len = byte_len;
+    bool compacted = try_compact(buf.data(), byte_len, enc, final_enc, compact_buf, compact_len);
+    const uint8_t *final_data = compacted ? compact_buf.data() : buf.data();
+    uint32_t final_byte_len   = compacted ? compact_len         : byte_len;
+
+    uint32_t length = count_codepoints(final_data, final_byte_len, final_enc);
+
+    gc::GcHandle h = alloc_flat(vm, final_data, final_byte_len, length, final_enc);
+    if (h == gc::GC_NULL_HANDLE) {
+        vm->registers.regs[r_dst].qword(static_cast<uint64_t>(gc::GC_NULL_HANDLE));
+        return;
+    }
+
+    h = auto_intern(vm, h, final_data, final_byte_len, final_enc);
     vm->registers.regs[r_dst].qword(static_cast<uint64_t>(h));
 }
 
@@ -1098,6 +1152,102 @@ void exec_instr_strfinalize(ProcessVM *vm, const DecodedInstr &instr) {
     loader::str_hash_compute(s);   // calcular inmediatamente
     // garantizar terminador nulo tras el nuevo contenido
     loader::str_data(s)[new_byte_len] = 0;
+}
+
+// =========================================================================
+// 0x6B  GETARGC   r_dst                  - argv: numero de argumentos
+// 0x6C  GETARG    r_dst, r_idx           - argv: arg[i] como StringObject
+// =========================================================================
+
+/**
+ * @brief Ejecuta GETARGC: deposita el numero de argumentos del script en r_dst.
+ *
+ * Lee `vm->scheduler.vm_reference.script_args.size()` y lo escribe como
+ * uint64 en el registro destino.  Permite que un programa Vex consulte
+ * argc via el builtin `args_count()` que baja a esta instruccion.
+ *
+ * No falla nunca; si no hay args, devuelve 0.
+ *
+ * @param vm    Proceso virtual.
+ * @param instr Instruccion decodificada.  reg1 = registro destino.
+ */
+void exec_instr_getargc(ProcessVM *vm, const DecodedInstr &instr) {
+    const uint8_t r_dst = instr.data_instruction.reg_data.reg1;
+    const auto&   args  = vm->scheduler.vm_reference.script_args;
+    vm->registers.regs[r_dst].qword(static_cast<uint64_t>(args.size()));
+}
+
+// =========================================================================
+// 0x6E  GETMETHAT r_class, r_idx       - variante reg-reg de getmethod
+// 0x6F  GETFLDAT  r_class, r_idx       - variante reg-reg de getfield
+// =========================================================================
+// El opcode existente getmethod 0xD9 toma idx como inmediato (rango 0..255)
+// lo cual no permite iteracion dinamica desde Vex.  Estos opcodes nuevos
+// toman idx en registro para que `getMethodAt(cls, i)` funcione con i
+// runtime.  Mismo comportamiento: R00 = &cls->methods[idx] o 0 si fuera de
+// rango / nulo.
+
+void exec_instr_getmethat(ProcessVM *vm, const DecodedInstr &instr) {
+    const uint8_t r_cls = instr.data_instruction.reg_data.reg1;
+    const uint8_t r_idx = instr.data_instruction.reg_data.reg2;
+    auto *cls = reinterpret_cast<loader::ClassInfo *>(vm->registers.regs[r_cls].qword());
+    const uint64_t idx = vm->registers.regs[r_idx].qword();
+    if (cls == nullptr || idx >= cls->method_count) {
+        vm->registers.regs[R00].qword(0);
+        return;
+    }
+    vm->registers.regs[R00].qword(reinterpret_cast<uint64_t>(&cls->methods[idx]));
+}
+
+void exec_instr_getfldat(ProcessVM *vm, const DecodedInstr &instr) {
+    const uint8_t r_cls = instr.data_instruction.reg_data.reg1;
+    const uint8_t r_idx = instr.data_instruction.reg_data.reg2;
+    auto *cls = reinterpret_cast<loader::ClassInfo *>(vm->registers.regs[r_cls].qword());
+    const uint64_t idx = vm->registers.regs[r_idx].qword();
+    if (cls == nullptr || idx >= cls->field_count) {
+        vm->registers.regs[R00].qword(0);
+        return;
+    }
+    vm->registers.regs[R00].qword(reinterpret_cast<uint64_t>(&cls->fields[idx]));
+}
+
+/**
+ * @brief Ejecuta GETARG: aloca un StringObject con el contenido del arg i-esimo.
+ *
+ * Lee el indice de `r_idx`, valida rango, y aloca un StringObject FLAT
+ * en el GcHeap (via alloc_pinned) con los bytes del arg correspondiente.
+ * Encoding por defecto: UTF-8 (la VM asume args UTF-8 desde main.cpp).
+ *
+ * En caso de indice fuera de rango o fallo de alocacion, devuelve
+ * GC_NULL_HANDLE (0) que el frontend Vex interpretara como string vacio /
+ * nulo (la verificacion de rango debe hacerla el llamador con
+ * `args_count()` antes).
+ *
+ * @param vm    Proceso virtual.
+ * @param instr Instruccion decodificada.  reg1 = dst, reg2 = idx.
+ */
+void exec_instr_getarg(ProcessVM *vm, const DecodedInstr &instr) {
+    const uint8_t r_dst = instr.data_instruction.reg_data.reg1;
+    const uint8_t r_idx = instr.data_instruction.reg_data.reg2;
+    const auto&   args  = vm->scheduler.vm_reference.script_args;
+    const uint64_t idx  = vm->registers.regs[r_idx].qword();
+
+    if (idx >= args.size()) {
+        vm->registers.regs[r_dst].qword(0);  // GC_NULL_HANDLE
+        return;
+    }
+
+    const std::string& s = args[idx];
+    // Conteo de code points UTF-8.  Para ASCII puro coincide con byte_len;
+    // para UTF-8 multi-byte lo recalcula la helper count_codepoints.
+    const auto* data = reinterpret_cast<const uint8_t*>(s.data());
+    uint32_t byte_len = static_cast<uint32_t>(s.size());
+    uint32_t length   = count_codepoints(data, byte_len,
+                                         loader::StringEncoding::UTF8);
+
+    gc::GcHandle h = alloc_flat(vm, data, byte_len, length,
+                                loader::StringEncoding::UTF8);
+    vm->registers.regs[r_dst].qword(static_cast<uint64_t>(h));
 }
 
 } // namespace runtime

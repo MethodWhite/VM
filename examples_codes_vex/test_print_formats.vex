@@ -1,0 +1,73 @@
+class Foo {
+    i32 x;
+    Foo(i32 x) {
+        this.x = x;
+    }
+}
+
+void main() {
+    // 1. Decimal (default).
+    println("dec 42 = ${42}");
+
+    // 2. Hex (16-digit fixed).
+    print("hex 42 = ");
+    print_hex(42);
+    println("");
+
+    // 3. Binary (compact, no leading zeros).
+    print("bin 42 = ");
+    print_bin(42);
+    println("");
+    print("bin 0xff = ");
+    print_bin(0xff);
+    println("");
+
+    // 4. Octal.
+    print("oct 42 = ");
+    print_oct(42);
+    println("");
+    print("oct 0xff = ");
+    print_oct(0xff);
+    println("");
+
+    // 5. Pointer printing - host pointer.
+    i64* p = malloc(8);
+    *p = 99;
+    print("host ptr p = ");
+    print_ptr(p);
+    println("");
+    free(p);
+
+    // 6. VirtualPtr printing.
+    i64 v = 77;
+    VirtualPtr<i64> vp = &v;
+    print("virtual ptr vp = ");
+    print_ptr(vp);
+    println("");
+
+    // 7. Pointer in interpolation.
+    i64* p2 = malloc(8);
+    println("ptr via interp: ${p2}");
+    free(p2);
+
+    // 8. GC handle of class object.
+    Foo f = new Foo(123);
+    print("gchandle f = ");
+    print_gchandle(f);
+    println("");
+    println("class via interp: ${f}");
+
+    // 9. Padding for alignment.
+    print("[");
+    print_pad(32, 5); // 5 spaces
+    print("]");
+    println("");
+    print("[name");
+    print_pad(46, 6); // 6 dots ('.')
+    println("]");
+
+    print("num=42, padded:");
+    print_pad(32, 8);
+    print_int(42);
+    println("");
+}

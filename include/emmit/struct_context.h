@@ -649,6 +649,24 @@ namespace Assembly::Bytecode {
                 sp.compute_sections_ranges(bytes_aligned);
             }
         }
+
+        // === Tabla de debug (modulo-local) ===
+        // Pares (byte_offset_dentro_del_modulo, source_line) acumulados
+        // por el Assembler al emitir cada Instruccion cuyo source_line > 0
+        // (i.e., compiladas con --vex-debug).  El linker los consume al
+        // ensamblar el .velb final, sumando module_base_offset al
+        // byte_offset para producir entradas DebugLineEntry con offsets
+        // absolutos dentro del .velb.
+        struct DebugLineRec {
+            uint32_t byte_offset; ///< offset dentro del bytecode del modulo
+            uint32_t source_line; ///< linea fuente Vex (1-based)
+        };
+        std::vector<DebugLineRec> debug_lines;
+
+        // Nombre del archivo fuente Vex que origino este modulo.  Se usa
+        // como `file_offset` (resuelto al strings blob) en la seccion
+        // debug del .velb.  Si vacio, el linker no escribe info de file.
+        std::string debug_source_file;
     } Context;
 
     /**

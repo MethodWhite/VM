@@ -1,0 +1,31 @@
+// Test unique_with con deleter Vesta personalizado:
+//   - El usuario declara su propia funcion de liberacion en Vesta.
+//   - unique_with(value, deleter_fn) registra el cleanup al exit.
+//   - Cada exit invoca el deleter UNA vez con el valor.
+//
+// Counter en static field; incrementado por cada deleter call.
+// Tras 3 invocaciones a make_and_drop() esperamos Counter.count == 3.
+
+class Counter {
+    public static i64 count;
+}
+
+void my_release(i64 p) {
+    Counter.count = Counter.count + 1;
+}
+
+void make_and_drop() {
+    i64 raw = 0xDEADBEEF;
+    // Adoptamos el valor en un unique<i64>; en scope exit -> my_release(raw).
+    unique<i64> p = unique_with(raw, my_release);
+    // Sin uso explicito.  Al final de la funcion: cleanup automatico.
+}
+
+i32 main() {
+    Counter.count = 0;
+    make_and_drop();    // libera 1 vez
+    make_and_drop();    // libera 1 vez
+    make_and_drop();    // libera 1 vez
+    // expected: Counter.count == 3
+    return Counter.count;
+}

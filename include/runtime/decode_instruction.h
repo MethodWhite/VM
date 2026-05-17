@@ -459,6 +459,54 @@ namespace runtime {
      */
     void decode_instr_callni(ProcessVM *vm, DecodedInstr &instr);
 
+    /**
+     * @brief Decoder de @c gcallocp (FIXED_4, 2 regs en byte2).
+     * Layout: [0x00][0x65][b2][0x00] con b2 = (r_dst<<4) | r_size.
+     */
+    void decode_instr_gcallocp(ProcessVM *vm, DecodedInstr &instr);
+
+    /**
+     * @brief Decoder de @c spawnargs (FIXED_4, 1 reg en byte2 hi-nibble).
+     * Layout: [0x00][0x66][b2][0x00] con b2 = (r_pc<<4).  argc se lee de R15
+     * en runtime (mismo modelo que callni / callvm).
+     */
+    void decode_instr_spawnargs(ProcessVM *vm, DecodedInstr &instr);
+
+    /**
+     * @brief Decoder de @c fulfillhlt (FIXED_4, 2 regs en byte2).
+     * Layout: [0x00][0x67][b2][0x00] con b2 = (r_fut<<4) | r_value.
+     */
+    void decode_instr_fulfillhlt(ProcessVM *vm, DecodedInstr &instr);
+
+    /**
+     * @brief Decoder de @c cmpjmp / @c cmpjmpu (FIXED_8, 2 regs + cond + target).
+     *
+     * Layout: [0x00][0x68|0x69][b2][cond][target_u32].
+     * Reusa la struct @c static_data de @c data_instruction:
+     *   static_data.r0     = r_a (b2 high nibble)
+     *   static_data.r1     = r_b (b2 low nibble)
+     *   static_data._pad   = cond_byte (0x00..0x0D)
+     *   static_data.offset = target u32
+     */
+    void decode_instr_cmpjmp(ProcessVM *vm, DecodedInstr &instr);
+
+    /**
+     * @brief Decoder de @c decjnz (FIXED_8, 1 reg + target).
+     *
+     * Layout: [0x00][0x6A][b2][0x00][target_u32].
+     *   static_data.r0     = r_counter (b2 high nibble)
+     *   static_data.offset = target u32
+     */
+    void decode_instr_decjnz(ProcessVM *vm, DecodedInstr &instr);
+
+    /**
+     * @brief Descodifica @c fastpush / @c fastpop (extended 0x6B / 0x6C).
+     *
+     * Layout: [0x00][opcode2][mask_lo][mask_hi].  El mask uint16 (LE) se
+     * almacena en @c data_instruction.mask_data.mask.
+     */
+    void decode_instr_fastmask(ProcessVM *vm, DecodedInstr &instr);
+
     // =========================================================================
     //  Funciones principales del pipeline
     // =========================================================================

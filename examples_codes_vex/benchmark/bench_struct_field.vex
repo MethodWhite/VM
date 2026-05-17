@@ -1,0 +1,23 @@
+// Bench: lectura/escritura de fields de struct value-type.
+// 30M iter, cada iter modifica 3 fields y los suma.
+// Mide field access throughput.
+
+struct Vec3 {
+    i32 x;
+    i32 y;
+    i32 z;
+}
+
+i32 main() {
+    Vec3 v = {1, 2, 3};
+    i32 sum = 0;
+    i32 i = 0;
+    while (i < 30000000) {
+        v.x = v.x + 1;
+        v.y = v.y + 2;
+        v.z = v.z + 3;
+        sum = sum + v.x + v.y + v.z;
+        i = i + 1;
+    }
+    return sum;
+}

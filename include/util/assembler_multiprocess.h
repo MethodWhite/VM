@@ -177,7 +177,9 @@ namespace asm_multi_process {
      */
     int run_worker(const std::string &file_name,
                    const std::string &output_prefix,
-                   bool skip_preprocessor = false);
+                   bool skip_preprocessor = false,
+                   bool keep_labels       = false,
+                   const std::vector<uint8_t> *ir_section_bytes = nullptr);
 
     /**
      * @brief Ejecuta un comando externo y captura toda su salida estandar.

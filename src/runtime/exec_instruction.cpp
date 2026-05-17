@@ -45,6 +45,23 @@ namespace runtime {
      * @param instr Instruccion descodificada (no se usan sus campos).
      */
     void exec_instr_hlt(ProcessVM *vm, const DecodedInstr &instr) {
+        (void)instr;
+        // Si hay un loadmod activo, el HLT al final del main del plugin se
+        // trata como RET para regresar al caller.  Reemplaza el viejo
+        // `patch_first_hlt_to_ret` que escaneaba bytes y rompia cuando algun
+        // imm de mov/callvm contenia la secuencia 0x00 0x03.
+        if (vm->loadmod_call_depth > 0) {
+            vm->loadmod_call_depth -= 1;
+            // Pop ret_addr del stack y saltar a el (mismo flujo que RET).
+            uint64_t ret_addr = 0;
+            vm->vm_mem.read_bytes(vm->registers.stack_pointer.raw(),
+                                  &ret_addr, 8);
+            const uint64_t cur_rsp = vm->registers.stack_pointer.qword();
+            vm->registers.stack_pointer.qword(cur_rsp + 8);
+            vm->registers.rip.qword(ret_addr);
+            vm->decoded_ptr->flags_info.did_jump = true;
+            return;
+        }
         // bloquear la instruccion ANTES de notificar al scheduler para evitar re-entradas
         vm->scheduler.on_event(EVT_HALT);
         vm->decoded_ptr->flags_info.blocking = true; // impedir el avance del PC tras exec
@@ -342,8 +359,9 @@ namespace runtime {
         const uint64_t ret_addr = vm->registers.rip.raw() + instr.flags_info.size_instr; // siguiente PC
 
         // apilar la direccion de retorno para que RET pueda recuperarla
-        vm->registers.stack_pointer.qword(vm->registers.stack_pointer.qword() - 8);
-        vm->vm_mem.write_bytes(vm->registers.stack_pointer.raw(), &ret_addr, 8);
+        const uint64_t new_rsp = vm->registers.stack_pointer.qword() - 8;
+        vm->registers.stack_pointer.qword(new_rsp);
+        vm->vm_mem.write_u64_fast(new_rsp, ret_addr); // page-cache hot path
         write_rip(vm, addr); // saltar al callee
     }
 
@@ -384,8 +402,7 @@ namespace runtime {
         } else {
             // RET de callvm puro (sin frame OOP, o anidado dentro de uno):
             // leer ret_addr desde el slot del stack VM.
-            ret_addr = 0;
-            vm->vm_mem.read_bytes(vm->registers.stack_pointer.raw(), &ret_addr, 8);
+            ret_addr = vm->vm_mem.read_u64_fast(cur_rsp); // page-cache hot path
         }
         // Avanzar RSP para liberar el slot reservado por el CALL correspondiente.
         vm->registers.stack_pointer.qword(cur_rsp + 8);
@@ -405,15 +422,15 @@ namespace runtime {
         const uint64_t frame_size = instr.data_instruction.inmmed_data.inmmed; // tamano del frame en bytes
         const uint64_t rbp_val    = vm->registers.base_pointer.raw();          // valor actual de RBP
 
-        // push rbp: guardar el frame base del llamador
-        vm->registers.stack_pointer.qword(vm->registers.stack_pointer.qword() - 8);
-        vm->vm_mem.write_bytes(vm->registers.stack_pointer.raw(), &rbp_val, 8);
+        // push rbp: guardar el frame base del llamador (con page-cache fast path)
+        const uint64_t rsp_after_push = vm->registers.stack_pointer.qword() - 8;
+        vm->vm_mem.write_u64_fast(rsp_after_push, rbp_val);
 
         // mov rbp, rsp: establecer el nuevo frame base
-        vm->registers.base_pointer.raw(vm->registers.stack_pointer.raw());
+        vm->registers.base_pointer.raw(rsp_after_push);
 
         // sub rsp, frame_size: reservar espacio para las variables locales
-        const uint64_t new_rsp = vm->registers.stack_pointer.qword() - frame_size;
+        const uint64_t new_rsp = rsp_after_push - frame_size;
         vm->registers.stack_pointer.qword(new_rsp);
 
         // fix8 - tracking de low-water-mark del stack para el GC scan.
@@ -432,13 +449,12 @@ namespace runtime {
      * @param instr Instruccion descodificada (no se usan sus campos).
      */
     void exec_instr_leave(ProcessVM *vm, const DecodedInstr &instr) {
+        (void)instr;
         // mov rsp, rbp: liberar el espacio del frame actual
-        vm->registers.stack_pointer.raw(vm->registers.base_pointer.raw());
-
-        // pop rbp: restaurar el frame base del llamador
-        uint64_t rbp_val = 0;
-        vm->vm_mem.read_bytes(vm->registers.stack_pointer.raw(), &rbp_val, 8);
-        vm->registers.stack_pointer.qword(vm->registers.stack_pointer.qword() + 8);
+        const uint64_t rsp_at_rbp = vm->registers.base_pointer.raw();
+        // pop rbp: restaurar el frame base del llamador (page-cache fast path)
+        const uint64_t rbp_val = vm->vm_mem.read_u64_fast(rsp_at_rbp);
+        vm->registers.stack_pointer.qword(rsp_at_rbp + 8);
         vm->registers.base_pointer.raw(rbp_val);
     }
 
@@ -475,9 +491,10 @@ namespace runtime {
             : read_reg64(vm, instr.data_instruction.reg_data.reg1);
         const uint64_t ret_addr = vm->registers.rip.raw() + instr.flags_info.size_instr; // PC de retorno
 
-        // apilar la direccion de retorno
-        vm->registers.stack_pointer.qword(vm->registers.stack_pointer.qword() - 8);
-        vm->vm_mem.write_bytes(vm->registers.stack_pointer.raw(), &ret_addr, 8);
+        // apilar la direccion de retorno (page-cache fast path)
+        const uint64_t new_rsp = vm->registers.stack_pointer.qword() - 8;
+        vm->registers.stack_pointer.qword(new_rsp);
+        vm->vm_mem.write_u64_fast(new_rsp, ret_addr);
         write_rip(vm, addr); // saltar al callee
     }
 

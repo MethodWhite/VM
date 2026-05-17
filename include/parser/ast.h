@@ -107,6 +107,12 @@ namespace vm {
     struct Instruction : ASTNode {
         std::string                            opcode;   // "mov", "add", "jmp", "db"
         std::vector<std::unique_ptr<ASTNode> > operands; // r0, 1, "msg", etc.
+        // Linea fuente Vex que origino esta instruccion (capturada del
+        // marcador `// @line N` previo en el .vel).  0 = sin info (la
+        // instruccion no proviene de codigo Vex con --vex-debug).  Usado
+        // por el linker para construir la seccion DebugLineEntry[] del
+        // .velb que el debugger usa para resolver `b file.vex:42`.
+        int source_line = 0;
 
         Instruction(std::string op, std::vector<std::unique_ptr<ASTNode> > ops)
             : opcode(std::move(op)), operands(std::move(ops)) {}

@@ -51,7 +51,67 @@ namespace vm {
             }
 
             // ---------------- COMENTARIOS // ----------------
-            if (peek() == '/' && peek_token(1) == '/') {  // peek_token(1) mira 1 char adelante
+            // Caso especial: `// @line N` capturado en `last_src_line`
+            // (no consumido como token; queda accesible al parser).
+            // Esto permite asociar cada instruccion del .vel a su linea
+            // Vex original sin anadir un opcode dedicado al bytecode.
+            if (peek() == '/' && peek_token(1) == '/') {
+                size_t save_pos = pos;
+                int    save_ln  = line;
+                int    save_col = column;
+                advance(); advance(); // saltar `//`
+                // skip leading spaces/tabs entre `//` y posible `@line`
+                while (peek() == ' ' || peek() == '\t') advance();
+                // Detectar `@line `, capturar el numero hasta fin de linea.
+                if (peek() == '@'
+                 && peek_token(1) == 'l'
+                 && peek_token(2) == 'i'
+                 && peek_token(3) == 'n'
+                 && peek_token(4) == 'e'
+                 && (peek_token(5) == ' ' || peek_token(5) == '\t')) {
+                    advance(); advance(); advance(); advance(); advance(); // @line
+                    while (peek() == ' ' || peek() == '\t') advance();
+                    int ln_val = 0;
+                    while (peek() >= '0' && peek() <= '9') {
+                        ln_val = ln_val * 10 + (peek() - '0');
+                        advance();
+                    }
+                    if (ln_val > 0) last_src_line = ln_val;
+                    // consumir el resto del comentario hasta '\n'
+                    while (peek() != '\n' && peek() != '\0') advance();
+                    continue;
+                }
+                // Detectar `@file <path>` (path puede contener espacios y
+                // ':' en Windows; consumimos hasta fin de linea).
+                if (peek() == '@'
+                 && peek_token(1) == 'f'
+                 && peek_token(2) == 'i'
+                 && peek_token(3) == 'l'
+                 && peek_token(4) == 'e'
+                 && (peek_token(5) == ' ' || peek_token(5) == '\t')) {
+                    advance(); advance(); advance(); advance(); advance(); // @file
+                    while (peek() == ' ' || peek() == '\t') advance();
+                    std::string path;
+                    while (peek() != '\n' && peek() != '\0') {
+                        path.push_back(peek());
+                        advance();
+                    }
+                    // Trim espacios al final
+                    while (!path.empty()
+                        && (path.back() == ' ' || path.back() == '\t' ||
+                            path.back() == '\r')) {
+                        path.pop_back();
+                    }
+                    if (!path.empty() && last_src_file.empty()) {
+                        last_src_file = path;
+                    }
+                    continue;
+                }
+                // No es `@line`: rebobinar al `//` y consumir como
+                // comentario normal (descartar hasta fin de linea).
+                pos    = save_pos;
+                line   = save_ln;
+                column = save_col;
                 while (peek() != '\n' && peek() != '\0') {
                     advance();
                 }
@@ -273,17 +333,31 @@ namespace vm {
     }
 
     Token Lexer::peek_token() const {
-        // Guardar estado actual
-        const size_t save_pos = pos;
-        int save_line = line;
-        int save_column = column;
-
-        // Crear lexer temporal con mismo estado
-        Lexer temp(source, save_pos, save_line, save_column);
-
-        // Obtener token sin modificar estado real
-        Token peeked = temp.next_token();
-
+        // Performance fix CRITICO: la version anterior creaba un Lexer
+        // entero (copiando el source completo, ~1 MB en el editor) por
+        // cada peek.  Con ~500k peeks en compilaciones grandes eso
+        // significaba ~500 GB de allocs y desencadenaba que el "parser"
+        // tardara 30+ s donde el lexer es realmente el bottleneck.
+        //
+        // Solucion: re-ejecutar next_token() sobre ESTE objeto y luego
+        // restaurar todo el estado mutable.  Usamos const_cast porque la
+        // API publica es const pero la implementacion necesita modificar
+        // pos/line/column transitoriamente.  Tambien restauramos los
+        // marcadores de debug (last_src_line / last_src_file) que
+        // skip_whitespace puede mutar, para que peek no tenga efectos
+        // secundarios observables fuera del valor retornado.
+        auto *self = const_cast<Lexer *>(this);
+        const size_t      save_pos       = self->pos;
+        const int         save_line      = self->line;
+        const int         save_column    = self->column;
+        const int         save_src_line  = self->last_src_line;
+        const std::string save_src_file  = self->last_src_file;
+        Token peeked = self->next_token();
+        self->pos           = save_pos;
+        self->line          = save_line;
+        self->column        = save_column;
+        self->last_src_line = save_src_line;
+        self->last_src_file = save_src_file;
         return peeked;
     }
 

@@ -1,0 +1,31 @@
+void main() {
+    println("=== test 1: deref nullptr host ===");
+    try {
+        i64* p = (i64*)0;
+        i64 v = *p;     // AV: deref null host pointer
+        println("no deberia llegar aqui: ${v}");
+    } catch (FatalError e) {
+        println("CAPTURADO: kind=${e.kind} pc=${e.pc:hex}");
+        print_cstr(e.message);
+        println("");
+    }
+
+    println("");
+    println("=== test 2: deref direccion arbitraria invalida ===");
+    try {
+        i64* bad = (i64*)0xDEADBEEF;
+        i64 v = *bad;   // AV: direccion no mapeada
+        println("no deberia llegar aqui: ${v}");
+    } catch (FatalError e) {
+        println("CAPTURADO: kind=${e.kind} pc=${e.pc:hex}");
+        print_cstr(e.message);
+        println("");
+    }
+
+    println("");
+    println("=== test 3: catch sin try previo (debe seguir funcionando) ===");
+    i64 normal = 42;
+    println("normal = ${normal}");
+
+    println("=== ok ===");
+}

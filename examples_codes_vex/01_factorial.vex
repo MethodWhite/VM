@@ -26,5 +26,5 @@ i64 factorial(i64 n) {
 }
 
 i32 main() {
-    return factorial(5);
+    return factorial(10);
 }

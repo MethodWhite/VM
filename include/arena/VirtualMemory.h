@@ -52,6 +52,75 @@ namespace vm {
         ArenaManager       &arena_mgr;          ///< Gestor de bloques de memoria real
         MemPerm             permsDefault;        ///< Permisos usados en lazy allocation (RWX por defecto)
 
+        /**
+         * @brief Cache de pagina de 1 entrada para acelerar accesos secuenciales.
+         *
+         * El stack del proceso vive en una unica pagina (o pocas) y los accesos
+         * de @c enter / @c leave / @c push / @c pop golpean la misma pagina
+         * en sucesion.  Cachear la traduccion (vaddr_base -> host_ptr) salta
+         * el TLB walk de 3 niveles para hits.
+         *
+         * Invalidacion: el cache se invalida cuando se llama a @c map() o se
+         * crea una arena nueva (lazy allocation).
+         */
+        mutable uint64_t  cached_page_vaddr = UINT64_MAX; ///< Base de la pagina cacheada (vaddr alineado a 4096)
+        mutable uint8_t * cached_page_host  = nullptr;    ///< Host pointer correspondiente
+
+    public:
+        /**
+         * @brief Acceso al cached_page_vaddr (publico para uso del JIT).
+         *
+         * El codigo JIT-eated puede leer la pagina cacheada y emitir un
+         * fast-path inline para accesos a memoria VM (~10 instrucciones)
+         * que evita el call a write_u64_fast / read_u64_fast cuando hay
+         * cache hit.  Los offsets de estos campos en ProcessVM se exponen
+         * en @c vesta_rt/abi.h con @c static_assert.
+         */
+        inline uint64_t jit_cached_page_vaddr() const noexcept { return cached_page_vaddr; }
+        inline uint8_t *jit_cached_page_host()  const noexcept { return cached_page_host; }
+
+    public:
+        /**
+         * @brief Invalida la cache de pagina (usar tras @c map / lazy alloc).
+         */
+        inline void invalidate_page_cache() const {
+            cached_page_vaddr = UINT64_MAX;
+            cached_page_host  = nullptr;
+        }
+
+        /**
+         * @brief Escritura rapida de 8 bytes aprovechando la cache de pagina.
+         *
+         * Si @p vaddr y @p vaddr+8 caen en la pagina cacheada, hace una
+         * escritura directa sin TLB walk.  En caso contrario delega en
+         * write_bytes (que tambien actualiza la cache).
+         */
+        inline void write_u64_fast(uint64_t vaddr, uint64_t value) {
+            const uint64_t page = vaddr & ~0xFFFULL;
+            const uint64_t off  = vaddr & 0xFFFULL;
+            // Pagina cacheada Y la escritura no cruza el limite de pagina.
+            if (__builtin_expect(page == cached_page_vaddr && off <= 4096 - 8, 1)) {
+                std::memcpy(cached_page_host + off, &value, 8);
+                return;
+            }
+            write_bytes(vaddr, &value, 8);
+        }
+
+        /**
+         * @brief Lectura rapida de 8 bytes aprovechando la cache de pagina.
+         */
+        inline uint64_t read_u64_fast(uint64_t vaddr) {
+            const uint64_t page = vaddr & ~0xFFFULL;
+            const uint64_t off  = vaddr & 0xFFFULL;
+            uint64_t v;
+            if (__builtin_expect(page == cached_page_vaddr && off <= 4096 - 8, 1)) {
+                std::memcpy(&v, cached_page_host + off, 8);
+                return v;
+            }
+            read_bytes(vaddr, &v, 8);
+            return v;
+        }
+
     public:
         /**
          * @brief Construye la interfaz de memoria virtual.

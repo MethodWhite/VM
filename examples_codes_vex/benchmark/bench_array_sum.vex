@@ -1,0 +1,32 @@
+// Bench: suma array i32[N] iterando con puntero/subscript.
+// Mide LOAD throughput.  10M iter sobre array de 100K elementos.
+
+i32 sum_array(i32[] arr, i32 n) {
+    i32 sum = 0;
+    i32 i   = 0;
+    while (i < n) {
+        sum = sum + arr[i];
+        i   = i + 1;
+    }
+    return sum;
+}
+
+i32 main() {
+    i32[100000] arr;
+    // Init: arr[i] = i (mod 1000 para evitar overflow).
+    i32 i = 0;
+    while (i < 100000) {
+        arr[i] = i;
+        i = i + 1;
+    }
+    // Sumar 100 veces (total: 10M loads).
+    i32 total = 0;
+    i32 k = 0;
+    while (k < 100) {
+        total = total + sum_array(arr, 100000);
+        k = k + 1;
+    }
+    // total = 100 * (0+1+...+99999) = 100 * 4999950000
+    // -> overflow i32, no chequeo exacto.  Solo medimos tiempo.
+    return total;
+}

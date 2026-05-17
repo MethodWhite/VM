@@ -116,6 +116,18 @@ namespace vex {
         Token expect(TokenKind k, const char *msg);
 
         /**
+         * @brief Cierra un grupo de argumentos de tipo `<...>`.
+         *
+         * Acepta tanto un solo `>` (token GT) como el primer `>` de un
+         * `>>` (token SHR), que se "parte" en dos: consume la mitad
+         * izquierda y deja la derecha como nuevo current_ (kind=GT).
+         * Esto permite tipos genericos anidados como
+         * `VirtualPtr<VirtualPtr<i64>>` sin requerir espacios entre los
+         * dos cierres (`> >`).
+         */
+        Token expect_close_angle(const char *msg);
+
+        /**
          * @brief Avanza tokens hasta hallar un punto de sincronizacion.
          *
          * Sincronizadores: ';', '}', EOF, y el inicio de cualquier
@@ -266,6 +278,20 @@ namespace vex {
          * @brief Decide si el token actual abre un tipo primitivo (i32, ...).
          */
         [[nodiscard]] bool starts_type() const noexcept;
+
+        /**
+         * @brief Decide si el `(` actual inicia un cast C-style `(T) expr`.
+         *
+         * El parser reconoce el patron `(<type>) <unary>` solo cuando el
+         * primer token tras `(` es claramente un type-starter (primitivo,
+         * @c VirtualPtr, @c fn, @c nonnull) y la secuencia se cierra con
+         * un `)` seguido de un token que pueda iniciar una expresion.
+         * Sin esto, el parser bajaria a `(expr)` y fallaria al ver el
+         * `)` en mitad del tipo.  No aceptamos `(Foo) x` para typedefs
+         * de identificadores; el usuario puede escribir
+         * `(VirtualPtr<Foo>) x` o `(Foo*) x` que son inequivocos.
+         */
+        [[nodiscard]] bool looks_like_cast() const noexcept;
 
         Lexer       &lex_;
         Diagnostics &diags_;

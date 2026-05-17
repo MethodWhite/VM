@@ -164,6 +164,73 @@ namespace vex {
         TREEMAP,
         TREESET,
         STACK,
+        /// `Future<T>` builtin del compilador (Mejora II).  Reference-type
+        /// que envuelve el handle del FutureObject runtime (i64) preservando
+        /// el tipo logico T del valor que el future resolvera.  El bytecode
+        /// no cambia: FutureObject::result sigue siendo i64 opaco.  El
+        /// frontend hace coercion T -> i64 al @c fulfill (zero/sign-extend
+        /// para tipos < 8B) y i64 -> T al @c await (truncate/cast back).
+        ///
+        /// @c pointee = tipo T (payload del future).
+        ///
+        /// Limitaciones MVP:
+        ///   - T debe tener tamano <= 8 bytes (i8..i64, u8..u64, f32, f64,
+        ///     bool, char, ptr/handle).  Tipos compuestos (struct, array)
+        ///     requeririan futures con buffer auxiliar (deferido).
+        ///   - El handle queda en HandleTable hasta que el caller hace
+        ///     await; tras await, el future muere salvo que algo lo
+        ///     referencie (e.g., otra closure).
+        FUTURE,
+        /// `unique<T>` builtin del compilador (smart pointer move-only).
+        /// Modelado como un slot de stack de 8 bytes (Tier 0: deleter
+        /// conocido en compile-time, p.ej. @c free) o 16 bytes (Tier 1:
+        /// deleter custom guardado al lado del ptr).
+        ///
+        /// Tier 0 (caso 95%): `[+0 u64 ptr]`.  El deleter se decide en
+        /// compile-time por el builtin de construccion (@c unique_malloc
+        /// usa @c free; @c unique_new usa @c ~T() virtual; @c unique_fopen
+        /// usa @c fclose).  Cleanup al exit del scope emite un CALL
+        /// directo al deleter, sin indireccion.
+        ///
+        /// Tier 1 (caso 4%): `[+0 u64 ptr][+8 u64 deleter_fn]`.  El
+        /// deleter es variable runtime (capturado en construccion).
+        /// Cleanup emite un CALL indirecto via reg.  Si el deleter es
+        /// literal, el compilador colapsa a Tier 0.
+        ///
+        /// Move semantics: `unique<T> q = move(p)` emite UN solo opcode
+        /// @c mvtake (0x72) que copia el ptr de p a q y zerifica p en
+        /// 1 instr VM (3 instr host x86-64 tras JIT).
+        ///
+        /// @c pointee = tipo T del recurso apuntado.
+        /// `borrow<T>` (shared) y `borrow_mut<T>` (exclusivo) builtins
+        /// del compilador.  Modelan un puntero T* host pero con
+        /// VERIFICACION DE ALIASING en compile-time (borrow checker).
+        ///
+        /// Runtime: ambos son 8 bytes (host_ptr, identico a `T*`).
+        /// Toda la seguridad esta en el type checker:
+        ///   R1: solo UN borrow_mut activo OR multiples borrow shared.
+        ///   R2: prohibido leer/mutar/mover el owner mientras prestado.
+        ///   R3: los borrows no pueden sobrevivir al owner (no escape).
+        ///
+        /// @c pointee = tipo T apuntado.
+        BORROW,
+        BORROW_MUT,
+        UNIQUE_PTR,
+        /// `shared<T>` builtin del compilador (smart pointer con refcount).
+        /// Slot de stack de 8 bytes (host_ptr al control block).  El
+        /// control block vive en el GcHeap y se aloca via @c gcallocp
+        /// (alocacion unica con el payload contiguo, estilo
+        /// @c std::make_shared):
+        ///
+        ///   `[+0 i64 refcount][+8 u64 deleter][+16 T payload]`
+        ///
+        /// La copia incrementa el refcount; la destruccion al exit lo
+        /// decrementa y, si llega a 0, ejecuta el deleter.  No atomic
+        /// por defecto (single-thread).  Con @c @ThreadSafe se usaria
+        /// CAS, pero el MVP mantiene refcount simple.
+        ///
+        /// @c pointee = tipo T del payload.
+        SHARED_PTR,
         // Sentinela para construir tablas planas.
         COUNT
     };
@@ -341,6 +408,51 @@ namespace vex {
             t.fn_params = std::move(params);
             return t;
         }
+
+        /// @brief Construye un Future<T> builtin (Mejora II).  Layout en
+        /// memoria: 8 bytes (handle del FutureObject runtime).  El @c pointee
+        /// es el tipo T del payload que el future resolvera.  Dos
+        /// @c Future<T> son iguales si los T son iguales.
+        static Type make_future(Type inner) {
+            Type t;
+            t.kind    = PrimitiveKind::FUTURE;
+            t.pointee = std::make_shared<Type>(std::move(inner));
+            return t;
+        }
+
+        /// @brief Construye un @c borrow<T> (shared) o @c borrow_mut<T>
+        /// (exclusive).  Layout 8 bytes (host_ptr).  El borrow checker
+        /// del type_checker valida las reglas de aliasing en compile-time.
+        static Type make_borrow(Type inner, bool is_mut) {
+            Type t;
+            t.kind    = is_mut ? PrimitiveKind::BORROW_MUT : PrimitiveKind::BORROW;
+            t.pointee = std::make_shared<Type>(std::move(inner));
+            return t;
+        }
+
+        /// @brief Construye un @c unique<T> builtin (smart pointer move-only).
+        /// El campo @c is_virtual del Type result distingue HOST vs VM,
+        /// heredado del Type apuntado segun lo decida el builtin de
+        /// construccion (e.g. @c unique_malloc devuelve host, una
+        /// hipotetica @c unique_local devolveria virtual).  Por
+        /// defecto: host (la mayoria de usos: malloc/new/fopen).
+        static Type make_unique(Type inner) {
+            Type t;
+            t.kind    = PrimitiveKind::UNIQUE_PTR;
+            t.pointee = std::make_shared<Type>(std::move(inner));
+            return t;
+        }
+
+        /// @brief Construye un @c shared<T> builtin (smart pointer con refcount).
+        /// El control block + payload viven en el GcHeap (heap GC); el
+        /// slot stack contiene un host_ptr al control block.
+        static Type make_shared(Type inner) {
+            Type t;
+            t.kind    = PrimitiveKind::SHARED_PTR;
+            t.pointee = std::make_shared<Type>(std::move(inner));
+            return t;
+        }
+
         bool operator!=(const Type &o) const noexcept {
             return !(*this == o);
         }
@@ -405,6 +517,14 @@ namespace vex {
             case TokenKind::KW_TREEMAP:   return PrimitiveKind::TREEMAP;
             case TokenKind::KW_TREESET:   return PrimitiveKind::TREESET;
             case TokenKind::KW_STACK:     return PrimitiveKind::STACK;
+
+            // Smart pointers builtins (move-only + refcount).  El payload T
+            // se completa en el parser via `unique<T>` / `shared<T>`.
+            case TokenKind::KW_UNIQUE:    return PrimitiveKind::UNIQUE_PTR;
+            case TokenKind::KW_SHARED:    return PrimitiveKind::SHARED_PTR;
+            // Borrows (referencias compile-time-checkadas, runtime = host_ptr).
+            case TokenKind::KW_BORROW:    return PrimitiveKind::BORROW;
+            case TokenKind::KW_BORROW_MUT: return PrimitiveKind::BORROW_MUT;
 
             // No es un tipo primitivo.
             default: return PrimitiveKind::COUNT;
@@ -491,6 +611,19 @@ namespace vex {
             case PrimitiveKind::TREEMAP:   return 8;
             case PrimitiveKind::TREESET:   return 8;
             case PrimitiveKind::STACK:     return 8;
+            // Future<T>: 8 bytes (handle del FutureObject runtime).  El T
+            // logico no afecta al storage: el bytecode siempre opera sobre
+            // el handle como i64.
+            case PrimitiveKind::FUTURE:    return 8;
+            // Borrows: 8 bytes (host_ptr).  Verificacion compile-time.
+            case PrimitiveKind::BORROW:     return 8;
+            case PrimitiveKind::BORROW_MUT: return 8;
+            // Smart pointers: 8 bytes (slot stack con host_ptr al recurso).
+            // Para Tier 1 con deleter custom seran 16 bytes; el frontend
+            // todavia no usa esa variante (cuando llegue se diferenciara
+            // via campo extra del Type).
+            case PrimitiveKind::UNIQUE_PTR: return 8;
+            case PrimitiveKind::SHARED_PTR: return 8;
             case PrimitiveKind::COUNT:  return 0;
         }
         return 0;
@@ -548,6 +681,26 @@ namespace vex {
             return std::string("Result<") +
                    (t.pointee  ? type_to_string(*t.pointee)  : "?") + ", " +
                    (t.pointee2 ? type_to_string(*t.pointee2) : "?") + ">";
+        }
+        if (t.kind == PrimitiveKind::FUTURE) {
+            return std::string("Future<") +
+                   (t.pointee ? type_to_string(*t.pointee) : "?") + ">";
+        }
+        if (t.kind == PrimitiveKind::UNIQUE_PTR) {
+            return std::string("unique<") +
+                   (t.pointee ? type_to_string(*t.pointee) : "?") + ">";
+        }
+        if (t.kind == PrimitiveKind::SHARED_PTR) {
+            return std::string("shared<") +
+                   (t.pointee ? type_to_string(*t.pointee) : "?") + ">";
+        }
+        if (t.kind == PrimitiveKind::BORROW) {
+            return std::string("borrow<") +
+                   (t.pointee ? type_to_string(*t.pointee) : "?") + ">";
+        }
+        if (t.kind == PrimitiveKind::BORROW_MUT) {
+            return std::string("borrow_mut<") +
+                   (t.pointee ? type_to_string(*t.pointee) : "?") + ">";
         }
         if (t.kind == PrimitiveKind::FUNCTION) {
             // fn(P1, P2, ...) -> R con cada Pi formateado recursivamente.
@@ -618,6 +771,11 @@ namespace vex {
             case PrimitiveKind::TREEMAP:   return "TreeMap";
             case PrimitiveKind::TREESET:   return "TreeSet";
             case PrimitiveKind::STACK:     return "Stack";
+            case PrimitiveKind::FUTURE:    return "Future";
+            case PrimitiveKind::BORROW:     return "borrow";
+            case PrimitiveKind::BORROW_MUT: return "borrow_mut";
+            case PrimitiveKind::UNIQUE_PTR: return "unique";
+            case PrimitiveKind::SHARED_PTR: return "shared";
             case PrimitiveKind::COUNT:  return "<count>";
         }
         return "<unknown>";
@@ -727,6 +885,55 @@ namespace vex {
                 target.kind == PrimitiveKind::STACK))
         {
             return true;
+        }
+        // Mejora II: Future<T1> -> Future<T2> con coercion numerica del
+        // payload (mismo principio que Optional/Result).  Tambien permite
+        // Future<T> -> Future<T> trivial (cubierto por target==value
+        // anterior; redundante pero explicito para clarity).
+        if (target.kind == PrimitiveKind::FUTURE
+         && value.kind == PrimitiveKind::FUTURE
+         && target.pointee && value.pointee) {
+            // Compatibilidad estructural exacta o coercion numerica.
+            if (*target.pointee == *value.pointee) return true;
+            if (is_numeric(target.pointee->kind) && is_numeric(value.pointee->kind)) return true;
+        }
+        // Mejora II compat: Future<T> -> i64/u64 (extraer el handle como
+        // entero opaco).  Permite codigo legacy `i64 f = compute()` cuando
+        // compute es @Async.  El handle es identico bit-a-bit en runtime.
+        if (value.kind == PrimitiveKind::FUTURE
+         && (target.kind == PrimitiveKind::I64 || target.kind == PrimitiveKind::U64)) {
+            return true;
+        }
+        // Y la inversa: i64/u64 -> Future<T> (interpretar el handle).
+        // Sin esto, codigo que aloca un future raw via `future_alloc()`
+        // (devuelve i64) no podria asignarse a una variable Future<T>.
+        if (target.kind == PrimitiveKind::FUTURE
+         && (value.kind == PrimitiveKind::I64 || value.kind == PrimitiveKind::U64)) {
+            return true;
+        }
+        // Smart pointers: unique<X> -> unique<Y> y shared<X> -> shared<Y>
+        // son asignables si X == Y exacto (no admitimos coercion numerica
+        // entre punteros porque cambiaria la semantica del sizeof + del
+        // deleter; el usuario debe usar el tipo correcto).  La excepcion
+        // es Y == VOID (placeholder devuelto por los builtins `unique_box`
+        // / `shared_box` cuando no hay info de tipo - se unifica con el
+        // tipo concreto del LHS).
+        if (target.kind == PrimitiveKind::UNIQUE_PTR
+         && value.kind == PrimitiveKind::UNIQUE_PTR
+         && target.pointee && value.pointee) {
+            if (*target.pointee == *value.pointee) return true;
+            if (value.pointee->kind == PrimitiveKind::VOID) return true;
+            // Coercion numerica para `unique_box(50)` que devuelve
+            // unique<i64> y se asigna a unique<i32> - misma logica que
+            // Some(50) con Optional.
+            if (is_numeric(target.pointee->kind) && is_numeric(value.pointee->kind)) return true;
+        }
+        if (target.kind == PrimitiveKind::SHARED_PTR
+         && value.kind == PrimitiveKind::SHARED_PTR
+         && target.pointee && value.pointee) {
+            if (*target.pointee == *value.pointee) return true;
+            if (value.pointee->kind == PrimitiveKind::VOID) return true;
+            if (is_numeric(target.pointee->kind) && is_numeric(value.pointee->kind)) return true;
         }
         return false;
     }

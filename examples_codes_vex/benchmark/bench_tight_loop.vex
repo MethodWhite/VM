@@ -1,0 +1,16 @@
+// Bench: loop tight aritmetico.
+// 50M iter, suma con shift + xor + and.
+// Mide MIPS en ALU pura sin calls ni mem ops.
+// Resultado esperado: el valor final acumulado, > 0.
+
+i32 main() {
+    i64 sum = 0;
+    i64 i   = 0;
+    while (i < 50000000) {
+        sum = sum + (i * 3);
+        sum = sum ^ 0x12345678;
+        sum = sum & 0xFFFFFFFF;
+        i   = i + 1;
+    }
+    return sum;
+}

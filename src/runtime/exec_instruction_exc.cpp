@@ -63,8 +63,33 @@ namespace runtime {
         ef->saved_rsp         = vm->registers.stack_pointer.qword();
         ef->saved_rbp         = vm->registers.base_pointer.qword();
         ef->saved_frame_stack = (uint64_t)(uintptr_t)vm->frame_stack;
+        // Snapshot de R0..R15 para que do_throw los restaure antes de
+        // saltar al handler.  Resuelve el problema clasico de regs
+        // clobreados durante el try-body que dejaban variables vivas
+        // del catch con valores stale (incluido `this` y parametros).
+        // Coste: 16 store de qword en tryenter (raro) + 16 load qword
+        // en do_throw (raro tambien).  Despreciable comparado con un
+        // AV/throw real.
+        for (int i = 0; i < 16; ++i) {
+            ef->saved_regs[i] = vm->registers.regs[i].qword();
+        }
         ef->prev       = vm->exc_frame_stack;                           // encadenar con el frame anterior
         vm->exc_frame_stack = ef;                                       // empujar al tope de la pila
+
+        // Optimizacion AV recovery (fix19 ext): forzar fin de
+        // batch para que el scheduler arme @c setjmp en el siguiente.
+        // El scheduler solo arma recovery cuando @c exc_frame_stack es
+        // no-null al INICIO del batch, lo que ahorra ~10-15 ns por
+        // batch en programas sin try.  Sin este forzado, un AV
+        // ocurrido entre la ejecucion de @c tryenter y el final del
+        // batch actual se escaparia del recovery (la ventana podria
+        // ser de cientos de instrucciones).  Coste: 1 store + alguna
+        // perdida por terminar batch antes; tryenter es raro asi que
+        // es despreciable.  Si reductions_remaining ya es <= 1, no
+        // hacer nada (el batch ya esta a punto de terminar).
+        if (vm->reductions_remaining > 1) {
+            vm->reductions_remaining = 1;
+        }
     }
 
     /**

@@ -1,0 +1,23 @@
+// Test F3 ext - Reborrow MUT (suspend semantics):
+//   lend_mut(borrow_mut_var) reborrowea el mutable, SUSPENDIENDO el
+//   original mientras viva el reborrow.
+//
+// Patron clasico estilo Rust:
+//   fn helper(p: &mut T) { bar(&mut *p); }
+//
+// Aqui: m1 = lend_mut(owner); m2 = lend_mut(m1) reborrowea m1.
+// El owner sigue Mutable a traves de m2.  Cuando m2 dropea (NLL tras
+// ultimo uso), m1 vuelve a ser el mut activo.
+
+i32 main() {
+    unique<i32> owner = unique_box(42);
+
+    borrow_mut<i32> m1 = lend_mut(owner);    // owner -> Mut (por m1)
+    borrow_mut<i32> m2 = lend_mut(m1);       // m1 suspendido, owner -> Mut (por m2)
+
+    write_borrow(m2, 100);                   // muta a traves del reborrow
+    i32 v = read_borrow(m2);
+
+    if (v != 100) return 99;
+    return 42;
+}

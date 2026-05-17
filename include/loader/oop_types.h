@@ -250,6 +250,13 @@ namespace loader {
         size_t            handler_count;
 
         void             *jit_code;     ///< nullptr si no esta compilado JIT
+        ///  contador de invocaciones via CALLVIRT.
+        /// Incrementado en cada dispatch.  Cuando supera el threshold
+        /// global @c g_jit_threshold (default UINT32_MAX = JIT off), el
+        /// runtime busca el IR de este metodo en el Loader y lo pasa al
+        /// @c JitCompiler.  El resultado se asigna a @c jit_code y a
+        /// partir de ese punto el CALLVIRT despacha al codigo nativo.
+        uint32_t          invocation_count = 0;
         // --- reflexion/documentacion (offsets 112-143) ---
         stringx           doc;          ///< docstring del metodo
         AttrEntry        *attrs;        ///< tabla de anotaciones clave/valor

@@ -1,0 +1,13 @@
+// Test de move() para unique<T>:
+//   - move(p) transfiere ownership a otra variable.
+//   - Tras el move, p queda con slot=0; el cleanup automatico de p
+//     ejecuta free(0) que es no-op.
+//   - El destino q se libera al exit del scope.
+
+i32 main() {
+    unique<i32> p = unique_box(100);
+    unique<i32> q = move(p);
+    i32* raw = ptr_of(q);
+    i32 v = *raw;
+    return v;  // R00 = 100
+}

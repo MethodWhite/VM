@@ -20,6 +20,9 @@ class FileIO {
     public i64 sym_fseek;
     public i64 sym_ftell;
     public i64 sym_rewind;
+    public i64 sym_fflush;
+    public i64 sym_chdir;       // _chdir: cambiar directorio actual (Win32 msvcrt)
+    public i64 sym_getcwd;      // _getcwd: obtener directorio actual
 
     public FileIO() {
         this.lib         = ffi_open("msvcrt.dll");
@@ -30,6 +33,31 @@ class FileIO {
         this.sym_fseek   = ffi_sym(this.lib, "fseek");
         this.sym_ftell   = ffi_sym(this.lib, "ftell");
         this.sym_rewind  = ffi_sym(this.lib, "rewind");
+        this.sym_fflush  = ffi_sym(this.lib, "fflush");
+        this.sym_chdir   = ffi_sym(this.lib, "_chdir");
+        this.sym_getcwd  = ffi_sym(this.lib, "_getcwd");
+    }
+
+    // chdir: cambiar el directorio actual del proceso.  Devuelve 0 si OK,
+    // -1 si error (path no existe).  Usado por el editor para fijar la
+    // carpeta del proyecto al arrancar (FileExplorer lista "*" del cwd).
+    public i32 chdir(string path) {
+        if (this.sym_chdir == 0) { return -1; }
+        i64 r = ffi_call(this.sym_chdir, str_cstr(path));
+        return (i32) r;
+    }
+
+    // getcwd: rellena `buf` (tamano `size`) con el path absoluto del cwd
+    // null-terminated.  Devuelve buf en exito, 0 en error.
+    public i64 getcwd(u8* buf, i32 size) {
+        if (this.sym_getcwd == 0) { return 0; }
+        return ffi_call(this.sym_getcwd, buf, size);
+    }
+
+    // Flush del buffer interno del FILE* al disco.  Importante para
+    // logs de debug que deben sobrevivir a un crash.
+    public i64 flush_fp(i64 fp) {
+        return ffi_call(this.sym_fflush, fp);
     }
 
     // open: devuelve FILE* (i64) o 0 si falla.  mode = "wb", "rb", "ab".

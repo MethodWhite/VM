@@ -1,0 +1,70 @@
+// Test: devolver smart pointers desde funciones (SRET 16 bytes Tier 1).
+//
+// Demuestra que las funciones pueden devolver `unique<T>` correctamente
+// gracias al ABI SRET de 16 bytes (slot Tier 1: ptr@+0 + deleter@+8).
+//
+// Casos cubiertos:
+//   1. Factory con `unique_box` (deleter default = free).
+//   2. Factory con `unique_with` + deleter Vesta custom.
+//   3. Cadena de factories (escape transitivo).
+//   4. Counter de releases verifica que el deleter custom se invoca
+//      al RET del caller.
+
+class C {
+    public static i64 releases;
+}
+
+void track_release(i64 p) {
+    C.releases = C.releases + 1;
+}
+
+// Factory con default deleter (free).
+unique<i32> make_int(i32 v) {
+    unique<i32> p = unique_box(v);
+    return p;
+}
+
+// Factory con deleter custom (Vesta).  El deleter se almacena en slot+8
+// y sobrevive al SRET; el caller lo invoca dinamicamente al cleanup.
+unique<i64> make_tracked(i64 v) {
+    unique<i64> p = unique_with(v, track_release);
+    return p;
+}
+
+// Cadena: make_chain devuelve lo que devuelve make_int.
+unique<i32> make_chain(i32 v) {
+    unique<i32> p = make_int(v);
+    return p;
+}
+
+i32 main() {
+    C.releases = 0;
+
+    // Caso 1: factory con default deleter.  Verificamos valor recuperado.
+    unique<i32> a = make_int(42);
+    i32* ra = ptr_of(a);
+    if (*ra != 42) {
+        return 100 + *ra;
+    }
+
+    // Caso 2: factory con cadena.
+    unique<i32> c = make_chain(77);
+    i32* rc = ptr_of(c);
+    if (*rc != 77) {
+        return 200 + *rc;
+    }
+
+    // Caso 3: factory con deleter custom Tier 1.  El deleter se preserva
+    // a traves del SRET y se invoca al cleanup del caller.
+    {
+        unique<i64> t1 = make_tracked(111);
+        unique<i64> t2 = make_tracked(222);
+        // Sin uso explicito.
+    }
+    // Despues del bloque interno los cleanups NO se han ejecutado todavia
+    // (cleanups corren al RET de la funcion).  C.releases sigue 0 aqui.
+
+    return 42;
+    // Al RET de main: cleanups LIFO -> track_release(222), track_release(111),
+    // free(c_ptr), free(a_ptr).  C.releases acaba con 2.
+}

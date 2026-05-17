@@ -93,6 +93,27 @@ LivenessResult compute_liveness(const IrFunction &fn) {
         // en SSA la definicion ocurre exactamente una vez; ignoramos redefiniciones
     };
 
+    // Permite SOBREESCRIBIR el def con una posicion mas temprana.  Solo
+    // usado para destinos PHI: en SSA-on-CFG la copia que materializa
+    // el valor se emite al final de cada predecesor (emit_phi_copies),
+    // por lo que el destino del PHI vive en su registro asignado desde
+    // (al menos) el final del predecesor mas temprano.  Si dejamos el
+    // def en la posicion de la instruccion PHI (start del sucesor), el
+    // regalloc ve el reg como "libre" durante todos los bloques entre
+    // pred_end y phi_instr_pos -- y `live_regs_through_call` decide que
+    // no contiene un GC value vivo.  Resultado: una llamada con GC
+    // (e.g. strmake_h, __new_X) entre la copia y la instruccion PHI
+    // deja el host_ptr stale en el reg, y al cruzar la siguiente
+    // iteracion del loop se dereferencia memoria liberada.
+    auto mark_def_extend_earlier = [&](IrValueId vid, uint32_t def_pos) {
+        if (vid == IR_NO_VALUE) return;
+        auto it = imap.find(vid);
+        if (it == imap.end()) return;
+        if (it->second.def == UNDEF || def_pos < it->second.def) {
+            it->second.def = def_pos;
+        }
+    };
+
     // --- Paso 3: recorrer todas las instrucciones ---
     for (size_t b = 0; b < nblocks; ++b) {
         const IrBlock &bb = fn.blocks[b];
@@ -100,7 +121,9 @@ LivenessResult compute_liveness(const IrFunction &fn) {
             uint32_t instr_pos = result.block_start[b] + static_cast<uint32_t>(i);
             const IrInstr &ins = bb.instrs[i];
 
-            // Definicion: el valor destino nace aqui
+            // Definicion: el valor destino nace aqui.  Para PHIs, la
+            // sobreescribimos mas abajo con la posicion del predecesor
+            // mas temprano (donde realmente se emite la copia).
             mark_def(ins.dst, instr_pos);
 
             // Usos de operandos normales
@@ -120,12 +143,29 @@ LivenessResult compute_liveness(const IrFunction &fn) {
             // Argumentos phi: el valor V que llega desde el bloque P
             // se considera "usado" al FINAL del bloque P (no en la instruccion phi).
             // Esto modela correctamente que V debe estar en un registro al salir de P.
+            //
+            // Adicionalmente: el DESTINO del PHI ya esta vivo en su reg
+            // desde el final del predecesor (emit_phi_copies emite la
+            // copia ahi).  Sin extender el def hacia atras, el regalloc
+            // ignora el reg en cualquier llamada entre la copia y la
+            // instruccion PHI, y un GC dispara host_ptrs stale en el
+            // reg.  Marcamos el def del destino al pred_end mas
+            // temprano (over-aproxima por linealidad pero garantiza
+            // que `live_regs_through_call` lo vea como vivo).
+            uint32_t earliest_pred_end = instr_pos;
             for (const auto &pa : ins.phi_args) {
                 if (pa.value == IR_NO_VALUE) continue;
                 uint32_t pred_end = (pa.block < static_cast<IrBlockId>(nblocks))
                                     ? result.block_end[pa.block]
                                     : instr_pos;
                 mark_use(pa.value, pred_end);
+                if (ins.op == IrOp::PHI && pred_end < earliest_pred_end) {
+                    earliest_pred_end = pred_end;
+                }
+            }
+            if (ins.op == IrOp::PHI && ins.dst != IR_NO_VALUE
+             && earliest_pred_end < instr_pos) {
+                mark_def_extend_earlier(ins.dst, earliest_pred_end);
             }
         }
     }

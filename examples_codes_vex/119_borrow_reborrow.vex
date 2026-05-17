@@ -1,0 +1,18 @@
+// Test F3 - Reborrowing:
+//   lend(borrow_var) crea un nuevo shared borrow del root owner.
+//   Permite cadenas: r1 derivado de owner; r2 = lend(r1) derivado de
+//   r1 (root: owner) -> 2 shared del mismo owner, valido R2.
+
+i32 main() {
+    unique<i32> owner = unique_box(42);
+
+    borrow<i32> r1 = lend(owner);    // shared del owner
+    borrow<i32> r2 = lend(r1);       // reborrow shared (root: owner)
+
+    // Ambos shared coexisten OK (R2).
+    i32 v1 = read_borrow(r1);
+    i32 v2 = read_borrow(r2);
+
+    if (v1 != 42 || v2 != 42) return 99;
+    return 42;
+}

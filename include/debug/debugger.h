@@ -114,6 +114,28 @@ namespace debug {
         INFO_PROC    = 13, ///< informacion de un proceso virtual
         EVAL         = 14, ///< evaluar expresion simple (nombre de registro)
         PAUSE        = 15, ///< forzar pausa del proceso
+        SET_BREAK_SRC= 16, ///< bp por (file, line) usando DebugInfo
+        INFO_SOURCE  = 17, ///< file:line del PC actual (usa DebugInfo)
+        // Comandos de inspeccion ampliados (anadidos para depuracion rica)
+        GC_STATS     = 18, ///< estadisticas del GC (handles vivos, nursery, oldgen, ciclos)
+        GC_HANDLES   = 19, ///< lista de handles GC vivos con clase + payload addr + size
+        GC_INSPECT   = 20, ///< dump de un handle: header, class_ptr, fields raw
+        FLAGS        = 21, ///< RFlags desglosado (CF/OF/SF/ZF/DM)
+        FREGS        = 22, ///< registros float f0..f15 (64-bit IEEE 754)
+        DUMP_STACK   = 23, ///< qwords del stack VM desde rsp + N entradas
+        FRAME_INFO   = 24, ///< saved_rbp / frame_size / locals del frame actual
+        BACKTRACE    = 25, ///< stack_trace mejorado con method.name + file:line
+        // Comandos potentes anadidos para Tier 2 / Tier 3
+        DISASM       = 26, ///< desensamblar N instrucciones desde una direccion VM
+        LOCALS       = 27, ///< variables locales del scope actual via DebugInfo
+        GC_RUN       = 28, ///< forzar major_gc en un proceso
+        STEP_OUT     = 29, ///< correr hasta el RET del frame actual (finish)
+        STEP_UNTIL   = 30, ///< one-shot bp por (file, line) y continuar
+        SET_WATCH    = 31, ///< watchpoint sobre GcHandle (pausa al evacuar/morir)
+        DEL_WATCH    = 32, ///< eliminar watchpoint por id
+        LIST_WATCHES = 33, ///< listar watchpoints activos
+        TRACE_MSGS   = 34, ///< toggle de tracing de msgsend/msgrecv del proceso
+        BREAK_MON    = 35, ///< toggle de break-on-monitor-contention global
     };
 
     /**
@@ -149,11 +171,31 @@ namespace debug {
      * y por la direccion VM absoluta donde se activa.
      */
     struct Breakpoint {
-        uint32_t id;       ///< identificador unico (1-based, 0 = invalido)
-        uint64_t addr;     ///< direccion VM absoluta
-        uint64_t pid;      ///< 0 = todos los procesos; != 0 = proceso especifico
-        bool     enabled;  ///< false = desactivado temporalmente
-        uint32_t hit_count;///< numero de veces que se ha activado
+        uint32_t    id;        ///< identificador unico (1-based, 0 = invalido)
+        uint64_t    addr;      ///< direccion VM absoluta
+        uint64_t    pid;       ///< 0 = todos los procesos; != 0 = proceso especifico
+        bool        enabled;   ///< false = desactivado temporalmente
+        uint32_t    hit_count; ///< numero de veces que se ha activado
+        bool        one_shot = false;   ///< auto-eliminar tras el primer hit
+        std::string condition;          ///< vacio = incondicional; ej "r0 == 100"
+    };
+
+    /**
+     * @brief Watchpoint sobre un GcHandle.
+     *
+     * Pausa el proceso indicado (o cualquiera con pid=0) cuando el handle
+     * cambia de direccion (evacuacion YOUNG -> OLD por el GC) o muere
+     * (release_handle).  Implementacion por polling: en el slow path de
+     * on_before_exec se compara handle_payload_addr() con la ultima vista.
+     * Coste cero cuando no hay watchpoints (any_watch_=false).
+     */
+    struct Watchpoint {
+        uint32_t id;        ///< identificador unico (1-based, 0 = invalido)
+        uint64_t pid;       ///< 0 = todos los procesos
+        uint64_t handle;    ///< GcHandle observado
+        uint64_t last_addr; ///< ultimo host_ptr conocido del handle
+        bool     enabled;
+        bool     was_alive; ///< estado vivo en la ultima observacion
     };
 
     // =========================================================================
@@ -180,6 +222,21 @@ namespace debug {
         uint32_t      call_depth;  ///< profundidad de llamada al iniciar next
         std::mutex    pause_mu;    ///< mutex para la pausa/reanudacion
         std::condition_variable pause_cv; ///< cv para bloquear el proceso en pausa
+        // PC en el que el proceso fue pausado por ULTIMO bp.  Cuando el
+        // cliente emite continue/step, la siguiente entrada a
+        // on_before_exec debe SALTAR el chequeo de bp si pc == este
+        // valor (sino tendriamos un loop infinito: bp -> pause -> resume
+        // -> bp -> pause...).  Tras consumir el skip se resetea a
+        // UINT64_MAX para que la siguiente entrada chequee bps normal.
+        uint64_t      last_bp_pc = UINT64_MAX;
+        // PC donde el proceso fue pausado por step_mode.  Cuando el cliente
+        // emite STEP de nuevo, debemos saltarnos el chequeo de step_mode
+        // en la siguiente entrada a on_before_exec (al MISMO pc) para
+        // permitir que la instruccion se ejecute; en caso contrario el
+        // proceso queda re-pausado en el mismo PC sin avanzar.  Tras
+        // ejecutar la instruccion el PC cambia y el proximo on_before_exec
+        // dispara la pausa correctamente.
+        uint64_t      last_step_pc = UINT64_MAX;
     };
 
     // =========================================================================
@@ -271,12 +328,62 @@ namespace debug {
          */
         void on_process_spawn(uint64_t parent_pid, uint64_t child_pid);
 
+        /**
+         * @brief Hook para tracing de mensajes (msgsend / msgrecv).
+         *
+         * Invocado desde el runtime cuando un proceso envia o recibe un
+         * mensaje.  Si el pid esta en la lista de tracing, emite un evento
+         * "msg_trace" hacia los clientes.  Sin overhead cuando no hay
+         * pids tracing (atomic load + branch).
+         *
+         * @param pid       PID local del proceso emisor/receptor.
+         * @param is_send   true=msgsend, false=msgrecv.
+         * @param target    PID destino (en send) o origen (en recv).
+         * @param payload64 64 bits del payload (para visualizacion rapida).
+         */
+        void on_message(uint64_t pid, bool is_send,
+                        uint64_t target, uint64_t payload64);
+
+        /**
+         * @brief Hook para break-on-monitor-contention.
+         *
+         * Invocado desde exec_instr_monenter en el path donde el monitor
+         * esta ocupado por otro proceso.  Si el toggle global esta activo,
+         * pausa el proceso y emite evento "mon_block".  Sin overhead cuando
+         * el toggle esta desactivado.
+         *
+         * @param pid    PID local del proceso bloqueado.
+         * @param handle GcHandle del objeto del monitor.
+         * @param owner  PID local del proceso que lo posee.
+         */
+        void on_monitor_contention(uint64_t pid, uint64_t handle,
+                                   uint64_t owner);
+
+        /**
+         * @brief Marca @p pid como PAUSADO antes de ejecutar su primera
+         *        instruccion.
+         *
+         * Activa step_mode + state=PAUSED para el proceso, asi cuando el
+         * scheduler invoque @c on_before_exec por primera vez, el hilo se
+         * bloqueara en la condition variable hasta que el cliente envie
+         * CONTINUE.  Util al arrancar la VM con @c --debug-port: sin esto,
+         * el proceso main empezaria a ejecutar antes de que el usuario
+         * tenga tiempo de conectar el cliente y poner breakpoints.
+         *
+         * @param pid PID local del proceso a pausar.
+         */
+        void pause_at_start(uint64_t pid);
+
     private:
         runtime::VM &vm_;     ///< referencia a la instancia VM
         uint16_t     port_;   ///< puerto TCP del servidor
 
         std::atomic<bool> running_{false};  ///< estado del servidor
         std::atomic<bool> any_bp_{false};   ///< hay breakpoints activos (fast path)
+        std::atomic<bool> any_step_{false}; ///< hay procesos en step/next o pausados (fast path)
+        std::atomic<bool> any_watch_{false};        ///< hay watchpoints activos (fast path slow)
+        std::atomic<bool> any_msg_trace_{false};    ///< hay procesos en msg-trace (fast path)
+        std::atomic<bool> break_on_mon_{false};     ///< break-on-monitor-contention global
 
         std::thread accept_thread_;  ///< hilo de aceptacion TCP
 
@@ -284,6 +391,15 @@ namespace debug {
         std::mutex                            bp_mutex_;
         std::vector<Breakpoint>               breakpoints_;
         uint32_t                              next_bp_id_{1};
+
+        /* --- estado de watchpoints --- */
+        std::mutex                            watch_mutex_;
+        std::vector<Watchpoint>               watchpoints_;
+        uint32_t                              next_watch_id_{1};
+
+        /* --- tracing de mensajes --- */
+        std::mutex                            trace_mutex_;
+        std::unordered_set<uint64_t>          traced_msg_pids_;
 
         /* --- estado por proceso depurado --- */
         std::mutex                            proc_mutex_;

@@ -1,0 +1,27 @@
+// Test F1 - Non-Lexical Lifetimes (NLL):
+//   Un borrow se "libera" en compile-time tras su ULTIMO USO real,
+//   no al exit del scope.  Patron clasico: tomar un borrow, usarlo,
+//   y despues mover el owner (sin que el borrow siga vivo).
+//
+// Sin NLL: ERROR R3 (move while borrowed).
+// Con NLL: OK (el borrow ya no se usa cuando se hace el move).
+
+unique<i32> consume(unique<i32> p) {
+    return p;
+}
+
+i32 main() {
+    unique<i32> owner = unique_box(42);
+
+    // Tomar borrow, ultimo uso en read_borrow.
+    borrow<i32> r = lend(owner);
+    i32 v = read_borrow(r);                 // ultimo uso de r
+    // <- aqui NLL libera el borrow
+
+    // Ahora podemos mover owner sin error.
+    unique<i32> q = move(owner);            // OK con NLL
+    i32* raw = ptr_of(q);
+    i32 w = *raw;
+
+    return v + w - 84 + 42;  // 42 + 42 - 84 + 42 = 42
+}

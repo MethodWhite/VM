@@ -1,0 +1,53 @@
+// Patron Rust: state machine que muta su estado via borrow_mut.
+// Una sola variable contiene el estado completo; las operaciones lo
+// modifican via &mut.  El borrow checker garantiza que no hay dos
+// operaciones simultaneas mutando el mismo estado.
+//
+//   let mut total = Box::new(0);
+//   apply_op(&mut total, OP_ADD, 10);   // 0 + 10 = 10
+//   apply_op(&mut total, OP_MUL, 3);    // 10 * 3 = 30
+//   apply_op(&mut total, OP_SUB, 5);    // 30 - 5 = 25
+//   apply_op(&mut total, OP_ADD, 17);   // 25 + 17 = 42
+
+void apply_op(borrow_mut<i32> total, i32 op, i32 arg) {
+    i32 cur = read_borrow(total);
+    i32 nxt = cur;
+    if (op == 1) nxt = cur + arg;      // OP_ADD
+    if (op == 2) nxt = cur - arg;      // OP_SUB
+    if (op == 3) nxt = cur * arg;      // OP_MUL
+    if (op == 4 && arg != 0) nxt = cur / arg;  // OP_DIV
+    write_borrow(total, nxt);
+}
+
+// Validador read-only: comprueba si el total cumple un predicado sin
+// mutarlo.  Coexiste con multiples shared sobre el mismo total cuando
+// el caller no tiene un mut activo.
+bool is_in_range(borrow<i32> total, i32 lo, i32 hi) {
+    i32 v = read_borrow(total);
+    return v >= lo && v <= hi;
+}
+
+i32 main() {
+    unique<i32> total = unique_box(0);
+
+    // Fase 1: aplicar 4 operaciones via mut borrow.
+    {
+        borrow_mut<i32> bm = lend_mut(total);
+        apply_op(bm, 1, 10);   // 0 + 10  = 10
+        apply_op(bm, 3, 3);    // 10 * 3  = 30
+        apply_op(bm, 2, 5);    // 30 - 5  = 25
+        apply_op(bm, 1, 17);   // 25 + 17 = 42
+        // NLL: bm dropea al ultimo uso aqui.
+    }
+
+    // Fase 2: validar con shared borrows (R2 permite multiples shared).
+    borrow<i32> s1 = lend(total);
+    borrow<i32> s2 = lend(total);
+    bool ok1 = is_in_range(s1, 40, 50);
+    bool ok2 = is_in_range(s2, 0, 100);
+    if (!ok1) return 100;
+    if (!ok2) return 200;
+
+    borrow<i32> s3 = lend(total);
+    return read_borrow(s3);
+}

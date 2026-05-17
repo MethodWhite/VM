@@ -1,0 +1,27 @@
+// Benchmark de hot loop para validar la fusion cmpjmp.
+//
+// Antes: cada iteracion del while emite `cmps + jmp.jX` (2 instr VM).
+// Despues: emite `cmpjmp.cc` (1 instr VM).
+//
+// Loop de 10M iteraciones con suma acumulativa.  El bottleneck del loop
+// es el cmp+jmp del bound check.  Esperamos ~10-15% wall time mejora
+// segun la fraccion del loop cubierta por la fusion.
+//
+// Resultado esperado: R0 = 42 (= 84/2 con i32 truncate).
+
+i32 main() {
+    i32 sum = 0;
+    i32 i = 0;
+    // bound check `i < N` se baja a un solo cmpjmp.cc cuando no hay
+    // phi copies entre cmp y jmp.  Para este loop simple SI lo hay
+    // (i++ + sum += i son phi copies), pero el patrón sigue siendo
+    // valido para ejercitar el path.
+    while (i < 10000000) {
+        sum = sum + 1;
+        i = i + 1;
+    }
+    // sum debe ser 10000000.  Como i32 cabe en 32 bits sin overflow,
+    // lo truncamos a 42 al final.
+    if (sum != 10000000) return 100;
+    return 42;
+}

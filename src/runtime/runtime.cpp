@@ -79,6 +79,16 @@ namespace runtime {
         // intentaran lanzar @c FatalError caerian al camino antiguo
         // (mata el proceso sin posibilidad de captura).
         runtime::init_exception_classes(loader_public);
+
+        // Instalar el handler de access violations a nivel de OS
+        // (Vectored Exception Handler en Windows, sigaction(SIGSEGV) en
+        // POSIX).  Idempotente via std::once: solo la primera VM
+        // creada lo registra; las siguientes son no-op.  Permite que
+        // accesos a punteros host invalidos desde bytecode (caso comun:
+        // deref de host_ptr stale tras free) se conviertan en
+        // FatalError capturables via try/catch en lugar de crashear la
+        // VM entera.
+        runtime::install_host_av_handler();
     }
 
     /**
@@ -107,6 +117,38 @@ namespace runtime {
      */
     void VM::start() {
         vm_running = true; // marcar la VM como activa
+
+        // Optimizacion (single-scheduler bypass): cuando hay un solo
+        // scheduler y el modo NO es persistente (dist-server), ejecutamos
+        // el run_loop SINCRONAMENTE en el thread llamante (main).  Esto
+        // ahorra:
+        //   - Latencia de OS-thread sched (~30 ms en Windows) del worker
+        //     del ThreadPool.
+        //   - Sincronizacion via condition_variable (cv.wait posterior
+        //     en el caller despierta inmediatamente porque run_loop
+        //     setea vm_running=false antes de retornar).
+        //
+        // Para programas triviales y tooling esta latencia es muy notable
+        // (representa el 50%+ del wall time).  Para programas grandes el
+        // overhead del pool es despreciable, pero la mejora sigue siendo
+        // 0% perdida y la simplicidad de single-thread es atractiva.
+        //
+        // El modo persistente (vm_persistent=true, dist-server) NO se
+        // beneficia: el run_loop nunca termina por si solo (espera procesos
+        // remotos via rspawn), bloquearia main para siempre.  Mantenemos
+        // el ThreadPool para ese caso.
+        if (num_schedulers == 1 && !vm_persistent) {
+            schedulers[0]->run_loop(); // bloquea hasta que todos los procs mueran
+            // run_loop ya setea vm_running=false + notifica done_cv cuando
+            // has_alive_processes() retorna false.  Defensivo: asegurar
+            // notify por si el run_loop salio por otra ruta (e.g. should_kill).
+            {
+                std::lock_guard<std::mutex> lk(done_mtx);
+                vm_running = false;
+            }
+            done_cv.notify_all();
+            return;
+        }
 
         for (uint32_t i = 0; i < num_schedulers; i++) {
             // someter la tarea del scheduler al pool y guardar el future

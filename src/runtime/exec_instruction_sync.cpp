@@ -41,8 +41,11 @@
 
 #include "runtime/exec_instruction.h"
 #include "runtime/proceso_runtime.h"
+#include "runtime/scheduler.h"
+#include "runtime/runtime.h"
 #include "gc/gc_heap.h"
 #include "loader/oop_types.h"
+#include "debug/debugger.h"  // Debugger::on_monitor_contention
 
 namespace runtime {
 
@@ -91,6 +94,20 @@ namespace runtime {
 
         // monitor ocupado: registrar en la cola de espera y bloquear
         vm->gc_heap.monitor_add_waiter(h, encode_pid(vm));
+        // Hook del debugger: notificar contention al monitor.  Sin overhead
+        // si break_on_mon_=false (atomic load + branch).
+        if (vm->scheduler.vm_reference.debugger) {
+            // Leer owner_pid del ObjectHeader del objeto referenciado (offset
+            // 16 dentro del header v2: class_ptr@0, flags@8, hash@12, owner@16).
+            uint64_t owner_pid = 0;
+            uint8_t *payload = vm->gc_heap.deref(h);
+            if (payload) {
+                uint8_t *header = payload - 24; // ObjectHeader v2 size = 24
+                owner_pid = *reinterpret_cast<uint32_t *>(header + 16);
+            }
+            vm->scheduler.vm_reference.debugger->on_monitor_contention(
+                vm->pid.local_pid, static_cast<uint64_t>(h), owner_pid);
+        }
         vm->decoded_ptr->flags_info.blocking = true; // bloquear sin avanzar PC
         vm->scheduler.on_event(EVT_IO_WAIT);         // transicion al estado WAIT_IO
     }

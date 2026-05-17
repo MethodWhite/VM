@@ -1,0 +1,257 @@
+// =============================================================================
+// extensions/ext_syntax_vex.vex - extension runtime de syntax highlighting
+// =============================================================================
+//
+// Plugin Vex compilado a `.velb` por separado.  El editor lo carga con
+// `loadmodule("ext_syntax_vex.velb")` y registra la clase `ExtSyntaxVex`
+// en el ExtensionRegistry; luego el editor invoca el hook `on_render_line`
+// via reflexion (forName + newInstance + getMethod + invoke) para colorear
+// cada linea visible.
+//
+// Categorias resaltadas:
+//   * keywords    -> CYAN bold      (class fn if while for return ...)
+//   * tipos       -> GREEN          (i32 i64 u8 ptr string void bool ...)
+//   * literales   -> MAGENTA        (numeros 0..9, hex, bin, oct, true/false/null)
+//   * strings     -> YELLOW         (entre comillas)
+//   * comentarios -> DIM            (// hasta fin de linea)
+//   * anotaciones -> CYAN bold      (@Override @Async @Inline ...)
+//   * operadores  -> RESET          (no resaltado)
+//   * identifs    -> RESET
+//
+// El hook `on_render_line` se invoca via:
+//   invoke(method_handle, instance, bdat_host_ptr, line_off, line_end, cols)
+//
+// Devuelve 1 si la extension imprimio la linea (el editor saltara su
+// render por defecto), 0 si no la consumio (render por defecto se aplica).
+
+// Categorias de caracter para el dispatch principal.
+const i32 CHARTYPE_OTHER = 0;
+const i32 CHARTYPE_SLASH = 1;
+const i32 CHARTYPE_QUOTE = 2;
+const i32 CHARTYPE_DIGIT = 3;
+const i32 CHARTYPE_ALPHA = 4;
+const i32 CHARTYPE_AT    = 5;
+
+// El editor instancia esta clase via `Class.newInstance()` que ahora SI
+// invoca el constructor (fix #1: caso estatico con `Class.forName(literal)`
+// emite `new X()` directo via __new_X synthetic).  Los campos se inicializan
+// en el ctor.  El editor controla el toggle global via su campo `syntax_on`.
+
+class ExtSyntaxVex {
+    public string keywords;
+    public string types;
+
+    public ExtSyntaxVex() {
+        this.keywords = "|class|fn|if|else|while|for|do|return|break|continue|true|false|null|new|this|super|public|private|protected|static|final|const|let|import|using|typedef|struct|enum|match|case|interface|extends|implements|throw|try|catch|finally|synchronized|spawn|await|rspawn|here|on|nonnull|delete|free|sizeof|in|extern|@Override|@Inline|@Async|@Aspect|@Before|@After|@Around|@Module|@Export|@Generic|@Asm|";
+        this.types    = "|i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|bool|char|void|string|ptr|cstring|Optional|Result|Some|None|Ok|Err|ArrayList|HashMap|HashSet|Queue|Deque|TreeMap|TreeSet|Stack|VirtualPtr|Class|Method|Field|Object|";
+    }
+
+    public i32 is_alpha(i32 c) {
+        if (c >= 65 && c <= 90)  { return 1; }
+        if (c >= 97 && c <= 122) { return 1; }
+        if (c == 95)             { return 1; }
+        return 0;
+    }
+
+    public i32 is_digit(i32 c) {
+        if (c >= 48 && c <= 57) { return 1; }
+        return 0;
+    }
+
+    public i32 is_alnum(i32 c) {
+        if (this.is_alpha(c) == 1) { return 1; }
+        if (this.is_digit(c) == 1) { return 1; }
+        return 0;
+    }
+
+    public i32 is_numchar(i32 c) {
+        if (this.is_digit(c) == 1) { return 1; }
+        if (c == 46)               { return 1; }
+        if (c == 120 || c == 88)   { return 1; }
+        if (c == 98  || c == 111)  { return 1; }
+        if (c >= 97  && c <= 102)  { return 1; }
+        if (c >= 65  && c <= 70)   { return 1; }
+        return 0;
+    }
+
+    public i32 categorize(i32 c) {
+        if (c == 47)               { return CHARTYPE_SLASH; }
+        if (c == 34)               { return CHARTYPE_QUOTE; }
+        if (this.is_digit(c) == 1) { return CHARTYPE_DIGIT; }
+        if (this.is_alpha(c) == 1) { return CHARTYPE_ALPHA; }
+        if (c == 64)               { return CHARTYPE_AT;    }
+        return CHARTYPE_OTHER;
+    }
+
+    public i32 match_at(u8* bdat, i32 off, i32 len, u8* draw, i32 dlen, i32 dict_pos) {
+        i32 i = 0;
+        while (i < len) {
+            if (dict_pos + i >= dlen) { return 0; }
+            if (bdat[off + i] != draw[dict_pos + i]) { return 0; }
+            i = i + 1;
+        }
+        return 1;
+    }
+
+    public i32 in_dict(u8* bdat, i32 off, i32 len, string dict) {
+        u8* draw = str_cstr(dict);
+        i32 dlen = str_bytes(dict);
+        i32 p = 0;
+        while (p < dlen) {
+            if (draw[p] == 124) {
+                p = p + 1;
+                if (this.match_at(bdat, off, len, draw, dlen, p) == 1) {
+                    if (p + len < dlen && draw[p + len] == 124) {
+                        return 1;
+                    }
+                }
+            } else {
+                p = p + 1;
+            }
+        }
+        return 0;
+    }
+
+    public i32 emit_comment(u8* bdat, i32 i, i32 line_end) {
+        print(DIM); print(WHITE);
+        while (i < line_end) {
+            print_char(bdat[i]);
+            i = i + 1;
+        }
+        print(RESET);
+        return i;
+    }
+
+    public i32 emit_string(u8* bdat, i32 i, i32 line_end) {
+        print(YELLOW);
+        print_char(bdat[i]);
+        i = i + 1;
+        i32 done = 0;
+        while (done == 0 && i < line_end) {
+            i32 cc = bdat[i];
+            if (cc == 92 && i + 1 < line_end) {
+                print_char(cc);
+                i = i + 1;
+                print_char(bdat[i]);
+                i = i + 1;
+            } else if (cc == 34) {
+                print_char(cc);
+                i = i + 1;
+                done = 1;
+            } else {
+                print_char(cc);
+                i = i + 1;
+            }
+        }
+        print(RESET);
+        return i;
+    }
+
+    public i32 emit_number(u8* bdat, i32 i, i32 line_end) {
+        print(MAGENTA);
+        i32 done = 0;
+        while (done == 0 && i < line_end) {
+            if (this.is_numchar(bdat[i]) == 1) {
+                print_char(bdat[i]);
+                i = i + 1;
+            } else {
+                done = 1;
+            }
+        }
+        print(RESET);
+        return i;
+    }
+
+    public i32 emit_ident(u8* bdat, i32 i, i32 line_end) {
+        i32 start = i;
+        i32 done = 0;
+        while (done == 0 && i < line_end) {
+            if (this.is_alnum(bdat[i]) == 1) {
+                i = i + 1;
+            } else {
+                done = 1;
+            }
+        }
+        i32 tlen = i - start;
+        i32 is_kw = this.in_dict(bdat, start, tlen, this.keywords);
+        i32 is_ty = 0;
+        if (is_kw == 0) {
+            is_ty = this.in_dict(bdat, start, tlen, this.types);
+        }
+        if (is_kw == 1)      { print(BOLD); print(CYAN); }
+        else if (is_ty == 1) { print(GREEN); }
+        i32 j = start;
+        while (j < i) {
+            print_char(bdat[j]);
+            j = j + 1;
+        }
+        if (is_kw == 1 || is_ty == 1) { print(RESET); }
+        return i;
+    }
+
+    public i32 emit_annot(u8* bdat, i32 i, i32 line_end) {
+        i32 start = i;
+        i = i + 1;
+        i32 done = 0;
+        while (done == 0 && i < line_end) {
+            if (this.is_alnum(bdat[i]) == 1) {
+                i = i + 1;
+            } else {
+                done = 1;
+            }
+        }
+        i32 tlen = i - start;
+        i32 is_kw = this.in_dict(bdat, start, tlen, this.keywords);
+        if (is_kw == 1) { print(BOLD); print(CYAN); }
+        i32 j = start;
+        while (j < i) {
+            print_char(bdat[j]);
+            j = j + 1;
+        }
+        if (is_kw == 1) { print(RESET); }
+        return i;
+    }
+
+    // Hook llamado por el editor via invoke().
+    // line_no: numero de linea absoluto (1-based) -- ignorado por syntax,
+    // util para extensiones tipo gutter.
+    // Devuelve 1 = linea consumida (saltar render por defecto), 0 = no.
+    public i32 on_render_line(i32 line_no, u8* bdat, i32 line_off, i32 line_end, i32 cols) {
+        i32 i = line_off;
+        i32 col = 0;
+        while (i < line_end) {
+            if (col >= cols) { i = line_end; }
+            if (i < line_end) {
+                i32 c   = bdat[i];
+                i32 cat = this.categorize(c);
+                i32 new_i = i;
+                if (cat == CHARTYPE_SLASH) {
+                    if (i + 1 < line_end && bdat[i + 1] == 47) {
+                        new_i = this.emit_comment(bdat, i, line_end);
+                    } else {
+                        print_char(c);
+                        new_i = i + 1;
+                    }
+                } else if (cat == CHARTYPE_QUOTE) {
+                    new_i = this.emit_string(bdat, i, line_end);
+                } else if (cat == CHARTYPE_DIGIT) {
+                    new_i = this.emit_number(bdat, i, line_end);
+                } else if (cat == CHARTYPE_ALPHA) {
+                    new_i = this.emit_ident(bdat, i, line_end);
+                } else if (cat == CHARTYPE_AT) {
+                    new_i = this.emit_annot(bdat, i, line_end);
+                } else {
+                    print_char(c);
+                    new_i = i + 1;
+                }
+                col = col + (new_i - i);
+                i = new_i;
+            }
+        }
+        return 1;
+    }
+}
+
+i32 main() {
+    return 1;
+}

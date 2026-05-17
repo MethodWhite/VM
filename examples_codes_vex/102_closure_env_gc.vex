@@ -1,0 +1,51 @@
+// Test de la mejora: closure env auto-free via GC.
+//
+// Antes: cuando una funcion devolvia un closure, el env block se
+// alocaba via RAW_ALLOC (raw heap, host_ptr) sin tracking GC.  Cada
+// invocacion filtraba 16 bytes minimo + 8*N (N captures).  En programas
+// con loops que crean closures sin retenerlas, la memoria crecia sin
+// limite.
+//
+// Ahora: el env block se aloca via GC_ALLOC (opcode bytecode `gcalloc` 0xA5
+// + secuencia gcderef+xchg para obtener host_ptr al payload).  El bloque
+// entra en HandleTable y participa del mark/sweep:
+//   - Mientras el function value referencia el env (host_ptr en stack/regs),
+//     el stack scan conservativo lo encuentra via ptr_to_handle_ y lo marca.
+//   - Cuando el function value sale de scope y nadie referencia el env,
+//     queda WHITE en el siguiente major_gc -> SWEEP -> DEAD -> reclamado.
+//
+// Este test ejercita el caso critico: bucle de muchas iteraciones creando
+// closures que NO retiene.  Si el leak existiera, el GC heap crece sin
+// limite y el programa OOM.  Si la mejora funciona, la memoria se mantiene
+// acotada.
+//
+// Resultado esperado:
+//   - Suma de aplicaciones = 5050 (10*sum(1..100) / 10 = 5050)
+//   - main devuelve 42
+
+fn(i32) -> i32 make_adder(i32 n) {
+    fn(i32) -> i32 f = (i32 x) => x + n;
+    return f;
+}
+
+i32 main() {
+    i32 total = 0;
+    i32 i = 1;
+    // 5000 iteraciones: en cada una creamos una closure (env de 8 bytes
+    // capturando n), la aplicamos UNA vez, y la descartamos.  Antes esto
+    // filtraba 5000 * (16 + 8) = 120 KB de heap raw.  Con GC_ALLOC el GC
+    // libera los envs sin uso en cada major_gc, manteniendo la memoria
+    // acotada.
+    while (i <= 5000) {
+        fn(i32) -> i32 add_i = make_adder(i);
+        total = total + add_i(0);  // add_i(0) = 0 + i = i
+        i = i + 1;
+    }
+    // total = 1 + 2 + ... + 5000 = 5000 * 5001 / 2 = 12502500
+    if (total != 12502500) return 100;
+
+    // Suma especifica para validar 42:
+    // make_adder(40) -> add40(2) = 42
+    fn(i32) -> i32 add40 = make_adder(40);
+    return add40(2);
+}

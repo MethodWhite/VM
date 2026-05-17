@@ -28,9 +28,10 @@
  */
 #include "runtime/exec_instruction.h"
 #include "runtime/proceso_runtime.h"
-#include "loader/loader.h"  // A.7.2: Loader::copy_executables_to en spawn
+#include "loader/loader.h"  // Loader::copy_executables_to en spawn
 #include "runtime/scheduler.h"
 #include "runtime/runtime.h"
+#include "runtime/exception_runtime.h" // throw_fatalf en spawnargs (argc > 12)
 
 namespace runtime {
 
@@ -226,6 +227,73 @@ namespace runtime {
         vm_ref.loader_public.copy_executables_to(*child);
         vm_ref.make_ready(new_pid);
 
+        const uint64_t encoded_pid =
+            (static_cast<uint64_t>(new_pid.scheduler_id) << 32) |
+             static_cast<uint64_t>(new_pid.local_pid & 0xFFFFFFFF);
+        vm->registers.regs[0].qword(encoded_pid);
+    }
+
+    // =========================================================================
+    // SPAWNARGS (0x00 0x66) - spawn que copia R1..R[R15] del padre al child
+    // =========================================================================
+
+    /**
+     * @brief Implementa @c spawnargs r_pc: spawn + copy de regs (calling conv CALLVM).
+     *
+     * Identico a @c exec_instr_spawn salvo que ANTES de @c make_ready copia
+     * los regs R1..R[R15] del padre a los mismos slots del child.  Calling
+     * convention identica a CALLVM: argc en R15 (rango 0..12), args en
+     * R1..R12.  Permite a @Async (lower_async_function) eliminar la
+     * serializacion via msgsend/msgrecv: pasamos los args directamente por
+     * los registros del proceso, ahorrando ~26 instr VM por @Async call y
+     * el lock del mailbox.
+     *
+     * El child encuentra los params en sus regs sin necesidad de decode +
+     * deserializacion en el body.  R15 del padre se preserva (no se copia
+     * porque sino el child interpretaria su contenido como argc, conflicto).
+     */
+    void exec_instr_spawnargs(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t  reg_idx = instr.data_instruction.reg_data.reg1;
+        const uint64_t fn_addr = vm->registers.regs[reg_idx].qword();
+        const uint64_t argc    = vm->registers.regs[R15].qword();
+
+        // Validar argc: max 12 (R1..R12 segun calling convention).
+        if (argc > 12) {
+            throw_fatalf(vm, FATAL_ILLEGAL_INSTRUCTION,
+                "spawnargs: argc=%llu excede el maximo de 12 args",
+                static_cast<unsigned long long>(argc));
+            return;
+        }
+
+        runtime::VM &vm_ref = vm->scheduler.vm_reference;
+        GlobalPID new_pid = (vm_ref.schedulers.size() > 1)
+            ? vm_ref.spawn_process()
+            : vm->scheduler.spawn();
+        Scheduler *owner_sched = vm_ref.schedulers[new_pid.scheduler_id].get();
+        ProcessVM *child = owner_sched->pid_index.at(new_pid);
+
+        // PC, stack, code copy: idem spawn.
+        child->registers.rip.qword(fn_addr);
+        const uint64_t stack_base =
+            0x10000000ULL + (new_pid.local_pid % 0x1000ULL) * 0x100000ULL;
+        child->registers.stack_pointer.qword(stack_base);
+        child->registers.base_pointer.qword(stack_base);
+        child->stack_high      = stack_base;
+        child->stack_low_water = stack_base;
+        vm_ref.loader_public.copy_executables_to(*child);
+
+        // CRITICO: copiar args ANTES de make_ready, para que el child los
+        // vea desde su primer ciclo de instruccion (sin race con el
+        // scheduler).  Copiamos R1..R[argc] (no incluimos R0 que sera el
+        // PID encoded del child que el padre recibe; el child no lo
+        // necesita).  R15 del child queda en 0 (default), asi el child no
+        // hereda el "argc" del padre.
+        for (uint64_t i = 1; i <= argc && i <= 12; ++i) {
+            child->registers.regs[i].qword(vm->registers.regs[i].qword());
+        }
+
+        // Activar el child y devolver PID encoded al padre en R0.
+        vm_ref.make_ready(new_pid);
         const uint64_t encoded_pid =
             (static_cast<uint64_t>(new_pid.scheduler_id) << 32) |
              static_cast<uint64_t>(new_pid.local_pid & 0xFFFFFFFF);

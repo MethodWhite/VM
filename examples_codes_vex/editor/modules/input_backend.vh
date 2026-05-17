@@ -30,6 +30,10 @@ class InputBackend {
 
     // poll_key: tecla actual o KEY_NONE.  Las teclas extendidas (flechas,
     // F1..F12, Home/End, etc.) llegan como secuencia 0x00 / 0xE0 + scancode.
+    // Si SHIFT esta pulsado fisicamente durante una flecha/nav, emitimos
+    // KEY_SHIFT_* en vez del KEY_* normal para que el editor extienda la
+    // seleccion.  Capturamos el estado del shift JUSTO antes del
+    // win_special para minimizar ventanas de carrera.
     public i32 poll_key() {
         i64 n = ffi_call(this.sym_kbhit);
         if (n == 0) {
@@ -38,7 +42,17 @@ class InputBackend {
         i64 c = ffi_call(this.sym_getch);
         if (c == 0 || c == 224) {
             i64 c2 = ffi_call(this.sym_getch);
-            return this.win_special(c2);
+            i32 shift_now = this.is_key_down(VK_SHIFT);
+            i32 base = this.win_special(c2);
+            if (shift_now == 1) {
+                if (base == KEY_UP)    { return KEY_SHIFT_UP;    }
+                if (base == KEY_DOWN)  { return KEY_SHIFT_DOWN;  }
+                if (base == KEY_LEFT)  { return KEY_SHIFT_LEFT;  }
+                if (base == KEY_RIGHT) { return KEY_SHIFT_RIGHT; }
+                if (base == KEY_HOME)  { return KEY_SHIFT_HOME;  }
+                if (base == KEY_END)   { return KEY_SHIFT_END;   }
+            }
+            return base;
         }
         i32 ic = c;
         return ic;
@@ -72,6 +86,13 @@ class InputBackend {
         if (c2 == 61) { return KEY_F3;    }
         if (c2 == 62) { return KEY_F4;    }
         if (c2 == 63) { return KEY_F5;    }
+        if (c2 == 64) { return KEY_F6;    }
+        if (c2 == 65) { return KEY_F7;    }
+        if (c2 == 66) { return KEY_F8;    }
+        if (c2 == 67) { return KEY_F9;    }
+        if (c2 == 68) { return KEY_F10;   }
+        if (c2 == 133){ return KEY_F11;   }   // VK_F11 extended
+        if (c2 == 134){ return KEY_F12;   }   // VK_F12 extended
         return KEY_NONE;
     }
 

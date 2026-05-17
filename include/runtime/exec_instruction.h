@@ -402,6 +402,21 @@ namespace runtime {
     void exec_instr_strmake(ProcessVM *vm, const DecodedInstr &instr);
 
     /**
+     * @brief Ejecuta STRMAKE_H r_dst, r_src: crea StringObject desde buffer HOST.
+     *
+     * Variante de STRMAKE (0x46) para casos donde el buffer reside en memoria
+     * del proceso host (resultado de @c malloc, @c gcallocp, etc.) en lugar de
+     * memoria VM.  Este escenario aparece naturalmente en codigo Vex que
+     * combina punteros raw (`u8* buf = malloc(n)`) con la API de strings:
+     * `string s = str_make(buf, n)`.
+     *
+     * Encoding FIXED_4: [0x00][0x55][ctrl][byte3]  -- mismo layout que STRMAKE.
+     *   ctrl  = (r_dst<<4)|r_src   r_src contiene host_ptr (uint64) al buffer
+     *   byte3 = (encoding<<4)|r_len r_len contiene byte_len del buffer
+     */
+    void exec_instr_strmake_h(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
      * @brief Ejecuta STRLEN r_dst, r_src: almacena el numero de code points en r_dst.
      *
      * Encoding FIXED_4: [0x00][0x47][ctrl][0x00]  ctrl = (r_dst<<4)|r_src
@@ -497,6 +512,44 @@ namespace runtime {
      * Encoding FIXED_4: [0x00][0x54][ctrl][0x00]  ctrl=(r_dst<<4)|r_newlen
      */
     void exec_instr_strfinalize(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta GETMETHAT r_cls, r_idx: variante reg-reg de getmethod (0xD9).
+     *
+     * Devuelve en R00 el puntero host a MethodInfo del metodo i-esimo, o 0 si
+     * cls es nulo o idx >= cls->method_count.  Permite iteracion dinamica
+     * via builtin Vex `getMethodAt(cls, i)` (idx desde registro, no inmediato).
+     * Encoding FIXED_4: [0x00][0x6E][ctrl][0x00] con ctrl=(r_idx<<4)|r_cls.
+     */
+    void exec_instr_getmethat(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta GETFLDAT r_cls, r_idx: variante reg-reg de getfield (0xD8).
+     *
+     * Devuelve en R00 el puntero host a FieldInfo del campo i-esimo, o 0.
+     * Builtin Vex `getFieldAt(cls, i)`.  Encoding FIXED_4 igual que getmethat.
+     */
+    void exec_instr_getfldat(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta GETARGC r_dst: deposita el numero de argumentos del script.
+     *
+     * Lee `vm->scheduler.vm_reference.script_args.size()` y lo escribe en r_dst.
+     * Encoding FIXED_4: [0x00][0x6B][ctrl][0x00] con ctrl=(r_dst<<4).
+     * Builtin Vex `args_count()`.
+     */
+    void exec_instr_getargc(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta GETARG r_dst, r_idx: aloca StringObject con arg[idx].
+     *
+     * Lee idx de r_idx; si idx < script_args.size(), aloca un StringObject FLAT
+     * (UTF-8) con los bytes del arg correspondiente y deposita el GcHandle en
+     * r_dst.  Si idx fuera de rango, deposita 0 (GC_NULL_HANDLE).
+     * Encoding FIXED_4: [0x00][0x6C][ctrl][0x00] con ctrl=(r_dst<<4)|r_idx.
+     * Builtin Vex `args_get(i)`.
+     */
+    void exec_instr_getarg(ProcessVM *vm, const DecodedInstr &instr);
 
     // =========================================================================
     //  Ejecutores: control de flujo y pila
@@ -677,6 +730,51 @@ namespace runtime {
      * @param instr Instruccion descodificada con reg_data.reg1 = r_dst, reg2 = r_src.
      */
     void exec_instr_gchandle(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta MVTAKE: move-and-take de 8 bytes en memoria VM.
+     *
+     * Semantica: copia un qword desde la direccion en r_src hasta la
+     * direccion en r_dst, y deja en cero la direccion fuente.  Es el
+     * primitivo de move ownership para smart pointers (unique<T>,
+     * shared<T>) sin atomicidad cross-thread (el move siempre es
+     * single-owner por construccion).  Tres pasos atomicos en codigo VM,
+     * pensado para colapsar a 3 instrucciones host x86-64 cuando el JIT
+     * lo recozca (load + store + zero-store).
+     *
+     * Formato: [0x00][0x72][byte2][0x00]  (FIXED_4)
+     *   byte2 = (r_src_addr << 4) | r_dst_addr.
+     *
+     * Postcondiciones:
+     *   *(u64*)[r_dst] = *(u64*)[r_src]
+     *   *(u64*)[r_src] = 0
+     *
+     * @param vm    Proceso virtual que ejecuta MVTAKE.
+     * @param instr Instruccion descodificada con reg_data.reg1=r_dst, reg2=r_src.
+     */
+    void exec_instr_mvtake(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta super-instrucciones ALU 3-operandos (0x73-0x7B).
+     *
+     * Combina @c mov rd,rs1 + OP rd,rs2 en una sola instruccion VM.  La
+     * operacion se determina por opcode_index (0x73 adds3, 0x74 subs3,
+     * 0x75 muls3, 0x76 addu3, 0x77 subu3, 0x78 mulu3, 0x79 and3, 0x7A or3,
+     * 0x7B xor3).  Lee r_src1 y r_src2 de los nibbles altos de byte2 y
+     * byte3 respect., escribe en r_dst (nibble bajo de byte2).  Actualiza
+     * ZF/SF/CF/OF segun semantica de la operacion.
+     */
+    void exec_instr_alu3(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta super-instruccion LOAD con zero-extend (loadz / loadzh).
+     *
+     * Combina @c mov rd,0 + @c mov rd_sized,[rs] en una sola instruccion VM.
+     * El tamano (8/16/32/64 bits) se selecciona por @c flags_info.mode; el
+     * bit @c _signed_instruct = 1 indica que el puntero es HOST (loadzh
+     * opcode 0x7D), 0 = VM mem (loadz opcode 0x7C).
+     */
+    void exec_instr_loadz(ProcessVM *vm, const DecodedInstr &instr);
 
     /**
      * @brief Ejecuta ADDCUR: suma un inmediato con signo al registro cursor indicado.
@@ -951,6 +1049,14 @@ namespace runtime {
      *              reg2 = registro con longitud en bytes del path.
      */
     void exec_instr_loadmod(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Ejecuta UNLOADMOD r_path_addr, r_path_len: descarga modulo dinamico.
+     *
+     * Mismo formato que loadmod (path en VM mem).  Delega en
+     * `Loader::unload_module_dynamic(path)`.  R0 = 1 si descargado, 0 si no encontrado.
+     */
+    void exec_instr_unloadmod(ProcessVM *vm, const DecodedInstr &instr);
 
     /**
      * @brief PANIC (0x5A): lanza un @c FatalError con kind=FATAL_USER_ABORT
@@ -1399,6 +1505,115 @@ namespace runtime {
      * @c FatalError desde Vex.
      */
     void exec_instr_callni(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Aloca un bloque GC y deposita host_ptr al payload en r_dst (0x65).
+     *
+     * Operandos:
+     *   reg1 = r_dst  (registro destino para host_ptr)
+     *   reg2 = r_size (registro con tamano en bytes)
+     *
+     * Equivalente fusionado a:
+     *   gcalloc r_size       ; R0 = handle
+     *   gcderef cur0, r0     ; cur0 = host_ptr
+     *   xchg cur0, r_dst     ; r_dst = host_ptr
+     * pero en una sola instruccion VM.  3x speedup en creacion de envs
+     * para closures que escapan (gap O del roadmap).  Si OOM, lanza
+     * FATAL_OUT_OF_MEMORY capturable via try/catch.
+     */
+    void exec_instr_gcallocp(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Spawn que copia R1..R[R15] del padre al child (0x66).
+     *
+     * Operandos:
+     *   reg1 = r_pc   (registro con direccion de inicio del child)
+     *   R15 (implicito) = argc (numero de args 0..12)
+     *   R1..R[argc] (implicitos) = args
+     *
+     * Antes de make_ready, copia los regs R1..R[argc] del padre a los
+     * mismos slots del child, asi el child ve los args directamente sin
+     * necesidad de msgrecv + deserializar buffer.  Calling convention
+     * identica a CALLVM.  Devuelve PID encoded del child en R0 del padre.
+     * Mismo set up de PC, RSP/RBP, copy_executables_to que @c spawn.
+     */
+    void exec_instr_spawnargs(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Fulfill + hlt fusionados (0x67).
+     *
+     * Operandos:
+     *   reg1 = r_fut   (registro con handle del Future)
+     *   reg2 = r_value (registro con valor a depositar)
+     *
+     * Equivalente fusionado a:
+     *   fulfill r_fut, r_value   ; resolver future + wake waiter
+     *   hlt                       ; terminar proceso
+     * Usado por el helper sintetico de @Async para que cada `return X`
+     * del body se reduzca a 1 instruccion VM en lugar de 2.
+     */
+    void exec_instr_fulfillhlt(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Cmp signed + jcc fusionados (0x68).
+     *
+     * Equivalente atomic a la secuencia:
+     *   cmps r_a, r_b           ; setea ZF/SF/CF/OF segun a-b signed
+     *   jmp.cond target         ; salta si la condicion se cumple
+     * en una sola instruccion VM.  Reduce 2 instr -> 1 por comparacion
+     * condicional en hot loops.
+     *
+     * Operandos descodificados:
+     *   static_data.r0     = r_a
+     *   static_data.r1     = r_b
+     *   static_data._pad   = cond_byte (0x00..0x0D, mismo set que jmp.j*)
+     *   static_data.offset = target u32 (direccion absoluta)
+     *
+     * Si la condicion se cumple, escribe @c rip = offset y marca did_jump.
+     */
+    void exec_instr_cmpjmp(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Cmp unsigned + jcc fusionados (0x69).
+     *
+     * Identico a @c exec_instr_cmpjmp pero hace comparacion unsigned (cmpu).
+     */
+    void exec_instr_cmpjmpu(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Decremento + branch-if-not-zero (0x6A).
+     *
+     * Equivalente atomic a:
+     *   subs r_counter, 1
+     *   jmp.jne target           ; salta si r_counter != 0
+     * en una sola instruccion VM.  Reduce 2-3 instr -> 1 por iteracion en
+     * loops contadores estilo `for (i = N; i > 0; i--)`.
+     *
+     * Operandos descodificados:
+     *   static_data.r0     = r_counter
+     *   static_data.offset = target u32
+     */
+    void exec_instr_decjnz(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Empuja a la pila N registros segun el bitmask (opcode extended 0x6B).
+     *
+     * Cada bit puesto en @c data_instruction.mask_data.mask representa un
+     * registro general (bit r = r0..r15).  Itera bits ascendentes via TZCNT,
+     * decrementa RSP por (popcount(mask)*8) en una sola escritura, y empuja
+     * cada registro a su slot.  Equivalente a una secuencia de N push, pero
+     * en 1 instr VM con aritmetica de pila amortizada.
+     */
+    void exec_instr_fastpush(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
+     * @brief Desempila N registros del bitmask en orden simetrico a fastpush.
+     *
+     * Restaura cada registro marcado en el mask leyendo de slots descendentes
+     * y luego incrementa RSP por (popcount(mask)*8).  Para un mismo mask,
+     * revierte exactamente el efecto de @c fastpush.
+     */
+    void exec_instr_fastpop(ProcessVM *vm, const DecodedInstr &instr);
 
     /**
      * @brief Escribe un static field (i64) en una clase (opcode extended 0x61).

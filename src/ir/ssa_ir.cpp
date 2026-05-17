@@ -167,6 +167,9 @@ namespace ir {
         {"callvirt",   IrOp::CALLVIRT},
         {"callm",      IrOp::CALLM},
         {"callclosure",IrOp::CALLCLOSURE},
+        {"make_closure",IrOp::MAKE_CLOSURE},
+        {"make_variant",IrOp::MAKE_VARIANT},
+        {"match_variant",IrOp::MATCH_VARIANT},
         {"calln",      IrOp::CALLN},
         // memoria
         {"alloca",     IrOp::ALLOCA},
@@ -175,6 +178,8 @@ namespace ir {
         {"memcpy",     IrOp::MEMCPY},
         {"raw_alloc",  IrOp::RAW_ALLOC},
         {"raw_free",   IrOp::RAW_FREE},
+        {"gc_alloc",   IrOp::GC_ALLOC},
+        {"spawn_args", IrOp::SPAWN_ARGS},
         // OOP / GC
         {"newobj",       IrOp::NEWOBJ},
         {"getfield",     IrOp::GETFIELD},
@@ -492,6 +497,46 @@ namespace ir {
                 o << ")";
                 break;
 
+            case IrOp::MAKE_CLOSURE: {
+                // B.1 marker: make_closure @helper, env_kind=K, mutable_mask=M,
+                //                          captures=[%c0, %c1, ...]
+                // No produce SSA value.  El C2 lo consume para escape analysis.
+                const uint64_t env_kind     = ins.imm & 0x1ULL;
+                const uint64_t mutable_mask = (ins.imm >> 1) & 0xFFFFULL;
+                o << " @" << ins.func_name
+                  << ", env_kind=" << (env_kind ? "GC_HEAP" : "STACK")
+                  << ", mutable_mask=0x" << std::hex << mutable_mask << std::dec
+                  << ", captures=[";
+                for (size_t i = 0; i < ins.operands.size(); i++) {
+                    if (i > 0) o << ", ";
+                    print_val(o, fn, ins.operands[i]);
+                }
+                o << "]";
+                break;
+            }
+
+            case IrOp::MAKE_VARIANT: {
+                // B.2 marker: make_variant @"Enum.Variant", tag=K, payload=[%p0, %p1, ...]
+                o << " @" << ins.func_name
+                  << ", tag=" << ins.imm
+                  << ", payload=[";
+                for (size_t i = 0; i < ins.operands.size(); i++) {
+                    if (i > 0) o << ", ";
+                    print_val(o, fn, ins.operands[i]);
+                }
+                o << "]";
+                break;
+            }
+
+            case IrOp::MATCH_VARIANT: {
+                // B.2 marker: match_variant %scrutinee, @EnumName, n_arms=K
+                o << " ";
+                if (!ins.operands.empty()) print_val(o, fn, ins.operands[0]);
+                o << ", @" << ins.func_name
+                  << ", n_arms=" << ins.imm;
+                break;
+            }
+
             case IrOp::CALLVIRT:
                 // callvirt.T %obj, vtbl_idx(args...)
                 o << " ";
@@ -705,6 +750,20 @@ namespace ir {
 
         // funciones
         for (const auto &fn : mod.functions) {
+            // contract: si la funcion es una instanciacion de
+            // un template generico, emitir las anotaciones de
+            // provenance ANTES del @function.  Asi el round-trip
+            // preserva el contract para C2/AOT/tools.
+            if (!fn.generic_template_name.empty()) {
+                o << "@template_of " << fn.generic_template_name << "\n";
+                o << "@type_args [";
+                for (size_t i = 0; i < fn.generic_type_args.size(); ++i) {
+                    if (i > 0) o << ", ";
+                    o << fn.generic_type_args[i];
+                }
+                o << "]\n";
+            }
+
             // @function nombre(param: tipo, ...) -> tipo_retorno [flags] {
             o << "@function " << fn.name << "(";
             bool first = true;
@@ -875,6 +934,15 @@ namespace ir {
         };
 
         bool in_block_comment = false; // estado para /* ... */
+
+        // B.3 contract: estado pendiente para las anotaciones de
+        // monomorphizacion (@template_of / @type_args).  Se acumulan
+        // hasta que se vea el siguiente @function, momento en que se
+        // aplican y se limpian.  Si aparecen sin un @function siguiente
+        // (programa malformado), simplemente se descartan al final.
+        std::string              pending_template_of;
+        std::vector<std::string> pending_type_args;
+
         while (std::getline(ss, line)) {
             lineno++;
 
@@ -973,12 +1041,59 @@ namespace ir {
                 continue;
             }
 
+            // --- @template_of <TemplateName> --- (contract)
+            // Anotacion que aplica al siguiente @function: marca esta
+            // como una instanciacion del template indicado.
+            if (line.rfind("@template_of", 0) == 0) {
+                pending_template_of = line.substr(12);
+                trim(pending_template_of);
+                continue;
+            }
+
+            // --- @type_args [t1, t2, ...] --- (contract)
+            // Lista de tipos concretos sustituidos en la instanciacion.
+            // Se aplica al siguiente @function junto con @template_of.
+            if (line.rfind("@type_args", 0) == 0) {
+                std::string body = line.substr(10);
+                // Quitar `[` y `]` si estan presentes.
+                size_t lb = body.find('[');
+                size_t rb = body.find(']');
+                if (lb != std::string::npos) body.erase(0, lb + 1);
+                if (rb != std::string::npos && rb > 0) {
+                    size_t rb2 = body.find(']');
+                    if (rb2 != std::string::npos) body.erase(rb2);
+                }
+                // Split por coma.
+                pending_type_args.clear();
+                std::string acc;
+                for (char c : body) {
+                    if (c == ',') {
+                        trim(acc);
+                        if (!acc.empty()) pending_type_args.push_back(acc);
+                        acc.clear();
+                    } else {
+                        acc += c;
+                    }
+                }
+                trim(acc);
+                if (!acc.empty()) pending_type_args.push_back(acc);
+                continue;
+            }
+
             // --- @function nombre(...) -> tipo [flags] { ---
             if (line.rfind("@function", 0) == 0) {
                 IrFunction fn;
                 fn.is_native   = false;
                 fn.is_variadic = false;
                 fn.ret_type    = IrType::VOID;
+
+                // Aplicar anotaciones pendientes del contract.
+                if (!pending_template_of.empty()) {
+                    fn.generic_template_name = std::move(pending_template_of);
+                    fn.generic_type_args     = std::move(pending_type_args);
+                    pending_template_of.clear();
+                    pending_type_args.clear();
+                }
 
                 size_t paren = line.find('(');
                 if (paren == std::string::npos) {

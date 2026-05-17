@@ -1,0 +1,71 @@
+// Demo: smart pointer auto-released con VirtualAlloc / VirtualFree.
+//
+// Estructura del test:
+//   1. Declaramos VirtualAlloc y VirtualFree como extern de kernel32.dll.
+//   2. Escribimos un wrapper Vesta release_vmem(p) que invoca VirtualFree
+//      con args fijos (size=0, type=MEM_RELEASE=0x8000).
+//   3. La funcion alloc_and_use() reserva 4096 bytes con VirtualAlloc,
+//      los envuelve en unique<i64> con unique_with(mem, release_vmem),
+//      y termina.  Al hacer RET el cleanup ejecuta release_vmem(mem).
+//   4. main() invoca alloc_and_use() varias veces para verificar que
+//      cada llamada incrementa el contador en 1 (no leak / no double-free).
+//
+// Argumentos VirtualAlloc:
+//   addr:    0           (sistema elige direccion)
+//   size:    4096
+//   type:    0x3000      (MEM_COMMIT|MEM_RESERVE)
+//   protect: 0x04        (PAGE_READWRITE)
+//
+// Argumentos VirtualFree:
+//   addr:    p
+//   size:    0           (debe ser 0 para MEM_RELEASE)
+//   type:    0x8000      (MEM_RELEASE)
+//
+// Resultado esperado:
+//   R00 = 42 si las 3 invocaciones de alloc_and_use() liberan correctamente.
+
+extern "kernel32.dll" {
+    fn VirtualAlloc(u64 addr, u64 size, u32 alloc_type, u32 protect) -> u64;
+    fn VirtualFree(u64 addr, u64 size, u32 free_type) -> u32;
+}
+
+class Stats {
+    public static i64 releases;
+    public static i64 allocs_ok;
+}
+
+// Wrapper de 1 arg que envuelve la llamada de 3 args nativa.
+void release_vmem(i64 p) {
+    VirtualFree(p, 0, 0x8000);   // MEM_RELEASE
+    Stats.releases = Stats.releases + 1;
+}
+
+// Alloca 4096 bytes via VirtualAlloc + adopta en unique<i64>.
+// El cleanup automatico al RET invoca release_vmem(mem).
+void alloc_and_use() {
+    i64 mem = VirtualAlloc(0, 4096, 0x3000, 0x04);
+    unique<i64> guard = unique_with(mem, release_vmem);
+    if (mem != 0) {
+        Stats.allocs_ok = Stats.allocs_ok + 1;
+    }
+}
+
+i32 main() {
+    Stats.releases  = 0;
+    Stats.allocs_ok = 0;
+
+    alloc_and_use();    // alloc + auto release
+    alloc_and_use();    // alloc + auto release
+    alloc_and_use();    // alloc + auto release
+
+    // Verificaciones:
+    //  - Stats.allocs_ok == 3 (las 3 VirtualAlloc tuvieron exito)
+    //  - Stats.releases  == 3 (cada cleanup invoco release_vmem una vez)
+    if (Stats.allocs_ok != 3) {
+        return 100 + Stats.allocs_ok;
+    }
+    if (Stats.releases != 3) {
+        return 200 + Stats.releases;
+    }
+    return 42;
+}

@@ -1,0 +1,77 @@
+// Test integrador: combina todos los patrones realistas en un solo
+// programa que imita un cache simple con operaciones de lectura y
+// escritura.  Cubre simultaneamente:
+//
+//   F1 NLL: borrows liberados tras ultimo uso
+//   F2 OwnerKind: param escape via lifetime elision
+//   F3 Reborrow: helper con reborrow_mut a otra helper
+//   F4 Elision: factory devolviendo borrow del input
+//   R1/R2: exclusividad mut + shared compatibles
+
+// Validador read-only que cuenta cuantas veces la suma cae en un rango.
+i32 count_in_range(borrow<i64> a, borrow<i64> b, borrow<i64> c,
+                   i64 lo, i64 hi) {
+    i32 count = 0;
+    i64 va = read_borrow(a);
+    i64 vb = read_borrow(b);
+    i64 vc = read_borrow(c);
+    if (va >= lo && va <= hi) count = count + 1;
+    if (vb >= lo && vb <= hi) count = count + 1;
+    if (vc >= lo && vc <= hi) count = count + 1;
+    return count;
+}
+
+// Acumulador mut: aplica delta a un valor.
+void accumulate(borrow_mut<i64> p, i64 delta) {
+    i64 cur = read_borrow(p);
+    write_borrow(p, cur + delta);
+}
+
+// Pipeline mut: aplica 3 transformaciones via reborrow encadenado.
+void pipeline(borrow_mut<i64> p) {
+    accumulate(p, 5);          // +5
+    {
+        borrow_mut<i64> rb = lend_mut(p);   // suspend p
+        accumulate(rb, 10);    // +10 via reborrow
+        // rb dropea aqui (NLL) -> p activo de nuevo
+    }
+    accumulate(p, 7);          // +7
+    // Neto por pipeline call: +22
+}
+
+// Factory con F4: devuelve el mismo borrow recibido (elision rule 1).
+borrow<i64> identity(borrow<i64> p) {
+    return p;
+}
+
+i32 main() {
+    unique<i64> a = unique_box(10);
+    unique<i64> b = unique_box(20);
+    unique<i64> c = unique_box(30);
+
+    // Fase 1: aplicar pipeline a uno de los uniques (mut).
+    {
+        borrow_mut<i64> bm = lend_mut(a);
+        pipeline(bm);   // 10 + 22 = 32
+        // bm dropea (NLL)
+    }
+
+    // Fase 2: lectura concurrente con shared borrows.  count_in_range
+    // recibe 3 borrows shared simultaneos (R2).
+    borrow<i64> sa = lend(a);
+    borrow<i64> sb = lend(b);
+    borrow<i64> sc = lend(c);
+
+    // F4: identity(sb) hereda owner_source = b.
+    borrow<i64> sb2 = identity(sb);
+
+    // count_in_range tipica: cuenta valores en [25, 35].
+    // a=32, b=20, c=30.  Solo a y c estan en [25,35] -> count=2.
+    i32 cnt = count_in_range(sa, sb2, sc, 25, 35);
+
+    if (cnt != 2) return 99;
+
+    // Computo final: 32 (valor de a) + 10 = 42.
+    i64 va = read_borrow(sa);
+    return (i32)(va + 10);
+}

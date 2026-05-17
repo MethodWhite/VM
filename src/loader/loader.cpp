@@ -10,14 +10,19 @@
  */
 #include "loader/loader.h"
 
+#include <cstdio>
 #include <cstring>
+#include "debug/debug_info.h"
+#include "ir/ssa_ir_serialize.h"
 #include "emmit/bytereader.h"
 #include "emmit/struct_context.h"
 #include "runtime/manager_runtime.h"
-#include "runtime/decode_table.h"   // A.9: rebase_bytecode_addresses usa decode tables
-#include "runtime/decode_instruction.h" // A.9: InstrFormat para size_from_mode
+#include "runtime/decode_table.h"   // rebase_bytecode_addresses usa decode tables
+#include "runtime/decode_instruction.h" // InstrFormat para size_from_mode
 #include "ffi/vesta_plugin.h"
 #include "cli/sync_io.h"
+#include "jit/auto_jit.h"           // eager-compile main + jit_entry_fn
+#include "jit/jit_compiler.h"       // CompileResult forward decl ya en auto_jit.h
 
 /*
  *  Loader
@@ -170,12 +175,18 @@ namespace loader {
         (void) reader.read8(); // _debug_pad[1]
         (void) reader.read8(); // _debug_pad[2]
 
-        // A.9: campos nuevos de la tabla de relocations.  Bumped VERSION_VELB
+        // campos nuevos de la tabla de relocations.  Bumped VERSION_VELB
         // a 0x2 para indicar el cambio de layout.  Si VERSION_VELB esta en
         // este file ya cumple, podemos leer estos campos sin riesgo.
         exe.header.offset_reloc_table = reader.read64();
         exe.header.size_reloc_table   = reader.read32();
-        for (int i = 0; i < 12; ++i) (void)reader.read8(); // _reloc_pad[12]
+        /* VERSION_VELB 0x3 anyade offset_ir_section + size_ir_section
+         * en los mismos 12 bytes que antes eran _reloc_pad.  En binarios
+         * v2 (donde _reloc_pad era zero-init) estos campos quedan a 0
+         * -> no IR section, JIT deshabilitado para ese modulo.  Forward
+         * compatible. */
+        exe.header.offset_ir_section = reader.read64();
+        exe.header.size_ir_section   = reader.read32();
 
         // el header siempre debe estar alineado a 16 bytes
         while (reader.offset % 16 != 0) {
@@ -319,33 +330,69 @@ namespace loader {
             import_table_from_file.push_back(entry);
         }
 
+        // BUG fix: solo patchear los call sites de ESTE modulo, no los
+        // acumulados de modulos previos.  ffi_loader.imports es un map
+        // global que persiste entre cargas; si simplemente llamamos
+        // resolve_all() tras cada parser_import_table, el bytecode del
+        // modulo NUEVO se patchea en TODOS los offsets registrados
+        // (incluidos los del CALLER previo), corrompiendo bytes
+        // arbitrarios.  Sintoma: plugin halt mid-instruccion porque
+        // un callsite de caller (e.g. offset 0x4D para vio_print)
+        // sobreescribe la imm de algun mov en el plugin con un host
+        // pointer (la addr resuelta de vio_print).
+        //
+        // Fix: separar registro (acumular import key + symbolos) de
+        // parcheo (solo en los offsets DE ESTE modulo).  Recolectamos
+        // los pares (key, offset_bytecode) en un vector local, y al
+        // final iteramos resolviendo y parcheando solo esos.  Las
+        // entradas del global imports quedan como cache de simbolos
+        // resueltos para que no haya que volver a llamar dlsym.
+        struct LocalPatchSite {
+            ffi::NativeImportKey key;
+            uint32_t              offset_bytecode;
+        };
+        std::vector<LocalPatchSite> local_sites;
+        local_sites.reserve(import_table_from_file.size());
         for (auto &imp: import_table_from_file) {
             uint32_t module_idx   = ffi_loader.intern_module(read_string_at(reader, imp.offset_module_string));
             uint32_t function_idx = ffi_loader.intern_function(read_string_at(reader, imp.offset_function_string));
 
             // si el metodo no tiene firma no se usa firma
             std::string sig = "";
-            //if (imp.offset_signature_string != 0) { // aun no se usa por que no se a implementado
-            //    sig = read_string_at(reader, imp.offset_signature_string);
-            //}
             uint32_t sig_idx = ffi_loader.intern_signature(sig);
 
             ffi::NativeImportKey key{module_idx, function_idx, sig_idx};
 
             auto &entry = ffi_loader.imports[key]; // crea si no existe
-
             if (entry.patch_sites.empty()) {
                 entry.key.module_idx    = module_idx;
                 entry.key.function_idx  = function_idx;
                 entry.key.signature_idx = sig_idx;
             }
-
             entry.patch_sites.push_back(imp.offset_bytecode);
+            local_sites.push_back({key, imp.offset_bytecode});
         }
 
-        // resolver todas las instrucciones que usan la tabla de importacion
-        // nativa.
-        this->ffi_loader.resolve_all(exe.bytecode.data(), exe.offset_real_bytecode);
+        // Resolver simbolos para CADA key (carga modulo nativo si no esta
+        // ya cargado, dlsym del simbolo) y patchear en bytecode SOLO los
+        // offsets de ESTE modulo.
+        for (const auto &site : local_sites) {
+            auto it = ffi_loader.imports.find(site.key);
+            if (it == ffi_loader.imports.end()) continue;
+            auto &entry = it->second;
+            if (entry.resolved_ptr == nullptr) {
+                const std::string &mod_name  = ffi_loader.modules[site.key.module_idx];
+                const std::string &func_name = ffi_loader.functions[site.key.function_idx];
+                void *mod = ffi_loader.load_native_module(mod_name);
+                void *fn  = ffi_loader.resolve_native_symbol(mod, func_name);
+                entry.resolved_ptr = fn;
+            }
+            const uint64_t real_offset = static_cast<uint64_t>(site.offset_bytecode)
+                                       + exe.offset_real_bytecode;
+            ffi::patch_call(exe.bytecode.data(),
+                            static_cast<uint32_t>(real_offset),
+                            entry.resolved_ptr);
+        }
 
         // construir la tabla de callbacks de la API del plugin y notificar
         // a los modulos que exporten "vesta_init".
@@ -442,6 +489,29 @@ namespace loader {
         // parseamos la tabla de importacion.
         parser_import_table(*exe, reader);
 
+        // Cargar la seccion debug (DVBG) si esta presente.  El header
+        // del .velb tiene `offset_debug_section` + `size_debug_section`
+        // emitidos por el linker cuando se compila con --vex-debug.
+        // Construimos un DebugInfo a partir del blob; el debugger
+        // accede luego via Executable::debug_info para resolver
+        // breakpoints por (file, line) o devolver line info de un PC.
+        if (exe->header.offset_debug_section != 0
+         && exe->header.size_debug_section > 0
+         && exe->header.offset_debug_section
+              + exe->header.size_debug_section
+            <= exe->bytecode.size()) {
+            const uint8_t *blob = exe->bytecode.data()
+                + exe->header.offset_debug_section;
+            const size_t blob_size = exe->header.size_debug_section;
+            exe->debug_info = std::make_unique<debug::DebugInfo>(blob, blob_size);
+            if (!exe->debug_info->valid()) {
+                // Magic/version invalido: descartar para no confundir al
+                // debugger.  Si esto ocurre, el linker emitio mal la
+                // seccion -- bug a investigar.
+                exe->debug_info.reset();
+            }
+        }
+
         // parsear la tabla de relocations al final del archivo (si existe).
         // Cada entry son 24 bytes packed: bytecode_offset (u64) + target_value
         // (u64) + type (u8) + pad (u8x7).  El header indica offset y count.
@@ -461,6 +531,90 @@ namespace loader {
                 e.type            = rr.read8();
                 for (int p = 0; p < 7; ++p) e._pad[p] = rr.read8();
                 exe->velb_relocations.push_back(e);
+            }
+        }
+
+        // parsear la seccion @c @ir si existe.  El header
+        // tiene offset_ir_section + size_ir_section (post bump VERSION_VELB
+        // a 0x3).  Si offset == 0 o size == 0, el .velb no tiene IR
+        // embebido (build sin frontend Vex o version antigua) -> se queda
+        // ir_functions vacio y el auto-JIT no se dispara para este modulo.
+        if (exe->header.offset_ir_section != 0
+         && exe->header.size_ir_section > 0
+         && static_cast<size_t>(exe->header.offset_ir_section)
+              + exe->header.size_ir_section <= exe->bytecode.size()) {
+            const size_t ir_off  = static_cast<size_t>(exe->header.offset_ir_section);
+            const size_t ir_size = exe->header.size_ir_section;
+            std::vector<ir::IrFunction> fns;
+            /* parse_ir_section lee desde ir_off hasta el final del @ir
+             * subsection (no consume bytes mas alla del VEIR + functions).
+             * Si tras @ir hay un @sym section, parse_ir_section retornara
+             * exitosamente y los bytes adicionales quedaran disponibles. */
+            const bool ok = ir::parse_ir_section(
+                exe->bytecode, ir_off, ir_size, fns);
+            if (ok) {
+                exe->ir_functions = std::move(fns);
+                /* Poblar lookup por nombre para O(1) dispatch JIT. */
+                exe->ir_lookup.reserve(exe->ir_functions.size());
+                for (size_t i = 0; i < exe->ir_functions.size(); ++i) {
+                    exe->ir_lookup[exe->ir_functions[i].name] = i;
+                }
+            }
+            /* Si !ok, ignoramos silenciosamente (graceful degradation).
+             * El bytecode sigue siendo ejecutable via interp. */
+
+            /* parsear @sym section (symbol table del linker)
+             * que vive RIGHT AFTER el @ir.  Magic "VSYM" + version + count
+             * + entries.  Si no aparece o esta corrupta, dejamos el
+             * symbol_table vacio y el JIT mini-parser cae a unsupported
+             * para @Absolute refs (backward compatible). */
+            const size_t section_end = ir_off + ir_size;
+            /* Buscar VSYM scanneando desde algun offset razonable dentro
+             * de la region.  Como ir::parse_ir_section termino su lectura
+             * en algun byte interno, scaneamos los ultimos N bytes para
+             * encontrar el VSYM (heuristica simple). */
+            for (size_t scan = ir_off + 12; scan + 12 <= section_end; ++scan) {
+                if (exe->bytecode[scan]   == 'V'
+                 && exe->bytecode[scan+1] == 'S'
+                 && exe->bytecode[scan+2] == 'Y'
+                 && exe->bytecode[scan+3] == 'M') {
+                    /* Parsear VSYM header. */
+                    auto rd16 = [&](size_t off) {
+                        return static_cast<uint16_t>(exe->bytecode[off])
+                             | (static_cast<uint16_t>(exe->bytecode[off+1]) << 8);
+                    };
+                    auto rd32 = [&](size_t off) {
+                        return static_cast<uint32_t>(exe->bytecode[off])
+                             | (static_cast<uint32_t>(exe->bytecode[off+1]) << 8)
+                             | (static_cast<uint32_t>(exe->bytecode[off+2]) << 16)
+                             | (static_cast<uint32_t>(exe->bytecode[off+3]) << 24);
+                    };
+                    auto rd64 = [&](size_t off) {
+                        uint64_t v = 0;
+                        for (int i = 0; i < 8; ++i)
+                            v |= static_cast<uint64_t>(exe->bytecode[off+i]) << (i * 8);
+                        return v;
+                    };
+                    const uint16_t version = rd16(scan + 4);
+                    if (version != 1) break;  /* version desconocida */
+                    const uint32_t count = rd32(scan + 8);
+                    if (count > 1'000'000) break;  /* sanity check */
+                    size_t cur = scan + 12;
+                    exe->symbol_table.reserve(count);
+                    for (uint32_t k = 0; k < count; ++k) {
+                        if (cur + 2 > section_end) break;
+                        const uint16_t nlen = rd16(cur);
+                        cur += 2;
+                        if (cur + nlen + 8 > section_end) break;
+                        std::string name(reinterpret_cast<const char *>(
+                            &exe->bytecode[cur]), nlen);
+                        cur += nlen;
+                        const uint64_t addr = rd64(cur);
+                        cur += 8;
+                        exe->symbol_table[std::move(name)] = addr;
+                    }
+                    break;
+                }
             }
         }
 
@@ -558,6 +712,138 @@ namespace loader {
         // poner ejecutable a la pila de ejecutuables
         executables.push_back(std::move(exe));
 
+        // ---- Eager JIT compile de `main` REACTIVADO (2026-05-16) ----
+        //
+        // Bugs cerrados que bloqueaban este flow:
+        //   (a) enum mismatch VESTA_FATAL_* <-> FatalKind alineado.
+        //   (b) vrt_callm tiene fallback a bytecode interp sincronico
+        //       cuando JIT compile falla -- no devuelve 0 silente.
+        //   (c) wrappers dual VM/HOST en vrt_findclass/findmethod/findfield
+        //       detectan ptrs > 4GB como host ptrs (ALLOCA del JIT) y
+        //       leen via memcpy en lugar de vm_mem.read_bytes.
+        //   (d) bug clobber RDX en CALLM fix con R10/R11 scratch.
+        //
+        // Si el JIT main compila exitosamente, se ejecuta nativo via
+        // enter_jit en el scheduler.  Si falla parcialmente (algun raw_asm
+        // complejo no soportado), unsupported=true y caemos a interp.
+        if (jit::g_jit_threshold != UINT32_MAX && !executables.empty()) {
+            auto &last_exe = executables.back();
+            /* AOP fix 2026-05-16: si el programa tiene CUALQUIER metodo con
+             * advice_chain != null (i.e. usa @Before/@After/@Around), no
+             * eager-compile main.  El JIT-eated main hace CALLVIRT inline
+             * que no aplica advices, y el fallback a vrt_callvirt+interp
+             * tampoco los aplica correctamente (ejecuta solo el body sin
+             * setup de la cadena).  Resultado: doblar(21)=0 + advice no
+             * dispara.  Workaround: main siempre via interp cuando hay AOP. */
+            /* Detectar AOP y closures escaneando el IR (no ClassRegistry
+             * porque __module_init aun no se ejecuto).  Si el programa
+             * usa aspectos (addadvice) o closures (make_closure /
+             * callclosure), NO eager-compile main porque:
+             *   - AOP: el JIT inline dispatch no aplica advices, y el
+             *     fallback tampoco los aplica desde dentro de un JIT frame.
+             *   - Closures: el frontend emite VM bytecode vaddr para
+             *     __lambda_<N> que vrt_callclosure no puede saltar
+             *     correctamente con env_addr como host ptr (el lambda
+             *     bytecode interpreta R14 como VM vaddr). */
+            bool skip_main_jit = false;
+            bool has_closures = false;
+            for (const auto &irf : last_exe->ir_functions) {
+                for (const auto &block : irf.blocks) {
+                    for (const auto &ins : block.instrs) {
+                        if (ins.op == ir::IrOp::RAW_ASM &&
+                            ins.func_name.find("addadvice") != std::string::npos) {
+                            skip_main_jit = true;
+                            break;
+                        }
+                        if (ins.op == ir::IrOp::MAKE_CLOSURE
+                         || ins.op == ir::IrOp::CALLCLOSURE) {
+                            skip_main_jit = true;
+                            has_closures = true;
+                            break;
+                        }
+                    }
+                    if (skip_main_jit) break;
+                }
+                if (skip_main_jit) break;
+            }
+            const bool has_aop = skip_main_jit;
+            /* Si hay closures, desactivar JIT entero (no solo main eager).
+             * vrt_callclosure no puede pasar env_addr como VM vaddr a
+             * bytecode lambda (que interpreta R14 como VM), y el bytecode
+             * lambda crashea con segfault al leer env via vm_mem.  Hasta
+             * un fix proper (copy env to VM stack o JIT compile lambda),
+             * cualquier metodo invocado en programas con closures debe
+             * correr en interp. */
+            if (has_closures) {
+                jit::set_jit_threshold(UINT32_MAX);
+                if (jit::g_jit_warn_unsupported) {
+                    std::fprintf(stderr,
+                        "[jit] desactivado para este programa: usa closures (callclosure) que aun no son JIT-safe\n");
+                }
+            }
+            auto it = last_exe->ir_lookup.find("main");
+            if (!has_aop
+             && it != last_exe->ir_lookup.end()
+             && it->second < last_exe->ir_functions.size()) {
+                const ir::IrFunction &ir_main = last_exe->ir_functions[it->second];
+                /* Resolver native fn (CALLN handler en Selector):
+                 * dado "lib:func", carga la DLL via FFI y resuelve el simbolo
+                 * a un host fn_ptr.  El Selector embebe el ptr como imm64
+                 * + emite CALL nativo.  Cero overhead runtime vs llamada
+                 * directa de C. */
+                ffi::FFI *ffi_ptr = &ffi_loader;
+                auto resolve_native = [ffi_ptr](const std::string &name) -> uint64_t {
+                    size_t colon = name.find(':');
+                    if (colon == std::string::npos) return 0;
+                    std::string lib  = name.substr(0, colon);
+                    std::string func = name.substr(colon + 1);
+                    try {
+                        void *mod = ffi_ptr->load_native_module(lib);
+                        if (!mod) return 0;
+                        void *fn = ffi_ptr->resolve_native_symbol(mod, func);
+                        return reinterpret_cast<uint64_t>(fn);
+                    } catch (...) {
+                        return 0;
+                    }
+                };
+                /* lectura compile-time de vm_mem.  El proceso
+                 * @c proccess ya tiene static_data del .velb cargado por
+                 * el linker; @c __module_init aun no corrio, pero los
+                 * literales del data section (e.g. name strings,
+                 * placeholders de @c s_<X>) si estan disponibles.  El
+                 * inlining espera por @c __module_init para tener los
+                 * @c ClassInfo* cacheados -- usualmente el eager-compile
+                 * de main happens DESPUES de __module_init en runtime.  */
+                runtime::ProcessVM *proc_for_read = proccess;
+                auto read_vmem_cb = [proc_for_read](uint64_t vaddr) -> uint64_t {
+                    try {
+                        return proc_for_read->vm_mem.read_u64(vaddr);
+                    } catch (...) {
+                        return 0;
+                    }
+                };
+                try {
+                    jit::CompileResult res = jit::eager_compile_function(
+                        ir_main, &last_exe->ir_lookup, &last_exe->ir_functions,
+                        &last_exe->symbol_table, resolve_native, read_vmem_cb);
+                    if (res.fn != nullptr) {
+                        proccess->jit_entry_fn = reinterpret_cast<void *>(res.fn);
+                        if (jit::g_jit_warn_unsupported) {
+                            std::fprintf(stderr,
+                                "[jit] eager-compiled main (%zu bytes, %zu MInstrs)\n",
+                                res.code_size, res.instr_count);
+                        }
+                    } else if (jit::g_jit_warn_unsupported) {
+                        std::fprintf(stderr,
+                            "[jit] main no se eager-compilo (unsupported=%d) -- fallback a interp\n",
+                            res.unsupported ? 1 : 0);
+                    }
+                } catch (...) {
+                    /* Cualquier excepcion en la compilacion eager se ignora. */
+                }
+            }
+        }
+
         //vm->vm_mem[0x10] = 1;
         return proccess;
     }
@@ -589,8 +875,9 @@ namespace loader {
         const int64_t delta = static_cast<int64_t>(new_base)
                             - static_cast<int64_t>(orig_base);
         for (const auto &rel : relocs) {
-            if (rel.type != static_cast<uint8_t>(RelocTypeVELB::ABSOLUTE64))
-                continue; // por ahora solo Absolute64
+            const bool is_abs64 = (rel.type == static_cast<uint8_t>(RelocTypeVELB::ABSOLUTE64));
+            const bool is_abs32 = (rel.type == static_cast<uint8_t>(RelocTypeVELB::ABSOLUTE32));
+            if (!is_abs64 && !is_abs32) continue; // solo Absolute64 / Absolute32
             // Solo reescribir si target original esta en el rango del code
             // section que estamos relocando.
             if (rel.target_value < orig_base || rel.target_value >= orig_end)
@@ -598,8 +885,18 @@ namespace loader {
             const uint64_t patched = static_cast<uint64_t>(
                 static_cast<int64_t>(rel.target_value) + delta);
             const size_t file_off = bytecode_base_in_file + rel.bytecode_offset;
-            if (file_off + 8 > data.size()) continue; // safety
-            std::memcpy(&data[file_off], &patched, 8);
+            if (is_abs64) {
+                if (file_off + 8 > data.size()) continue; // safety
+                std::memcpy(&data[file_off], &patched, 8);
+            } else {
+                // ABSOLUTE32: truncar la nueva direccion.  Si el rebase
+                // empuja el target fuera del rango u32 lo dejamos igual y
+                // fallamos en runtime con error claro (caso muy raro).
+                if (file_off + 4 > data.size()) continue;
+                if (patched > 0xFFFFFFFFULL) continue; // mantener el valor ya patcheado en cmpjmp
+                uint32_t patched32 = static_cast<uint32_t>(patched);
+                std::memcpy(&data[file_off], &patched32, 4);
+            }
         }
     }
 
@@ -774,13 +1071,16 @@ namespace loader {
                 }
             }
 
-            // Convertir el primer `hlt` del code section en `ret` para que
-            // el main del modulo sea callable via CALLVM (tras esto el modulo
-            // ya no funciona standalone -- aceptable porque es un plugin).
-            // code_sec->file_offset YA es absoluto en el archivo.
-            patch_first_hlt_to_ret(exe->bytecode,
-                code_sec->file_offset,
-                static_cast<size_t>(code_size));
+            // (ya NO patcheamos el HLT del main del plugin a RET en bytes:
+            // el viejo `patch_first_hlt_to_ret` hacia search textual de la
+            // secuencia 0x00 0x03 y podia false-match con imm de mov/callvm
+            // que contienen esos bytes adyacentes por casualidad.  Ahora el
+            // runtime maneja HLT-during-loadmod via
+            // `ProcessVM::loadmod_call_depth`: si el contador > 0 al
+            // ejecutar HLT, lo tratamos como RET y decrementamos.  El plugin
+            // sigue siendo standalone-runnable; al ejecutarlo via `--run`
+            // directo, loadmod_call_depth queda en 0 y HLT halta normal.)
+            (void)code_size;
         }
 
         // Replicar la copia de secciones a TODOS los procesos vivos de la
@@ -788,28 +1088,36 @@ namespace loader {
         // procesos.  Procesos creados DESPUES heredan el codigo via
         // copy_executables_to invocado en exec_instr_spawn.
         //
-        // CRITICO: a diferencia de load_executable (que carga en
-        // un proceso fresco con vm_mem vacio), aqui el proceso destino YA
-        // tiene codigo del caller cargado.  No podemos copiar
-        // exe->bytecode.size() bytes desde cada sec->memory.address_init
-        // porque secciones vacias (e.g. 'strings' con VA 0..0) destruirian
-        // el codigo del caller en VA 0.  Usamos sec->size_real (el tamano
-        // real de la seccion) en su lugar.  Para secciones con size_real=0
-        // simplemente no copiamos nada.
+        // BUG fix (load_module_dynamic): el plugin tiene multiples secciones
+        // (code + auxiliar metaspace).  La auxiliar tiene size_real=0 (no
+        // populado por el linker) y address_init=0.  Tras la remap a
+        // new_base (para evitar colision con VA 0 del caller), la
+        // auxiliar termina con address_init = new_base = MISMA VA que la
+        // seccion code.  Si copiamos avail bytes para size_real=0, la
+        // auxiliar SOBREESCRIBE la code recien copiada en new_base.
+        // Sintoma: el plugin halt en bytes 0x00 0x00 mid-instruccion
+        // dentro de __module_init porque parte de su bytecode fue
+        // aplastado por la auxiliar.
+        //
+        // Fix: SOLO copiar la seccion principal "code" (la unica que
+        // realmente contiene bytecode ejecutable).  Las auxiliares
+        // (MetaSpace etc.) son metadata que el loader ya extrajo durante
+        // parse_velb (strings, imports, relocs); no necesitan estar en
+        // vm_mem para que la VM ejecute el plugin.
         for (auto &sched : vm.schedulers) {
             for (auto &proc : sched->processes) {
                 if (!proc) continue;
                 for (const auto *sec : exe->sections) {
                     if (!sec) continue;
+                    if (sec != code_sec) continue;  // solo la seccion ejecutable
                     const uint64_t vm_addr = sec->memory.address_init;
                     const uint64_t offset  = sec->file_offset;
                     if (offset >= exe->bytecode.size()) continue;
                     const uint8_t *src    = exe->bytecode.data() + offset;
                     const size_t   avail  = exe->bytecode.size() - offset;
-                    // Si la seccion declara un tamano (size_real > 0), respetarlo
-                    // para no destruir codigo del caller en VAs colindantes.
-                    // Si size_real == 0 (formato actual sin rangos populados),
-                    // copiar todo lo restante del archivo hasta el final.
+                    // Si la seccion declara un tamano (size_real > 0), respetarlo.
+                    // Si size_real == 0 (formato actual), tomar avail.  Para code
+                    // section es seguro porque es la primera y unica que copiamos.
                     const size_t sec_size = sec->size_real
                                           ? std::min<size_t>(sec->size_real, avail)
                                           : avail;
@@ -822,6 +1130,68 @@ namespace loader {
         // los procesos futuros (e.g. spawn).
         executables.push_back(std::move(exe));
         return init_pc;
+    }
+
+    // Variante con path: registra el source_path en el Executable creado.
+    // Mismo flujo interno que load_module_dynamic; pasa por load_module_dynamic
+    // para evitar duplicacion de logica, luego patchea el campo source_path
+    // del ultimo Executable agregado.
+    uint64_t Loader::load_module_dynamic_with_path(runtime::VM &vm,
+                                                    std::vector<uint8_t> raw_bytecode_file,
+                                                    const std::string &source_path) {
+        const size_t before = executables.size();
+        const uint64_t init_pc = load_module_dynamic(vm, std::move(raw_bytecode_file));
+        if (init_pc == 0) return 0;
+        // Si load_module_dynamic anadio un executable (en raros casos podria
+        // no anadirlo, e.g. parse_velb falla), patcheamos su source_path.
+        if (executables.size() > before && executables.back()) {
+            executables.back()->source_path = source_path;
+        }
+        return init_pc;
+    }
+
+    bool Loader::unload_module_dynamic(runtime::VM &vm, const std::string &path) {
+        (void)vm;  // por ahora no necesitamos tocar el vm directamente.
+        // Buscar de atras hacia adelante (mas probable encontrar el ultimo
+        // cargado, reduce iteraciones tipicas).
+        for (auto it = executables.rbegin(); it != executables.rend(); ++it) {
+            if (!*it) continue;
+            if ((*it)->source_path == path) {
+                // Si este modulo fue el ultimo en `next_dyn_base`, retroceder
+                // el contador para reutilizar la VA.  Solo seguro si su VA
+                // de inicio es < next_dyn_base actual (caso conflict-rebase).
+                Section *code_sec = nullptr;
+                for (auto *sec : (*it)->sections) {
+                    if (sec && sec->name == "code") { code_sec = sec; break; }
+                }
+                if (code_sec) {
+                    const uint64_t va = code_sec->memory.address_init;
+                    // Calcular tamano efectivo del code section (mismo razonamiento
+                    // que en load_module_dynamic).
+                    uint64_t bc_end = (*it)->bytecode.size();
+                    if ((*it)->header.offset_reloc_table != 0
+                     && (*it)->header.offset_reloc_table < bc_end) {
+                        bc_end = (*it)->header.offset_reloc_table;
+                    }
+                    if ((*it)->header.offset_import_table != 0
+                     && (*it)->header.size_import_table > 0
+                     && (*it)->header.offset_import_table < bc_end) {
+                        bc_end = (*it)->header.offset_import_table;
+                    }
+                    const uint64_t code_size = (code_sec->file_offset < bc_end)
+                                             ? (bc_end - code_sec->file_offset) : 0;
+                    const uint64_t aligned_size = (code_size + 0xFFFULL) & ~0xFFFULL;
+                    // Solo retroceder si esta VA fue la ultima asignada.
+                    if (va + aligned_size == next_dyn_base) {
+                        next_dyn_base = va;
+                    }
+                }
+                // Convertir reverse_iterator a forward_iterator para erase.
+                executables.erase(std::next(it).base());
+                return true;
+            }
+        }
+        return false;
     }
 
     void Loader::copy_executables_to(runtime::ProcessVM &dest) {

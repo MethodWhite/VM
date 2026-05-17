@@ -6,15 +6,27 @@
 #include "runtime/exception_runtime.h"
 #include "runtime/proceso_runtime.h"
 #include "runtime/scheduler.h"
+#include "runtime/runtime.h"
 #include "loader/loader.h"
 #include "loader/class_registry.h"
+#include "debug/debugger.h"
 
+#include <csetjmp>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#else
+#  include <signal.h>
+#endif
 
 namespace runtime {
 
@@ -308,6 +320,18 @@ namespace runtime {
     void throw_fatal(ProcessVM *vm, uint32_t kind, const char *message) {
         if (!vm) return;
 
+        // Notificar al debugger de la excepcion ANTES de elegir ruta
+        // (capturable o fatal).  El cliente recibe evento "exception"
+        // con clase + pid; util para parar y ver el contexto incluso
+        // si el codigo del usuario captura la excepcion.  Si no hay
+        // debugger activo (caso comun), la rama es 1 carga + 1 branch
+        // bien predicho (~0 ns en hot path).
+        if (vm->scheduler.vm_reference.debugger != nullptr) {
+            vm->scheduler.vm_reference.debugger->on_exception(
+                vm->pid.local_pid,
+                message ? std::string(message) : std::string("FatalError"));
+        }
+
         // FAST PATH: si no hay handler activo, ruta antigua.  Esto es
         // el caso comun (programas sin try/catch envolvente).  Cero
         // overhead anadido: 1 lectura + 1 branch.
@@ -370,6 +394,140 @@ namespace runtime {
     // ---------------------------------------------------------------------
     // exec_instr_panic: lee mensaje de la VM y lanza FATAL_USER_ABORT.
     // ---------------------------------------------------------------------
+
+    // =====================================================================
+    // OS-level access violation -> FatalError capturable.
+    // =====================================================================
+
+    // Thread-local: ProcessVM cuyo bytecode esta corriendo.  El handler
+    // de AV/SIGSEGV lo consulta para identificar el receptor del longjmp.
+    // Limitacion: el VM corre cada proceso en su scheduler, asi que un
+    // mismo OS thread tiene UN ProcessVM activo a la vez.  Si en el
+    // futuro se anade preemption con context-switch dentro del run_loop,
+    // habria que actualizar el TLS antes de cambiar de proceso.
+#if defined(__GNUC__) || defined(__clang__)
+    static __thread ProcessVM *t_executing_proc = nullptr;
+#elif defined(_MSC_VER)
+    static __declspec(thread) ProcessVM *t_executing_proc = nullptr;
+#else
+    static thread_local ProcessVM *t_executing_proc = nullptr;
+#endif
+
+    void set_current_executing_process(ProcessVM *proc) noexcept {
+        t_executing_proc = proc;
+    }
+
+    ProcessVM *get_current_executing_process() noexcept {
+        return t_executing_proc;
+    }
+
+    static std::once_flag g_av_handler_init_flag;
+
+#if defined(_WIN32)
+    /**
+     * @brief Stub al que el VEH redirige RIP cuando ocurre un AV
+     *        capturable.  Corre en contexto de usuario normal (no async)
+     *        asi que el longjmp es seguro aqui.
+     *
+     * Marcado @c noinline para que el compilador no inline el contenido
+     * en otro punto del binary -- queremos una direccion estable que el
+     * VEH pueda apuntar.
+     */
+    static void __attribute__((noinline)) av_recovery_stub() {
+        ProcessVM *proc = t_executing_proc;
+        if (proc != nullptr && proc->av_recovery_active) {
+            std::longjmp(proc->av_recovery_jmpbuf, 1);
+        }
+        // Sin recovery activo: no podemos hacer nada utilidad; salir.
+        // En la practica esto no deberia ocurrir porque el VEH ya
+        // verifica av_recovery_active antes de redirigir.
+        std::abort();
+    }
+
+    /**
+     * @brief Vectored Exception Handler global.  Solo trata
+     *        EXCEPTION_ACCESS_VIOLATION cuando el thread actual esta
+     *        ejecutando bytecode con un try/catch envolvente.  En todos
+     *        los demas casos retorna EXCEPTION_CONTINUE_SEARCH para no
+     *        interferir con el manejo normal de excepciones (otros
+     *        plugins, debugger, etc.).
+     */
+    static LONG WINAPI vex_av_veh(EXCEPTION_POINTERS *info) {
+        if (info == nullptr || info->ExceptionRecord == nullptr) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        const DWORD code = info->ExceptionRecord->ExceptionCode;
+        // Solo manejamos AV.  Otras excepciones (div0 hardware, illegal
+        // instr, debug breakpoints, etc.) siguen su curso normal.
+        if (code != EXCEPTION_ACCESS_VIOLATION) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        ProcessVM *proc = t_executing_proc;
+        if (proc == nullptr || !proc->av_recovery_active) {
+            // No hay bytecode corriendo o el scheduler no ha armado el
+            // setjmp: la VM crashea como antes (comportamiento legado).
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // Capturar la direccion del fault (segundo elemento de
+        // ExceptionInformation: 0=read/write flag, 1=virtual addr).
+        if (info->ExceptionRecord->NumberParameters >= 2) {
+            proc->pending_av_addr =
+                (uint64_t)info->ExceptionRecord->ExceptionInformation[1];
+        } else {
+            proc->pending_av_addr = 0;
+        }
+        // Redirigir RIP al stub que hara longjmp en contexto normal.
+        // No tocamos RSP: el stub es una funcion C++ valida; reusara
+        // el frame del callee, que ya tiene espacio suficiente.
+#if defined(_M_X64) || defined(__x86_64__)
+        info->ContextRecord->Rip = (DWORD64)(uintptr_t)&av_recovery_stub;
+#elif defined(_M_IX86) || defined(__i386__)
+        info->ContextRecord->Eip = (DWORD)(uintptr_t)&av_recovery_stub;
+#elif defined(_M_ARM64) || defined(__aarch64__)
+        info->ContextRecord->Pc  = (DWORD64)(uintptr_t)&av_recovery_stub;
+#else
+        // Plataforma desconocida: dejar que la VM crashee como antes.
+        return EXCEPTION_CONTINUE_SEARCH;
+#endif
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    void install_host_av_handler() noexcept {
+        std::call_once(g_av_handler_init_flag, []() {
+            // Primer parametro = 1 -> registrar al inicio de la cadena
+            // (antes del default Windows handler).  Asi capturamos AVs
+            // antes de que llegue el "Application has stopped" del OS.
+            (void)AddVectoredExceptionHandler(1u, &vex_av_veh);
+        });
+    }
+#else
+    // POSIX: handler de SIGSEGV.  El handler usa siglongjmp directamente
+    // ya que en POSIX longjmp desde un signal handler es bien definido
+    // si se usa sigsetjmp con savesigs=1.
+    static void posix_sigsegv_handler(int /*sig*/, siginfo_t *info, void *ctx) {
+        (void)ctx;
+        ProcessVM *proc = t_executing_proc;
+        if (proc == nullptr || !proc->av_recovery_active) {
+            // Restaurar handler default y dejar que el OS mate el proceso.
+            std::signal(SIGSEGV, SIG_DFL);
+            std::raise(SIGSEGV);
+            return;
+        }
+        proc->pending_av_addr = info ? (uint64_t)(uintptr_t)info->si_addr : 0;
+        std::longjmp(proc->av_recovery_jmpbuf, 1);
+    }
+
+    void install_host_av_handler() noexcept {
+        std::call_once(g_av_handler_init_flag, []() {
+            struct sigaction sa{};
+            sa.sa_flags     = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
+            sa.sa_sigaction = &posix_sigsegv_handler;
+            sigemptyset(&sa.sa_mask);
+            (void)sigaction(SIGSEGV, &sa, nullptr);
+            (void)sigaction(SIGBUS,  &sa, nullptr);
+        });
+    }
+#endif
 
 } // namespace runtime
 

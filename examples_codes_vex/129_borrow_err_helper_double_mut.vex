@@ -1,0 +1,27 @@
+// Test negativo realista: el bug clasico "doble mutable cross-call" que
+// el borrow checker debe rechazar.
+//
+// Patron:
+//   let mut counter = Box::new(0);
+//   let m1 = &mut counter;
+//   modify_both(m1, &mut counter);  // ERROR: ya hay m1 mut activo.
+//
+// rustc rechaza esto con E0499 "cannot borrow `counter` as mutable
+// more than once at a time".  Nuestro borrow checker emite R1
+// "ya esta prestado como mutable" en el SEGUNDO lend_mut.
+
+void modify_both(borrow_mut<i32> a, borrow_mut<i32> b) {
+    write_borrow(a, 1);
+    write_borrow(b, 2);
+}
+
+i32 main() {
+    unique<i32> counter = unique_box(0);
+    borrow_mut<i32> m1 = lend_mut(counter);
+
+    // ERROR esperado en la siguiente linea: lend_mut(counter) cuando
+    // m1 ya tiene un borrow_mut activo.
+    modify_both(m1, lend_mut(counter));
+
+    return read_borrow(m1);
+}

@@ -43,6 +43,14 @@ namespace runtime {
     class VM;           ///< Declaracion adelantada de la instancia VM
 
     /**
+     * @brief hook function pointer para auto-JIT trigger.
+     *        Default nullptr (sin JIT).  El main binario lo setea a
+     *        @c &jit::maybe_compile_method en VM init si quiere habilitar
+     *        JIT.  Ver @c include/runtime/proceso_runtime.h para detalle.
+     */
+    void (*g_callvirt_post_hook)(ProcessVM *vm, loader::MethodInfo *method) = nullptr;
+
+    /**
      * @brief Puntero a la llamada nativa en curso (si existe alguna).
      *
      * Se usa para coordinar llamadas FFI desde instrucciones que necesitan

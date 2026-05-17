@@ -1,0 +1,9 @@
+// Test NEGATIVO: R2 - mut borrow tras shared activo = ERROR.
+
+i32 main() {
+    unique<i32> owner = unique_box(42);
+    borrow<i32>     r1 = lend(owner);
+    borrow<i32>     r2 = lend(owner);     // OK: 2 shared coexisten
+    borrow_mut<i32> m  = lend_mut(owner); // ERROR esperado
+    return 0;
+}

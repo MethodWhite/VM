@@ -1,0 +1,8 @@
+// Test NEGATIVO: R3 - move(owner) mientras tiene borrows activos = ERROR.
+
+i32 main() {
+    unique<i32> owner = unique_box(42);
+    borrow<i32> r = lend(owner);
+    unique<i32> q = move(owner);     // ERROR esperado
+    return 0;
+}

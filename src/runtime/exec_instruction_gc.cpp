@@ -255,6 +255,33 @@ namespace runtime {
         vm->registers.regs[r_dst].qword(static_cast<uint64_t>(h));                // GC_NULL_HANDLE si no encontrado
     }
 
+    /**
+     * @brief Ejecuta MVTAKE: copia qword src->dst y zerifica src.
+     *
+     * Primitivo de move ownership para smart pointers.  En 1 instr VM
+     * realiza la secuencia que de otra forma requeriria 4 instrucciones
+     * (LOAD + STORE + CONST 0 + STORE).  El compilador host puede
+     * inlinarlo a 3 instrucciones x86-64 (mov rax,[src]; mov [dst],rax;
+     * mov qword [src],0) cuando el JIT lo recoja.
+     */
+    void exec_instr_mvtake(ProcessVM *vm, const DecodedInstr &instr) {
+        // reg1 = r_dst_addr (destino), reg2 = r_src_addr (fuente)
+        const uint8_t  r_dst    = instr.data_instruction.reg_data.reg1;
+        const uint8_t  r_src    = instr.data_instruction.reg_data.reg2;
+        const uint64_t dst_addr = vm->registers.regs[r_dst].qword();
+        const uint64_t src_addr = vm->registers.regs[r_src].qword();
+
+        // Si las direcciones coinciden, mvtake equivale a zerificar el slot.
+        // Aprovechamos un load + dos stores (LD + ST dst + ST 0 src).
+        // No usamos atomic por diseno: move es siempre intra-thread.
+        const uint64_t tmp = vm->vm_mem.read_u64(src_addr);
+        vm->vm_mem.write_u64(dst_addr, tmp);
+        // Si dst == src, este store final deja el slot a cero (semantica
+        // correcta para move-to-self: el ownership "vuelve a si mismo"
+        // pero el slot original queda invalidado).
+        vm->vm_mem.write_u64(src_addr, 0ULL);
+    }
+
     // -------------------------------------------------------------------------
     // GC generacional - opcodes 0x00 0xA0 .. 0xA5
     // -------------------------------------------------------------------------

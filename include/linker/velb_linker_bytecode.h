@@ -82,7 +82,7 @@ extern "C" {
 // bumped to 0x2 cuando se anyadio la tabla de relocations al header.
 // Loaders viejos (v1) no entenderan los campos nuevos; no es backward
 // compatible.  Las .velb existentes deben recompilarse.
-#define VERSION_VELB 0x2
+#define VERSION_VELB 0x3
 #define VERSION_VELA 0x1
 
 /**
@@ -268,9 +268,29 @@ typedef struct PACKED HeaderVELB {
     uint32_t size_reloc_table = 0;   // 4, offset 128
 
     /**
-     * @brief Relleno hasta alineacion de 16 bytes (offset 132 -> 144).
+     * @brief Opcion W: offset al inicio de la seccion @c @ir dentro del
+     *        .velb.  Esta seccion contiene SSA IR serializado de las
+     *        funciones para JIT compile-time.
+     *
+     * Layout de la seccion:
+     *   +0  [4]  magic "VEIR"
+     *   +4  [2]  version u16
+     *   +6  [2]  reserved u16
+     *   +8  [4]  function_count
+     *   +12 [..] IrFunctions serializadas (back-to-back)
+     *
+     * El valor 0 indica que el .velb no contiene IR (build sin JIT,
+     * solo bytecode interpretado).  VERSION_VELB es 0x3 cuando se
+     * introduce este campo; archivos 0x2 con _reloc_pad zero-init
+     * continuan funcionando si se actualiza el version check (ya que
+     * leen 0 en este campo = no IR).
      */
-    uint8_t _reloc_pad[12] = {};     // 12, offsets 132-143
+    uint64_t offset_ir_section = 0;  // 8, offset 132
+
+    /**
+     * @brief Opcion W: tamano en bytes de la seccion @c @ir.
+     */
+    uint32_t size_ir_section = 0;    // 4, offset 140
 
     table_spaces_address *address_spaces = nullptr; // tabla de espacios de direcciones (NO se serializa)
 } HeaderVELB;
@@ -341,6 +361,7 @@ enum class RelocTypeVELB : uint8_t {
     ABSOLUTE64 = 1,
     RELATIVE32 = 2,
     RELATIVE64 = 3,
+    ABSOLUTE32 = 4, ///< Direccion absoluta truncada a 32 bits (cmpjmp/decjnz).
 };
 
 /**
@@ -449,6 +470,14 @@ namespace Assembly::Bytecode::Linker {
         bool allow_undefined_symbols = false;
         bool generate_map_file       = false; // archivo .map opcional
         bool verbose                 = false; // logs detallados
+        // Strip label names del .velb: una vez resueltas las relocations,
+        // los nombres simbolicos de los labels NO los usa nadie en runtime
+        // (el loader lee `offset_label_table`/`size_label_table` pero
+        // nunca consulta la tabla, y ningun campo del binario referencia
+        // strings_offsets[<label>]).  Por defecto los omitimos para
+        // reducir el tamano del ejecutable ~9%.  Setear a false para
+        // forzar la inclusion (util si debug tooling externo los necesita).
+        bool strip_labels            = true;
 
         std::string output_path;   // ruta del ejecutable final
         std::string map_file_path; // donde generar el map
@@ -1046,6 +1075,33 @@ namespace Assembly::Bytecode::Linker {
 
         // para construir el binario final, buffer de salida
         ByteWriter *result;
+
+        /**
+         * @brief Opcion W: setea los bytes pre-serializados de la seccion
+         *        @c @ir.  Llamado por el frontend Vex (via assembler)
+         *        antes de @c build_executable.
+         *
+         * Los bytes deben venir de @c ir::emit_ir_section(functions),
+         * que produce el layout binario completo (magic + header +
+         * funciones serializadas back-to-back).  El Linker simplemente
+         * los appendea al .velb final tras la seccion de debug, y
+         * patchea @c offset_ir_section + @c size_ir_section en el header.
+         *
+         * Vacio = no IR section -> @c offset_ir_section queda en 0.
+         */
+        void set_ir_section_bytes(std::vector<uint8_t> bytes) {
+            ir_section_bytes = std::move(bytes);
+        }
+
+        /** @brief Acceso const para tests / inspeccion. */
+        const std::vector<uint8_t> &get_ir_section_bytes() const noexcept {
+            return ir_section_bytes;
+        }
+
+    private:
+        /// Opcion W: bytes pre-serializados del @c @ir section.  Set via
+        /// @c set_ir_section_bytes; usado en @c build_executable.
+        std::vector<uint8_t> ir_section_bytes;
 
     private:
         // Interno: lista de modulos cargados

@@ -222,4 +222,58 @@ namespace runtime {
         }
     }
 
+    // =========================================================================
+    //  0x67  FULFILLHLT  r_fut, r_val   (fulfill + hlt fusionados)
+    // =========================================================================
+
+    /**
+     * @brief Ejecuta FULFILLHLT: resuelve future + termina el proceso.
+     *
+     * Operacion atomic equivalente a la secuencia:
+     *   fulfill r_fut, r_val   ; setea RESOLVED + wake waiter
+     *   hlt                     ; transiciona el proceso a HALT
+     *
+     * Usado por el helper sintetico de @Async para que cada `return X`
+     * del body genere 1 instruccion VM en lugar de 2 en el path critico.
+     * Sin coste runtime extra: solo amortiza el decode + advance PC del
+     * hlt separado (1 byte extra de bytecode + 1 dispatch del decoder).
+     *
+     * @param vm    Proceso virtual que ejecuta FULFILLHLT.
+     * @param instr reg1 = handle del FutureObject, reg2 = valor de resolucion.
+     */
+    void exec_instr_fulfillhlt(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t  r_fut = instr.data_instruction.reg_data.reg1;
+        const uint8_t  r_val = instr.data_instruction.reg_data.reg2;
+
+        const uint64_t h   = vm->registers.regs[r_fut].qword();
+        const uint64_t val = vm->registers.regs[r_val].qword();
+
+        // Fase 1: misma logica que exec_instr_fulfill (resolver future +
+        // capturar waiter bajo lock).
+        runtime::VM &vm_ref = vm->scheduler.vm_reference;
+        uint64_t waiter = UINT64_MAX;
+        {
+            std::lock_guard<std::mutex> lk(vm_ref.shared_futures_mtx);
+            if (h < vm_ref.shared_futures.size()) {
+                loader::FutureObject &fut = vm_ref.shared_futures[h];
+                fut.state       = loader::FutureState::RESOLVED;
+                fut.result      = val;
+                waiter          = fut.waiter_pid;
+                fut.waiter_pid  = UINT64_MAX;
+            }
+        }
+        // Wake del waiter FUERA del lock para no contender.
+        if (waiter != UINT64_MAX) {
+            GlobalPID target;
+            target.scheduler_id = static_cast<uint32_t>(waiter >> 32);
+            target.local_pid    = static_cast<uint64_t>(waiter & 0xFFFFFFFF);
+            vm_ref.make_ready(target);
+        }
+
+        // Fase 2: misma logica que exec_instr_hlt.  Notificar HALT al
+        // scheduler ANTES de marcar blocking, mismo orden que hlt regular.
+        vm->scheduler.on_event(EVT_HALT);
+        vm->decoded_ptr->flags_info.blocking = true;
+    }
+
 } // namespace runtime

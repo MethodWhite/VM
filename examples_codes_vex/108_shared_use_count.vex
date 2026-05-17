@@ -1,0 +1,44 @@
+// Test exhaustivo de shared<T>:
+//   - shared_box(value) crea control block con refcount=1.
+//   - move() transfiere ownership sin tocar refcount (sigue 1).
+//   - ptr_of(s) extrae host_ptr al payload (ctrl+16).
+//
+// Verificaciones:
+//   1. Tras shared_box, use_count == 1.
+//   2. Tras move, use_count seguimos viendo 1 (no se incrementa con move).
+//   3. ptr_of devuelve el valor original (777).
+//   4. El control block sigue accesible tras moves dentro del mismo scope.
+
+i32 main() {
+    shared<i64> s = shared_box(777);
+
+    // Verificar refcount inicial.
+    i64 rc0 = use_count(s);
+    if (rc0 != 1) {
+        return 100 + rc0;
+    }
+
+    // Verificar valor a traves de ptr_of.
+    i64* raw_ptr = ptr_of(s);
+    i64 v0 = *raw_ptr;
+    if (v0 != 777) {
+        return 200;
+    }
+
+    // Move chain.  s queda con slot=0; t tiene el ctrl_block.
+    shared<i64> t = move(s);
+    i64 rc1 = use_count(t);
+    if (rc1 != 1) {
+        // El refcount no cambia con move; sigue 1.
+        return 300 + rc1;
+    }
+
+    // Verificar valor desde t.
+    i64* raw_ptr_t = ptr_of(t);
+    i64 v1 = *raw_ptr_t;
+    if (v1 != 777) {
+        return 400 + v1;
+    }
+
+    return 42;
+}

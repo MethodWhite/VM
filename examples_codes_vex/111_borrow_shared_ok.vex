@@ -1,0 +1,22 @@
+// Test borrow checker: multiples shared borrows del mismo owner.
+// REGLA R2: pueden coexistir N borrow<T> mientras NINGUN borrow_mut<T>
+// este activo.  Lectura a traves de los borrows es siempre OK.
+
+i32 main() {
+    unique<i32> owner = unique_box(42);
+
+    // 3 shared borrows simultaneos -> OK por R2.
+    borrow<i32> r1 = lend(owner);
+    borrow<i32> r2 = lend(owner);
+    borrow<i32> r3 = lend(owner);
+
+    // Leemos a traves de los 3 borrows.  Todos deben dar 42.
+    i32 v1 = read_borrow(r1);
+    i32 v2 = read_borrow(r2);
+    i32 v3 = read_borrow(r3);
+
+    if (v1 != 42 || v2 != 42 || v3 != 42) {
+        return 99;
+    }
+    return 42;
+}

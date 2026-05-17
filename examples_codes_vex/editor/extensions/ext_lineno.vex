@@ -1,45 +1,51 @@
 // =============================================================================
-// extensions/ext_lineno.vex - Extension de ejemplo: contador de teclas
+// extensions/ext_lineno.vex - extension runtime: gutter de numeros de linea
 // =============================================================================
 //
-// Es una mini-extension que demuestra el modelo de plugins:
+// Demuestra:
+//   - Multi-extension: convive con ExtSyntaxVex en el mismo editor.
+//   - Composicion: imprime un prefijo (numero de linea) y devuelve 0
+//     para que la siguiente extension (syntax-highlight) continue
+//     procesando la linea.
 //
-//   1. El usuario compila este `.vex` separado a `ext_lineno.velb` con
-//      el flag `--vex-base 0x80000000` para asignar VA fija (no obligatorio
-//      desde A.9 ext rebase transparente, pero recomendado para diagnostics).
-//
-//   2. El editor llama `loadmodule("examples_codes_vex/editor/extensions/ext_lineno.velb")`.
-//      `loadmodule` ejecuta el `main` de la extension (que registra la
-//      clase ExtLineNo en el ClassRegistry global) y devuelve el codigo
-//      de retorno.  La clase queda visible para `findclass` desde el
-//      editor.
-//
-//   3. El editor invoca metodos de la extension via reflexion
-//      (forName + getMethod + callm).  Para esta version MVP sin
-//      newInstance, la extension se llama via metodos `static` -- no
-//      soportado todavia tampoco en Vex.  Por simplicidad, la extension
-//      define una funcion de modulo que devuelve un counter incremental.
-//
-// La extension aqui solo CUENTA cuantas veces se ha cargado el modulo
-// (util para verificar que loadmodule efectivamente ejecuta el main).
-// Una extension real registraria comandos con callbacks reales -- el
-// modelo se establecera en una iteracion posterior cuando Vex tenga
-// `Class.newInstance()` y `Method.invoke(obj, args[])`.
+// Layout del prefijo: " NNNN | " (5 dig digit + separator).
+// Para lineas con NNNN <= 9999 cabe en 5 chars; numeros mayores
+// expanden el ancho dinamicamente.
 
 class ExtLineNo {
-    public i32 magic;
-    public ExtLineNo() {
-        this.magic = 0xDEAD;
+    public ExtLineNo() { }
+
+    // Devuelve la posicion de la i-esima potencia de 10 menor que n.
+    // Equivale a num_digits(n) en decimal.
+    public i32 num_digits(i32 n) {
+        if (n < 10)        { return 1; }
+        if (n < 100)       { return 2; }
+        if (n < 1000)      { return 3; }
+        if (n < 10000)     { return 4; }
+        if (n < 100000)    { return 5; }
+        if (n < 1000000)   { return 6; }
+        if (n < 10000000)  { return 7; }
+        if (n < 100000000) { return 8; }
+        return 9;
     }
-    public i32 hello() {
-        return 1234;
+
+    // Hook composable: imprime el prefijo " NNNN | " y devuelve 0 para
+    // que la siguiente extension (e.g. syntax-highlight) procese el
+    // contenido de la linea.
+    public i32 on_render_line(i32 line_no, u8* bdat, i32 line_off, i32 line_end, i32 cols) {
+        // Padding a la izquierda hasta ancho 5.
+        i32 nd = this.num_digits(line_no);
+        i32 pad = 0;
+        if (nd < 5) { pad = 5 - nd; }
+        print(DIM); print(WHITE);
+        if (pad > 0) { print_pad(32, pad); }   // 32 = ' ' (espacio)
+        print_int(line_no);
+        print(" | ");
+        print(RESET);
+        return 0;  // continuar al siguiente hook (syntax)
     }
 }
 
 i32 main() {
-    // El __module_init de Vex (auto-generado) registra ExtLineNo en el
-    // ClassRegistry ANTES de invocar este main.  Aqui solo confirmamos
-    // que la carga corrio: devolvemos un valor magico que el editor
-    // puede comprobar.
-    return 0xCAFE;
+    return 1;
 }

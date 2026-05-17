@@ -40,6 +40,8 @@
 
 #include "runtime/vm_address_space.h"
 #include "loader/oop_types.h"
+#include "debug/debug_info.h"
+#include "ir/ssa_ir.h"
 
 #include <cstdint>   // uint8_t, uint32_t
 #include <cstddef>   // size_t
@@ -226,6 +228,66 @@ namespace loader {
          * relocations (formato viejo o sin relocations resolubles).
          */
         std::vector<entry_relocation_table> velb_relocations{};
+
+        /**
+         * @brief Informacion de depuracion bytecode -> source line.
+         *
+         * Construida cuando el .velb tiene la seccion DVBG (compilado
+         * con --vex-debug).  Permite al debugger resolver `b file.vex:42`
+         * al offset de bytecode correcto via DebugInfo::lookup_offset_for_line,
+         * y mostrar `file:line` del PC actual via DebugInfo::lookup_line.
+         * nullptr si el .velb no tiene info de debug (caso comun).
+         */
+        std::unique_ptr<debug::DebugInfo> debug_info;
+
+        /**
+         * @brief Path del archivo .velb desde el filesystem (si fue cargado
+         *        dinamicamente via load_module_dynamic).
+         *
+         * Vacio para el ejecutable principal cargado al inicio.  Usado por
+         * `unload_module_dynamic(path)` para localizar el Executable y
+         * removerlo del pool sin afectar otros modulos.
+         */
+        std::string source_path;
+
+        /**
+         * @brief Opcion W: funciones IR deserializadas desde la seccion
+         *        @c @ir del `.velb` v3.  Llenado por @c parse_velb si
+         *        @c header.offset_ir_section != 0; vacio para `.velb` v2
+         *        o si la seccion no se pudo parsear.
+         *
+         * Habilitan auto-JIT (Phase D.3-C+ del roadmap): cuando una
+         * funcion del bytecode se invoca repetidamente (counter >=
+         * threshold), el runtime busca su @c IrFunction aqui via nombre
+         * (la entrada del map @c ir_lookup) y la pasa a @c JitCompiler.
+         * El resultado se asigna a @c MethodInfo::jit_code y futuras
+         * invocaciones via @c exec_instr_callvirt despachan directo al
+         * codigo nativo.
+         */
+        std::vector<ir::IrFunction> ir_functions;
+
+        /**
+         * @brief Lookup acelerado por nombre (@c IrFunction::name -> indice
+         *        en @c ir_functions).  Construido junto con @c ir_functions
+         *        durante @c parse_velb para que el dispatch JIT no haga
+         *        busqueda lineal en cada invocacion.
+         */
+        std::unordered_map<std::string, size_t> ir_lookup;
+
+        /**
+         * @brief symbol table resuelta del linker.
+         *
+         * Mapa nombre completo de label (e.g. "code.s_0", "code.s_3") a
+         * direccion VM absoluta resuelta por el linker.  Usado por el
+         * JIT mini-parser para resolver `@Absolute("code.X")` referencias
+         * en raw_asm sin tener que delegar al interp.
+         *
+         * Layout en el `.velb`: appendeado RIGHT AFTER la seccion @c @ir
+         * con magic "VSYM" + version + count + entries.  Backward
+         * compatible: archivos sin VSYM tras @ir simplemente dejan este
+         * mapa vacio.
+         */
+        std::unordered_map<std::string, uint64_t> symbol_table;
 
         /**
          * @brief Metadatos arbitrarios en formato JSON.
@@ -420,6 +482,44 @@ namespace loader {
          */
         uint64_t load_module_dynamic(runtime::VM &vm,
                                       std::vector<uint8_t> raw_bytecode_file);
+
+        /**
+         * @brief Variante de load_module_dynamic que registra source_path.
+         *
+         * Equivalente a load_module_dynamic pero ademas asocia el path
+         * fuente al Executable resultante para que pueda ser localizado
+         * por unload_module_dynamic(path).
+         *
+         * @param vm                  Instancia VM activa.
+         * @param raw_bytecode_file   Bytes del archivo .velb.
+         * @param source_path         Path original del archivo (para unload).
+         * @return init_pc del modulo cargado, o 0 en error.
+         */
+        uint64_t load_module_dynamic_with_path(runtime::VM &vm,
+                                                std::vector<uint8_t> raw_bytecode_file,
+                                                const std::string &source_path);
+
+        /**
+         * @brief Descarga un modulo previamente cargado dinamicamente.
+         *
+         * Localiza el Executable cuyo source_path coincide con @p path y lo
+         * elimina del pool `executables`.  Si era el ultimo modulo cargado
+         * en `next_dyn_base`, retrocede el contador para reutilizar la VA.
+         *
+         * IMPORTANTE: las clases que el modulo registro en ClassRegistry NO
+         * se eliminan automaticamente (los ClassInfo* podrian estar referenciados
+         * por instancias vivas).  Si el usuario quiere "reload" debe versionar
+         * los nombres de las clases (ExtSyntaxV1 -> ExtSyntaxV2) o aceptar
+         * que la 2a load no redefine la clase.  La memoria del bytecode SI
+         * se libera (Executable se destruye), reduciendo el footprint.
+         *
+         * @param vm   Instancia VM cuyos procesos no deben referenciar mas
+         *             el bytecode descargado (no se valida; responsabilidad
+         *             del llamador).
+         * @param path Path al .velb tal como fue pasado a loadmodule().
+         * @return true si se encontro y descargo, false si no existe.
+         */
+        bool unload_module_dynamic(runtime::VM &vm, const std::string &path);
 
         void resolve_labels(Assembly::Bytecode::Section &section);
 

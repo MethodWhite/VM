@@ -186,39 +186,42 @@ namespace vm {
             size_t offset       = vaddr & 0xFFFULL;            // offset dentro de la pagina
             size_t chunk        = std::min<size_t>(4096 - offset, size); // bytes a leer en esta iteracion
 
-            tlb::TLBEntryData *entry = tlb.get_entry(vaddr); // consultar el TLB
+            uint8_t *base;
+            if (__builtin_expect(page_vaddr == cached_page_vaddr, 1)) {
+                base = cached_page_host;
+            } else {
+                tlb::TLBEntryData *entry = tlb.get_entry(vaddr); // consultar el TLB
 
-            // MISS: pagina no mapeada -> asignar perezosamente con los permisos por defecto
-            if (!entry || entry->type_address == NONE) {
-                void *host_mem = get_ptr_arena(
-                    arena_mgr, arena_mgr.create_arena(4096, permsDefault)); // reservar pagina nueva
+                // MISS: pagina no mapeada -> asignar perezosamente con los permisos por defecto
+                if (!entry || entry->type_address == NONE) {
+                    void *host_mem = get_ptr_arena(
+                        arena_mgr, arena_mgr.create_arena(4096, permsDefault)); // reservar pagina nueva
 
-                ptr_mapped pm{};
-                pm.ptr_host = host_mem; // apuntar al bloque recien reservado
+                    ptr_mapped pm{};
+                    pm.ptr_host = host_mem; // apuntar al bloque recien reservado
 
-                tlb.translate(page_vaddr, MAPPED_PTR_HOST, pm); // registrar traduccion
-                entry = tlb.get_entry(vaddr); // releer la entrada tras el registro
-            }
-
-            switch (entry->type_address) {
-                case MAPPED_PTR_HOST: {
-                    uint8_t *base = static_cast<uint8_t *>(entry->address.ptr_host); // base de la pagina en el host
-
-                    // FAST-PATH: offset alineado a 16 bytes -> el compilador puede usar SIMD
-                    if ((offset & 0xF) == 0) {
-                        uint8_t *aligned = (uint8_t *) __builtin_assume_aligned(base + offset, 16);
-                        memcpy(out, aligned, chunk); // copia potencialmente vectorizada
-                    } else {
-                        memcpy(out, base + offset, chunk); // copia estandar sin alineacion
-                    }
-                    break;
+                    tlb.translate(page_vaddr, MAPPED_PTR_HOST, pm); // registrar traduccion
+                    entry = tlb.get_entry(vaddr); // releer la entrada tras el registro
                 }
 
-                default:
-                    // tipo de mapeo no soportado en lectura
+                if (entry->type_address != MAPPED_PTR_HOST) {
                     std::cout << "Modo de acceso no implementado: "
                             << entry->type_address << std::endl;
                     exit(-1);
+                }
+
+                base = static_cast<uint8_t *>(entry->address.ptr_host);
+                // Cachear para la proxima iteracion en la misma pagina.
+                cached_page_vaddr = page_vaddr;
+                cached_page_host  = base;
+            }
+
+            // FAST-PATH: offset alineado a 16 bytes -> el compilador puede usar SIMD
+            if ((offset & 0xF) == 0) {
+                uint8_t *aligned = (uint8_t *) __builtin_assume_aligned(base + offset, 16);
+                memcpy(out, aligned, chunk); // copia potencialmente vectorizada
+            } else {
+                memcpy(out, base + offset, chunk); // copia estandar sin alineacion
             }
 
             // avanzar cursores para la siguiente pagina
@@ -247,39 +250,41 @@ namespace vm {
             size_t offset       = vaddr & 0xFFFULL;            // offset dentro de la pagina
             size_t chunk        = std::min<size_t>(4096 - offset, size); // bytes a escribir en esta iteracion
 
-            tlb::TLBEntryData *entry = tlb.get_entry(vaddr); // consultar el TLB
+            uint8_t *base;
+            if (__builtin_expect(page_vaddr == cached_page_vaddr, 1)) {
+                base = cached_page_host;
+            } else {
+                tlb::TLBEntryData *entry = tlb.get_entry(vaddr); // consultar el TLB
 
-            // MISS: pagina no mapeada -> asignar perezosamente con los permisos por defecto
-            if (!entry || entry->type_address == NONE) {
-                void *host_mem = get_ptr_arena(
-                    arena_mgr, arena_mgr.create_arena(4096, permsDefault)); // reservar pagina nueva
+                // MISS: pagina no mapeada -> asignar perezosamente con los permisos por defecto
+                if (!entry || entry->type_address == NONE) {
+                    void *host_mem = get_ptr_arena(
+                        arena_mgr, arena_mgr.create_arena(4096, permsDefault)); // reservar pagina nueva
 
-                ptr_mapped pm{};
-                pm.ptr_host = host_mem; // apuntar al bloque recien reservado
+                    ptr_mapped pm{};
+                    pm.ptr_host = host_mem; // apuntar al bloque recien reservado
 
-                tlb.translate(page_vaddr, MAPPED_PTR_HOST, pm); // registrar traduccion
-                entry = tlb.get_entry(vaddr); // releer la entrada tras el registro
-            }
-
-            switch (entry->type_address) {
-                case MAPPED_PTR_HOST: {
-                    uint8_t *base = static_cast<uint8_t *>(entry->address.ptr_host); // base de la pagina en el host
-
-                    // FAST-PATH: offset alineado a 16 bytes -> el compilador puede usar SIMD
-                    if ((offset & 0xF) == 0) {
-                        uint8_t *aligned = (uint8_t *) __builtin_assume_aligned(base + offset, 16);
-                        memcpy(aligned, in, chunk); // escritura potencialmente vectorizada
-                    } else {
-                        memcpy(base + offset, in, chunk); // escritura estandar sin alineacion
-                    }
-                    break;
+                    tlb.translate(page_vaddr, MAPPED_PTR_HOST, pm); // registrar traduccion
+                    entry = tlb.get_entry(vaddr); // releer la entrada tras el registro
                 }
 
-                default:
-                    // tipo de mapeo no soportado en escritura
+                if (entry->type_address != MAPPED_PTR_HOST) {
                     std::cout << "Modo de acceso no implementado: "
                             << entry->type_address << std::endl;
                     exit(-1);
+                }
+
+                base = static_cast<uint8_t *>(entry->address.ptr_host);
+                cached_page_vaddr = page_vaddr;
+                cached_page_host  = base;
+            }
+
+            // FAST-PATH: offset alineado a 16 bytes -> el compilador puede usar SIMD
+            if ((offset & 0xF) == 0) {
+                uint8_t *aligned = (uint8_t *) __builtin_assume_aligned(base + offset, 16);
+                memcpy(aligned, in, chunk); // escritura potencialmente vectorizada
+            } else {
+                memcpy(base + offset, in, chunk); // escritura estandar sin alineacion
             }
 
             // avanzar cursores para la siguiente pagina

@@ -245,6 +245,15 @@ namespace vex {
                 x->operand = clone_expr(s->operand.get());
                 return x;
             }
+            case ast::NodeKind::CastExpr: {
+                auto *s = static_cast<const ast::CastExpr *>(e);
+                auto x = std::make_unique<ast::CastExpr>();
+                x->loc         = s->loc;
+                x->target_type = clone_type_with_subst(s->target_type.get(),
+                                                        GenSubst{nullptr, nullptr});
+                x->operand     = clone_expr(s->operand.get());
+                return x;
+            }
             case ast::NodeKind::AssignExpr: {
                 auto *s = static_cast<const ast::AssignExpr *>(e);
                 auto x = std::make_unique<ast::AssignExpr>();
@@ -455,6 +464,20 @@ namespace vex {
         }
 
         monomorphized_[mangled] = true;
+
+        // B.3 contract: registrar provenance para que el lowering
+        // marque cada IrFunction generada con template_name + type_args
+        // legibles.  Los nombres legibles vienen de @c type_to_string
+        // sobre cada arg (e.g., "i32", "string", "Box<i64>" para
+        // generics anidados).
+        MonomorphInfo info;
+        info.template_name = template_name;
+        info.type_args.reserve(args.size());
+        for (const auto &t : args) {
+            info.type_args.push_back(type_to_string(t));
+        }
+        monomorph_info_[mangled] = std::move(info);
+
         mod_.decls.push_back(std::move(cloned));
         return mangled;
     }
@@ -545,7 +568,9 @@ namespace vex {
             // aqui; type_from_node los resuelve a Type{OPTIONAL/RESULT}.
             // Pero SI necesitamos recursar en los args para detectar
             // templates de usuario anidados (Optional<MyTpl<i32>>).
-            if (nt->name == "Optional" || nt->name == "Result") {
+            if (nt->name == "Optional" || nt->name == "Result"
+             || nt->name == "Future") {
+                // Mejora II: Future<T> es builtin igual que Optional/Result.
                 for (auto &ta : nt->type_args) {
                     pre_mono_collect_in_type(tc, ta.get(), loc);
                 }
@@ -594,6 +619,14 @@ namespace vex {
             case ast::NodeKind::UnaryExpr: {
                 auto *u = static_cast<const ast::UnaryExpr *>(e);
                 pre_mono_collect_in_expr(tc, u->operand.get());
+                return;
+            }
+            case ast::NodeKind::CastExpr: {
+                auto *c = static_cast<const ast::CastExpr *>(e);
+                if (c->target_type) {
+                    pre_mono_collect_in_type(tc, c->target_type.get(), c->loc);
+                }
+                pre_mono_collect_in_expr(tc, c->operand.get());
                 return;
             }
             case ast::NodeKind::AssignExpr: {
@@ -805,6 +838,15 @@ namespace vex {
         return &function_sigs_[it->second];
     }
 
+    std::string
+    TypeChecker::lookup_extern_qualified(const std::string &name) const {
+        const FunctionSig *sig = function_sig_by_name(name);
+        if (!sig) return std::string();
+        if (sig->extern_lib.empty()) return std::string();
+        // Formato: "@extern:<lib>:<fn>" - el cleanup distingue del nombre Vesta.
+        return std::string("@extern:") + sig->extern_lib + ":" + name;
+    }
+
     const Symbol *TypeChecker::lookup_with_depth(const std::string &name,
                                                  size_t *depth_out) const {
         // Mismo algoritmo que @c lookup pero devolviendo tambien el indice
@@ -850,6 +892,19 @@ namespace vex {
                         type_from_node(pt->type_args[0].get()));
                 }
             }
+            // Smart pointers: unique<T> / shared<T> almacenan el tipo del
+            // recurso apuntado en @c pointee (analogo a Optional<T>).
+            // Sin esto, `unique<i32>` quedaria como kind=UNIQUE_PTR sin
+            // pointee, y la asignacion `unique<i32> p = unique_box(42)`
+            // fallaria al unificar.
+            if (!pt->type_args.empty()
+             && (pt->prim == PrimitiveKind::UNIQUE_PTR
+              || pt->prim == PrimitiveKind::SHARED_PTR
+              || pt->prim == PrimitiveKind::BORROW
+              || pt->prim == PrimitiveKind::BORROW_MUT)) {
+                t.pointee = std::make_shared<Type>(
+                    type_from_node(pt->type_args[0].get()));
+            }
             return t;
         }
         if (tn->kind == ast::NodeKind::NamedTypeNode) {
@@ -867,6 +922,12 @@ namespace vex {
                 return Type::make_result(
                     type_from_node(nt->type_args[0].get()),
                     type_from_node(nt->type_args[1].get()));
+            }
+            // Mejora II: Future<T> es builtin igual que Optional/Result.
+            // El frontend lo modela con kind=FUTURE + pointee=T.  El
+            // bytecode no cambia: el handle sigue siendo i64 opaco.
+            if (nt->name == "Future" && nt->type_args.size() == 1) {
+                return Type::make_future(type_from_node(nt->type_args[0].get()));
             }
             // 0) Generics: si tiene type_args, mapeamos al mangled name
             //    (la monomorphizacion ya se hizo en el pre-pase).
@@ -1013,6 +1074,23 @@ namespace vex {
         // print_cstr(host_ptr) imprime una cstring desde memoria host
         // (FatalError.message o .stack_trace).  Acepta cualquier PTR.
         reg_builtin("print_cstr",  Type{PrimitiveKind::VOID}, {PrimitiveKind::PTR});
+        // Formatos numericos alternativos: binario y octal con prefijo
+        // "0b" / "0o".  Compactos (sin ceros lider).
+        reg_builtin("print_bin",   Type{PrimitiveKind::VOID}, {PrimitiveKind::U64});
+        reg_builtin("print_oct",   Type{PrimitiveKind::VOID}, {PrimitiveKind::U64});
+        // print_ptr(addr) imprime "0x<hex>" compacto sin ceros lider.
+        // Acepta cualquier PTR (host o virtual) o un i64 con la direccion.
+        // print_gchandle(handle) imprime "<gc:N>" donde N es el handle
+        // como entero decimal.  Para uso con CLASS objects el lowering
+        // emite la instruccion @c gchandle antes de llamar.
+        reg_builtin("print_ptr",      Type{PrimitiveKind::VOID}, {PrimitiveKind::PTR});
+        reg_builtin("print_gchandle", Type{PrimitiveKind::VOID}, {PrimitiveKind::I64});
+        // Padding/alineacion: emite @p width copias del codepoint
+        // @p fill_cp.  El usuario calcula la diferencia entre el ancho
+        // deseado y el ancho actual del texto y llama a este builtin.
+        // Para alineacion manual de columnas en TUIs.
+        reg_builtin("print_pad",   Type{PrimitiveKind::VOID},
+                    {PrimitiveKind::U32, PrimitiveKind::U64});
         // I/O de fichero.  fopen recibe path y modo como literales de
         // string; devuelve un FILE* (uint64_t).  fwrite recibe el FILE*
         // y un buffer literal; devuelve el numero de bytes escritos.
@@ -1043,6 +1121,21 @@ namespace vex {
             Type t_char = Type{PrimitiveKind::CHAR};
             Type t_cstring = Type::make_ptr(t_char);
             type_aliases_["cstring"] = t_cstring;
+        }
+
+        // Alias predefinidos para reflexion: Class / Method / Field / Object.
+        // Se resuelven a i64 (handle opaco del ClassRegistry / MethodInfo* /
+        // FieldInfo* / host_ptr del objeto).  Cuando se declara una variable
+        // con uno de estos tipos (e.g. `Class cls = forName("X")`), el type
+        // checker registra el alias en el Symbol; las llamadas
+        // `cls.getMethod("foo")` se desazucaran a `getMethod(cls, "foo")`.
+        // Esto provee sintaxis OO ergonomica sin cambios en el runtime.
+        {
+            const Type t_i64 = Type{PrimitiveKind::I64};
+            type_aliases_["Class"]  = t_i64;
+            type_aliases_["Method"] = t_i64;
+            type_aliases_["Field"]  = t_i64;
+            type_aliases_["Object"] = t_i64;
         }
 
         // Builtins de string operando sobre StringObject (tipo
@@ -1243,6 +1336,7 @@ namespace vex {
                     ClassLayout empty;
                     empty.name         = c->name;
                     empty.is_interface = c->is_interface;
+                    empty.is_aspect    = c->is_aspect;
                     class_layouts_.emplace(c->name, std::move(empty));
                 }
             } else if (decl->kind == ast::NodeKind::EnumDecl) {
@@ -1898,7 +1992,18 @@ namespace vex {
                 auto *fn = static_cast<ast::FunctionDecl *>(decl.get());
 
                 FunctionSig sig;
-                sig.return_type = type_from_node(fn->return_type.get());
+                Type ret_t = type_from_node(fn->return_type.get());
+                // Mejora II: si la funcion es @Async, el wrapper publico
+                // visible al callsite devuelve Future<T> donde T es el tipo
+                // declarado del @c return.  El bytecode del wrapper sigue
+                // produciendo un i64 (handle), pero al frontend le
+                // interesa preservar T para que `T r = await fn();` se
+                // tipo-checkee correctamente.
+                if (fn->is_async) {
+                    sig.return_type = Type::make_future(std::move(ret_t));
+                } else {
+                    sig.return_type = std::move(ret_t);
+                }
                 sig.param_types.reserve(fn->params.size());
                 for (auto &p : fn->params) {
                     sig.param_types.push_back(type_from_node(p->type.get()));
@@ -1981,27 +2086,41 @@ namespace vex {
             auto *fn = static_cast<ast::FunctionDecl *>(decl.get());
             if (!fn->body) continue;
 
-            // fase 2: validacion de funciones @Async (MVP).
-            // Restricciones temporales hasta que lleguen closures con captura:
-            //   - Sin parametros (no podemos pasar args al spawn body sin captures).
-            //   - Return type debe ser i64 (handle del Future).  El programador
-            //     escribe `@Async i64 fn() { ...; return future_value; }`.  El
-            //     valor retornado por `return X` se pasa como payload del
-            //     fulfill al final del spawn body.
+            // Mejora II: validacion @Async extendida.  Antes solo permitia
+            // funciones sin parametros y return type i64.  Ahora:
+            //   - Cualquier numero de parametros, cada uno con tipo de
+            //     tamano <= 8 bytes (primitivos numericos, bool, char,
+            //     ptr, handle de string/objeto, futures).
+            //   - Cualquier tipo de retorno T con tamano <= 8 bytes.
+            //   - El wrapper publico visible al callsite devuelve
+            //     Future<T> (envuelto automaticamente por el type checker).
+            //     `i32 r = await compute(10, 20);` tipo-checkea correctamente.
+            //
+            // Tipos > 8 bytes (struct, array, optional, result) requeririan
+            // serializacion en buffer auxiliar.  Deferido a Phase B.
             if (fn->is_async) {
-                if (!fn->params.empty()) {
-                    diags_.error(fn->loc,
-                        "@Async (MVP): la funcion '" + fn->name +
-                        "' no puede tener parametros.  Las captures llegaran en Phase B; "
-                        "por ahora, comunique entrada/salida via msgsend/msgrecv.");
+                auto fits_in_qword = [](const Type &t) -> bool {
+                    if (t.kind == PrimitiveKind::COUNT) return true; // tipo desconocido OK
+                    return primitive_size_bytes(t.kind) > 0
+                        && primitive_size_bytes(t.kind) <= 8;
+                };
+                for (size_t pi = 0; pi < fn->params.size(); ++pi) {
+                    Type pt = type_from_node(fn->params[pi]->type.get());
+                    if (!fits_in_qword(pt)) {
+                        diags_.error(fn->params[pi]->loc,
+                            "@Async: parametro '" + fn->params[pi]->name +
+                            "' de tipo '" + type_to_string(pt) +
+                            "' excede 8 bytes.  Tipos compuestos (struct, array, "
+                            "Optional, Result) no soportados aun.");
+                    }
                 }
                 const Type rt_chk = type_from_node(fn->return_type.get());
-                if (rt_chk.kind != PrimitiveKind::I64
-                 && rt_chk.kind != PrimitiveKind::COUNT) {
+                if (rt_chk.kind != PrimitiveKind::COUNT
+                 && rt_chk.kind != PrimitiveKind::VOID
+                 && !fits_in_qword(rt_chk)) {
                     diags_.error(fn->loc,
-                        "@Async (MVP): el tipo de retorno de '" + fn->name +
-                        "' debe ser i64 (handle del Future).  El valor real "
-                        "fluye via fulfill+await.");
+                        "@Async: tipo de retorno '" + type_to_string(rt_chk) +
+                        "' excede 8 bytes.  Tipos compuestos no soportados aun.");
                 }
             }
 
@@ -2021,6 +2140,28 @@ namespace vex {
             // validar returns dentro del match con el tipo correcto.
             const Type saved_ret = current_fn_return_type_;
             current_fn_return_type_ = fn_ret;
+            // Resetear el borrow checker al entrar a cada funcion.
+            // Cada funcion tiene su propio scope de borrows; los borrows
+            // de una funcion no afectan a otra.
+            borrow_checker_.reset();
+            // F2: registrar parametros como owners con OwnerKind::Param.
+            // Si el parametro ES un borrow (su tipo es BORROW/BORROW_MUT),
+            // ademas lo registramos como borrower self-referencial: el
+            // borrow checker lo reconoce como "borrow valido cuyo owner
+            // es Param" -> escape via return permitido.
+            for (auto &p : fn->params) {
+                borrow_checker_.declare_owner(p->name, OwnerKind::Param);
+                const Type pt = type_from_node(p->type.get());
+                if (pt.kind == PrimitiveKind::BORROW
+                 || pt.kind == PrimitiveKind::BORROW_MUT) {
+                    borrow_checker_.register_borrow(
+                        p->name, p->name,
+                        /*is_mut=*/(pt.kind == PrimitiveKind::BORROW_MUT));
+                }
+            }
+            // F1 NLL: pre-pase de last-uses + reset del contador.
+            current_stmt_idx_ = 0;
+            compute_borrow_last_uses(fn->body.get());
             check_block(fn->body.get(), fn_ret);
             current_fn_return_type_ = saved_ret;
             pop_scope();
@@ -2099,8 +2240,149 @@ namespace vex {
         pop_scope();
     }
 
+    // F1 NLL - pre-pase: numera stmts en DFS order y para cada IdentExpr
+    // registra el stmt_idx de su uso.  Calcula el max per nombre y se lo
+    // da al borrow checker.
+    void TypeChecker::compute_borrow_last_uses(ast::Stmt *body) {
+        if (!body) return;
+        std::unordered_map<std::string, uint32_t> last_use;
+        uint32_t                                   counter = 0;
+
+        std::function<void(ast::Expr *)> visit_expr;
+        std::function<void(ast::Stmt *)> visit_stmt;
+
+        // Recorre la expr y registra el stmt_idx actual (counter) en
+        // cualquier IdentExpr.  Para CallExpr, recurse en callee + args.
+        // Para los demas, recurse en sub-exprs relevantes.
+        visit_expr = [&](ast::Expr *e) {
+            if (!e) return;
+            switch (e->kind) {
+                case ast::NodeKind::IdentExpr: {
+                    auto *id = static_cast<ast::IdentExpr *>(e);
+                    auto  it = last_use.find(id->name);
+                    if (it == last_use.end() || it->second < counter) {
+                        last_use[id->name] = counter;
+                    }
+                    return;
+                }
+                case ast::NodeKind::BinaryExpr: {
+                    auto *b = static_cast<ast::BinaryExpr *>(e);
+                    visit_expr(b->lhs.get());
+                    visit_expr(b->rhs.get());
+                    return;
+                }
+                case ast::NodeKind::UnaryExpr: {
+                    auto *u = static_cast<ast::UnaryExpr *>(e);
+                    visit_expr(u->operand.get());
+                    return;
+                }
+                case ast::NodeKind::CallExpr: {
+                    auto *c = static_cast<ast::CallExpr *>(e);
+                    visit_expr(c->callee.get());
+                    for (auto &a : c->args) visit_expr(a.get());
+                    return;
+                }
+                case ast::NodeKind::FieldAccessExpr: {
+                    auto *f = static_cast<ast::FieldAccessExpr *>(e);
+                    visit_expr(f->base.get());
+                    return;
+                }
+                case ast::NodeKind::IndexExpr: {
+                    auto *ix = static_cast<ast::IndexExpr *>(e);
+                    visit_expr(ix->base.get());
+                    visit_expr(ix->index.get());
+                    return;
+                }
+                case ast::NodeKind::AssignExpr: {
+                    auto *as = static_cast<ast::AssignExpr *>(e);
+                    visit_expr(as->target.get());
+                    visit_expr(as->value.get());
+                    return;
+                }
+                default:
+                    return;
+            }
+        };
+
+        visit_stmt = [&](ast::Stmt *s) {
+            if (!s) return;
+            // Para BlockStmt no incrementamos: solo es contenedor; check_stmt
+            // tampoco lo cuenta como un stmt aparte (se procesa via check_block
+            // que itera children).  Mantenemos la simetria con la fase
+            // de checkeo.
+            if (s->kind == ast::NodeKind::BlockStmt) {
+                auto *b = static_cast<ast::BlockStmt *>(s);
+                for (auto &sub : b->body) visit_stmt(sub.get());
+                return;
+            }
+            ++counter;
+            switch (s->kind) {
+                case ast::NodeKind::BlockStmt: {
+                    auto *b = static_cast<ast::BlockStmt *>(s);
+                    for (auto &sub : b->body) visit_stmt(sub.get());
+                    return;
+                }
+                case ast::NodeKind::VarDeclStmt: {
+                    auto *vd = static_cast<ast::VarDeclStmt *>(s);
+                    if (vd->init) visit_expr(vd->init.get());
+                    return;
+                }
+                case ast::NodeKind::ExprStmt: {
+                    auto *es = static_cast<ast::ExprStmt *>(s);
+                    visit_expr(es->expr.get());
+                    return;
+                }
+                case ast::NodeKind::IfStmt: {
+                    auto *is = static_cast<ast::IfStmt *>(s);
+                    visit_expr(is->cond.get());
+                    if (is->then_branch) visit_stmt(is->then_branch.get());
+                    if (is->else_branch) visit_stmt(is->else_branch.get());
+                    return;
+                }
+                case ast::NodeKind::WhileStmt: {
+                    auto *ws = static_cast<ast::WhileStmt *>(s);
+                    visit_expr(ws->cond.get());
+                    if (ws->body) visit_stmt(ws->body.get());
+                    return;
+                }
+                case ast::NodeKind::ForStmt: {
+                    auto *fs = static_cast<ast::ForStmt *>(s);
+                    if (fs->init) visit_stmt(fs->init.get());
+                    if (fs->cond) visit_expr(fs->cond.get());
+                    if (fs->step) visit_expr(fs->step.get());
+                    if (fs->body) visit_stmt(fs->body.get());
+                    return;
+                }
+                case ast::NodeKind::ReturnStmt: {
+                    auto *r = static_cast<ast::ReturnStmt *>(s);
+                    if (r->value) visit_expr(r->value.get());
+                    return;
+                }
+                default:
+                    return;
+            }
+        };
+
+        visit_stmt(body);
+
+        // Entregar los last-uses al borrow checker.  El borrow checker
+        // los aplica solo a entradas ya registradas en borrows_; las
+        // de variables que no son borrows se ignoran silenciosamente.
+        for (const auto &kv : last_use) {
+            borrow_checker_.set_last_use(kv.first, kv.second);
+        }
+    }
+
     void TypeChecker::check_stmt(ast::Stmt *s, const Type &fn_return_type) {
         if (!s) return;
+        // F1 NLL: BlockStmt no cuenta como un stmt independiente (delegamos
+        // a check_block que itera children).  Para todos los demas, este
+        // ES el stmt: incrementar el contador y avanzar el borrow checker
+        // (drop NLL de borrows cuyo last_use < current_stmt_idx_).
+        if (s->kind != ast::NodeKind::BlockStmt) {
+            ++current_stmt_idx_;
+            borrow_checker_.advance_stmt(current_stmt_idx_);
+        }
         switch (s->kind) {
             case ast::NodeKind::BlockStmt:
                 check_block(static_cast<ast::BlockStmt *>(s), fn_return_type);
@@ -2248,6 +2530,19 @@ namespace vex {
         s.kind     = SymbolKind::Variable;
         s.type     = type_from_node(vd->type.get());
         s.is_const = vd->is_const;
+        // Captura del alias de reflexion (Class/Method/Field/Object) para
+        // habilitar dispatch ergonomico `cls.getMethod(...)` etc.  El TypeNode
+        // original era un NamedTypeNode con el nombre del alias; tras
+        // type_from_node el tipo subyacente queda como i64.  Si el nombre
+        // textual coincide con uno de los aliases magicos, registramos en
+        // el Symbol para que `check_field_access` lo recupere despues.
+        if (vd->type && vd->type->kind == ast::NodeKind::NamedTypeNode) {
+            const auto *nt = static_cast<const ast::NamedTypeNode *>(vd->type.get());
+            if (nt->name == "Class"  || nt->name == "Method"
+             || nt->name == "Field"  || nt->name == "Object") {
+                s.reflection_alias = nt->name;
+            }
+        }
         // Restricciones para arrays nativos como variables locales:
         //  - El tamano debe ser conocido (T[]) solo se admite como tipo de
         //    parametro de funcion, no como variable.
@@ -2261,6 +2556,16 @@ namespace vex {
         }
         if (!declare(vd->name, s)) {
             diags_.error(vd->loc, "redefinicion de variable: '" + vd->name + "'");
+        }
+        // Borrow checker: si la variable es @c unique<T>/shared<T>,
+        // registrarla como owner (posible objeto de prestamos).  Si la
+        // variable es @c borrow<T>/borrow_mut<T>, registrarla como
+        // borrower del owner del que provino.  El registro real ocurre
+        // tras chequear el init (que es donde sabemos el owner via
+        // lend(owner)).
+        if (s.type.kind == PrimitiveKind::UNIQUE_PTR
+         || s.type.kind == PrimitiveKind::SHARED_PTR) {
+            borrow_checker_.declare_owner(vd->name);
         }
         if (vd->init) {
             // si la variable tiene tipo `fn(T1, T2) -> R` y
@@ -2376,6 +2681,45 @@ namespace vex {
                     std::string("tipo del inicializador (") + type_to_string(t) +
                     ") incompatible con tipo declarado (" + type_to_string(s.type) + ")");
             }
+            // Borrow checker: si el var-decl recibio un borrow, asociar
+            // el nombre de la variable como borrower del owner correcto.
+            // El owner puede venir de tres rutas:
+            //   1. lend(owner_var) directo            -> owner = owner_var
+            //   2. lend(borrow_var) (reborrow)        -> owner = root via root_owner_of
+            //   3. factory(): borrow propagado via F4 -> owner = init->borrow_owner_source
+            if ((s.type.kind == PrimitiveKind::BORROW
+              || s.type.kind == PrimitiveKind::BORROW_MUT)) {
+                std::string owner = vd->init->borrow_owner_source;
+                if (owner.empty()
+                 && vd->init->kind == ast::NodeKind::CallExpr) {
+                    auto *ce = static_cast<ast::CallExpr *>(vd->init.get());
+                    if (ce->callee
+                     && ce->callee->kind == ast::NodeKind::IdentExpr
+                     && ce->args.size() == 1
+                     && ce->args[0]->kind == ast::NodeKind::IdentExpr) {
+                        auto *cid = static_cast<ast::IdentExpr *>(ce->callee.get());
+                        if (cid->name == "lend" || cid->name == "lend_mut") {
+                            auto *o = static_cast<ast::IdentExpr *>(ce->args[0].get());
+                            owner = borrow_checker_.root_owner_of(o->name);
+                            if (owner.empty()) owner = o->name;
+                        }
+                    }
+                }
+                if (!owner.empty()) {
+                    const bool is_mut = (s.type.kind == PrimitiveKind::BORROW_MUT);
+                    borrow_checker_.register_borrow(vd->name, owner, is_mut);
+                    // F3 ext - si el init fue un lend()/lend_mut() cuya
+                    // fuente era un borrow_mut, marcamos este binding como
+                    // reborrow para que su drop restaure el estado
+                    // suspendido del owner.
+                    if (vd->init->borrow_reborrow_source_is_mut
+                     && !vd->init->borrow_reborrow_source_name.empty()) {
+                        borrow_checker_.mark_as_reborrow(
+                            vd->name,
+                            vd->init->borrow_reborrow_source_name);
+                    }
+                }
+            }
         }
     }
 
@@ -2418,6 +2762,19 @@ namespace vex {
     void TypeChecker::check_return(ast::ReturnStmt *s, const Type &fn_return_type) {
         if (s->value) {
             Type t = check_expr(s->value.get());
+            // Borrow checker R4: si el valor de retorno es un borrow,
+            // validar via on_borrow_escape.  El owner_kind del borrow
+            // (Local vs Param/Global) decide si el escape es valido.
+            // - return borrow de local -> error (lifetime invalido).
+            // - return borrow de param -> OK (param vive durante funcion).
+            // - return borrow propagado via F4 -> OK si el source es Param.
+            if ((t.kind == PrimitiveKind::BORROW
+              || t.kind == PrimitiveKind::BORROW_MUT)
+              && s->value->kind == ast::NodeKind::IdentExpr) {
+                auto *id = static_cast<ast::IdentExpr *>(s->value.get());
+                (void)borrow_checker_.on_borrow_escape(
+                    id->name, s->loc, "return");
+            }
             if (fn_return_type.kind == PrimitiveKind::VOID) {
                 diags_.error(s->loc, "'return' con valor en funcion declarada void");
             } else if (t.kind != PrimitiveKind::COUNT && t != fn_return_type) {
@@ -2618,6 +2975,31 @@ namespace vex {
                     pop_scope();
                 }
                 t = Type{PrimitiveKind::I64};
+                break;
+            }
+            case ast::NodeKind::CastExpr: {
+                // Cast C-style `(T) expr`.  Validacion permisiva: el
+                // tipo destino se evalua y se chequea el operando, pero
+                // no se rechaza ninguna conversion concreta (la decision
+                // sobre como bajar la conversion la toma el lowering
+                // segun los tipos actual y destino).  Convertir entre
+                // punteros (incl. virtual <-> host) es legal; convertir
+                // de int a ptr o viceversa tambien.  Quien escriba el
+                // cast asume las consecuencias.
+                auto *ce = static_cast<ast::CastExpr *>(e);
+                if (ce->target_type) {
+                    t = type_from_node(ce->target_type.get());
+                } else {
+                    t = Type{};
+                }
+                if (ce->operand) {
+                    Type to = check_expr(ce->operand.get());
+                    ce->operand->result_type = to;
+                    if (to.kind == PrimitiveKind::VOID) {
+                        diags_.error(ce->loc,
+                            "no se puede castear una expresion de tipo void");
+                    }
+                }
                 break;
             }
             default:
@@ -2946,6 +3328,23 @@ namespace vex {
         size_t depth = 0;
         const Symbol *s = lookup_with_depth(e->name, &depth);
         if (!s) {
+            // Aliases magicos para reflexion estatica:
+            // `Class`, `Method`, `Field`, `Object` pueden aparecer como
+            // base de una llamada estatica `Class.forName(...)` SIN haber
+            // sido declarados como variable.  En ese contexto NO son
+            // identificadores resolubles; el dispatch los reconoce en
+            // `check_call` con la forma estatica.  Aqui devolvemos un
+            // tipo i64 silencioso para que `check_expr` no reporte error.
+            // Si el ident "Class" aparece fuera de ese contexto (e.g.
+            // como expresion suelta `i32 x = Class;`), el lowering no
+            // sabra que hacer y eso si fallara.  En la practica el unico
+            // uso valido es como base de un FieldAccessExpr.
+            if (e->name == "Class"  || e->name == "Method"
+             || e->name == "Field"  || e->name == "Object") {
+                Type t{PrimitiveKind::I64};
+                e->result_type = t;
+                return t;
+            }
             diags_.error(e->loc, "nombre no declarado: '" + e->name + "'");
             return Type{};
         }
@@ -3232,7 +3631,62 @@ namespace vex {
                         return Type{};
                     }
                 }
-                return Type{promote_arith(tl.kind, tr.kind)};
+                /* Narrowing de literales enteros 2026-05-16: si UN operando es
+                 * un IntLit (default i64) y el otro tiene un tipo entero
+                 * estrecho (i32/i16/i8/u32/u16/u8), y el literal CABE en ese
+                 * tipo, narrow el literal al tipo del otro.  Esto evita que
+                 * `i32 + 1` se baje como sext.i64 + add.i64 + trunc.i32
+                 * cuando puede ser add.i32 directo.
+                 *
+                 * Beneficio: el hot loop tipico (counter i32 += 1) baja a
+                 * `add.i32` puro en lugar de la cadena sext+add+trunc.  Cada
+                 * iteracion elimina 4 instrucciones IR (-> 4-7 instr maquina).
+                 */
+                auto narrow_int_lit_to = [&](ast::Expr *operand,
+                                              PrimitiveKind target) -> bool {
+                    if (!operand) return false;
+                    if (operand->kind != ast::NodeKind::IntLitExpr) return false;
+                    if (!is_integral(target)) return false;
+                    auto *il = static_cast<ast::IntLitExpr *>(operand);
+                    const int64_t v = static_cast<int64_t>(il->value);
+                    bool fits = false;
+                    switch (target) {
+                        case PrimitiveKind::I8:
+                            fits = v >= INT8_MIN && v <= INT8_MAX; break;
+                        case PrimitiveKind::I16:
+                            fits = v >= INT16_MIN && v <= INT16_MAX; break;
+                        case PrimitiveKind::I32:
+                            fits = v >= INT32_MIN && v <= INT32_MAX; break;
+                        case PrimitiveKind::I64:
+                            fits = true; break;
+                        case PrimitiveKind::U8:
+                            fits = v >= 0 && v <= 0xFF; break;
+                        case PrimitiveKind::U16:
+                            fits = v >= 0 && v <= 0xFFFF; break;
+                        case PrimitiveKind::U32:
+                            fits = v >= 0 && static_cast<uint64_t>(v) <= 0xFFFFFFFFULL; break;
+                        case PrimitiveKind::U64:
+                            fits = v >= 0; break;
+                        default:
+                            return false;
+                    }
+                    if (!fits) return false;
+                    /* Modificar el result_type del literal in-place. */
+                    il->result_type = Type{target};
+                    return true;
+                };
+                Type adj_l = tl;
+                Type adj_r = tr;
+                /* Si lhs es IntLit y rhs es entero estrecho que lo contiene. */
+                if (is_integral(tl.kind) && is_integral(tr.kind)
+                 && tl.kind != tr.kind) {
+                    if (narrow_int_lit_to(e->lhs.get(), tr.kind)) {
+                        adj_l = tr;
+                    } else if (narrow_int_lit_to(e->rhs.get(), tl.kind)) {
+                        adj_r = tl;
+                    }
+                }
+                return Type{promote_arith(adj_l.kind, adj_r.kind)};
             }
             case ast::BinOp::Eq:
             case ast::BinOp::Neq:
@@ -3313,18 +3767,24 @@ namespace vex {
                 }
                 return t;
             case ast::UnOp::Await: {
-                // `await fut` espera un i64 (handle del FutureObject).
-                // El resultado del await es i64 (el valor con el que el
-                // future fue resuelto via fulfill).  En el futuro, cuando
-                // exista PrimitiveKind::FUTURE, podriamos extraer el tipo
-                // payload del Future<T> y devolverlo aqui.
+                // Mejora II: `await fut` extrae el tipo logico T de
+                // Future<T>.  Casos aceptados:
+                //   - Future<T>: devuelve T (el frontend hace cast/bitcast
+                //     adecuado al lowering).
+                //   - i64/i32/u64/u32 (legacy): devuelve I64 sin cast.
+                //     Util para handles raw alocados via `future` directo.
+                //   - COUNT (tipo desconocido): devuelve I64 default.
+                if (t.kind == PrimitiveKind::FUTURE) {
+                    if (t.pointee) return *t.pointee;
+                    return Type{PrimitiveKind::I64};
+                }
                 if (t.kind != PrimitiveKind::I64
                  && t.kind != PrimitiveKind::I32
                  && t.kind != PrimitiveKind::U64
                  && t.kind != PrimitiveKind::U32
                  && t.kind != PrimitiveKind::COUNT) {
                     diags_.error(e->loc,
-                        std::string("'await' requiere un handle de Future (i64), recibido ")
+                        std::string("'await' requiere Future<T> o handle i64, recibido ")
                         + type_to_string(t));
                 }
                 return Type{PrimitiveKind::I64};
@@ -3812,6 +4272,115 @@ namespace vex {
             }
         }
 
+        // ------------------------------------------------------------
+        // Reflexion OO: dispatch para `cls.getMethod`, `m.invoke`, etc.
+        // Se activa cuando el base es un IdentExpr resolviendo a un
+        // Symbol con `reflection_alias` no vacio (declarado como
+        // `Class cls`, `Method m`, `Field f`, `Object o`), o cuando el
+        // base es el identifier literal "Class"/"Method"/"Field"
+        // (forma estatica `Class.forName`).  Cada metodo se desazucara
+        // a su builtin standalone equivalente (forName, getMethod, etc.)
+        // sin cambios en el runtime: solo conveniencia sintactica.
+        // ------------------------------------------------------------
+        if (e->callee->kind == ast::NodeKind::FieldAccessExpr) {
+            auto *fa = static_cast<ast::FieldAccessExpr *>(e->callee.get());
+            if (fa->base && fa->base->kind == ast::NodeKind::IdentExpr) {
+                auto *idb = static_cast<ast::IdentExpr *>(fa->base.get());
+                std::string alias_kind;  // "Class" | "Method" | "Field" | "Object" o vacio
+                bool is_static_form = false;
+                // Forma estatica: literal "Class"/"Method"/etc. como base.
+                if (idb->name == "Class" || idb->name == "Method"
+                 || idb->name == "Field" || idb->name == "Object") {
+                    if (lookup(idb->name) == nullptr) {
+                        // No es una variable real con ese nombre; es la
+                        // forma estatica.  El base no se evaluara.
+                        alias_kind = idb->name;
+                        is_static_form = true;
+                    }
+                }
+                // Forma instancia: variable cuyo Symbol tiene reflection_alias.
+                if (!is_static_form) {
+                    if (const Symbol *sym = lookup(idb->name)) {
+                        if (!sym->reflection_alias.empty()) {
+                            alias_kind = sym->reflection_alias;
+                        }
+                    }
+                }
+                if (!alias_kind.empty()) {
+                    // Mapeo de metodo OO -> builtin standalone equivalente
+                    // y validacion de aridad.  El lowering hace la reescritura
+                    // efectiva (CallExpr al builtin con base prepended).
+                    struct DispatchEntry {
+                        const char *alias;
+                        const char *method;
+                        const char *builtin;
+                        int min_args;
+                        int max_args;  // -1 = variadico
+                        PrimitiveKind ret;
+                        bool needs_self;  // true: prepend base como primer arg
+                    };
+                    // Tabla declarativa.  args contados sin contar self.
+                    static const DispatchEntry MAP[] = {
+                        // Estatico: Class.forName(name)
+                        {"Class", "forName",     "forName",     1, 1, PrimitiveKind::I64, false},
+                        // Instancia: Class -> getMethod / getField / newInstance / getMethods
+                        {"Class", "getMethod",   "getMethod",   1, 1, PrimitiveKind::I64, true},
+                        {"Class", "getField",    "getField",    1, 1, PrimitiveKind::I64, true},
+                        {"Class", "newInstance", "newInstance", 0, 0, PrimitiveKind::I64, true},
+                        {"Class", "getMethods",  "getMethods",  0, 0, PrimitiveKind::I64, true},
+                        // Instancia: Method -> invoke
+                        {"Method", "invoke",     "invoke",      1, -1, PrimitiveKind::I64, true},
+                        // Instancia: Object -> getClass (alias del builtin)
+                        {"Object", "getClass",   "getClass",    0, 0, PrimitiveKind::I64, true},
+                    };
+                    const DispatchEntry *match = nullptr;
+                    for (const auto &e0 : MAP) {
+                        if (alias_kind == e0.alias && fa->field_name == e0.method) {
+                            // Filtrar por static/instance segun forma.
+                            if (is_static_form && !e0.needs_self) { match = &e0; break; }
+                            if (!is_static_form && e0.needs_self) { match = &e0; break; }
+                        }
+                    }
+                    if (match) {
+                        const int n = static_cast<int>(e->args.size());
+                        if (n < match->min_args
+                         || (match->max_args >= 0 && n > match->max_args)) {
+                            diags_.error(e->loc,
+                                std::string(alias_kind) + "." + match->method +
+                                ": numero de argumentos incorrecto (recibidos " +
+                                std::to_string(n) + ")");
+                        }
+                        // Validacion de tipos minima: solo evaluamos los args
+                        // para que tengan result_type asignado (el lowering
+                        // hara la coercion final).
+                        for (auto &a : e->args) (void)check_expr(a.get());
+                        // Marca al callee con dispatch_kind para que el
+                        // lowering lo reconozca y emita la builtin.
+                        // Usamos property_kind como vehiculo (ya existe en
+                        // FieldAccessExpr para getter/setter de propiedad).
+                        // Codigos:
+                        //   100 = forName        (estatico)
+                        //   101 = getMethod
+                        //   102 = getField
+                        //   103 = newInstance
+                        //   104 = getMethods
+                        //   105 = invoke
+                        //   106 = getClass
+                        if      (match->method == std::string("forName"))     fa->property_kind = 100;
+                        else if (match->method == std::string("getMethod"))   fa->property_kind = 101;
+                        else if (match->method == std::string("getField"))    fa->property_kind = 102;
+                        else if (match->method == std::string("newInstance")) fa->property_kind = 103;
+                        else if (match->method == std::string("getMethods"))  fa->property_kind = 104;
+                        else if (match->method == std::string("invoke"))      fa->property_kind = 105;
+                        else if (match->method == std::string("getClass"))    fa->property_kind = 106;
+                        const Type rt{match->ret};
+                        e->result_type = rt;
+                        return rt;
+                    }
+                }
+            }
+        }
+
         // -------------------------------------------------------------
         // ADTs: si el callee es un FieldAccessExpr con base que es
         // un IDENTIFIER nombrando un enum (e.g. `Color.Red(42)`), lo
@@ -4105,6 +4674,100 @@ namespace vex {
             e->result_type = rt;
             return rt;
         }
+        // argv del script: builtins args_count() y args_get(i).
+        // El runtime guarda los args en VM::script_args (poblado desde
+        // main.cpp con todo lo que viene tras `--run prog.velb`).  Los
+        // opcodes bytecode getargc (0x6B) y getarg (0x6C) los consultan.
+        if (id->name == "args_count") {
+            if (!e->args.empty()) {
+                diags_.error(e->loc, "args_count: no acepta argumentos");
+            }
+            const Type rt{PrimitiveKind::I32};
+            e->result_type = rt;
+            return rt;
+        }
+        // Builtins de terminal / VT100.  Sin args (clear/save/restore/show/hide/reset)
+        // o con (row, col) para term_move.  Cada uno baja a una secuencia
+        // de vio_print con escapes ANSI hardcodeados.
+        if (id->name == "term_clear" || id->name == "term_clear_line"
+         || id->name == "term_save_cursor" || id->name == "term_restore_cursor"
+         || id->name == "term_hide_cursor" || id->name == "term_show_cursor"
+         || id->name == "term_reset") {
+            if (!e->args.empty()) {
+                diags_.error(e->loc, id->name + ": no acepta argumentos");
+            }
+            const Type rt{PrimitiveKind::VOID};
+            e->result_type = rt;
+            return rt;
+        }
+        if (id->name == "term_move") {
+            if (e->args.size() != 2) {
+                diags_.error(e->loc,
+                    "term_move: se esperan 2 argumentos (row, col), recibidos "
+                    + std::to_string(e->args.size()));
+            }
+            for (auto &a : e->args) (void)check_expr(a.get());
+            const Type rt{PrimitiveKind::VOID};
+            e->result_type = rt;
+            return rt;
+        }
+        if (id->name == "args_get") {
+            if (e->args.size() != 1) {
+                diags_.error(e->loc,
+                    "args_get: se espera 1 argumento (i32 indice), recibidos "
+                    + std::to_string(e->args.size()));
+            }
+            for (auto &a : e->args) (void)check_expr(a.get());
+            const Type rt{PrimitiveKind::STRING};
+            e->result_type = rt;
+            return rt;
+        }
+        // unloadmodule(path_lit): descarga un modulo dinamico previamente
+        // cargado via loadmodule.  Devuelve i32 (1 ok, 0 no encontrado).
+        // path debe ser string literal por las mismas razones que loadmodule:
+        // se interna en static_data en compile time.
+        // Reflexion: enumeracion de miembros de una clase.
+        //   getMethods(cls) -> i32        (numero de metodos)
+        //   getMethodAt(cls, i) -> i64    (MethodInfo* del i-esimo)
+        //   getFields(cls) -> i32         (numero de fields de instancia)
+        //   getFieldAt(cls, i) -> i64     (FieldInfo* del i-esimo)
+        // Permiten descubrimiento dinamico sin conocer los nombres.
+        if (id->name == "getMethods" || id->name == "getFields") {
+            if (e->args.size() != 1) {
+                diags_.error(e->loc, id->name +
+                    ": se espera 1 argumento (cls), recibidos "
+                    + std::to_string(e->args.size()));
+            }
+            for (auto &a : e->args) (void)check_expr(a.get());
+            const Type rt{PrimitiveKind::I32};
+            e->result_type = rt;
+            return rt;
+        }
+        if (id->name == "getMethodAt" || id->name == "getFieldAt") {
+            if (e->args.size() != 2) {
+                diags_.error(e->loc, id->name +
+                    ": se esperan 2 argumentos (cls, i), recibidos "
+                    + std::to_string(e->args.size()));
+            }
+            for (auto &a : e->args) (void)check_expr(a.get());
+            const Type rt{PrimitiveKind::I64};
+            e->result_type = rt;
+            return rt;
+        }
+        if (id->name == "unloadmodule") {
+            if (e->args.size() != 1) {
+                diags_.error(e->loc,
+                    "unloadmodule: se espera 1 argumento (string literal con path), recibidos "
+                    + std::to_string(e->args.size()));
+            } else if (e->args[0] && e->args[0]->kind != ast::NodeKind::StringLitExpr) {
+                diags_.error(e->loc,
+                    "unloadmodule: el path debe ser un string literal");
+            }
+            for (auto &a : e->args) (void)check_expr(a.get());
+            const Type rt{PrimitiveKind::I32};
+            e->result_type = rt;
+            return rt;
+        }
         if (id->name == "msgsend") {
             if (e->args.size() != 2) {
                 diags_.error(e->loc,
@@ -4331,6 +4994,373 @@ namespace vex {
             return rt;
         }
 
+        // ===================================================================
+        // Builtins de smart pointers: unique<T> y shared<T>.
+        // ===================================================================
+        //
+        // Modelo de inferencia: estos builtins devuelven un tipo "generico"
+        // con T = typeof(arg) (o U8 placeholder si el arg es count).  La
+        // unificacion con el tipo declarado del LHS la hace check_var_decl
+        // mediante types_assignable (que admite cualquier T compatible).
+        //
+        // `unique_box(value)` -> unique<typeof(value)>
+        //   Aloca un slot host_ptr para `value` y lo guarda.  Deleter por
+        //   defecto: `free` (Tier 0).  El lowering emite malloc(sizeof(T)) +
+        //   STORE value + cleanup CALL free al exit del scope.
+        if (id->name == "unique_box" || id->name == "shared_box") {
+            if (e->args.size() != 1) {
+                diags_.error(e->loc,
+                    id->name + ": se esperaba 1 argumento (valor a envolver)");
+                e->result_type = Type{};
+                return Type{};
+            }
+            Type vt = check_expr(e->args[0].get());
+            if (vt.kind == PrimitiveKind::VOID
+             || vt.kind == PrimitiveKind::COUNT) {
+                diags_.error(e->loc,
+                    id->name + ": tipo del valor invalido ('" +
+                    type_to_string(vt) + "')");
+            }
+            Type rt = (id->name == "unique_box")
+                ? Type::make_unique(vt)
+                : Type::make_shared(vt);
+            e->result_type = rt;
+            return rt;
+        }
+
+        // ===================================================================
+        // unique_with(value, deleter_fn) -> unique<typeof(value)>
+        // shared_with(value, deleter_fn) -> shared<typeof(value)>
+        //
+        // Permite al programador especificar el alloc + dealloc para
+        // cualquier recurso (memoria, archivos, sockets, handles OS, etc).
+        // El primer argumento es el RESULTADO de la alocacion (ya hecho
+        // por el usuario), y el segundo es el nombre de una funcion
+        // (Vesta o extern) de aridad 1 que se invocara con el value al
+        // exit del scope.
+        //
+        // Ejemplos:
+        //   extern "kernel32" {
+        //       fn VirtualAlloc(addr: u64, size: u64, t: u32, prot: u32) -> u64;
+        //       fn VirtualFree(addr: u64, size: u64, type: u32) -> u32;
+        //   }
+        //   fn release_vmem(p: u64) { VirtualFree(p, 0, 0x8000); }
+        //
+        //   u64 mem = VirtualAlloc(0, 4096, 0x3000, 0x04);
+        //   unique<i64> auto_mem = unique_with(mem, release_vmem);
+        //   // ... usar auto_mem ... cleanup: release_vmem(mem) automatico
+        // ===================================================================
+        if (id->name == "unique_with" || id->name == "shared_with") {
+            if (e->args.size() != 2) {
+                diags_.error(e->loc,
+                    id->name + ": se esperaba 2 argumentos (value, deleter_fn)");
+                e->result_type = Type{};
+                return Type{};
+            }
+            Type vt = check_expr(e->args[0].get());
+            if (vt.kind == PrimitiveKind::VOID
+             || vt.kind == PrimitiveKind::COUNT) {
+                diags_.error(e->loc,
+                    id->name + ": tipo del valor invalido ('" +
+                    type_to_string(vt) + "')");
+            }
+            // El segundo argumento debe ser IdentExpr de una funcion.
+            if (e->args[1]->kind != ast::NodeKind::IdentExpr) {
+                diags_.error(e->args[1]->loc,
+                    id->name + ": el deleter debe ser un identificador de funcion (no una expresion)");
+                e->result_type = Type{};
+                return Type{};
+            }
+            auto *deleter_id = static_cast<ast::IdentExpr *>(e->args[1].get());
+            const Symbol *del_sym = lookup(deleter_id->name);
+            if (!del_sym) {
+                diags_.error(e->args[1]->loc,
+                    id->name + ": funcion deleter no declarada: '" +
+                    deleter_id->name + "'");
+                e->result_type = Type{};
+                return Type{};
+            }
+            if (del_sym->kind != SymbolKind::Function) {
+                diags_.error(e->args[1]->loc,
+                    id->name + ": '" + deleter_id->name +
+                    "' no es una funcion (es " +
+                    (del_sym->kind == SymbolKind::Variable ? "variable" : "constante") + ")");
+                e->result_type = Type{};
+                return Type{};
+            }
+            const FunctionSig &sig = function_sigs_[del_sym->sig_index];
+            if (sig.param_types.size() != 1) {
+                diags_.error(e->args[1]->loc,
+                    id->name + ": el deleter '" + deleter_id->name +
+                    "' debe tener aridad 1, tiene " +
+                    std::to_string(sig.param_types.size()));
+                e->result_type = Type{};
+                return Type{};
+            }
+            // Validar que el tipo del parametro del deleter sea compatible
+            // con el value (laxa: aceptamos tipos numericos o ptr equivalentes).
+            const Type &pt = sig.param_types[0];
+            if (!types_assignable(pt, vt)
+             && !(is_numeric(pt.kind) && is_numeric(vt.kind))) {
+                diags_.error(e->args[1]->loc,
+                    id->name + ": parametro del deleter '" +
+                    type_to_string(pt) + "' incompatible con tipo del value '" +
+                    type_to_string(vt) + "'");
+            }
+            // Marcamos el deleter_id para que el lowering sepa que es
+            // referencia a funcion (no llamada).  Usamos result_type
+            // FUNCTION para distinguir.  El lowering NO debe bajar este
+            // IdentExpr a un valor; en su lugar lee el nombre y emite
+            // el cleanup apropiado.
+            deleter_id->result_type = Type::make_function(sig.param_types, sig.return_type);
+            Type rt = (id->name == "unique_with")
+                ? Type::make_unique(vt)
+                : Type::make_shared(vt);
+            e->result_type = rt;
+            return rt;
+        }
+
+        // `move(p)` -> typeof(p): transfiere ownership.  El compilador
+        // marca p como "consumed" via flag en lowering; un uso posterior
+        // de p sera comprobado por el cleanup (binding = 0, skip).
+        // Borrow checker R3: prohibe mover si p tiene borrows activos.
+        if (id->name == "move") {
+            if (e->args.size() != 1) {
+                diags_.error(e->loc, "move: se esperaba 1 argumento");
+                e->result_type = Type{};
+                return Type{};
+            }
+            Type at = check_expr(e->args[0].get());
+            if (at.kind != PrimitiveKind::UNIQUE_PTR
+             && at.kind != PrimitiveKind::SHARED_PTR
+             && at.kind != PrimitiveKind::COUNT) {
+                diags_.error(e->loc,
+                    "move: el argumento debe ser unique<T> o shared<T>, no '" +
+                    type_to_string(at) + "'");
+                e->result_type = Type{};
+                return Type{};
+            }
+            // Borrow checker R3: si el argumento es IdentExpr, validar
+            // que no tenga borrows activos.
+            if (e->args[0]->kind == ast::NodeKind::IdentExpr) {
+                auto *idarg = static_cast<ast::IdentExpr *>(e->args[0].get());
+                (void)borrow_checker_.on_owner_move(idarg->name, e->loc);
+            }
+            e->result_type = at;
+            return at;
+        }
+
+        // `ptr_of(p)` -> T* host: extrae el puntero raw de un unique<T>
+        // o shared<T> SIN consumir el smart pointer.  Para unique<T> es
+        // p.ptr; para shared<T> es ctrl_block + 16 (offset del payload
+        // inline).  El resultado es un T* host (movh).  Util para
+        // operaciones que no deben extender la vida (e.g., pasar a una
+        // funcion que no retiene el ptr).  Se llama `ptr_of` y no `get`
+        // porque `get` ya es keyword reservada para properties (`get
+        // name => expr`).
+        if (id->name == "ptr_of") {
+            if (e->args.size() != 1) {
+                diags_.error(e->loc, "ptr_of: se esperaba 1 argumento");
+                e->result_type = Type{};
+                return Type{};
+            }
+            Type at = check_expr(e->args[0].get());
+            if (at.kind != PrimitiveKind::UNIQUE_PTR
+             && at.kind != PrimitiveKind::SHARED_PTR) {
+                diags_.error(e->loc,
+                    "ptr_of: el argumento debe ser unique<T> o shared<T>, no '" +
+                    type_to_string(at) + "'");
+                e->result_type = Type{};
+                return Type{};
+            }
+            // T* host (is_virtual=false por defecto).
+            Type rt = Type::make_ptr(at.pointee ? *at.pointee : Type{}, false);
+            e->result_type = rt;
+            return rt;
+        }
+
+        // ===================================================================
+        // Builtins de borrow checker: lend / lend_mut / read_borrow / write_borrow
+        // ===================================================================
+        //
+        //   lend(owner)        -> borrow<T> (shared)
+        //   lend_mut(owner)    -> borrow_mut<T> (exclusive)
+        //   read_borrow(b)     -> T (lee el contenido apuntado)
+        //   write_borrow(m, v) -> void (escribe a traves del mut borrow)
+        //
+        // lend/lend_mut: valida R1/R2 via BorrowChecker.  El argumento
+        // debe ser un IdentExpr (no se permite tomar borrow de una
+        // expresion compleja porque no hay un "owner" estable).
+        if (id->name == "lend" || id->name == "lend_mut") {
+            const bool is_mut = (id->name == "lend_mut");
+            if (e->args.size() != 1) {
+                diags_.error(e->loc,
+                    id->name + ": se esperaba 1 argumento (el owner a prestar)");
+                e->result_type = Type{};
+                return Type{};
+            }
+            if (e->args[0]->kind != ast::NodeKind::IdentExpr) {
+                diags_.error(e->args[0]->loc,
+                    id->name + ": el argumento debe ser un identificador de variable (no una expresion)");
+                e->result_type = Type{};
+                return Type{};
+            }
+            auto *owner_id = static_cast<ast::IdentExpr *>(e->args[0].get());
+            Type vt = check_expr(e->args[0].get());
+            // El tipo del borrow es borrow<T> donde T es el tipo
+            // logico del owner.
+            Type inner;
+            if ((vt.kind == PrimitiveKind::UNIQUE_PTR
+              || vt.kind == PrimitiveKind::SHARED_PTR)
+              && vt.pointee) {
+                inner = *vt.pointee;
+            } else if ((vt.kind == PrimitiveKind::BORROW
+                     || vt.kind == PrimitiveKind::BORROW_MUT)
+                     && vt.pointee) {
+                // F3 - reborrow: lend(borrow_var) -> shared borrow.
+                // lend_mut(borrow_mut_var) -> mut reborrow.  Validamos
+                // que el reborrow_mut solo se aplique a borrow_mut, no
+                // a borrow (upgrade shared->mut prohibido).
+                if (is_mut && vt.kind == PrimitiveKind::BORROW) {
+                    diags_.error(e->loc,
+                        "lend_mut: no se puede crear borrow_mut a partir de borrow shared (no se puede 'subir' la mutabilidad)");
+                }
+                inner = *vt.pointee;
+            } else {
+                inner = vt;
+            }
+            Type rt = Type::make_borrow(inner, is_mut);
+            // F4 - propagar borrow_owner_source para lifetime tracking.
+            // Si lend de un IdentExpr que es borrow: heredamos el source
+            // (transitivo via reborrow).  Sino: el id es el owner directo.
+            // IMPORTANTE: usamos @c borrow_owner_source de la expresion
+            // (campo dedicado para tracking), NO @c Type::struct_name
+            // que es parte de la identidad del tipo y romperia equality.
+            if (vt.kind == PrimitiveKind::BORROW
+             || vt.kind == PrimitiveKind::BORROW_MUT) {
+                e->borrow_owner_source = borrow_checker_.root_owner_of(owner_id->name);
+                if (e->borrow_owner_source.empty()) {
+                    e->borrow_owner_source = owner_id->name;
+                }
+            } else {
+                e->borrow_owner_source = owner_id->name;
+            }
+            // Registrar borrow en el borrow checker.  Para reborrow
+            // (lend de un borrow_var), trazamos al owner root.
+            std::string root_owner = owner_id->name;
+            if (vt.kind == PrimitiveKind::BORROW
+             || vt.kind == PrimitiveKind::BORROW_MUT) {
+                // root_owner = lookup_root_owner(owner_id->name)
+                // El borrow checker mantiene borrows_ con owner real.
+                // Necesitamos exponer ese lookup.
+                root_owner = borrow_checker_.root_owner_of(owner_id->name);
+                if (root_owner.empty()) root_owner = owner_id->name;
+            }
+            // F3 ext - suspend semantics: si la fuente es un borrow_mut
+            // activo, suspendemos su estado antes de @c on_lend para que
+            // R1 (exclusividad mutable) no falle.  El estado se restaura
+            // cuando el reborrow recien creado dropea (NLL o exit scope).
+            //
+            // Cubre dos casos:
+            //   1) lend_mut(borrow_mut_var) = reborrow mut.
+            //   2) lend(borrow_mut_var)     = shared reborrow (rebaja temporal).
+            //
+            // Si la fuente es un borrow shared (no mut) o el owner directo,
+            // no necesitamos suspend: el reborrow shared simplemente
+            // incrementa shared_count, y el lend de owner directo aplica
+            // las reglas normales.
+            const bool source_is_mut_borrow =
+                (vt.kind == PrimitiveKind::BORROW_MUT);
+            if (source_is_mut_borrow) {
+                (void)borrow_checker_.suspend_for_reborrow(owner_id->name);
+            }
+            (void)borrow_checker_.on_lend(
+                root_owner,
+                /*borrower_name=*/"",   // VarDecl lo registra correctamente
+                e->loc,
+                is_mut);
+            // F3 ext - marcar el binding pendiente como reborrow.  El
+            // nombre real del reborrower se establece en check_var_decl;
+            // alli leemos @c borrow_owner_source y comparamos con la
+            // fuente.  Aqui guardamos la info en el AST node para que
+            // check_var_decl pueda recuperarla sin re-analizar.
+            if (source_is_mut_borrow) {
+                e->borrow_reborrow_source_is_mut = true;
+                e->borrow_reborrow_source_name   = owner_id->name;
+            }
+            e->result_type = rt;
+            return rt;
+        }
+
+        // read_borrow(b) -> T: lee el valor a traves del borrow.
+        // Equivalente conceptual a `*b` (deref).  No requiere que el
+        // borrow sea mut.
+        if (id->name == "read_borrow") {
+            if (e->args.size() != 1) {
+                diags_.error(e->loc, "read_borrow: se esperaba 1 argumento (un borrow)");
+                e->result_type = Type{};
+                return Type{};
+            }
+            Type bt = check_expr(e->args[0].get());
+            if (bt.kind != PrimitiveKind::BORROW
+             && bt.kind != PrimitiveKind::BORROW_MUT) {
+                diags_.error(e->args[0]->loc,
+                    "read_borrow: el argumento debe ser borrow<T> o borrow_mut<T>, no '" +
+                    type_to_string(bt) + "'");
+                e->result_type = Type{};
+                return Type{};
+            }
+            Type rt = bt.pointee ? *bt.pointee : Type{};
+            e->result_type = rt;
+            return rt;
+        }
+
+        // write_borrow(m, v) -> void: escribe a traves del mut borrow.
+        // Solo admite borrow_mut<T>.
+        if (id->name == "write_borrow") {
+            if (e->args.size() != 2) {
+                diags_.error(e->loc, "write_borrow: se esperaba 2 argumentos (borrow_mut, value)");
+                e->result_type = Type{PrimitiveKind::VOID};
+                return Type{PrimitiveKind::VOID};
+            }
+            Type bt = check_expr(e->args[0].get());
+            Type vt = check_expr(e->args[1].get());
+            if (bt.kind != PrimitiveKind::BORROW_MUT) {
+                diags_.error(e->args[0]->loc,
+                    "write_borrow: el primer argumento debe ser borrow_mut<T>, no '" +
+                    type_to_string(bt) + "'");
+            }
+            if (bt.pointee && !types_assignable(*bt.pointee, vt)) {
+                diags_.error(e->args[1]->loc,
+                    "write_borrow: tipo del valor (" + type_to_string(vt) +
+                    ") incompatible con el tipo del borrow (" +
+                    type_to_string(bt.pointee ? *bt.pointee : Type{}) + ")");
+            }
+            const Type rt{PrimitiveKind::VOID};
+            e->result_type = rt;
+            return rt;
+        }
+
+        // `use_count(s)` -> i64: refcount actual del shared<T>.  Util
+        // para diagnostico; cero si el shared esta moved.  En MVP la
+        // operacion lee directamente el campo refcount del control block.
+        if (id->name == "use_count") {
+            if (e->args.size() != 1) {
+                diags_.error(e->loc, "use_count: se esperaba 1 argumento");
+                e->result_type = Type{};
+                return Type{};
+            }
+            Type at = check_expr(e->args[0].get());
+            if (at.kind != PrimitiveKind::SHARED_PTR) {
+                diags_.error(e->loc,
+                    "use_count: el argumento debe ser shared<T>, no '" +
+                    type_to_string(at) + "'");
+            }
+            const Type rt{PrimitiveKind::I64};
+            e->result_type = rt;
+            return rt;
+        }
+
         size_t id_depth = 0;
         const Symbol *s = lookup_with_depth(id->name, &id_depth);
         if (!s) {
@@ -4459,8 +5489,13 @@ namespace vex {
 
         // print/println/echo aceptan cualquier tipo escalar como
         // arg[0] (despacha en lowering).  Bypass del strict type-check.
+        // print_ptr/print_gchandle tambien son polimorficos: aceptan
+        // CLASS, PTR, ARRAY, o entero arbitrario sin que el bypass del
+        // type checker se queje del tipo.  El lowering despacha al
+        // CALLN apropiado convirtiendo a uint64.
         const bool is_io_print_relaxed =
-            (id->name == "print" || id->name == "println" || id->name == "echo");
+            (id->name == "print" || id->name == "println" || id->name == "echo"
+          || id->name == "print_ptr" || id->name == "print_gchandle");
         if (is_io_print_relaxed) {
             if (e->args.size() != 1) {
                 diags_.error(e->loc,
@@ -4522,6 +5557,40 @@ namespace vex {
         }
         // Chequear los argumentos extra para sus efectos (si la aridad fallo).
         for (size_t i = n; i < e->args.size(); ++i) (void)check_expr(e->args[i].get());
+
+        // F4 - lifetime elision rule 1: si la funcion devuelve borrow<T>
+        // o borrow_mut<T> y tiene EXACTAMENTE un parametro borrow (o un
+        // self CLASS implicito), el lifetime del retorno = lifetime de
+        // ese argumento.  Propagamos el borrow_owner_source del arg a
+        // la expresion CallExpr para que el caller pueda registrar el
+        // nuevo borrow con el owner correcto.
+        const Type &rty = sig.return_type;
+        const bool ret_is_borrow = (rty.kind == PrimitiveKind::BORROW
+                                 || rty.kind == PrimitiveKind::BORROW_MUT);
+        if (ret_is_borrow) {
+            size_t borrow_param_idx = SIZE_MAX;
+            size_t borrow_param_count = 0;
+            for (size_t i = 0; i < sig.param_types.size(); ++i) {
+                if (sig.param_types[i].kind == PrimitiveKind::BORROW
+                 || sig.param_types[i].kind == PrimitiveKind::BORROW_MUT) {
+                    borrow_param_idx = i;
+                    borrow_param_count++;
+                }
+            }
+            if (borrow_param_count == 1 && borrow_param_idx < e->args.size()) {
+                // Heredamos el source del arg correspondiente.
+                const std::string &src = e->args[borrow_param_idx]->borrow_owner_source;
+                if (!src.empty()) {
+                    e->borrow_owner_source = src;
+                }
+            } else if (borrow_param_count > 1) {
+                diags_.warning(e->loc,
+                    "lifetime elision ambigua: la funcion '" + id->name +
+                    "' tiene multiples parametros borrow; la elision rule 1 no aplica.\n"
+                    "  El borrow retornado podria tener cualquiera de los lifetimes.\n"
+                    "  (Anotaciones explicitas no soportadas; considera reescribir.)");
+            }
+        }
 
         return sig.return_type;
     }

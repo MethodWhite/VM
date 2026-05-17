@@ -1,0 +1,36 @@
+// Patron clasico Rust: pasar &mut a una funcion auxiliar que muta el
+// valor.  El compilador prueba que el aliasing es seguro y el helper
+// puede leer/escribir libremente sin race conditions ni double-mut.
+//
+//   void increment_by(borrow_mut<i32> n, i32 delta) { ... }
+//   void double_value(borrow_mut<i32> n) { ... }
+//
+// El caller crea un unique<i32>, lo presta como borrow_mut, y la
+// helper acumula sobre el.  Imita el patron:
+//
+//   let mut counter = Box::new(0);
+//   increment_by(&mut counter, 10);
+//   double_value(&mut counter);
+
+void increment_by(borrow_mut<i32> n, i32 delta) {
+    i32 cur = read_borrow(n);
+    write_borrow(n, cur + delta);
+}
+
+void double_value(borrow_mut<i32> n) {
+    i32 cur = read_borrow(n);
+    write_borrow(n, cur * 2);
+}
+
+i32 main() {
+    unique<i32> counter = unique_box(0);
+    borrow_mut<i32> bm = lend_mut(counter);
+
+    increment_by(bm, 7);     // 0 -> 7
+    increment_by(bm, 3);     // 7 -> 10
+    double_value(bm);        // 10 -> 20
+    increment_by(bm, 1);     // 20 -> 21
+    double_value(bm);        // 21 -> 42
+
+    return read_borrow(bm);
+}

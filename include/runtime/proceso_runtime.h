@@ -30,6 +30,7 @@
 #include "loader/oop_types.h"
 
 #include <atomic>
+#include <csetjmp>
 #include <vector>
 
 namespace distrib {
@@ -205,6 +206,22 @@ namespace runtime {
                 uint16_t _pad;     ///< Padding de alineacion
                 uint32_t offset;   ///< Offset dentro de @c ClassInfo::static_data (bytes)
             } static_data;
+
+            /**
+             * @brief Operandos para fastpush / fastpop con bitmask de registros.
+             *
+             * Cada bit del mask representa un registro general (bit 0 = r0, ..., bit 15 = r15).
+             * fastpush itera los bits ascendentes y empuja en orden r0, r1, ..., r15
+             * (los que tengan el bit puesto).  fastpop itera los bits ascendentes
+             * tambien, leyendo de offsets descendentes (orden inverso al push),
+             * lo que restaura los valores exactos.
+             *
+             * Encoding fisico FIXED_4:
+             *   [0x00][opcode2][mask_lo][mask_hi]
+             */
+            struct {
+                uint16_t mask;     ///< Bitmask de registros (bit r = r0..r15)
+            } mask_data;
         } data_instruction = {
             static_cast<uint64_t>(0),
             static_cast<uint64_t>(0)
@@ -223,6 +240,24 @@ namespace runtime {
         void (*exec_cached)(ProcessVM *, const DecodedInstr &) = nullptr;
 
         uint64_t pc = 0; ///< Direccion virtual del PC donde se encontro esta instruccion
+
+        /**
+         * @brief Inline cache para resolucion virtual (CALLVIRT/CALLM monomorfica).
+         *
+         * Las llamadas virtuales en la practica son MONOMORFICAS: el receptor
+         * suele ser de la misma clase en ejecuciones repetidas del mismo PC.
+         * Cachear `cached_class -> cached_method` permite saltarse el bounds
+         * check + indirect load de la vtable en el caso comun (cache hit).
+         *
+         * Invalidacion: si `hdr->class_ptr != cached_class` (cache miss), el
+         * exec hace lookup completo y actualiza el cache.  El primer hit tras
+         * un miss paga el coste de la resolucion; los hits subsiguientes son
+         * O(1) sin indireccion.
+         *
+         * Cero overhead si el call site nunca se ejecuta (campos a nullptr).
+         */
+        mutable void *cached_class  = nullptr;
+        mutable void *cached_method = nullptr;
     } DecodedInstr;
 
 
@@ -296,6 +331,33 @@ namespace runtime {
      */
     class ProcessVM {
     public:
+        /**
+         * @brief Safepoint flag (per-proceso).  PRIMER campo de la
+         *        clase a proposito para que el JIT-eado pueda emitir
+         *        polls con disp8 (mas compactos que disp32).
+         *
+         * El JIT mantiene @c ProcessVM* en RBX durante toda la funcion.
+         * Cada poll (back-edge / post-call) emite:
+         *
+         *     cmp byte [rbx], 0      ; 4 bytes (REX + cmp + modrm)
+         *     jne handler            ; 6 bytes (0F 85 rel32)
+         *
+         * Total: 10 bytes por poll, ~2 cycles cuando flag=0 (branch
+         * predictor lo aprende inmediatamente).  Esencialmente gratis.
+         *
+         * El GC del propio proceso setea este byte a 1 cuando quiere
+         * pausar al thread para stack scan.  El handler invoca
+         * @c vrt_safepoint_handler que captura RIP/RBP y cede el control
+         * al GC.
+         *
+         * NOTE: @c uint8_t (no atomic) para que el poll JIT-eado sea
+         * un simple @c cmp byte.  Ordenamiento garantizado porque el
+         * setter del GC y el reader del handler coordinan via
+         * @c std::atomic<bool> @c safepoint_acked posteriormente.
+         */
+        uint8_t safepoint_flag = 0;
+        uint8_t _safepoint_pad[7] = {0};  ///< Alineacion a 8 bytes
+
         GlobalPID pid; ///< Identificador global del proceso (scheduler_id + local_pid)
 
         /**
@@ -329,6 +391,23 @@ namespace runtime {
          * en lugar del 1 MiB completo.
          */
         uint64_t stack_low_water = 0;
+
+        /**
+         * @brief Puntero a codigo JIT a ejecutar al iniciar el proceso.
+         *
+         * Si != nullptr, el scheduler salta a este codigo nativo ANTES de
+         * iniciar el bucle interp.  Util para JIT-ear @c main (que es
+         * free function y no se invoca via CALLVIRT, asi que el hook
+         * normal no lo dispara).
+         *
+         * Cuando el JIT-eated @c main retorna, el proceso queda en HALT
+         * automaticamente (sin ejecutar el interp).  Se usa una sola vez
+         * (el campo se limpia tras la primera invocacion).
+         *
+         * Set por @c Loader::load_executable cuando JIT esta on y main
+         * compila correctamente.
+         */
+        void *jit_entry_fn = nullptr;
 
         uint64_t tsc{}; ///< Contador de instrucciones ejecutadas (Time Stamp Counter virtual)
 
@@ -446,6 +525,22 @@ namespace runtime {
 
         FrameHeaderPool frame_pool; ///< Pool de FrameHeader para CALLVIRT/CALLM/CALLVMR/RET.
 
+        /**
+         * @brief Contador de llamadas activas a `loadmod` no retornadas.
+         *
+         * Cada `loadmod` incrementa el contador antes de saltar al main del
+         * modulo cargado.  El main del modulo tipicamente termina con `hlt`
+         * (porque fue compilado para ejecutarse standalone), pero al ser
+         * llamado via loadmod debe regresar al caller via RET.  La solucion
+         * es runtime: cuando un `hlt` se ejecuta con `loadmod_call_depth>0`,
+         * se trata como un RET (decrementa contador, pop ret_addr del stack,
+         * salta a el).  Esto evita patchar bytecode (la solucion anterior
+         * `patch_first_hlt_to_ret` era fragil ante secuencias de bytes 0x00 0x03
+         * que aparecen en imm de mov/callvm aleatoriamente).  Soporta
+         * loadmodule anidado (counter > 1) sin esfuerzo extra.
+         */
+        uint32_t loadmod_call_depth = 0;
+
         uint64_t current_exception = 0; ///< Handle de la excepcion activa durante el unwinding (0 = sin excepcion)
 
         /**
@@ -469,6 +564,19 @@ namespace runtime {
                                                     ///< saltar al handler (descarta frames
                                                     ///< de calls dentro del try-body que no
                                                     ///< retornaron normalmente).
+            uint64_t              saved_regs[16];  ///< Snapshot de R0..R15 al
+                                                   ///< momento del tryenter.
+                                                   ///< @c do_throw los restaura antes de
+                                                   ///< saltar al handler para que el catch
+                                                   ///< vea exactamente el mismo estado que
+                                                   ///< el try entry (igual que C/C++ exc).
+                                                   ///< Resuelve la limitacion clasica de
+                                                   ///< que las vars vivas a traves del try
+                                                   ///< quedaban con valores stale tras
+                                                   ///< el throw (regalloc no preservaba
+                                                   ///< los regs en el unwind).
+                                                   ///< R0 se preserva PERO el catch lo
+                                                   ///< sobreescribe con la excepcion.
             struct ExceptionFrame *prev;       ///< Frame anterior en la pila
         };
 
@@ -484,6 +592,24 @@ namespace runtime {
         void   *fatal_slot      = nullptr;
         char   *fatal_msg_buf   = nullptr;   ///< buffer de mensajes (256 bytes)
         char   *fatal_trace_buf = nullptr;   ///< buffer de stack trace (4096 bytes)
+
+        /// Recovery point para errores fatales de OS-level (access
+        /// violation / SIGSEGV cuando el bytecode dereferencia un
+        /// puntero host invalido).  El scheduler hace setjmp aqui antes
+        /// de cada batch de instrucciones; el VEH (Windows) o el
+        /// handler de SIGSEGV (POSIX) hace longjmp si av_recovery_active
+        /// esta activo y el proceso tiene un try/catch envolvente
+        /// (exc_frame_stack != nullptr).  Tras el longjmp el scheduler
+        /// llama @c throw_fatal con FATAL_SEGMENTATION_FAULT y la
+        /// direccion del AV; el flujo normal de @c do_throw redirige al
+        /// handler `catch (FatalError e)`.
+        ///
+        /// Sin esta infra, accesos a punteros host invalidos (e.g.
+        /// `*(i32*)0`, deref de un host_ptr stale tras free) crashean
+        /// el proceso entero de la VM en lugar de ser capturados.
+        std::jmp_buf av_recovery_jmpbuf;
+        bool         av_recovery_active = false;
+        uint64_t     pending_av_addr    = 0; ///< direccion bruta del AV (informativa)
 
         StringInternPool *str_intern_pool = nullptr; ///< Pool de strings internados (creado bajo demanda)
 
@@ -542,6 +668,23 @@ namespace runtime {
 
     private:
     };
+
+    /**
+     * @brief Fase: hook opcional para auto-JIT trigger desde
+     *        @c exec_instr_callvirt.
+     *
+     * Llamado tras incrementar @c MethodInfo::invocation_count en cada
+     * dispatch CALLVIRT.  Si nullptr (default), no JIT.  Cuando el main
+     * binario inicializa el JIT subsystem registra
+     * @c &jit::maybe_compile_method aqui, habilitando el trigger.
+     *
+     * Por que function pointer: el codigo del auto-JIT depende del IR
+     * frontend (Selector, IrFunction) que NO esta en @c vesta_rt.
+     * El hook permite que vesta_rt despache al JIT sin acoplarse al
+     * frontend.  Coste: 1 cmp + 1 branch predicted = ~1 ns por
+     * CALLVIRT en programas sin JIT habilitado.
+     */
+    extern void (*g_callvirt_post_hook)(ProcessVM *vm, loader::MethodInfo *method);
 
 } // namespace runtime
 

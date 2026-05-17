@@ -2,3 +2,5 @@
 *.velb*
 *.ir
 out
+*.mmd
+*.c

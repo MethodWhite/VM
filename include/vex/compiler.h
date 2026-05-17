@@ -27,8 +27,10 @@
 #define VEX_COMPILER_H
 
 #include <string>
+#include <vector>
 
 #include "vex/diagnostic.h"
+#include "port/port_options.h"
 
 namespace vex {
 
@@ -46,6 +48,59 @@ namespace vex {
         /// frontend produce antes del backend, debug y verificacion de
         /// fixes (PHIs, SSA, CALLCLOSURE, etc.).
         bool        dump_ir = false;
+
+        /// Cuando true, llena @c CompileResult::mermaid_ast con un diagrama
+        /// Mermaid del AST Vex post type-check.  Util para visualizar la
+        /// estructura del codigo fuente: clases, herencia, anotaciones.
+        bool        dump_mermaid_ast      = false;
+        /// Cuando true, llena @c CompileResult::mermaid_ir_pre con el
+        /// diagrama Mermaid del SSA IR ANTES de optimizar.  Captura el
+        /// output crudo del lowering (todos los PHIs, todos los CONSTs,
+        /// blocks como los emite el frontend).
+        bool        dump_mermaid_ir_pre   = false;
+        /// Cuando true, llena @c CompileResult::mermaid_ir_post con el
+        /// diagrama Mermaid del SSA IR DESPUES de optimizar.  Permite
+        /// comparar contra ir_pre para ver que hizo el optimizer (DCE,
+        /// inline_loop_header, const fold, TCO).
+        bool        dump_mermaid_ir_post  = false;
+        /// Cuando true, llena @c CompileResult::mermaid_vel con el
+        /// diagrama Mermaid del bytecode .vel final.  Independiente de
+        /// dump_ir / dump_mermaid_ir_*: opera solo sobre el texto del .vel.
+        bool        dump_mermaid_vel      = false;
+
+        /// Variantes Graphviz (DOT) de los flags Mermaid.  Producen archivos
+        /// .dot listos para `dot -Tpng/-Tsvg`, con la misma topologia y
+        /// MAS informacion (tooltips, atributos arbitrarios, formas
+        /// distintas por tipo de nodo).  Usar cuando Mermaid se quede corto
+        /// para grafos grandes (>200 nodos) o se quiera exportar a PDF/SVG
+        /// con control fino del layout.  Coexisten con los flags Mermaid:
+        /// activar ambos genera ambos formatos en paralelo.
+        bool        dump_graphviz_ast     = false;
+        bool        dump_graphviz_ir_pre  = false;
+        bool        dump_graphviz_ir_post = false;
+        bool        dump_graphviz_vel     = false;
+
+        /// Lenguaje destino del transpiler IR -> codigo fuente.  Vacio = no
+        /// transpilar (default).  Valores soportados: "c" (Phase 1).
+        /// Futuros: "java", "js", "rust", etc.
+        std::string port_target;
+
+        /// Opciones del transpiler (GC, EH, type style).  Solo se consulta
+        /// si @c port_target != "".  Default segun PortOptions::PortOptions.
+        port::PortOptions port_options;
+
+        /// Instrumentacion para debugging: cuando esta activa, el lowering
+        /// emite CALLs sinteticas a @c "vex_trace:enter" y @c "vex_trace:exit"
+        /// al inicio y antes de cada @c RET de cada funcion del usuario.
+        /// Como las trazas estan en el IR (no en un backend especifico),
+        /// el bytecode VM, el JIT y todos los ports (C, futuro Java, JS)
+        /// las heredan automaticamente.
+        ///   "none" (default) - sin instrumentacion (cero overhead).
+        ///   "trace"          - imprime "ENTER name" y "EXIT name = value"
+        ///                      con indentacion segun call depth.
+        ///   "profile"        - mide tiempo per-funcion (rdtsc); imprime
+        ///                      estadisticas al exit del programa.
+        std::string instrument_mode;
     };
 
     /**
@@ -61,7 +116,50 @@ namespace vex {
         bool        ok = false;     ///< Exito global.
         std::string vel_text;       ///< Texto .vel generado a partir del IR.
         std::string ir_text;        ///< dump del IrModule (solo si CompileOptions::dump_ir).
-        Diagnostics diagnostics;    ///< Errores y warnings acumulados.
+        /// Diagrama Mermaid del AST post type-check.  Llenado solo si
+        /// @c CompileOptions::dump_mermaid_ast == true.  Vacio en caso
+        /// contrario para no pagar el coste de generacion en builds prod.
+        std::string mermaid_ast;
+        std::string mermaid_ir_pre;     ///< Mermaid del IR pre-optimizacion (dump_mermaid_ir_pre).
+        std::string mermaid_ir_post;    ///< Mermaid del IR post-optimizacion (dump_mermaid_ir_post).
+        std::string mermaid_vel;        ///< Mermaid del bytecode .vel final (dump_mermaid_vel).
+        /// Variantes Graphviz (DOT) llenas cuando los flags @c dump_graphviz_*
+        /// estan activos.  Vacias en otro caso.  El contenido es texto DOT
+        /// completo (con `digraph G { ... }`), listo para `dot -Tpng/-Tsvg`.
+        std::string graphviz_ast;
+        std::string graphviz_ir_pre;
+        std::string graphviz_ir_post;
+        std::string graphviz_vel;
+        Diagnostics diagnostics;        ///< Errores y warnings acumulados.
+
+        /**
+         * @brief Opcion W: IR serializado en bytes para embebido en `.velb`.
+         *
+         * Llenado por @c compile_vex_source con el resultado de
+         * @c ir::emit_ir_section sobre el @c IrModule optimizado.  El
+         * caller (main.cpp + assembler) pasa estos bytes al Linker
+         * via @c Linker::set_ir_section_bytes.  El Linker los appendea
+         * a la seccion @c @ir del `.velb` v3.
+         *
+         * Asi habilita auto-JIT: al cargar un `.velb`,
+         * el Loader deserializa esta seccion y mantiene un mapping
+         * @c MethodInfo* -> @c IrFunction.  Cuando una funcion se
+         * vuelve "hot" (invocation_count >= threshold), el JIT compila
+         * el IR y se patcha @c MethodInfo::jit_code.
+         *
+         * Vacio si la compilacion no produjo IR (caso de errores).
+         */
+        std::vector<uint8_t> ir_section_bytes;
+
+        /// Codigo fuente generado por el transpiler IR -> lenguaje destino.
+        /// Lleno solo si @c CompileOptions::port_target != "".  El contenido
+        /// es C/Java/JS/etc segun el target elegido, listo para escribir
+        /// a archivo y compilar con la toolchain nativa.
+        std::string port_text;
+
+        /// Warnings emitidos por el transpiler (IR ops no soportadas por
+        /// el backend, etc.).  Vacio si no hubo issues.
+        std::vector<std::string> port_warnings;
     };
 
     /**

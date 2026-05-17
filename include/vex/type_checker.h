@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "vex/ast.h"
+#include "vex/borrow_checker.h"
 #include "vex/diagnostic.h"
 
 namespace vex {
@@ -231,6 +232,11 @@ namespace vex {
         /// que sea localizable via reflexion.  El validador rechaza @c new
         /// X() para layouts con esta marca.
         bool                         is_interface = false;
+        /// true si la clase es @c @Aspect (contiene @Before/@After/@Around).
+        /// Habilita el devirt monomorfico saber que CALLVIRTs no se pueden
+        /// resolver estaticamente en este modulo (los advice chains corren
+        /// al despachar dinamicamente; un CALL directo los saltaria).
+        bool                         is_aspect = false;
         /// true si la clase declara `~ClassName()`.  Computado tras
         /// agregar todos los metodos.  El type checker usa este flag para
         /// rechazar escapes ilegales: una instancia con destructor NO puede
@@ -277,6 +283,14 @@ namespace vex {
         Type       type{};
         uint32_t   sig_index = 0; ///< Indice en TypeChecker::function_sigs_, si kind==Function.
         bool       is_const  = false;
+        /// Nombre del alias de tipo cuando el simbolo se declaro con un alias
+        /// "magico" como `Class`, `Method`, `Field`, `Object`.  El tipo
+        /// subyacente es i64 (para reflexion: handles del ClassRegistry).
+        /// Permite que `Class cls = ...` registre cls -> "Class" y que
+        /// `cls.getMethod("foo")` baje a `getMethod(cls, "foo")` sin que
+        /// el usuario escriba la builtin standalone.  Vacio para variables
+        /// normales.
+        std::string reflection_alias;
     };
 
     /**
@@ -366,6 +380,17 @@ namespace vex {
          * @return Puntero a su FunctionSig o nullptr si no es funcion conocida.
          */
         const FunctionSig *function_sig_by_name(const std::string &name) const;
+
+        /**
+         * @brief Si @p name es una funcion extern, devuelve "@extern:<lib>:<name>".
+         *        En cualquier otro caso devuelve "".
+         *
+         * Usado por @c unique_with / @c shared_with en el lowering para
+         * generar el literal_deleter de la CleanupAction con el formato
+         * que @c emit_cleanups_all sabe interpretar como CALLN a libreria
+         * nativa (en lugar de CALLVM a funcion Vesta).
+         */
+        std::string lookup_extern_qualified(const std::string &name) const;
 
     private:
         // -----------------------------------------------------------------
@@ -550,6 +575,24 @@ namespace vex {
         /// rellena en cada @c function_sigs_.push_back y nunca se limpia.
         std::unordered_map<std::string, uint32_t> sig_by_name_;
 
+        /// Borrow checker compile-time.  Mantiene estado de borrows
+        /// activos durante el chequeo de una funcion.  Se resetea al
+        /// entrar a cada funcion.
+        BorrowChecker borrow_checker_{diags_};
+
+        /// F1 NLL - contador de stmt durante el chequeo del cuerpo de
+        /// una funcion.  Incrementado en cada stmt; el borrow checker
+        /// consulta @c last_use_idx vs current_stmt_idx_ para dropear
+        /// borrows tras su ultimo uso (Non-Lexical Lifetimes).
+        uint32_t current_stmt_idx_ = 0;
+
+        /// F1 NLL - pre-pase: walk del body de la funcion en DFS order,
+        /// asignando stmt_idx a cada statement y registrando el stmt_idx
+        /// maximo en que cada nombre aparece referenciado.  El resultado
+        /// se entrega al @c borrow_checker_ via @c set_last_use antes
+        /// de empezar el chequeo del body.
+        void compute_borrow_last_uses(ast::Stmt *body);
+
         // Tabla de alias de tipo (introducidos por typedef / using).  Mapea
         // el nombre alias al Type ya resuelto al tipo subyacente; alias
         // anidados (a -> b -> u32) se aplanan en collect_globals.
@@ -584,6 +627,38 @@ namespace vex {
         // "Box_i32"; valor = true si ya esta generada.  Evita regenerar
         // la misma instanciacion mas de una vez.
         std::unordered_map<std::string, bool> monomorphized_;
+
+    public:
+        /**
+         * @brief Provenance de una clase monomorphizada.
+         *        Conocer el template + los args concretos permite que
+         *        el JIT/AOT identifique instanciaciones, deduplique
+         *        especializaciones, y emita stack traces legibles
+         *        ("Box<i32>" en vez de "Box_i32").
+         */
+        struct MonomorphInfo {
+            std::string              template_name;  ///< "Box"
+            std::vector<std::string> type_args;       ///< ["i32"] (legibles)
+        };
+
+        /**
+         * @brief Devuelve el provenance de una clase monomorphizada,
+         *        o @c nullptr si @p mangled no es una instanciacion.
+         *
+         * Lo consulta @c Lowering al generar IrFunction para los
+         * metodos de la clase: rellena @c IrFunction::generic_template_name
+         * y @c generic_type_args para que el IR lleve el contract.
+         */
+        const MonomorphInfo *monomorph_info(const std::string &mangled) const noexcept {
+            auto it = monomorph_info_.find(mangled);
+            return (it == monomorph_info_.end()) ? nullptr : &it->second;
+        }
+    private:
+
+        // Tabla paralela a @c monomorphized_ que ademas guarda el
+        // template_name + lista legible de type_args.  Util para
+        // pasar al IR y para tools.
+        std::unordered_map<std::string, MonomorphInfo> monomorph_info_;
 
         // Nombre de la clase contenedora durante la verificacion de un
         // metodo de instancia (vacio fuera de un metodo).  Lo usa

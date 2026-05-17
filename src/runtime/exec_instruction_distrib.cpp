@@ -36,6 +36,7 @@
 #include "distrib/dist_runtime.h"
 #include "distrib/mailbox.h"
 #include "loader/loader.h"   // Loader::load_module_dynamic
+#include "debug/debugger.h"  // Debugger::on_message hook (tracing)
 #include <fstream>           // leer archivo .velb del filesystem
 #include <iterator>          // istreambuf_iterator
 
@@ -134,6 +135,15 @@ void exec_instr_loadmod(ProcessVM *vm, const DecodedInstr &instr) {
     runtime::VM &vm_ref = vm->scheduler.vm_reference;
     const uint64_t init_pc = vm_ref.loader_public.load_module_dynamic(
         vm_ref, std::move(file_bytes));
+    // Tras un load exitoso, registrar el source_path en el Executable que
+    // acaba de anadirse (sera el ultimo del pool).  Permite que
+    // unloadmodule(path) lo localice por path mas tarde.  Si load fallo
+    // (init_pc==0), no hay nada que patchar.
+    if (init_pc != 0
+        && !vm_ref.loader_public.executables.empty()
+        && vm_ref.loader_public.executables.back()) {
+        vm_ref.loader_public.executables.back()->source_path = path;
+    }
 
     // NOTE: el init_pc puede legitimamente ser 0 (start del code section).
     // No usamos 0 como sentinela de error: el sentinela es file-not-found
@@ -164,6 +174,52 @@ void exec_instr_loadmod(ProcessVM *vm, const DecodedInstr &instr) {
     vm->registers.rip.qword(init_pc);
     vm->decoded_ptr->flags_info.did_jump = true;
     vm->registers.regs[0].qword(init_pc); // success indicator (puede ser sobrescrito)
+    // Incrementar contador para que el HLT del main del plugin se trate
+    // como RET (ver exec_instr_hlt + ProcessVM::loadmod_call_depth).
+    // Esto reemplaza el viejo `patch_first_hlt_to_ret` que escaneaba bytes
+    // y podia false-match con imm de mov/callvm que contengan 0x00 0x03.
+    vm->loadmod_call_depth += 1;
+}
+
+// =========================================================================
+//  0x6D  UNLOADMOD  r_path_addr, r_path_len   (descarga modulo dinamico)
+// =========================================================================
+
+/**
+ * @brief Ejecuta UNLOADMOD: descarga un modulo cargado dinamicamente.
+ *
+ * Lee el path del .velb (mismo formato que loadmod) desde memoria VM,
+ * y delega en `Loader::unload_module_dynamic(path)`.  Deposita 1 en r_dst
+ * (R0 por convencion) si se descargo, 0 si no se encontro.
+ *
+ * IMPORTANTE: las clases registradas por el modulo permanecen en
+ * ClassRegistry (sus ClassInfo* podrian estar referenciados por instancias
+ * vivas).  La memoria del bytecode SI se libera.  Para un "reload" efectivo
+ * el usuario debe versionar el nombre de la clase (e.g. ExtV1 -> ExtV2).
+ *
+ * Encoding FIXED_4: [0x00][0x6D][regs][0x00] con regs=(r_path_len<<4)|r_path_addr
+ * (mismo formato que loadmod).
+ */
+void exec_instr_unloadmod(ProcessVM *vm, const DecodedInstr &instr) {
+    const uint8_t  r_path_addr = instr.data_instruction.reg_data.reg1;
+    const uint8_t  r_path_len  = instr.data_instruction.reg_data.reg2;
+    const uint64_t path_addr   = vm->registers.regs[r_path_addr].qword();
+    const uint64_t path_len    = vm->registers.regs[r_path_len].qword();
+
+    if (path_len == 0 || path_len > 8192) {
+        vm->registers.regs[0].qword(0);
+        return;
+    }
+
+    std::vector<uint8_t> path_bytes(path_len);
+    vm->vm_mem.read_bytes(path_addr, path_bytes.data(),
+                          static_cast<size_t>(path_len));
+    std::string path(reinterpret_cast<const char *>(path_bytes.data()),
+                     static_cast<size_t>(path_len));
+
+    runtime::VM &vm_ref = vm->scheduler.vm_reference;
+    const bool ok = vm_ref.loader_public.unload_module_dynamic(vm_ref, path);
+    vm->registers.regs[0].qword(ok ? 1 : 0);
 }
 
 // =========================================================================
@@ -204,6 +260,13 @@ void exec_instr_msgsend(ProcessVM *vm, const DecodedInstr &instr) {
 
     bool ok = dr->msgsend(vm, target_pid, vm_addr, len);
     vm->registers.regs[0].qword(ok ? 1 : 0); // R0 = 1 si enviado/encolado, 0 si error
+    // Hook del debugger: tracing de mensajes (sin overhead si no hay tracing).
+    if (vm->scheduler.vm_reference.debugger) {
+        uint64_t payload64 = 0;
+        if (len >= 8) vm->vm_mem.read_bytes(vm_addr, &payload64, 8);
+        vm->scheduler.vm_reference.debugger->on_message(
+            vm->pid.local_pid, true, target_pid, payload64);
+    }
 }
 
 // =========================================================================
@@ -251,6 +314,13 @@ void exec_instr_msgrecv(ProcessVM *vm, const DecodedInstr &instr) {
 
     uint64_t bytes = dr->msgrecv(vm, buf_addr, max_len);
     vm->registers.regs[0].qword(bytes); // R0 = bytes copiados al buffer
+    // Hook del debugger: tracing de mensajes recibidos.
+    if (vm->scheduler.vm_reference.debugger) {
+        uint64_t payload64 = 0;
+        if (bytes >= 8) vm->vm_mem.read_bytes(buf_addr, &payload64, 8);
+        vm->scheduler.vm_reference.debugger->on_message(
+            vm->pid.local_pid, false, 0, payload64);
+    }
     // CRITICO: si la primera llamada a msgrecv (icache miss) seteo blocking=true
     // por mailbox vacio, ese flag queda CACHEADO en la entrada del icache.
     // En la re-ejecucion (post-wake) decode_instruction devuelve cache HIT con

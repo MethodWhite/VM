@@ -1,0 +1,51 @@
+// Patron Rust: NLL permite borrow + uso + move(owner) en SECUENCIA
+// porque el borrow se libera tras su ultimo uso, no al exit del scope.
+// Imita un workflow tipico de "leer un valor, usarlo en un calculo,
+// luego transferir el ownership a otra funcion":
+//
+//   let data = Box::new(load());
+//   let view = &data;
+//   let len = compute_length(view);   // ultimo uso de view
+//   let consumed = consume(data);     // OK con NLL: view ya muerto
+//
+// Sin NLL: error R3 "no se puede mover data porque tiene borrow activo".
+
+i32 compute_length(borrow<i64> p) {
+    i64 v = read_borrow(p);
+    // Simular un calculo (cuenta digitos en base 10).
+    i32 digits = 0;
+    i64 q = v;
+    if (q < 0) q = 0 - q;
+    if (q == 0) return 1;
+    while (q > 0) {
+        digits = digits + 1;
+        q = q / 10;
+    }
+    return digits;
+}
+
+unique<i64> consume(unique<i64> p) {
+    return p;
+}
+
+i32 main() {
+    unique<i64> data = unique_box(123456);
+
+    borrow<i64> view = lend(data);
+    i32 len = compute_length(view);    // ultimo uso de view
+    // <- NLL libera view aqui
+
+    // Move ownership a consume.  Sin NLL daria R3.
+    unique<i64> moved = consume(move(data));
+
+    // Crear nuevo borrow del moved para leer y devolver.
+    borrow<i64> view2 = lend(moved);
+    i64 v2 = read_borrow(view2);
+
+    // len debe ser 6 (123456 tiene 6 digitos).
+    if (len != 6) return 100;
+    if (v2 != 123456) return 200;
+
+    // 42 = 6 + 36, donde 36 = 6*6 (test trivial).
+    return len + 36;
+}

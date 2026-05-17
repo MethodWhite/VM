@@ -355,6 +355,79 @@ static size_t vio_u64_to_hex(uint64_t v, char *out) {
     return 18;
 }
 
+/**
+ * @brief Convierte un uint64 a binario con prefijo "0b" minimo necesario.
+ *
+ * Formato variable: "0b" + N digitos binarios, donde N son los bits
+ * significativos (sin ceros a la izquierda).  Para v=0 emite "0b0".
+ * Maximo 66 chars (66 = 2 prefijo + 64 bits).
+ */
+static size_t vio_u64_to_bin(uint64_t v, char *out) {
+    out[0] = '0';
+    out[1] = 'b';
+    if (v == 0) {
+        out[2] = '0';
+        return 3;
+    }
+    /* Calcular el numero de bits significativos.  Mismo patron que
+     * __builtin_clzll pero portable: encontrar el bit mas alto. */
+    int high = 63;
+    while (high > 0 && ((v >> high) & 1u) == 0) --high;
+    size_t k = 2;
+    for (int i = high; i >= 0; --i) {
+        out[k++] = (char)('0' + ((v >> i) & 1u));
+    }
+    return k;
+}
+
+/**
+ * @brief Convierte un uint64 a octal con prefijo "0o".
+ *
+ * Formato variable: "0o" + N digitos octales (sin ceros a la izquierda).
+ * Para v=0 emite "0o0".  Maximo 24 chars (2 prefijo + 22 octal max).
+ */
+static size_t vio_u64_to_oct(uint64_t v, char *out) {
+    out[0] = '0';
+    out[1] = 'o';
+    if (v == 0) {
+        out[2] = '0';
+        return 3;
+    }
+    /* Generar de menos a mas significativo y luego invertir. */
+    char rev[24];
+    int  n = 0;
+    while (v > 0) {
+        rev[n++] = (char)('0' + (int)(v & 7u));
+        v >>= 3;
+    }
+    for (int i = 0; i < n; ++i) out[2 + i] = rev[n - 1 - i];
+    return (size_t)(2 + n);
+}
+
+/**
+ * @brief Convierte un puntero (host o virtual) a "0x" + hex sin ceros lider.
+ *
+ * Diferente de @c vio_u64_to_hex: ese formato es 18 chars fijos para volcado
+ * tabular; este es compacto, util para imprimir punteros en mensajes.  Para
+ * v=0 emite "0x0".
+ */
+static size_t vio_u64_to_ptr(uint64_t v, char *out) {
+    static const char hex[] = "0123456789ABCDEF";
+    out[0] = '0';
+    out[1] = 'x';
+    if (v == 0) {
+        out[2] = '0';
+        return 3;
+    }
+    int high = 15;
+    while (high > 0 && ((v >> (high * 4)) & 0xFu) == 0) --high;
+    size_t k = 2;
+    for (int i = high; i >= 0; --i) {
+        out[k++] = hex[(v >> (i * 4)) & 0xFu];
+    }
+    return k;
+}
+
 /* -----------------------------------------------------------------------
  * Lectura corta desde memoria VM con buffer de pila (para print).
  * ----------------------------------------------------------------------- */
@@ -426,6 +499,106 @@ VESTA_PLUGIN_EXPORT uint64_t vio_print(uint64_t proc_ptr,
     return 0;
 }
 
+/* -----------------------------------------------------------------------
+ * Stringify helpers usados por la interpolacion `${expr}` en contexto
+ * STRING (e.g. `this.field = "msg ${count}"`).  Cada uno escribe la
+ * representacion ASCII del valor a un buffer en MEMORIA VM y devuelve
+ * la longitud en bytes.  El compilador combina cada llamada con un
+ * STRMAKE posterior para producir un StringObject GC-managed que se
+ * concatena via STRCAT con las partes literales.
+ *
+ * Convencion de buffers: 32 bytes son suficientes para i64/u64
+ * (max 20 caracteres + signo) y para hex de 64 bits ("0x" + 16
+ * digitos = 18 caracteres).
+ * ----------------------------------------------------------------------- */
+
+VESTA_PLUGIN_EXPORT uint64_t vio_int_to_vmbuf(uint64_t proc_ptr,
+                                               uint64_t vm_addr,
+                                               uint64_t value) {
+    char   tmp[32];
+    size_t k = vio_i64_to_str((int64_t) value, tmp);
+    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, k);
+    return (uint64_t) k;
+}
+
+VESTA_PLUGIN_EXPORT uint64_t vio_uint_to_vmbuf(uint64_t proc_ptr,
+                                                uint64_t vm_addr,
+                                                uint64_t value) {
+    char   tmp[32];
+    size_t k = vio_u64_to_str(value, tmp);
+    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, k);
+    return (uint64_t) k;
+}
+
+VESTA_PLUGIN_EXPORT uint64_t vio_hex_to_vmbuf(uint64_t proc_ptr,
+                                               uint64_t vm_addr,
+                                               uint64_t value) {
+    char   tmp[32];
+    size_t k = vio_u64_to_hex(value, tmp);
+    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, k);
+    return (uint64_t) k;
+}
+
+VESTA_PLUGIN_EXPORT uint64_t vio_bool_to_vmbuf(uint64_t proc_ptr,
+                                                uint64_t vm_addr,
+                                                uint64_t value) {
+    /* "true" (4) o "false" (5). */
+    const char *s = value ? "true" : "false";
+    size_t      k = value ? 4u : 5u;
+    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, s, k);
+    return (uint64_t) k;
+}
+
+VESTA_PLUGIN_EXPORT uint64_t vio_char_to_vmbuf(uint64_t proc_ptr,
+                                                uint64_t vm_addr,
+                                                uint64_t codepoint) {
+    /* Codifica el codepoint en UTF-8 (1-4 bytes). */
+    char   tmp[8];
+    size_t k = 0;
+    uint32_t cp = (uint32_t) codepoint;
+    if (cp < 0x80) {
+        tmp[k++] = (char) cp;
+    } else if (cp < 0x800) {
+        tmp[k++] = (char) (0xC0 | (cp >> 6));
+        tmp[k++] = (char) (0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        tmp[k++] = (char) (0xE0 | (cp >> 12));
+        tmp[k++] = (char) (0x80 | ((cp >> 6) & 0x3F));
+        tmp[k++] = (char) (0x80 | (cp & 0x3F));
+    } else {
+        tmp[k++] = (char) (0xF0 | (cp >> 18));
+        tmp[k++] = (char) (0x80 | ((cp >> 12) & 0x3F));
+        tmp[k++] = (char) (0x80 | ((cp >> 6) & 0x3F));
+        tmp[k++] = (char) (0x80 | (cp & 0x3F));
+    }
+    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, k);
+    return (uint64_t) k;
+}
+
+VESTA_PLUGIN_EXPORT uint64_t vio_ptr_to_vmbuf(uint64_t proc_ptr,
+                                               uint64_t vm_addr,
+                                               uint64_t addr) {
+    /* Compacto: "0x" + minimos digitos hex (max 18 caracteres). */
+    char     tmp[32];
+    size_t   k    = 0;
+    tmp[k++]      = '0';
+    tmp[k++]      = 'x';
+    if (addr == 0) {
+        tmp[k++] = '0';
+    } else {
+        char   rev[16];
+        size_t r = 0;
+        while (addr > 0) {
+            uint64_t d = addr & 0xFu;
+            rev[r++]   = (char) (d < 10 ? '0' + d : 'a' + (d - 10));
+            addr >>= 4;
+        }
+        while (r > 0) tmp[k++] = rev[--r];
+    }
+    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, k);
+    return (uint64_t) k;
+}
+
 /**
  * @brief Imprime una cadena de la memoria VM y agrega '\n'.
  */
@@ -485,6 +658,304 @@ VESTA_PLUGIN_EXPORT uint64_t vio_println_hex(uint64_t n) {
     size_t k = vio_u64_to_hex(n, tmp);
     tmp[k++] = '\n';
     vio_buffer_append(tmp, k);
+    return 0;
+}
+
+/**
+ * @brief Imprime un uint64 como binario "0b<bits>" (sin newline).
+ *
+ * Usa @c vio_u64_to_bin (formato compacto sin ceros lider).  Para n=0
+ * emite "0b0".  Util para depurar bitfields, masks, flags.
+ */
+VESTA_PLUGIN_EXPORT uint64_t vio_print_bin(uint64_t n) {
+    char   tmp[68]; /* 2 prefijo + 64 bits + margen */
+    size_t k = vio_u64_to_bin(n, tmp);
+    vio_buffer_append(tmp, k);
+    return 0;
+}
+
+VESTA_PLUGIN_EXPORT uint64_t vio_println_bin(uint64_t n) {
+    char   tmp[68];
+    size_t k = vio_u64_to_bin(n, tmp);
+    tmp[k++] = '\n';
+    vio_buffer_append(tmp, k);
+    return 0;
+}
+
+/**
+ * @brief Imprime un uint64 como octal "0o<dig>" (sin newline).
+ *
+ * Para n=0 emite "0o0".  Maximo 24 chars (uint64_t = 22 digitos octales).
+ */
+VESTA_PLUGIN_EXPORT uint64_t vio_print_oct(uint64_t n) {
+    char   tmp[26];
+    size_t k = vio_u64_to_oct(n, tmp);
+    vio_buffer_append(tmp, k);
+    return 0;
+}
+
+VESTA_PLUGIN_EXPORT uint64_t vio_println_oct(uint64_t n) {
+    char   tmp[26];
+    size_t k = vio_u64_to_oct(n, tmp);
+    tmp[k++] = '\n';
+    vio_buffer_append(tmp, k);
+    return 0;
+}
+
+/**
+ * @brief Imprime un puntero (host o virtual) como "0x<hex>" compacto.
+ *
+ * Sin ceros lider; util para mensajes de log.  Para volcado tabular con
+ * ancho fijo, usa @c vio_print_hex que siempre emite "0x" + 16 chars.
+ */
+VESTA_PLUGIN_EXPORT uint64_t vio_print_ptr(uint64_t addr) {
+    char   tmp[20];
+    size_t k = vio_u64_to_ptr(addr, tmp);
+    vio_buffer_append(tmp, k);
+    return 0;
+}
+
+VESTA_PLUGIN_EXPORT uint64_t vio_println_ptr(uint64_t addr) {
+    char   tmp[20];
+    size_t k = vio_u64_to_ptr(addr, tmp);
+    tmp[k++] = '\n';
+    vio_buffer_append(tmp, k);
+    return 0;
+}
+
+/**
+ * @brief Imprime un GcHandle como "<gc:N>" (sin newline).
+ *
+ * El handle es un uint32 internamente; solo los 32 bits bajos son
+ * significativos (los altos quedan a cero por convencion).  El formato
+ * "<gc:N>" enfatiza que NO es una direccion sino un indice opaco en la
+ * tabla del GC.  Si en el futuro queremos imprimir el class_name del
+ * objeto referenciado, anyadir una variante @c vio_print_gcobj que tome
+ * tambien el ProcessVM* y resuelva via GcHeap.
+ */
+VESTA_PLUGIN_EXPORT uint64_t vio_print_gchandle(uint64_t handle) {
+    /* Formato: "<gc:" + decimal(32 bits) + ">" -> max 16 chars */
+    char tmp[24];
+    tmp[0] = '<'; tmp[1] = 'g'; tmp[2] = 'c'; tmp[3] = ':';
+    size_t k = 4;
+    /* itoa unsigned in-line (handle nunca > 2^32, pero usamos uint64 por ABI) */
+    uint64_t v = handle;
+    if (v == 0) {
+        tmp[k++] = '0';
+    } else {
+        char rev[24];
+        int  n = 0;
+        while (v > 0) {
+            rev[n++] = (char)('0' + (int)(v % 10u));
+            v /= 10u;
+        }
+        for (int i = 0; i < n; ++i) tmp[k++] = rev[n - 1 - i];
+    }
+    tmp[k++] = '>';
+    vio_buffer_append(tmp, k);
+    return 0;
+}
+
+VESTA_PLUGIN_EXPORT uint64_t vio_println_gchandle(uint64_t handle) {
+    vio_print_gchandle(handle);
+    vio_buffer_putc('\n');
+    return 0;
+}
+
+/**
+ * @brief Imprime un padding de @p width chars del codepoint @p fill.
+ *
+ * Helper de bajo nivel para construir alineacion de texto: el caller
+ * calcula la diferencia entre @p width y el ancho actual del texto y
+ * llama a este builtin con ese delta.  El @p fill se codifica a UTF-8
+ * inline para soportar tanto ' ' (32) como cualquier codepoint Unicode
+ * (cuidado: UTF-8 multi-byte ocupa 2-4 bytes por copia, NO solo
+ * @p width bytes en el buffer).
+ *
+ * @param fill_cp Codepoint Unicode (U+0..U+10FFFF).  ' ' = 32 = 0x20.
+ * @param width   Numero de copias del fill a emitir.
+ */
+/**
+ * @brief Helper interno: codifica @p cp a UTF-8 en @p buf y devuelve N.
+ *        Misma logica que vio_print_char pero sin emitir.
+ */
+static size_t vio_encode_utf8(uint64_t cp, char *buf) {
+    if (cp <= 0x7Fu) { buf[0] = (char)cp; return 1; }
+    if (cp <= 0x7FFu) {
+        buf[0] = (char)(0xC0u | (cp >> 6));
+        buf[1] = (char)(0x80u | (cp & 0x3Fu));
+        return 2;
+    }
+    if (cp <= 0xFFFFu) {
+        if (cp >= 0xD800u && cp <= 0xDFFFu) return 0;
+        buf[0] = (char)(0xE0u | (cp >> 12));
+        buf[1] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        buf[2] = (char)(0x80u | (cp & 0x3Fu));
+        return 3;
+    }
+    if (cp <= 0x10FFFFu) {
+        buf[0] = (char)(0xF0u | (cp >> 18));
+        buf[1] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+        buf[2] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        buf[3] = (char)(0x80u | (cp & 0x3Fu));
+        return 4;
+    }
+    return 0;
+}
+
+/* Forward declaration: vio_print_pad esta definida abajo pero la
+ * usamos desde vio_print_fmt para emitir el padding. */
+VESTA_PLUGIN_EXPORT uint64_t vio_print_pad(uint64_t fill_cp, uint64_t width);
+
+/**
+ * @brief Imprime un valor con formato y alineacion.
+ *
+ * Combina kind + width + fill + align en un solo native helper para
+ * que el frontend Vex pueda mapear `${expr:hex:>10}` a un solo CALLN
+ * sin tener que medir ancho del valor desde IR.
+ *
+ * @param value   El valor entero (o bits IEEE para FLOAT_KIND).
+ * @param kind    Codigo de formato:
+ *                  0 = INT (signed, decimal)
+ *                  1 = UINT (unsigned, decimal)
+ *                  2 = HEX (0x + 16 hex fixed)
+ *                  3 = BIN (0b + bits compactos)
+ *                  4 = OCT (0o + dig compactos)
+ *                  5 = PTR (0x + hex compacto)
+ *                  6 = GC (<gc:N>)
+ *                  7 = BOOL ("true"/"false")
+ *                  8 = CHAR (codepoint -> UTF-8)
+ *                  9 = FLOAT (IEEE 754 bits via %g)
+ *                 10 = HEX_COMPACT (0x + hex sin ceros lider, igual a PTR)
+ * @param width   Ancho minimo deseado en bytes.  0 = sin padding.
+ * @param fill_cp Codepoint Unicode para el fill.
+ * @param align   0 = sin alineacion, 1 = LEFT (pad derecha), 2 = RIGHT (pad izq).
+ */
+VESTA_PLUGIN_EXPORT uint64_t vio_print_fmt(uint64_t value, uint64_t kind,
+                                            uint64_t width, uint64_t fill_cp,
+                                            uint64_t align) {
+    /* Formatear primero a un buffer local, luego decidir el padding. */
+    char tmp[80];
+    size_t tmp_n = 0;
+    switch ((unsigned)kind) {
+        case 0: { /* INT signed decimal */
+            int64_t s = (int64_t)value;
+            if (s == 0) { tmp[tmp_n++] = '0'; break; }
+            int neg = 0;
+            if (s < 0) {
+                neg = 1;
+                /* Convertir a positivo con cuidado por INT64_MIN. */
+                if (s == (int64_t)0x8000000000000000LL) {
+                    /* -9223372036854775808: hard-code el minimo. */
+                    const char *m = "-9223372036854775808";
+                    size_t k = 0; while (m[k]) ++k;
+                    memcpy(tmp + tmp_n, m, k); tmp_n += k;
+                    goto fmt_done;
+                }
+                s = -s;
+            }
+            char rev[24]; int n = 0;
+            while (s > 0) { rev[n++] = (char)('0' + (int)(s % 10)); s /= 10; }
+            if (neg) tmp[tmp_n++] = '-';
+            for (int i = 0; i < n; ++i) tmp[tmp_n++] = rev[n - 1 - i];
+            break;
+        }
+        case 1: { /* UINT decimal */
+            uint64_t u = value;
+            if (u == 0) { tmp[tmp_n++] = '0'; break; }
+            char rev[24]; int n = 0;
+            while (u > 0) { rev[n++] = (char)('0' + (int)(u % 10u)); u /= 10u; }
+            for (int i = 0; i < n; ++i) tmp[tmp_n++] = rev[n - 1 - i];
+            break;
+        }
+        case 2: tmp_n = vio_u64_to_hex(value, tmp); break;
+        case 3: tmp_n = vio_u64_to_bin(value, tmp); break;
+        case 4: tmp_n = vio_u64_to_oct(value, tmp); break;
+        case 5: tmp_n = vio_u64_to_ptr(value, tmp); break;
+        case 6: { /* GC: "<gc:N>" */
+            tmp[tmp_n++] = '<'; tmp[tmp_n++] = 'g'; tmp[tmp_n++] = 'c';
+            tmp[tmp_n++] = ':';
+            uint64_t u = value;
+            if (u == 0) { tmp[tmp_n++] = '0'; }
+            else {
+                char rev[24]; int n = 0;
+                while (u > 0) { rev[n++] = (char)('0' + (int)(u % 10u)); u /= 10u; }
+                for (int i = 0; i < n; ++i) tmp[tmp_n++] = rev[n - 1 - i];
+            }
+            tmp[tmp_n++] = '>';
+            break;
+        }
+        case 7: { /* BOOL */
+            if (value & 1u) { memcpy(tmp + tmp_n, "true", 4); tmp_n += 4; }
+            else            { memcpy(tmp + tmp_n, "false", 5); tmp_n += 5; }
+            break;
+        }
+        case 8: { /* CHAR codepoint -> UTF-8 */
+            tmp_n = vio_encode_utf8(value, tmp);
+            break;
+        }
+        case 9: { /* FLOAT bits via %g */
+            double d; memcpy(&d, &value, sizeof(d));
+            int k = snprintf(tmp, sizeof(tmp), "%g", d);
+            if (k > 0) tmp_n = (size_t)k;
+            break;
+        }
+        default:
+            tmp_n = 0;
+            break;
+    }
+fmt_done: ; /* statement vacio para que la label valga en C estricto */
+    /* Calcular padding y emitir.  width se interpreta en BYTES emitidos
+     * (no en columnas terminal): para texto puramente ASCII coincide con
+     * el ancho visible; para multi-byte UTF-8 puede diferir y queda como
+     * limitacion conocida del formato simple. */
+    uint64_t pad = (tmp_n < width) ? (width - tmp_n) : 0u;
+    if (align == 2u && pad > 0u) {
+        /* RIGHT-align: padding antes. */
+        vio_print_pad(fill_cp, pad);
+    }
+    if (tmp_n > 0u) vio_buffer_append(tmp, tmp_n);
+    if (align == 1u && pad > 0u) {
+        /* LEFT-align: padding despues. */
+        vio_print_pad(fill_cp, pad);
+    }
+    return 0;
+}
+
+VESTA_PLUGIN_EXPORT uint64_t vio_print_pad(uint64_t fill_cp, uint64_t width) {
+    if (width == 0) return 0;
+    /* Codificar fill a UTF-8 una vez, luego repetir. */
+    char enc[4];
+    size_t enc_n = 0;
+    if (fill_cp <= 0x7Fu) {
+        enc[enc_n++] = (char)fill_cp;
+    } else if (fill_cp <= 0x7FFu) {
+        enc[enc_n++] = (char)(0xC0u | (fill_cp >> 6));
+        enc[enc_n++] = (char)(0x80u | (fill_cp & 0x3Fu));
+    } else if (fill_cp <= 0xFFFFu) {
+        if (fill_cp >= 0xD800u && fill_cp <= 0xDFFFu) return 0;
+        enc[enc_n++] = (char)(0xE0u | (fill_cp >> 12));
+        enc[enc_n++] = (char)(0x80u | ((fill_cp >> 6) & 0x3Fu));
+        enc[enc_n++] = (char)(0x80u | (fill_cp & 0x3Fu));
+    } else if (fill_cp <= 0x10FFFFu) {
+        enc[enc_n++] = (char)(0xF0u | (fill_cp >> 18));
+        enc[enc_n++] = (char)(0x80u | ((fill_cp >> 12) & 0x3Fu));
+        enc[enc_n++] = (char)(0x80u | ((fill_cp >> 6) & 0x3Fu));
+        enc[enc_n++] = (char)(0x80u | (fill_cp & 0x3Fu));
+    } else {
+        return 0;
+    }
+    /* Emitir en chunks para no abusar del buffer en width grandes. */
+    char chunk[256];
+    size_t chunk_used = 0;
+    for (uint64_t i = 0; i < width; ++i) {
+        if (chunk_used + enc_n > sizeof(chunk)) {
+            vio_buffer_append(chunk, chunk_used);
+            chunk_used = 0;
+        }
+        for (size_t j = 0; j < enc_n; ++j) chunk[chunk_used++] = enc[j];
+    }
+    if (chunk_used > 0) vio_buffer_append(chunk, chunk_used);
     return 0;
 }
 

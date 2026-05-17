@@ -16,3 +16,7 @@
 [submodule "preprocessor"]
 	path = preprocessor
 	url = https://github.com/desmonHak/preprocessor.git
+[submodule "libs/SourceCode/LibPEparse"]
+	path = libs/SourceCode/LibPEparse
+	url = https://github.com/desmonHak/LibPEparse.git
+	branch = main

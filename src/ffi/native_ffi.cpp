@@ -26,7 +26,9 @@
 #include "windows.h"
 #else
 #include <dlfcn.h>
+#include <unistd.h>
 #endif
+#include <vector>
 
 namespace ffi {
 
@@ -64,35 +66,80 @@ namespace ffi {
         return idx;
     }
 
+#ifdef _WIN32
+    /* Devuelve el directorio donde reside @c vm.exe (sin trailing slash). */
+    static std::string vm_exe_dir(void) {
+        char buf[1024];
+        DWORD n = GetModuleFileNameA(NULL, buf, sizeof(buf));
+        if (n == 0 || n == sizeof(buf)) return std::string();
+        std::string p(buf, n);
+        size_t pos = p.find_last_of("/\\");
+        if (pos == std::string::npos) return std::string();
+        return p.substr(0, pos);
+    }
+#else
+    static std::string vm_exe_dir(void) {
+        char buf[4096];
+        ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (n <= 0) return std::string();
+        buf[n] = 0;
+        std::string p(buf);
+        size_t pos = p.find_last_of('/');
+        if (pos == std::string::npos) return std::string();
+        return p.substr(0, pos);
+    }
+#endif
+
     void *FFI::load_native_module(const std::string &name) {
         /* consultar cache antes de llamar al SO */
         auto it = native_modules.find(name);
         if (it != native_modules.end())
             return it->second;
 
+        /* Intentar varios paths candidatos en orden:
+         *   1. name tal cual (compatibilidad: usuario puede pasar path completo)
+         *   2. <vm_exe_dir>/<name>(.dll/.so)
+         *   3. <cwd>/<name>(.dll/.so)
+         *
+         * Para programas Vesta tipicos, las DLLs nativas viven en
+         * @c <vm_exe_dir>/stdlib/native/<subdir>/lib.dll mientras que el
+         * usuario puede ejecutar @c vesta --run desde cualquier dir.
+         * El @c name viene ya con el subdir (e.g. @c "stdlib/native/io/vesta_io")
+         * asi que basta con prefixar @c vm_exe_dir/ . */
+        std::vector<std::string> candidates;
+        candidates.push_back(name);
+        {
+            std::string dir = vm_exe_dir();
+            if (!dir.empty()) {
+                candidates.push_back(dir + "/" + name);
+            }
+        }
+        std::string last_err;
+
+        for (const auto &cand : candidates) {
 #ifdef _WIN32
-        HMODULE h = LoadLibraryA(name.c_str());
-        if (!h) {
+            HMODULE h = LoadLibraryA(cand.c_str());
+            if (h) {
+                native_modules[name] = static_cast<void *>(h);
+                return static_cast<void *>(h);
+            }
             DWORD err = GetLastError();
-            throw FFIError(
-                "FFI: No se pudo cargar la libreria '" + name +
-                "' (LoadLibraryA fallo, codigo: " + std::to_string(err) + ")"
-            );
-        }
-        native_modules[name] = static_cast<void *>(h);
-        return static_cast<void *>(h);
+            last_err  = "LoadLibraryA('" + cand + "') codigo " + std::to_string(err);
 #else
-        void *h = dlopen(name.c_str(), RTLD_LAZY);
-        if (!h) {
-            const char *err = dlerror();
-            throw FFIError(
-                "FFI: No se pudo cargar la libreria '" + name +
-                "' (dlopen fallo: " + std::string(err ? err : "error desconocido") + ")"
-            );
-        }
-        native_modules[name] = h;
-        return h;
+            void *h = dlopen(cand.c_str(), RTLD_LAZY);
+            if (h) {
+                native_modules[name] = h;
+                return h;
+            }
+            const char *e = dlerror();
+            last_err = std::string("dlopen('") + cand + "') " + (e ? e : "");
 #endif
+        }
+        throw FFIError(
+            "FFI: No se pudo cargar la libreria '" + name +
+            "' tras intentar " + std::to_string(candidates.size()) +
+            " paths. Ultimo error: " + last_err
+        );
     }
 
     void *FFI::resolve_native_symbol(void *module, const std::string &func) {

@@ -1,0 +1,23 @@
+// Benchmark del JIT con CALLVIRT en hot loop.  Cada iter llama un
+// metodo virtual de la misma clase (monomorphic) -> Inline Cache deberia
+// hit en cada call y eliminar el vtable lookup.
+
+class Counter {
+    public i32 n;
+    public Counter() { this.n = 0; }
+    public i32 inc(i32 d) {
+        this.n = this.n + d;
+        return this.n;
+    }
+}
+
+i32 main() {
+    Counter c = new Counter();
+    i32 sum = 0;
+    i32 i = 0;
+    while (i < 10000000) {
+        sum = c.inc(1);
+        i = i + 1;
+    }
+    return sum;
+}

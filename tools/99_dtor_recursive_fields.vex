@@ -1,0 +1,40 @@
+// Test exhaustivo de POO con destructores recursivos
+// y nested NEWOBJ en ctors (sin segfault gracias al fix gchandle/gcderef
+// alrededor de calls que disparan GC).
+//
+// El frontend ahora:
+//   * Sintetiza ~Holder() implicito porque Holder.field es destructible.
+//   * Inyecta gchandle/gcderef alrededor de calls que disparan GC, asi
+//     `this` y los locals CLASS siguen apuntando al objeto correcto
+//     incluso si el GC evacua nursery durante new Resource(...).
+//   * El __new_<X> helper preserva el GcHandle alrededor del ctor para
+//     devolver siempre un host_ptr fresco (post-GC) en r0.
+//
+// Esperado: R00 == 42 (= 21 + 21).
+
+class Resource {
+    public i32 value;
+    public Resource(i32 v) { this.value = v; }
+    public ~Resource() {
+        // dtor body intencionadamente trivial.
+    }
+}
+
+class Holder {
+    public Resource field;
+    public Holder(i32 v) {
+        // nested NEWOBJ dentro del ctor: este es el patron que fallaba
+        // antes.  El GC podia mover Holder durante new
+        // Resource() -> this stale -> segfault al guardar field.
+        this.field = new Resource(v);
+    }
+    // Sin dtor declarado: el frontend SINTETIZA uno que invoca
+    // ~Resource() sobre this.field.
+}
+
+i32 main() {
+    Holder h1 = new Holder(21);
+    Holder h2 = new Holder(21);
+    i32 r = h1.field.value + h2.field.value;
+    return r;
+}

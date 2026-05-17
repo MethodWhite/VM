@@ -83,6 +83,9 @@ namespace vex {
         ISTR_BEGIN,         ///< Inicio de string interpolado.
         ISTR_TEXT,          ///< Fragmento literal entre interpolaciones.
         ISTR_EXPR_BEGIN,    ///< Apertura de la expresion ${.
+        ISTR_EXPR_FMT,      ///< Especificador de formato tras `:` dentro
+                            ///< de `${expr:fmt}`.  El texto del formato
+                            ///< va en @c str_val sin tokenizar (raw).
         ISTR_EXPR_END,      ///< Cierre de la expresion }.
         ISTR_END,           ///< Fin de string interpolado.
 
@@ -132,6 +135,11 @@ namespace vex {
         KW_TREEMAP,
         KW_TREESET,
         KW_STACK,
+        // Smart pointers builtins (move-only + refcount).
+        KW_UNIQUE,          ///< unique<T> (smart pointer move-only)
+        KW_SHARED,          ///< shared<T> (smart pointer con refcount)
+        KW_BORROW,          ///< borrow<T> (shared borrow, immutable)
+        KW_BORROW_MUT,      ///< borrow_mut<T> (exclusive borrow, mutable)
 
         // ---------------------------------------------------------------
         // Categoria 5: palabras reservadas de declaracion.

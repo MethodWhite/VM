@@ -118,10 +118,12 @@ namespace Assembly::Bytecode {
         {"jmp.jz",  {{0x11, 0x00, InstrSizeMode::FIXED_10, AddressingMode::INMED, emit_instr_abs64}}},
         {"jmp.jne", {{0x11, 0x01, InstrSizeMode::FIXED_10, AddressingMode::INMED, emit_instr_abs64}}},
         {"jmp.jnz", {{0x11, 0x01, InstrSizeMode::FIXED_10, AddressingMode::INMED, emit_instr_abs64}}},
+        /* jcs/jb (jump if below)        : CF==1 -> cond 0x02 */
         {"jmp.jcs", {{0x11, 0x02, InstrSizeMode::FIXED_10, AddressingMode::INMED, emit_instr_abs64}}},
-        {"jmp.jae", {{0x11, 0x02, InstrSizeMode::FIXED_10, AddressingMode::INMED, emit_instr_abs64}}},
+        {"jmp.jb",  {{0x11, 0x02, InstrSizeMode::FIXED_10, AddressingMode::INMED, emit_instr_abs64}}},
+        /* jcc/jae (jump if above-or-equal) : CF==0 -> cond 0x03 */
         {"jmp.jcc", {{0x11, 0x03, InstrSizeMode::FIXED_10, AddressingMode::INMED, emit_instr_abs64}}},
-        {"jmp.jb",  {{0x11, 0x03, InstrSizeMode::FIXED_10, AddressingMode::INMED, emit_instr_abs64}}},
+        {"jmp.jae", {{0x11, 0x03, InstrSizeMode::FIXED_10, AddressingMode::INMED, emit_instr_abs64}}},
         {"jmp.jmi", {{0x11, 0x04, InstrSizeMode::FIXED_10, AddressingMode::INMED, emit_instr_abs64}}},
         {"jmp.jpl", {{0x11, 0x05, InstrSizeMode::FIXED_10, AddressingMode::INMED, emit_instr_abs64}}},
         {"jmp.jvs", {{0x11, 0x06, InstrSizeMode::FIXED_10, AddressingMode::INMED, emit_instr_abs64}}},
@@ -241,6 +243,18 @@ namespace Assembly::Bytecode {
         // El caller debe invocar `callvmr r0` para que el prologo de main
         // del nuevo modulo llame __module_init y registre las clases.
         {"loadmod", {{0x00, 0x59, InstrSizeMode::FIXED_4, AddressingMode::REG,  emit_instr_reg}}},
+
+        // unloadmod r_path_addr, r_path_len -- descarga modulo cargado
+        // dinamicamente (builtin Vex `unloadmodule(path) -> i32`).  Mismo
+        // formato de operandos que loadmod; R0 = 1 si descargado, 0 si no.
+        {"unloadmod", {{0x00, 0x6D, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
+
+        // getmethat / getfldat r_class, r_idx -- variantes reg-reg de
+        // getmethod / getfield para iteracion dinamica.  R00 = &cls->methods[idx]
+        // o &cls->fields[idx] respectivamente, o 0 si fuera de rango.
+        // Builtins Vex: getMethodAt(cls, i), getFieldAt(cls, i).
+        {"getmethat", {{0x00, 0x6E, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
+        {"getfldat",  {{0x00, 0x6F, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
         // A.17.x: panic r_msg_addr, r_msg_len -- lanza FatalError USER_ABORT.
         {"panic",   {{0x00, 0x5A, InstrSizeMode::FIXED_4, AddressingMode::REG,  emit_instr_reg}}},
         // A.17.y: setmethdbg r_method, r_params -- debug info para method.
@@ -318,6 +332,56 @@ namespace Assembly::Bytecode {
          *  getpid r_dst -> r_dst = (scheduler_id<<32) | (local_pid & 0xFFFFFFFF)
          */
         {"getpid",     {{0x00, 0x57, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_one_reg}}},
+
+        /* --- argv del script (opcodes 0x6B y 0x6C) ---
+         *  getargc r_dst         -> r_dst = numero de args del script
+         *  getarg  r_dst, r_idx  -> r_dst = GcHandle de StringObject con args[idx]
+         *                           (0 si idx fuera de rango)
+         *  Builtins Vex: args_count() y args_get(i).
+         */
+        {"getargc",    {{0x00, 0x6B, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_one_reg}}},
+        {"getarg",     {{0x00, 0x6C, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
+
+        /* --- Move-and-take (0x72) --- primitivo de move-ownership para smart pointers.
+         *  mvtake r_dst_addr, r_src_addr
+         *    -> *(u64*)dst = *(u64*)src; *(u64*)src = 0
+         *  Una sola instruccion VM que evita la secuencia LOAD + STORE + CONST 0 + STORE
+         *  necesaria para implementar move semantics sin overhead.
+         */
+        {"mvtake",     {{0x00, 0x72, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
+
+        /* --- Super-instrucciones ALU 3-operandos (0x73-0x7B) ---
+         *  Combinan `mov rd, rs1; OP rd, rs2` en una sola instruccion VM.
+         *  Reduce dispatch + decode para el patron mas frecuente del 2-address
+         *  codegen cuando el regalloc no puede coalescer dst con src1.
+         *
+         *  Encoding FIXED_4: [0x00][opcode2][byte2][byte3]
+         *      byte2 = (r_src1 << 4) | r_dst
+         *      byte3 = (r_src2 << 4) | 0  (flags reservados)
+         *
+         *  Opcodes 0x73-0x75: signed (adds3, subs3, muls3).
+         *  Opcodes 0x76-0x78: unsigned (addu3, subu3, mulu3).
+         *  Opcodes 0x79-0x7B: bitwise (and3, or3, xor3) -- sin signo.
+         */
+        {"adds3", {{0x00, 0x73, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_alu3}}},
+        {"subs3", {{0x00, 0x74, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_alu3}}},
+        {"muls3", {{0x00, 0x75, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_alu3}}},
+        {"addu3", {{0x00, 0x76, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_alu3}}},
+        {"subu3", {{0x00, 0x77, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_alu3}}},
+        {"mulu3", {{0x00, 0x78, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_alu3}}},
+        {"and3",  {{0x00, 0x79, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_alu3}}},
+        {"or3",   {{0x00, 0x7A, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_alu3}}},
+        {"xor3",  {{0x00, 0x7B, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_alu3}}},
+
+        /* --- Super-instruccion LOAD zero-extend (0x7C VM, 0x7D HOST) ---
+         *  loadz  rd_sized, r_src_ptr   - carga N-bit desde vm_mem, zero-extiende a 64b.
+         *  loadzh rd_sized, r_src_ptr   - igual pero desde memoria HOST.
+         *  Sustituye el patron `mov rd,0 + mov rd_sized,[rs]` (10 bytes -> 4 bytes,
+         *  2 instrucciones VM -> 1).  N se infiere del tamano del registro destino
+         *  (r11=64b, r11d=32b, r11w=16b, r11b=8b).
+         */
+        {"loadz",  {{0x00, 0x7C, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_loadz}}},
+        {"loadzh", {{0x00, 0x7D, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_loadz}}},
 
         /* --- Monitor / sincronizacion (0x35-0x39) ---
          *  monenter r_handle  -> adquiere el monitor del objeto GC
@@ -538,6 +602,14 @@ namespace Assembly::Bytecode {
             }
         },
         {
+            // strmake_h: variante de strmake que lee de memoria HOST (puntero
+            // crudo de malloc/str_cstr/etc.) en lugar de memoria VM.  Mismo
+            // encoding que strmake; cambia solo la semantica del read en runtime.
+            "strmake_h", {
+                {0x00, 0x5E, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_three_reg}
+            }
+        },
+        {
             "strlen", {
                 {0x00, 0x47, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_str_two_reg}
             }
@@ -703,6 +775,69 @@ namespace Assembly::Bytecode {
         {"dlopen", {{0x00, 0x62, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_dlopen}}},
         {"dlsym",  {{0x00, 0x63, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_dlsym}}},
         {"callni", {{0x00, 0x64, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_callni}}},
+
+        // Optimizaciones del frontend Vex (slots reservados 0x65-0x67):
+        //   gcallocp   = GC alloc + host_ptr en 1 instr (closure env heap).
+        //   spawnargs  = spawn que copia R1..R[R15] del padre al child.
+        //   fulfillhlt = fulfill + hlt fusionados (path critico @Async helper).
+        {"gcallocp",   {{0x00, 0x65, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_gcallocp}}},
+        {"spawnargs",  {{0x00, 0x66, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_spawnargs}}},
+        {"fulfillhlt", {{0x00, 0x67, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_fulfillhlt}}},
+
+        // Optimizaciones hot loops (slots 0x68-0x6A):
+        //   cmpjmp.cc r_a, r_b, label   = cmps + jmp.cc fusionados (signed).
+        //   cmpjmpu.cc r_a, r_b, label  = cmpu + jmp.cc fusionados (unsigned).
+        //   decjnz r_counter, label     = decremento + branch-if-not-zero.
+        // Encoding FIXED_8: [0x00][opcode2][b2][cond/_pad][target_u32_LE].
+        // El emitter usa el sufijo .jX del mnemonic para determinar @c cond.
+        // Todas las variantes de cmpjmp.cc / cmpjmpu.cc comparten opcode2.
+        {"cmpjmp.je",   {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jz",   {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jne",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jnz",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jcs",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jb",   {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jcc",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jae",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jmi",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jpl",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jvs",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jvc",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jhi",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jls",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jge",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jlt",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jgt",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+        {"cmpjmp.jle",  {{0x00, 0x68, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_signed}}},
+
+        {"cmpjmpu.je",  {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jz",  {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jne", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jnz", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jcs", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jb",  {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jcc", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jae", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jmi", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jpl", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jvs", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jvc", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jhi", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jls", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jge", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jlt", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jgt", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+        {"cmpjmpu.jle", {{0x00, 0x69, InstrSizeMode::FIXED_8, AddressingMode::REG, emit_instr_cmpjmp_unsigned}}},
+
+        // decjnz: 2 operandos (reg, label).  El select_variant detecta
+        // ops[0]=reg + ops[1]=AnnotationNode como modo INMED, NO REG.
+        {"decjnz",      {{0x00, 0x6A, InstrSizeMode::FIXED_8, AddressingMode::INMED, emit_instr_decjnz}}},
+
+        // fastpush <mask16> / fastpop <mask16>: empuja/desempila multiples regs
+        // en una sola instruccion segun el bitmask de 16 bits (bit r = r0..r15).
+        // Encoding FIXED_4: [0x00][opcode2][mask_lo][mask_hi].
+        {"fastpush",    {{0x00, 0x70, InstrSizeMode::FIXED_4, AddressingMode::INMED, emit_instr_fastmask}}},
+        {"fastpop",     {{0x00, 0x71, InstrSizeMode::FIXED_4, AddressingMode::INMED, emit_instr_fastmask}}},
     };
 
     /**

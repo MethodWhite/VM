@@ -1,0 +1,17 @@
+// Chain: make_chain calls make_inner.
+
+unique<i32> make_inner() {
+    unique<i32> p = unique_box(99);
+    return p;
+}
+
+unique<i32> make_chain() {
+    unique<i32> p = make_inner();
+    return p;
+}
+
+i32 main() {
+    unique<i32> q = make_chain();
+    i32* raw = ptr_of(q);
+    return *raw;
+}

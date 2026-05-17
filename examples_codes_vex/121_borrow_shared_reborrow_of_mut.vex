@@ -1,0 +1,18 @@
+// Test F3 ext - Shared reborrow de un borrow_mut:
+//   lend(borrow_mut_var) crea un borrow SHARED desde un mut.
+//   El mut original queda SUSPENDIDO mientras viva el shared.
+//
+// Patron Rust: let r: &T = &*m; donde m: &mut T.
+// El mut se "rebaja" temporalmente a shared.  Util para pasar a APIs
+// que solo necesitan lectura sin perder el mut original.
+
+i32 main() {
+    unique<i32> owner = unique_box(42);
+
+    borrow_mut<i32> m = lend_mut(owner);     // owner -> Mut (por m)
+    borrow<i32>     r = lend(m);             // m suspendido, shared activo
+
+    i32 v = read_borrow(r);                  // lectura via shared
+    if (v != 42) return 99;
+    return 42;
+}

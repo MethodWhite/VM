@@ -2527,11 +2527,15 @@ namespace runtime {
             exec_instr_fnarrow, decode_instr_simple_mov
         },
 
-        /* 0x5E */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x5E  strmake_h r_dst, r_src, r_len (FIXED_4)
+                 Crea StringObject FLAT desde un buffer en memoria HOST.
+                 Variante de strmake (0x46) para casos donde el buffer
+                 proviene de malloc/gcallocp/str_cstr y no de memoria VM.
+                 Misma encoding que strmake; ver exec_instr_strmake_h. */
+        {
+            "strmake_h", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_strmake_h, decode_instr_raw_bytes
         },
 
         /* 0x5F */{
@@ -2590,180 +2594,251 @@ namespace runtime {
             exec_instr_callni, decode_instr_callni
         },
 
-        /* 0x65 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x65  gcallocp r_dst, r_size (FIXED_4)
+                 GC alloc + host_ptr al payload directo en r_dst (1 instr VM
+                 vs 3 de la secuencia gcalloc+gcderef+xchg).  Optimizacion
+                 para envs heap de closures (mejora I optimizada). */
+        {
+            "gcallocp", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_gcallocp, decode_instr_gcallocp
         },
 
-        /* 0x66 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x66  spawnargs r_pc (FIXED_4)
+                 Spawn que copia R1..R[R15] del padre al child antes de
+                 make_ready.  Calling convention identica a CALLVM (argc en
+                 R15, args en R1..R12).  Elimina la serializacion via
+                 msgsend para pasar args al spawn body (mejora II
+                 optimizada).  Devuelve PID encoded del child en R0. */
+        {
+            "spawnargs", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_spawnargs, decode_instr_spawnargs
         },
 
-        /* 0x67 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x67  fulfillhlt r_fut, r_value (FIXED_4)
+                 Fusion atomic de fulfill (0x2B) + hlt (0x03) para el path
+                 critico del helper sintetico de @Async: cada `return X`
+                 del body baja a 1 instruccion VM en lugar de 2. */
+        {
+            "fulfillhlt", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_fulfillhlt, decode_instr_fulfillhlt
         },
 
-        /* 0x68 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x68  cmpjmp.cc r_a, r_b, target (FIXED_8, signed)
+                 Cmp signed + jmp.cc fusionados.  Equivalente a:
+                   cmps r_a, r_b
+                   jmp.cond target
+                 en 1 instruccion VM.  Encoding: [0x00][0x68][b2][cond][u32].
+                 Mejora ~33-50% en bytes y elimina 1 instr VM por comparacion
+                 condicional en hot loops. */
+        {
+            "cmpjmp", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_8,
+            exec_instr_cmpjmp, decode_instr_cmpjmp
         },
 
-        /* 0x69 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x69  cmpjmpu.cc r_a, r_b, target (FIXED_8, unsigned)
+                 Identico a 0x68 pero comparacion unsigned (CF se setea
+                 segun a<b unsigned). */
+        {
+            "cmpjmpu", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_8,
+            exec_instr_cmpjmpu, decode_instr_cmpjmp
         },
 
-        /* 0x6A */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x6A  decjnz r_counter, target (FIXED_8)
+                 Decremento + branch-if-not-zero en 1 instr.  Equivalente a:
+                   subs r_counter, 1
+                   jmp.jne target
+                 Reduce 2-3 instr VM -> 1 por iteracion en loops contadores. */
+        {
+            "decjnz", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_8,
+            exec_instr_decjnz, decode_instr_decjnz
         },
 
-        /* 0x6B */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x6B  getargc r_dst (FIXED_4)
+                 Deposita el numero de argumentos del script (argv del programa
+                 Vex) en r_dst.  Builtin Vex `args_count() -> i32`.  Lee de
+                 vm->scheduler.vm_reference.script_args.size(). */
+        {
+            "getargc", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_getargc, decode_instr_two_op_reg
         },
 
-        /* 0x6C */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x6C  getarg r_dst, r_idx (FIXED_4)
+                 Aloca un StringObject FLAT con el contenido del arg[idx] y
+                 deposita su GcHandle en r_dst.  Si idx fuera de rango,
+                 deposita 0 (GC_NULL_HANDLE).  Builtin Vex `args_get(i) -> string`. */
+        {
+            "getarg", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_getarg, decode_instr_two_op_reg
         },
 
-        /* 0x6D */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x6D  unloadmod r_path_addr, r_path_len (FIXED_4)
+                 Descarga un modulo previamente cargado via loadmod.  Mismo
+                 formato de operandos.  R0 = 1 si descargado, 0 si no encontrado.
+                 Builtin Vex `unloadmodule(path) -> i32`. */
+        {
+            "unloadmod", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_unloadmod, decode_instr_two_op_reg
         },
 
-        /* 0x6E */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x6E  getmethat r_class, r_idx (FIXED_4)
+                 Variante reg-reg de getmethod (0xD9).  R00 = &cls->methods[idx]
+                 o 0 si fuera de rango / nulo.  Builtin Vex `getMethodAt(cls, i)`. */
+        {
+            "getmethat", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_getmethat, decode_instr_two_op_reg
         },
 
-        /* 0x6F */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x6F  getfldat r_class, r_idx (FIXED_4)
+                 Variante reg-reg de getfield (0xD8).  R00 = &cls->fields[idx]
+                 o 0 si fuera de rango / nulo.  Builtin Vex `getFieldAt(cls, i)`. */
+        {
+            "getfldat", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_getfldat, decode_instr_two_op_reg
         },
 
-        /* 0x70 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x70  fastpush <mask16> (FIXED_4)
+                 Empuja a la pila los registros marcados en mask en orden
+                 ascendente (r0 primero, r_max ultimo).  1 instr VM reemplaza
+                 N x push reg.  Equivalente a:
+                   subsp rsp, N*8
+                   for each bit r in mask asc:
+                     [rsp + offset] = reg[r]  (offset descendente desde N-1) */
+        {
+            "fastpush", Assembly::Bytecode::AddressingMode::INMED,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_fastpush, decode_instr_fastmask
         },
 
 
-        /* 0x71 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x71  fastpop <mask16> (FIXED_4)
+                 Desempila los registros marcados restaurando los valores en
+                 orden simetrico al fastpush con el mismo mask.  Avanza RSP
+                 por N*8 al final. */
+        {
+            "fastpop", Assembly::Bytecode::AddressingMode::INMED,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_fastpop, decode_instr_fastmask
         },
 
-        /* 0x72 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x72  mvtake r_dst_addr, r_src_addr (FIXED_4)
+                 Move-and-take: copia un qword desde [r_src_addr] a
+                 [r_dst_addr] y zerifica [r_src_addr] en una sola
+                 instruccion VM (3 host x86-64 cuando llegue el JIT).
+                 Primitivo de move-ownership para smart pointers
+                 unique<T> y shared<T>: tras la operacion, el slot
+                 fuente queda invalidado (binding == null) lo que
+                 garantiza que el cleanup automatico en scope exit
+                 no haga double-free.  No es atomic cross-thread por
+                 diseno (move es siempre intra-thread).
+                 Encoding: [0x00][0x72][byte2][0x00] con
+                 byte2 = (r_src<<4) | r_dst. */
+        {
+            "mvtake", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_mvtake, decode_instr_two_op_reg
         },
 
-        /* 0x73 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x73  adds3 r_dst, r_src1, r_src2  (FIXED_4)
+                 Super-instruccion ADD signed con 3 operandos.  Combina
+                 `mov rd, rs1; adds rd, rs2` en una sola instruccion VM. */
+        {
+            "adds3", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_alu3, decode_instr_raw_bytes
         },
 
-        /* 0x74 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x74  subs3 r_dst, r_src1, r_src2  (FIXED_4) */
+        {
+            "subs3", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_alu3, decode_instr_raw_bytes
         },
 
-        /* 0x75 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x75  muls3 r_dst, r_src1, r_src2  (FIXED_4) */
+        {
+            "muls3", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_alu3, decode_instr_raw_bytes
         },
 
-        /* 0x76 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x76  addu3 r_dst, r_src1, r_src2  (FIXED_4) */
+        {
+            "addu3", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_alu3, decode_instr_raw_bytes
         },
 
-        /* 0x77 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x77  subu3 r_dst, r_src1, r_src2  (FIXED_4) */
+        {
+            "subu3", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_alu3, decode_instr_raw_bytes
         },
 
-        /* 0x78 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x78  mulu3 r_dst, r_src1, r_src2  (FIXED_4) */
+        {
+            "mulu3", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_alu3, decode_instr_raw_bytes
         },
 
-        /* 0x79 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x79  and3 r_dst, r_src1, r_src2  (FIXED_4) */
+        {
+            "and3", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_alu3, decode_instr_raw_bytes
         },
 
-        /* 0x7A */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x7A  or3 r_dst, r_src1, r_src2  (FIXED_4) */
+        {
+            "or3", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_alu3, decode_instr_raw_bytes
         },
 
-        /* 0x7B */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x7B  xor3 r_dst, r_src1, r_src2  (FIXED_4) */
+        {
+            "xor3", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_alu3, decode_instr_raw_bytes
         },
 
-        /* 0x7C */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x7C  loadz r_dst, r_src  (FIXED_4)
+                 Super-instruccion: load N-bit con zero-extend a 64-bit en
+                 una sola instruccion VM.  Sustituye el patron tipico:
+                     mov r_dst, 0       ; (clear)
+                     mov r_dst.d, [src] ; (32-bit load preserving upper)
+                 que el emisor IR genera para LOAD i8/i16/i32/u8/u16/u32.
+                 Encoding:
+                     [0x00][0x7C][ctrl][regs]
+                     ctrl bits 7-6 = mode (0=8b, 1=16b, 2=32b, 3=64b)
+                     ctrl bit  5   = is_host (1 = host_ptr, 0 = VM mem)
+                     regs = (r_src<<4) | r_dst */
+        {
+            "loadz", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_loadz, decode_instr_simple_mov
         },
 
-        /* 0x7D */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0x7D  loadzh r_dst, r_src  (FIXED_4)
+                 Variante HOST de loadz.  Mismo encoding pero el bit s
+                 del ctrl byte = 1.  Lee desde memoria del proceso host
+                 en lugar del vm_mem virtual. */
+        {
+            "loadzh", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_loadz, decode_instr_simple_mov
         },
 
         /* 0x7E */{

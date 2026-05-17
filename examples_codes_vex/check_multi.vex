@@ -1,0 +1,28 @@
+// Test: multiples factories que devuelven unique<i64> con deleter custom.
+// El deleter incrementa un contador.  No dereferenciamos el value porque
+// unique_with(111, ...) stores 111 literal en el slot (no aloca).
+
+class C {
+    public static i64 releases;
+}
+
+void track_release(i64 p) {
+    C.releases = C.releases + 1;
+}
+
+unique<i64> make_tracked(i64 v) {
+    unique<i64> p = unique_with(v, track_release);
+    return p;
+}
+
+i32 main() {
+    C.releases = 0;
+    {
+        unique<i64> a = make_tracked(111);
+        unique<i64> b = make_tracked(222);
+        // No dereferenciamos.  Solo dejamos que el cleanup ocurra al RET.
+    }
+    return 42;
+    // Al RET: cleanup de a y b -> dispatch dinamico via slot+8 ->
+    //         track_release(111) y track_release(222) (orden LIFO).
+}

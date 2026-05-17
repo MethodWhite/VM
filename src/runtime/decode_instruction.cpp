@@ -21,6 +21,7 @@
 #include "runtime/decode_table.h"
 #include "runtime/dispatch_table.h"
 #include "runtime/runtime.h"
+#include <cstdio>   // debug temporal
 
 // Activar con -DDEBUG_DECODE_PRINT para volcar cada instruccion descodificada
 //#define DEBUG_DECODE_PRINT
@@ -174,8 +175,17 @@ namespace runtime {
         uint8_t n1 = static_cast<uint8_t>(data & 0x00FF); // byte de modo
         uint8_t n2 = static_cast<uint8_t>((data & 0xFF00) >> 8); // byte de registros
 
-        // extraer modo de los bits 7-6 del byte de control
-        instr.flags_info.mode = (n1 >> 6) & 0b11;
+        // ctrl byte: mode(2) | signed(1) | dir(1) | reg(4)
+        // Extraer mode, _signed_instruct y direction del byte de control.
+        // Sin extraer el bit signed, las variantes con/sin signo
+        // (cmpu/cmps, addu/adds, etc.) compartirian _signed_instruct con
+        // el valor residual de la icache, llevando a semantica indefinida
+        // en CF/OF.  Bug observado: cmpu r2(0), r3(3) tomaba la rama
+        // erronea porque _signed_instruct quedaba a 1 -> SubOp::flags
+        // entraba por la rama signed y dejaba CF=0 en lugar de CF=1.
+        instr.flags_info.mode             = (n1 >> 6) & 0b11;  // ancho del operando
+        instr.flags_info._signed_instruct = (n1 >> 5) & 0b1;   // variante con/sin signo
+        instr.flags_info.direction        = (n1 >> 4) & 0b1;   // direccion (reservado)
 
         // los dos registros se codifican en el mismo byte: nibble bajo = reg1, nibble alto = reg2
         instr.data_instruction.reg_data.reg1 = static_cast<uint8_t>(n2 & 0xF);
@@ -841,6 +851,99 @@ namespace runtime {
         uint8_t  b2   = vm->vm_mem[base];
         instr.data_instruction.reg_data.reg1 = (b2 >> 4) & 0x0F; // r_fn
         instr.data_instruction.reg_data.reg2 = 0;                 // sin uso
+    }
+
+    /**
+     * @brief Decoder de @c gcallocp (FIXED_4, 2 regs en byte2).
+     * Layout: [0x00][0x65][b2][0x00] con b2 = (r_dst<<4) | r_size.
+     * Aloca en GcHeap y deposita host_ptr al payload directo en r_dst.
+     */
+    void decode_instr_gcallocp(ProcessVM *vm, DecodedInstr &instr) {
+        instr.flags_info.size_instr = 4;
+        uint64_t base = vm->registers.rip.raw() + 2;
+        uint8_t  b2   = vm->vm_mem[base];
+        instr.data_instruction.reg_data.reg1 = (b2 >> 4) & 0x0F; // r_dst
+        instr.data_instruction.reg_data.reg2 = b2 & 0x0F;         // r_size
+    }
+
+    /**
+     * @brief Decoder de @c spawnargs (FIXED_4, 1 reg en byte2 hi-nibble).
+     * Layout: [0x00][0x66][b2][0x00] con b2 = (r_pc<<4).  argc se lee de R15.
+     */
+    void decode_instr_spawnargs(ProcessVM *vm, DecodedInstr &instr) {
+        instr.flags_info.size_instr = 4;
+        uint64_t base = vm->registers.rip.raw() + 2;
+        uint8_t  b2   = vm->vm_mem[base];
+        instr.data_instruction.reg_data.reg1 = (b2 >> 4) & 0x0F; // r_pc
+        instr.data_instruction.reg_data.reg2 = 0;
+    }
+
+    /**
+     * @brief Decoder de @c fulfillhlt (FIXED_4, 2 regs en byte2).
+     * Layout: [0x00][0x67][b2][0x00] con b2 = (r_fut<<4) | r_value.
+     */
+    void decode_instr_fulfillhlt(ProcessVM *vm, DecodedInstr &instr) {
+        instr.flags_info.size_instr = 4;
+        uint64_t base = vm->registers.rip.raw() + 2;
+        uint8_t  b2   = vm->vm_mem[base];
+        instr.data_instruction.reg_data.reg1 = (b2 >> 4) & 0x0F; // r_fut
+        instr.data_instruction.reg_data.reg2 = b2 & 0x0F;         // r_value
+    }
+
+    /**
+     * @brief Decoder de @c cmpjmp / @c cmpjmpu (FIXED_8).
+     * Layout: [0x00][0x68|0x69][b2][cond][target_u32_LE]
+     *   static_data.r0     = r_a
+     *   static_data.r1     = r_b
+     *   static_data._pad   = cond_byte (0x00..0x0D)
+     *   static_data.offset = target u32
+     */
+    void decode_instr_cmpjmp(ProcessVM *vm, DecodedInstr &instr) {
+        instr.flags_info.size_instr = 8;
+        uint64_t base = vm->registers.rip.raw() + 2;
+        uint8_t  b2   = vm->vm_mem[base];
+        uint8_t  cond = vm->vm_mem[base + 1];
+        instr.data_instruction.static_data.r0     = (b2 >> 4) & 0x0F;
+        instr.data_instruction.static_data.r1     = b2 & 0x0F;
+        instr.data_instruction.static_data._pad   = static_cast<uint16_t>(cond);
+        instr.data_instruction.static_data.offset = vm->vm_mem.read_u32(base + 2);
+    }
+
+    /**
+     * @brief Decoder de @c decjnz (FIXED_8, 1 reg + target).
+     * Layout: [0x00][0x6A][b2][0x00][target_u32_LE]
+     *   static_data.r0     = r_counter
+     *   static_data.offset = target u32
+     */
+    void decode_instr_decjnz(ProcessVM *vm, DecodedInstr &instr) {
+        instr.flags_info.size_instr = 8;
+        uint64_t base = vm->registers.rip.raw() + 2;
+        uint8_t  b2   = vm->vm_mem[base];
+        instr.data_instruction.static_data.r0     = (b2 >> 4) & 0x0F;
+        instr.data_instruction.static_data.r1     = 0;
+        instr.data_instruction.static_data._pad   = 0;
+        instr.data_instruction.static_data.offset = vm->vm_mem.read_u32(base + 2);
+    }
+
+    /**
+     * @brief Descodifica @c fastpush / @c fastpop (extended 0x6B / 0x6C, FIXED_4).
+     *
+     * Layout fisico: [0x00][opcode2][mask_lo][mask_hi]
+     * Bytes [rip+2..rip+3] forman el mask uint16 little-endian.
+     */
+    void decode_instr_fastmask(ProcessVM *vm, DecodedInstr &instr) {
+        instr.flags_info.size_instr = 4;
+        const uint64_t base = vm->registers.rip.raw() + 2;
+        const uint8_t  lo   = vm->vm_mem[base];
+        const uint8_t  hi   = vm->vm_mem[base + 1];
+        instr.data_instruction.mask_data.mask =
+            static_cast<uint16_t>(lo) |
+            (static_cast<uint16_t>(hi) << 8);
+
+        DBG_DECODE(instr.pc, "Instruccion decode: ", instr.metadata->name,
+                   " mask=0x" << std::hex
+                   << (unsigned)instr.data_instruction.mask_data.mask
+                   << std::dec);
     }
 
     void decode_instr_calln(ProcessVM *vm, DecodedInstr &instr) {

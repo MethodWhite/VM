@@ -222,8 +222,17 @@ namespace vex {
             case PrimitiveKind::TREEMAP: return ir::IrType::I64;
             case PrimitiveKind::TREESET: return ir::IrType::I64;
             case PrimitiveKind::STACK: return ir::IrType::I64;
+            // Smart pointers: slot stack con host_ptr (8 bytes).
+            case PrimitiveKind::UNIQUE_PTR: return ir::IrType::PTR;
+            case PrimitiveKind::SHARED_PTR: return ir::IrType::PTR;
+            // Borrows: host_ptr de 8 bytes (zero overhead vs T* raw).
+            case PrimitiveKind::BORROW:     return ir::IrType::PTR;
+            case PrimitiveKind::BORROW_MUT: return ir::IrType::PTR;
+            // Future<T>: handle i64.
+            case PrimitiveKind::FUTURE:     return ir::IrType::I64;
+            // FUNCTION: par (fn_addr, env_addr); usamos PTR como aproximacion.
+            case PrimitiveKind::FUNCTION:   return ir::IrType::PTR;
             case PrimitiveKind::COUNT: return ir::IrType::VOID;
-            default: break;
         }
         return ir::IrType::VOID;
     }
@@ -241,6 +250,18 @@ namespace vex {
         // datos estaticos y imports nativos sin pasar el modulo en cada
         // signature.
         out_mod_ = &out_module;
+
+        // Inferir el fichero fuente del primer AST node con loc.file no
+        // vacio.  Esto se usa en warnings emitidos por @c cast_if_needed
+        // que solo recibe @c source_line.  Sin esta inferencia, los
+        // warnings se imprimirian sin nombre de fichero.
+        for (auto &d : mod_.decls) {
+            if (!d) continue;
+            if (!d->loc.file.empty()) {
+                current_file_ = d->loc.file;
+                break;
+            }
+        }
 
         // Pase 1: registrar el tipo de retorno de cada funcion para validar
         // las llamadas.  Esto en un programa real ya esta en el type checker,
@@ -298,10 +319,23 @@ namespace vex {
                     is_function_ret = true;
                     fn_returns_function_.insert(fd->name);
                 }
+                // Smart pointers: SRET de 8 bytes para `unique<T>` o
+                // `shared<T>`.  Sin esto, devolver un smart pointer
+                // desde una funcion seria inseguro (su slot vive en el
+                // stack del callee y muere al RET).  Con SRET el caller
+                // aloca el slot y el callee copia los 8 bytes ahi.
+                bool is_smartptr_ret = false;
+                if ((kind == PrimitiveKind::UNIQUE_PTR
+                  || kind == PrimitiveKind::SHARED_PTR)
+                  && fd->return_type) {
+                    is_smartptr_ret = true;
+                    fn_returns_smartptr_.insert(fd->name);
+                }
                 if (kind == PrimitiveKind::OPTIONAL
                     || kind == PrimitiveKind::RESULT
                     || is_user_enum
-                    || is_function_ret) {
+                    || is_function_ret
+                    || is_smartptr_ret) {
                     rt = ir::IrType::VOID;
                 }
                 fn_return_types_[fd->name] = rt;
@@ -408,12 +442,20 @@ namespace vex {
         generate_new_helpers(out_module);
         generate_module_init_function(out_module);
 
+        // Exportar metadata POO al @c IrModule para que el port transpiler
+        // (port-C, etc.) emita codigo POO eficiente sin reconstruir las
+        // clases desde @c __module_init.  Llamar tras lower_class_methods
+        // para que los @c IrMethod::ir_fn_name apunten a IrFunctions ya
+        // emitidas en @c out_module.functions.
+        export_classes_to_ir(out_module);
+
         // volcar las funciones sinteticas de spawn DESPUES de las
         // de usuario y POO.  Asi main sigue siendo la primera funcion del
         // modulo (entry point con hlt) y los helpers de spawn quedan al
         // final como funciones normales (cierran con ret, pero el body
         // siempre incluye un hlt explicito antes del fin del bloque).
         for (auto &h: pending_spawn_helpers_) {
+            propagate_is_gc_object_through_phis(h);
             out_module.add_function(std::move(h));
         }
         pending_spawn_helpers_.clear();
@@ -447,10 +489,14 @@ namespace vex {
         // (gap O): SRET para funciones que retornan FUNCTION.  El
         // slot del function value tiene 16 bytes (fn_addr + env_addr).
         const bool sret_function = (sem_ret.kind == PrimitiveKind::FUNCTION);
+        // Smart pointers: SRET de 8 bytes para `unique<T>` / `shared<T>`.
+        const bool sret_smartptr = (sem_ret.kind == PrimitiveKind::UNIQUE_PTR
+            || sem_ret.kind == PrimitiveKind::SHARED_PTR);
         const bool sret          = (sem_ret.kind == PrimitiveKind::OPTIONAL
             || sem_ret.kind == PrimitiveKind::RESULT
             || sret_enum
-            || sret_function);
+            || sret_function
+            || sret_smartptr);
         if (fd->return_type
             && fd->return_type->kind == ast::NodeKind::PrimitiveTypeNode) {
             auto *pt    = static_cast<ast::PrimitiveTypeNode *>(fd->return_type.get());
@@ -545,6 +591,13 @@ namespace vex {
         } else if (sret_function) {
             // el slot del function value es siempre 16 bytes.
             sret_buf_size_ = 16ULL;
+        } else if (sret_smartptr) {
+            // Smart pointer slot.  unique<T> usa Tier 1 (16 bytes: ptr + deleter).
+            // shared<T> usa 8 bytes (host_ptr al control block; deleter
+            // vive en el control block del GcHeap).  No tenemos forma
+            // simple de discriminar aqui (sem_ret.kind UNIQUE vs SHARED);
+            // usamos 16 para unique y 8 para shared.
+            sret_buf_size_ = (sem_ret.kind == PrimitiveKind::UNIQUE_PTR) ? 16ULL : 8ULL;
         } else if (sret) {
             sret_buf_size_ = (sem_ret.kind == PrimitiveKind::OPTIONAL ? 16ULL : 24ULL);
         } else {
@@ -646,6 +699,19 @@ namespace vex {
             }
         }
 
+        // Instrumentacion: vex_trace:enter al inicio.  Solo para funciones
+        // de usuario (saltamos __module_init, __new_*, __async_*, __lambda_*,
+        // __spawn_* y wrappers internos).  El bytecode VM, JIT y ports
+        // heredan la instrumentacion porque vive en el IR.
+        if (instrument_mode_ != "none" && instrument_mode_ != ""
+            && fd->name != "__module_init"
+            && fd->name.compare(0, 6, "__new_") != 0
+            && fd->name.compare(0, 8, "__async_") != 0
+            && fd->name.compare(0, 9, "__lambda_") != 0
+            && fd->name.compare(0, 8, "__spawn_") != 0) {
+            emit_instrument_enter(fd->name, fd->loc.line);
+        }
+
         // Cuerpo.
         if (fd->body) {
             lower_block(fd->body.get());
@@ -659,6 +725,15 @@ namespace vex {
             // del RET implicito.  Garantiza liberacion incluso si la
             // funcion cae al final sin un return explicito.
             emit_cleanups_all();
+            // Instrumentacion: vex_trace:exit antes del RET implicito.
+            if (instrument_mode_ != "none" && instrument_mode_ != ""
+                && fd->name != "__module_init"
+                && fd->name.compare(0, 6, "__new_") != 0
+                && fd->name.compare(0, 8, "__async_") != 0
+                && fd->name.compare(0, 9, "__lambda_") != 0
+                && fd->name.compare(0, 8, "__spawn_") != 0) {
+                emit_instrument_exit(fd->name, ir::IR_NO_VALUE, fd->loc.line);
+            }
             ir::IrInstr ret{};
             ret.op   = ir::IrOp::RET;
             ret.type = fn.ret_type;
@@ -685,8 +760,40 @@ namespace vex {
                          "' usada en goto pero nunca declarada");
             }
         }
+        propagate_is_gc_object_through_phis(fn);
         out.add_function(std::move(fn));
         fn_ = nullptr;
+    }
+
+    // Bug D fix: propagar is_gc_object a traves de todos los PHI nodes hasta
+    // punto fijo.  Cualquier IrValue cuya origen sea un host_ptr GC-managed
+    // (clase) debe heredar el flag para que save_live_regs del IR emitter
+    // convierta a gchandle pre-CALL (estable a evacuacion del GC) en lugar
+    // de pushar host_ptr crudo.  Sin esta propagacion, los PHIs de
+    // loops/if-merges con NULL inicial + valor real en back-edge perdian el
+    // flag, causando segfaults tras cualquier CALL (e.g. str_make) que
+    // disparara GC con head/tail vivos en regs.
+    void Lowering::propagate_is_gc_object_through_phis(ir::IrFunction &fn) {
+        bool gc_changed = true;
+        while (gc_changed) {
+            gc_changed = false;
+            for (auto &blk: fn.blocks) {
+                for (auto &ins: blk.instrs) {
+                    if (ins.op != ir::IrOp::PHI) continue;
+                    if (ins.dst == ir::IR_NO_VALUE) continue;
+                    if (static_cast<size_t>(ins.dst) >= fn.values.size()) continue;
+                    if (fn.values[ins.dst].is_gc_object) continue;
+                    for (const auto &arg: ins.phi_args) {
+                        if (static_cast<size_t>(arg.value) < fn.values.size()
+                         && fn.values[arg.value].is_gc_object) {
+                            fn.values[ins.dst].is_gc_object = true;
+                            gc_changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -880,6 +987,38 @@ namespace vex {
         // Resolver el Type semantico (aplicando aliases y structs).
         const Type sem_type = tc_.resolve_type_node(vd->type.get());
 
+        // Tracking para fix #1 newInstance: si el tipo declarado es alias
+        // `Class` y el init es `Class.forName("X")` con X literal, registrar
+        // var_name -> "X" para que `cls.newInstance()` luego pueda emitir
+        // `new X()` directo (con ctor invocado).  Detectamos via
+        // FieldAccessExpr con property_kind=100 (forName) que el type
+        // checker ya marco.
+        if (vd->type && vd->type->kind == ast::NodeKind::NamedTypeNode) {
+            const auto *nt = static_cast<const ast::NamedTypeNode *>(vd->type.get());
+            const bool is_class_alias = (nt->name == "Class");
+            if (is_class_alias && vd->init
+                && vd->init->kind == ast::NodeKind::CallExpr) {
+                auto *ce = static_cast<ast::CallExpr *>(vd->init.get());
+                if (ce->callee
+                    && ce->callee->kind == ast::NodeKind::FieldAccessExpr) {
+                    auto *fa = static_cast<ast::FieldAccessExpr *>(ce->callee.get());
+                    // property_kind 100 = forName (estatico, sin self).
+                    if (fa->property_kind == 100
+                        && ce->args.size() == 1
+                        && ce->args[0]
+                        && ce->args[0]->kind == ast::NodeKind::StringLitExpr) {
+                        auto *slit = static_cast<ast::StringLitExpr *>(ce->args[0].get());
+                        if (!slit->is_interpolated()) {
+                            class_origin_of_local_[vd->name] = slit->value;
+                        }
+                    }
+                }
+            } else if (is_class_alias) {
+                // Init no-trackeable -> borrar entrada previa por seguridad.
+                class_origin_of_local_.erase(vd->name);
+            }
+        }
+
         // Array init C-style: `i32 arr[N] = {e0, e1, ...};`.
         if (sem_type.kind == PrimitiveKind::ARRAY && vd->init
             && vd->init->kind == ast::NodeKind::InitListExpr) {
@@ -914,8 +1053,19 @@ namespace vex {
             for (size_t i = 0; i < il->elements.size(); ++i) {
                 ir::IrValueId v_val = lower_expr(il->elements[i].get());
                 if (v_val == ir::IR_NO_VALUE) continue;
+                // Suprimir warning de narrowing si el elemento es literal
+                // (`{10, 20, ...}` con i64-defaulted literals encajando en
+                // el tipo de elemento).  Mismo razonamiento que en
+                // var-decl con init literal.
+                const bool elem_is_literal =
+                        il->elements[i]->kind == ast::NodeKind::IntLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::FloatLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::BoolLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::CharLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::NullLitExpr;
                 v_val = cast_if_needed(v_val,
-                                       fn_->values[v_val].type, ir_elem, vd->loc.line);
+                                       fn_->values[v_val].type, ir_elem, vd->loc.line,
+                                       /*is_explicit=*/elem_is_literal);
                 ir::IrValueId v_addr_i = addr;
                 if (i > 0) {
                     ir::IrValueId v_off = emit_const(ir::IrType::I64,
@@ -1019,8 +1169,15 @@ namespace vex {
                 ir::IrValueId v_val = lower_expr(il->elements[i].get());
                 if (v_val == ir::IR_NO_VALUE) continue;
                 const ir::IrType ir_ft = ir_type_from_primitive(fi->type.kind);
-                v_val                  = cast_if_needed(v_val,
-                                                        fn_->values[v_val].type, ir_ft, vd->loc.line);
+                const bool elem_is_literal =
+                        il->elements[i]->kind == ast::NodeKind::IntLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::FloatLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::BoolLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::CharLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::NullLitExpr;
+                v_val = cast_if_needed(v_val,
+                                       fn_->values[v_val].type, ir_ft, vd->loc.line,
+                                       /*is_explicit=*/elem_is_literal);
                 ir::IrValueId v_addr = addr;
                 if (fi->offset > 0) {
                     ir::IrValueId v_off = emit_const(ir::IrType::I64,
@@ -1228,8 +1385,19 @@ namespace vex {
             for (size_t i = 0; i < il->elements.size(); ++i) {
                 ir::IrValueId v_val = lower_expr(il->elements[i].get());
                 if (v_val == ir::IR_NO_VALUE) continue;
+                // Suprimir warning de narrowing si el elemento es literal
+                // (`{10, 20, ...}` con i64-defaulted literals encajando en
+                // el tipo de elemento).  Mismo razonamiento que en
+                // var-decl con init literal.
+                const bool elem_is_literal =
+                        il->elements[i]->kind == ast::NodeKind::IntLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::FloatLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::BoolLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::CharLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::NullLitExpr;
                 v_val = cast_if_needed(v_val,
-                                       fn_->values[v_val].type, ir_elem, vd->loc.line);
+                                       fn_->values[v_val].type, ir_elem, vd->loc.line,
+                                       /*is_explicit=*/elem_is_literal);
                 ir::IrValueId v_addr_i = addr;
                 if (i > 0) {
                     ir::IrValueId v_off = emit_const(ir::IrType::I64,
@@ -1305,8 +1473,15 @@ namespace vex {
                 ir::IrValueId v_val = lower_expr(il->elements[i].get());
                 if (v_val == ir::IR_NO_VALUE) continue;
                 const ir::IrType ir_ft = ir_type_from_primitive(fi->type.kind);
-                v_val                  = cast_if_needed(v_val,
-                                                        fn_->values[v_val].type, ir_ft, vd->loc.line);
+                const bool elem_is_literal =
+                        il->elements[i]->kind == ast::NodeKind::IntLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::FloatLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::BoolLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::CharLitExpr
+                     || il->elements[i]->kind == ast::NodeKind::NullLitExpr;
+                v_val = cast_if_needed(v_val,
+                                       fn_->values[v_val].type, ir_ft, vd->loc.line,
+                                       /*is_explicit=*/elem_is_literal);
                 ir::IrValueId v_addr = addr;
                 if (fi->offset > 0) {
                     ir::IrValueId v_off = emit_const(ir::IrType::I64,
@@ -1406,7 +1581,19 @@ namespace vex {
                 v0 = lower_expr(vd->init.get());
                 if (v0 != ir::IR_NO_VALUE) {
                     const ir::IrType vfrom = fn_->values[v0].type;
-                    v0                     = cast_if_needed(v0, vfrom, vt, vd->loc.line);
+                    // Suprimir el warning de cast implicito cuando el
+                    // init es un literal: `u8 init = 0` no merece
+                    // alarma porque el valor es estatico y conocido en
+                    // compile-time; es un patron habitual y el type
+                    // checker ya valida el rango.
+                    const bool init_is_literal =
+                            vd->init->kind == ast::NodeKind::IntLitExpr
+                         || vd->init->kind == ast::NodeKind::FloatLitExpr
+                         || vd->init->kind == ast::NodeKind::BoolLitExpr
+                         || vd->init->kind == ast::NodeKind::CharLitExpr
+                         || vd->init->kind == ast::NodeKind::NullLitExpr;
+                    v0 = cast_if_needed(v0, vfrom, vt, vd->loc.line,
+                                        /*is_explicit=*/init_is_literal);
                 }
             }
             if (v0 == ir::IR_NO_VALUE) v0 = emit_const(vt, 0, vd->loc.line);
@@ -1423,6 +1610,99 @@ namespace vex {
 
         ir::IrValueId v = ir::IR_NO_VALUE;
         if (vd->init) {
+            // ----- Smart pointer move: unique/shared = move(p) -----
+            // Patron especial: si el tipo destino es unique<T>/shared<T>
+            // y el init es CallExpr(IdentExpr("move"), [p]), transferimos
+            // ownership via mvtake (1 instr VM: copia + zero source).
+            //
+            // Lowering:
+            //   1. lower p -> v_src_slot (SSA value que es la direccion
+            //                            del slot stack del origen).
+            //   2. ALLOCA 8 bytes -> v_dst_slot.
+            //   3. Emit `mvtake [dst], [src]` via RAW_ASM.
+            //   4. Marcar pointee_is_host_ptr en v_dst_slot.
+            //
+            // El cleanup del origen (registrado al declarar p) seguira
+            // ejecutandose al exit del scope; vera 0 en el slot (zerificado
+            // por mvtake) y RAW_FREE(0) sera no-op limpio.
+            if ((sem_type.kind == PrimitiveKind::UNIQUE_PTR
+              || sem_type.kind == PrimitiveKind::SHARED_PTR)
+                && vd->init->kind == ast::NodeKind::CallExpr) {
+                auto *ce = static_cast<ast::CallExpr *>(vd->init.get());
+                if (ce->callee
+                    && ce->callee->kind == ast::NodeKind::IdentExpr
+                    && ce->args.size() == 1) {
+                    auto *cid = static_cast<ast::IdentExpr *>(ce->callee.get());
+                    if (cid->name == "move") {
+                        const ir::IrValueId v_src = lower_expr(ce->args[0].get());
+                        if (v_src != ir::IR_NO_VALUE) {
+                            // unique<T> Tier 1: slot = 16 bytes (ptr + deleter).
+                            // shared<T>: slot = 8 bytes (ctrl_block_ptr).
+                            const uint32_t slot_bytes =
+                                (sem_type.kind == PrimitiveKind::UNIQUE_PTR) ? 16 : 8;
+                            // ALLOCA para el slot destino.
+                            const ir::IrValueId v_dst = fn_->new_value(ir::IrType::PTR);
+                            {
+                                ir::IrInstr al{};
+                                al.op          = ir::IrOp::ALLOCA;
+                                al.type        = ir::IrType::I8;
+                                al.dst         = v_dst;
+                                al.imm         = slot_bytes;
+                                al.source_line = vd->loc.line;
+                                fn_->append(current_block_, std::move(al));
+                            }
+                            // Emit mvtake [v_dst+0], [v_src+0] (ptr).
+                            // Para unique<T> tambien emit mvtake [v_dst+8], [v_src+8] (deleter).
+                            {
+                                ir::IrInstr ra{};
+                                ra.op          = ir::IrOp::RAW_ASM;
+                                ra.type        = ir::IrType::VOID;
+                                ra.dst         = ir::IR_NO_VALUE;
+                                ra.operands    = {v_dst, v_src};
+                                ra.func_name   = "mvtake {src0}, {src1}\n";
+                                ra.source_line = vd->loc.line;
+                                fn_->append(current_block_, std::move(ra));
+                            }
+                            if (slot_bytes == 16) {
+                                // Segundo qword: deleter.  Calculamos los dos
+                                // punteros +8 y emitimos otro mvtake.
+                                const ir::IrValueId v_eight  = emit_const(ir::IrType::I64, 8, vd->loc.line);
+                                const ir::IrValueId v_dst8   = fn_->new_value(ir::IrType::PTR);
+                                const ir::IrValueId v_src8   = fn_->new_value(ir::IrType::PTR);
+                                {
+                                    ir::IrInstr add{};
+                                    add.op          = ir::IrOp::ADD;
+                                    add.type        = ir::IrType::I64;
+                                    add.dst         = v_dst8;
+                                    add.operands    = {v_dst, v_eight};
+                                    add.source_line = vd->loc.line;
+                                    fn_->append(current_block_, std::move(add));
+                                }
+                                {
+                                    ir::IrInstr add{};
+                                    add.op          = ir::IrOp::ADD;
+                                    add.type        = ir::IrType::I64;
+                                    add.dst         = v_src8;
+                                    add.operands    = {v_src, v_eight};
+                                    add.source_line = vd->loc.line;
+                                    fn_->append(current_block_, std::move(add));
+                                }
+                                ir::IrInstr ra2{};
+                                ra2.op          = ir::IrOp::RAW_ASM;
+                                ra2.type        = ir::IrType::VOID;
+                                ra2.dst         = ir::IR_NO_VALUE;
+                                ra2.operands    = {v_dst8, v_src8};
+                                ra2.func_name   = "mvtake {src0}, {src1}\n";
+                                ra2.source_line = vd->loc.line;
+                                fn_->append(current_block_, std::move(ra2));
+                            }
+                            fn_->values[v_dst].pointee_is_host_ptr = true;
+                            v = v_dst;
+                            goto bind_and_cleanup;
+                        }
+                    }
+                }
+            }
             // Lazy promotion: si el tipo destino es STRING y el
             // init es un string literal puro (StringLitExpr), promover
             // a StringObject GC-managed via STRMAKE.  Asi `string s =
@@ -1430,8 +1710,11 @@ namespace vex {
             // sin alocar.
             if (sem_type.kind == PrimitiveKind::STRING
                 && vd->init
-                && vd->init->kind == ast::NodeKind::StringLitExpr
-                && !static_cast<ast::StringLitExpr *>(vd->init.get())->is_interpolated()) {
+                && vd->init->kind == ast::NodeKind::StringLitExpr) {
+                // Tanto literales puros como interpolados se promueven
+                // a StringObject GC-managed; el helper detecta el caso
+                // y emite STRMAKE simple o cadena de STRMAKE+STRCAT
+                // segun corresponda.
                 auto *slit = static_cast<ast::StringLitExpr *>(vd->init.get());
                 v          = lower_string_literal_to_string_object(slit);
                 bind(vd->name, v);
@@ -1440,13 +1723,24 @@ namespace vex {
             v = lower_expr(vd->init.get());
             if (v != ir::IR_NO_VALUE) {
                 const ir::IrType vfrom = fn_->values[v].type;
-                v                      = cast_if_needed(v, vfrom, vt, vd->loc.line);
+                // Misma supresion de warning que en la rama
+                // address-taken: literales no merecen alarma de
+                // narrowing porque el valor es compile-time conocido.
+                const bool init_is_literal =
+                        vd->init->kind == ast::NodeKind::IntLitExpr
+                     || vd->init->kind == ast::NodeKind::FloatLitExpr
+                     || vd->init->kind == ast::NodeKind::BoolLitExpr
+                     || vd->init->kind == ast::NodeKind::CharLitExpr
+                     || vd->init->kind == ast::NodeKind::NullLitExpr;
+                v = cast_if_needed(v, vfrom, vt, vd->loc.line,
+                                   /*is_explicit=*/init_is_literal);
             }
         } else {
             // Sin init: defecto 0.  Las variables sin init son raras
             // en uso normal pero el type checker no las prohibe.
             v = emit_const(vt, 0, vd->loc.line);
         }
+    bind_and_cleanup:
         bind(vd->name, v);
 
         // auto-free de colecciones primitivas.  Si el tipo del var
@@ -1541,6 +1835,74 @@ namespace vex {
                 cleanup_stack_.push_back(std::move(act));
             }
         }
+
+        // ---- Smart pointers: registrar cleanup automatico al scope exit ----
+        //
+        // Para @c unique<T>: SMARTPTR_FREE con literal_deleter="free" (default
+        // Tier 0) o nombre de funcion deleter custom (set por unique_with).
+        // Para @c shared<T>: SHAREDPTR_REL (refcount--; GC libera).
+        //
+        // Solo se registra si el local NO escapa (escaping_locals_).  Si
+        // escapa, el caller toma posesion (return) o lo guarda
+        // (asignacion a field/slot/deref), por lo que NO se debe liberar
+        // aqui.
+        if (v != ir::IR_NO_VALUE
+            && (sem_type.kind == PrimitiveKind::UNIQUE_PTR
+             || sem_type.kind == PrimitiveKind::SHARED_PTR)
+            && escaping_locals_.find(vd->name) == escaping_locals_.end()) {
+            CleanupAction act;
+            act.operands        = {v};
+            act.source_line     = vd->loc.line;
+            act.refresh_name    = vd->name;
+            if (sem_type.kind == PrimitiveKind::UNIQUE_PTR) {
+                act.kind            = CleanupAction::Kind::SMARTPTR_FREE;
+                // Decision del literal_deleter (cleanup mas eficiente
+                // posible segun la info compile-time disponible):
+                //
+                //   pending_smartptr_deleter_ no vacio
+                //     -> init fue unique_with(_, deleter) -> usar ese deleter.
+                //
+                //   init es CallExpr (factory que devuelve unique<T>)
+                //     -> dejar literal_deleter vacio -> dispatch dinamico
+                //        via slot+8 al runtime (lee deleter del slot).
+                //
+                //   otro (init es unique_box, IdentExpr, etc.)
+                //     -> usar "free" (Tier 1 con sentinel; el slot[+8]=0).
+                if (!pending_smartptr_deleter_.empty()) {
+                    act.literal_deleter = pending_smartptr_deleter_;
+                } else if (vd->init
+                        && vd->init->kind == ast::NodeKind::CallExpr) {
+                    auto *ce = static_cast<ast::CallExpr *>(vd->init.get());
+                    bool is_factory_call = false;
+                    if (ce->callee && ce->callee->kind == ast::NodeKind::IdentExpr) {
+                        auto *cid = static_cast<ast::IdentExpr *>(ce->callee.get());
+                        // Si el callee no es un builtin de smart pointer
+                        // (unique_box/unique_with/move/...), asumimos
+                        // factory de usuario y usamos dispatch dinamico.
+                        const std::string &n = cid->name;
+                        is_factory_call = (n != "unique_box" && n != "unique_with"
+                                        && n != "shared_box" && n != "shared_with"
+                                        && n != "move");
+                    }
+                    if (is_factory_call) {
+                        act.literal_deleter = "";  // dispatch dinamico
+                    } else {
+                        act.literal_deleter = "free";
+                    }
+                } else {
+                    act.literal_deleter = "free";  // Tier 1 con sentinel
+                }
+                act.slot_size       = 16;  // Tier 1
+            } else {
+                act.kind            = CleanupAction::Kind::SHAREDPTR_REL;
+                act.slot_size       = 8;
+            }
+            cleanup_stack_.push_back(std::move(act));
+        }
+        // Limpiar pending_smartptr_deleter_ tras consumirlo (o si el
+        // var-decl no era smart pointer pero hubo un unique_with previo
+        // sin var-decl asociado, evitar contaminacion del siguiente).
+        pending_smartptr_deleter_.clear();
     }
 
     void Lowering::lower_if(ast::IfStmt *s) {
@@ -1934,6 +2296,22 @@ namespace vex {
                 if (post == ir::IR_NO_VALUE) post = vi.phi_value;
                 fn_->blocks[header_id].instrs[vi.phi_idx]
                         .phi_args.push_back({post, body_end_id});
+                // Bug D fix: si algun arg del PHI es is_gc_object (e.g.
+                // una asignacion en el body propaga un host_ptr GC al
+                // PHI value), el PHI value mismo debe heredar el flag
+                // para que save_live_regs de futuros CALLs lo guarde
+                // como gchandle (estable a evacuacion del GC).  Sin
+                // esto, valores CLASS que entran al loop como NULL
+                // (no-GC) y se asignan en iter 1 a un objeto real,
+                // tienen sus host_ptrs invalidados en iter 2+.
+                if (static_cast<size_t>(post) < fn_->values.size()
+                 && fn_->values[post].is_gc_object) {
+                    fn_->values[vi.phi_value].is_gc_object = true;
+                }
+                if (static_cast<size_t>(vi.pre_loop) < fn_->values.size()
+                 && fn_->values[vi.pre_loop].is_gc_object) {
+                    fn_->values[vi.phi_value].is_gc_object = true;
+                }
             }
         } else {
             // Body termina con un return: el back-edge nunca se ejecuta.
@@ -2397,8 +2775,10 @@ namespace vex {
             // bytes en static_data y el caller intentaria tratarlo como
             // GcHandle, llamando a strraw/strlen sobre basura.
             if (current_fn_returns_string_
-                && s->value->kind == ast::NodeKind::StringLitExpr
-                && !static_cast<ast::StringLitExpr *>(s->value.get())->is_interpolated()) {
+                && s->value->kind == ast::NodeKind::StringLitExpr) {
+                // Tanto literales puros como interpolados: el helper
+                // construye el StringObject (1 STRMAKE para puros,
+                // cadena de STRMAKE+STRCAT para interpolados).
                 auto *slit = static_cast<ast::StringLitExpr *>(s->value.get());
                 v_ret      = lower_string_literal_to_string_object(slit);
             } else {
@@ -2413,20 +2793,58 @@ namespace vex {
         // `fulfill(async_fut, value) + hlt`.  El caller obtendra el valor
         // via `await`.  El hlt es necesario porque el child no debe hacer
         // ret (no hay caller en el stack del child).
+        //
+        // Mejora II: el bytecode `fulfill r_fut, r_value` espera un i64
+        // raw como payload.  Si el `return X` del usuario produjo un valor
+        // de tipo distinto (i32/i16/i8/bool/char/f32/f64), debemos coercerlo
+        // a i64 preservando la semantica de bits para que el `await` del
+        // caller pueda recuperarlo correctamente.  Para floats: BITCAST
+        // (no ITOF que cambiaria el valor).  Para enteros estrechos:
+        // cast_if_needed (zext/sext segun signedness).
         if (async_fut_id_ != ir::IR_NO_VALUE) {
             ir::IrValueId v_payload = v_ret;
             if (v_payload == ir::IR_NO_VALUE) {
                 v_payload = emit_const(ir::IrType::I64, 0, s->loc.line);
+            } else {
+                const ir::IrType pt = fn_->values[v_payload].type;
+                if (pt == ir::IrType::F64) {
+                    ir::IrValueId v_bits = fn_->new_value(ir::IrType::I64);
+                    ir::IrInstr bc{};
+                    bc.op = ir::IrOp::BITCAST;
+                    bc.type = ir::IrType::I64;
+                    bc.dst = v_bits;
+                    bc.operands = {v_payload};
+                    bc.source_line = s->loc.line;
+                    fn_->append(current_block_, std::move(bc));
+                    v_payload = v_bits;
+                } else if (pt == ir::IrType::F32) {
+                    // f32 -> bits i32 -> zero-extend a i64.
+                    ir::IrValueId v_i32 = fn_->new_value(ir::IrType::I32);
+                    ir::IrInstr bc{};
+                    bc.op = ir::IrOp::BITCAST;
+                    bc.type = ir::IrType::I32;
+                    bc.dst = v_i32;
+                    bc.operands = {v_payload};
+                    bc.source_line = s->loc.line;
+                    fn_->append(current_block_, std::move(bc));
+                    v_payload = cast_if_needed(v_i32, ir::IrType::I32,
+                                                ir::IrType::I64, s->loc.line);
+                } else if (pt != ir::IrType::I64 && pt != ir::IrType::U64
+                        && pt != ir::IrType::PTR) {
+                    v_payload = cast_if_needed(v_payload, pt, ir::IrType::I64,
+                                                s->loc.line);
+                }
             }
+            // Optimizado: emitimos `fulfillhlt {src0}, {src1}` en lugar de
+            // `fulfill + hlt` separados (1 instr VM en lugar de 2).
             ir::IrInstr ra{};
             ra.op        = ir::IrOp::RAW_ASM;
             ra.type      = ir::IrType::VOID;
             ra.dst       = ir::IR_NO_VALUE;
             ra.operands  = {async_fut_id_, v_payload};
             ra.func_name = std::string(
-                "// @Async return -> fulfill + hlt\n"
-                "fulfill {src0}, {src1}\n"
-                "hlt\n");
+                "// @Async return -> fulfillhlt (fusionado)\n"
+                "fulfillhlt {src0}, {src1}\n");
             ra.source_line = s->loc.line;
             fn_->append(current_block_, std::move(ra));
             block_terminated_ = true;
@@ -2459,6 +2877,20 @@ namespace vex {
         // El SSA value v_ret sobrevive: el regalloc garantiza que se mantenga
         // vivo hasta el RET (o se reescriba antes si conviene).
         emit_cleanups_all();
+        // Instrumentacion: vex_trace:exit antes del RET explicito.  Skipea
+        // helpers internos (mismo filtro que en lower_function).
+        if (instrument_mode_ != "none" && instrument_mode_ != ""
+            && fn_ != nullptr) {
+            const std::string &fname = fn_->name;
+            const bool is_helper = fname == "__module_init"
+                || fname.compare(0, 6, "__new_") == 0
+                || fname.compare(0, 8, "__async_") == 0
+                || fname.compare(0, 9, "__lambda_") == 0
+                || fname.compare(0, 8, "__spawn_") == 0;
+            if (!is_helper) {
+                emit_instrument_exit(fname, v_ret, s->loc.line);
+            }
+        }
         ir::IrInstr ret{};
         ret.op          = ir::IrOp::RET;
         ret.type        = fn_->ret_type;
@@ -2468,6 +2900,105 @@ namespace vex {
         }
         fn_->append(current_block_, std::move(ret));
         block_terminated_ = true;
+    }
+
+    // =========================================================================
+    //  Instrumentacion (vex_trace:enter / vex_trace:exit)
+    // =========================================================================
+    //
+    // Como el lowering emite CALLN a un nombre @c "vex_trace:enter" /
+    // @c "vex_trace:exit", todos los backends (bytecode VM, JIT, port C,
+    // futuros) heredan la instrumentacion automaticamente.  Cada backend
+    // resuelve el simbolo a su forma:
+    //   - bytecode VM: CALLN se resuelve via stdlib/native/runtime/vex_trace.dll
+    //   - JIT: idem (mismo CALLN dispatch)
+    //   - port C: emit_native_call lo bridgea a fprintf stderr (default)
+    //             o el usuario provee su propia implementacion.
+
+    void Lowering::emit_instrument_enter(const std::string &fn_name,
+                                          uint32_t line) {
+        if (!fn_ || !out_mod_) return;
+        // 1. Internar el nombre como literal en static_data.  Incluye nul
+        //    terminator para que sea NUL-terminated C string utilizable
+        //    por strdup/printf en cualquier backend hosted.
+        std::vector<uint8_t> bytes(fn_name.begin(), fn_name.end());
+        bytes.push_back(0);
+        const uint64_t name_idx = out_mod_->intern_static_data(std::move(bytes));
+
+        // 2. STR_LIT_ADDR: cargar ptr al literal en un SSA value.
+        const ir::IrValueId v_name = fn_->new_value(ir::IrType::PTR);
+        {
+            ir::IrInstr sa{};
+            sa.op          = ir::IrOp::STR_LIT_ADDR;
+            sa.type        = ir::IrType::PTR;
+            sa.dst         = v_name;
+            sa.imm         = name_idx;
+            sa.source_line = line;
+            fn_->append(current_block_, std::move(sa));
+        }
+
+        // 3. CALLN void a "vex_trace:enter"(proc_ptr, name_ptr).
+        //    El proc_ptr lo obtenemos via @c getproc; el plugin nativo
+        //    lo usa para @c vm_read_bytes del nombre.  En port C el
+        //    bridge ignora el proc_ptr.
+        const ir::IrValueId v_proc = emit_getproc(line);
+        ir::IrInstr call{};
+        call.op          = ir::IrOp::CALLN;
+        call.type        = ir::IrType::VOID;
+        call.dst         = ir::IR_NO_VALUE;
+        // El @c lib_path incluye el subdir bajo @c stdlib/native/ para
+        // que el loader pueda resolver la DLL via path relativo al
+        // @c vm.exe (igual convencion que vesta_io / vesta_math).
+        call.func_name   = "stdlib/native/runtime/vex_trace:enter";
+        call.operands    = {v_proc, v_name};
+        call.source_line = line;
+        fn_->append(current_block_, std::move(call));
+
+        // 4. Registrar el import nativo para que el linker .velb
+        //    incluya la libreria.
+        out_mod_->register_native_import(
+            "stdlib/native/runtime/vex_trace", "enter");
+    }
+
+    void Lowering::emit_instrument_exit(const std::string &fn_name,
+                                         ir::IrValueId v_ret,
+                                         uint32_t line) {
+        if (!fn_ || !out_mod_) return;
+        std::vector<uint8_t> bytes(fn_name.begin(), fn_name.end());
+        bytes.push_back(0);
+        const uint64_t name_idx = out_mod_->intern_static_data(std::move(bytes));
+
+        const ir::IrValueId v_name = fn_->new_value(ir::IrType::PTR);
+        {
+            ir::IrInstr sa{};
+            sa.op          = ir::IrOp::STR_LIT_ADDR;
+            sa.type        = ir::IrType::PTR;
+            sa.dst         = v_name;
+            sa.imm         = name_idx;
+            sa.source_line = line;
+            fn_->append(current_block_, std::move(sa));
+        }
+
+        // Si la funcion es void, pasar 0 como return value placeholder.
+        ir::IrValueId v_val = v_ret;
+        if (v_val == ir::IR_NO_VALUE) {
+            v_val = emit_const(ir::IrType::I64, 0, line);
+        }
+
+        const ir::IrValueId v_proc = emit_getproc(line);
+        ir::IrInstr call{};
+        call.op          = ir::IrOp::CALLN;
+        call.type        = ir::IrType::VOID;
+        call.dst         = ir::IR_NO_VALUE;
+        // Usamos @c leave en lugar de @c exit para evitar colision con la
+        // libc @c exit() cuando el port C emite @c extern declarations.
+        call.func_name   = "stdlib/native/runtime/vex_trace:leave";
+        call.operands    = {v_proc, v_name, v_val};
+        call.source_line = line;
+        fn_->append(current_block_, std::move(call));
+
+        out_mod_->register_native_import(
+            "stdlib/native/runtime/vex_trace", "leave");
     }
 
     // Forward decls de helpers definidos mas abajo en el TU.  Necesarias
@@ -2525,7 +3056,19 @@ namespace vex {
         // variable en registros distintos en cada rama -> el merge lee
         // el registro equivocado.  Ej: `i32 v=0; try { v=42; } catch
         // (E e) { v=99; } println(v);` antes y devolvia basura.
-        const auto entry_bindings = scopes_.back();
+        // Snapshot del scope chain APLANADO: combina todos los scopes
+        // visibles desde el current_block_ en un solo mapa, con el
+        // innermost ganando en caso de colision.  Necesario para que
+        // `this` y los parametros del metodo (que viven en el outer
+        // scope, NO en scopes_.back()) sean spillables a traves de
+        // try/catch.  Sin esto, entry_bindings.find("this") fallaba y
+        // la reload del catch leia basura.
+        std::unordered_map<std::string, ir::IrValueId> entry_bindings;
+        for (const auto &sc: scopes_) {
+            for (const auto &kv: sc) {
+                entry_bindings[kv.first] = kv.second; // innermost wins
+            }
+        }
 
         // Pre-scan: detectar variables del scope outer que se
         // asignan dentro del body o de algun catch.  Reservamos un slot
@@ -2637,6 +3180,166 @@ namespace vex {
         scan_assign(s->body.get());
         for (const auto &cc: s->catches) scan_assign(cc.body.get());
 
+        // Pre-scan adicional: detectar variables del scope outer que se
+        // LEEN dentro de los catches (incluyendo `this` y parametros del
+        // metodo).  Sin esto, un throw clobreaba los registros y el
+        // catch leia basura: por ejemplo `try { foo(); } catch (E e)
+        // { this.dlog(...); }` fallaba con CALLVIRT null porque r1
+        // (this) ya no era valido tras el throw.  Tratamos READ-en-catch
+        // igual que assign-en-body: spill al entry value y reload por LOAD
+        // en el merge.  Cubre `this`, parametros, locales no-modificadas
+        // y cualquier otro binding del entry scope.
+        // NOTA: solo escaneamos los CATCH bodies (no el try-body) porque
+        // dentro del try-body los registros se mantienen normales hasta
+        // el throw; el problema es post-throw -> handler.
+        std::function<void(const ast::Expr *)> scan_read_expr;
+        std::function<void(const ast::Stmt *)> scan_read_stmt;
+        // Helper: comprueba si `name` esta visible en CUALQUIER scope
+        // (no solo el innermost).  `this` y los parametros del metodo
+        // viven en el outer scope, por lo que entry_bindings (que solo
+        // tiene el innermost) no los ve.
+        auto is_visible_in_any_scope = [&](const std::string &name) -> bool {
+            for (const auto &sc: scopes_) {
+                if (sc.count(name)) return true;
+            }
+            return false;
+        };
+        scan_read_expr = [&](const ast::Expr *e) {
+            if (!e) return;
+            switch (e->kind) {
+                case ast::NodeKind::IdentExpr: {
+                    auto *id = static_cast<const ast::IdentExpr *>(e);
+                    if (is_visible_in_any_scope(id->name)) {
+                        assigned_in_try.insert(id->name);
+                    }
+                    return;
+                }
+                case ast::NodeKind::ThisExpr: {
+                    // `this` se resuelve via lookup("this") en
+                    // lower_this_expr, igual que un IdentExpr.  Vive
+                    // en el outer scope (function-level binding), no
+                    // en entry_bindings (innermost).  Por eso usamos
+                    // is_visible_in_any_scope.
+                    if (is_visible_in_any_scope("this")) {
+                        assigned_in_try.insert("this");
+                    }
+                    return;
+                }
+                case ast::NodeKind::AssignExpr: {
+                    auto *ae = static_cast<const ast::AssignExpr *>(e);
+                    scan_read_expr(ae->target.get());
+                    scan_read_expr(ae->value.get());
+                    return;
+                }
+                case ast::NodeKind::BinaryExpr: {
+                    auto *be = static_cast<const ast::BinaryExpr *>(e);
+                    scan_read_expr(be->lhs.get());
+                    scan_read_expr(be->rhs.get());
+                    return;
+                }
+                case ast::NodeKind::UnaryExpr: {
+                    auto *ue = static_cast<const ast::UnaryExpr *>(e);
+                    scan_read_expr(ue->operand.get());
+                    return;
+                }
+                case ast::NodeKind::CallExpr: {
+                    auto *ce = static_cast<const ast::CallExpr *>(e);
+                    scan_read_expr(ce->callee.get());
+                    for (auto &a: ce->args) scan_read_expr(a.get());
+                    return;
+                }
+                case ast::NodeKind::FieldAccessExpr: {
+                    auto *fa = static_cast<const ast::FieldAccessExpr *>(e);
+                    scan_read_expr(fa->base.get());
+                    return;
+                }
+                case ast::NodeKind::IndexExpr: {
+                    auto *ix = static_cast<const ast::IndexExpr *>(e);
+                    scan_read_expr(ix->base.get());
+                    scan_read_expr(ix->index.get());
+                    return;
+                }
+                case ast::NodeKind::CastExpr: {
+                    auto *ce = static_cast<const ast::CastExpr *>(e);
+                    scan_read_expr(ce->operand.get());
+                    return;
+                }
+                case ast::NodeKind::NewExpr: {
+                    auto *ne = static_cast<const ast::NewExpr *>(e);
+                    for (auto &a: ne->args) scan_read_expr(a.get());
+                    return;
+                }
+                default: return;
+            }
+        };
+        scan_read_stmt = [&](const ast::Stmt *st) {
+            if (!st) return;
+            switch (st->kind) {
+                case ast::NodeKind::ExprStmt: {
+                    auto *es = static_cast<const ast::ExprStmt *>(st);
+                    scan_read_expr(es->expr.get());
+                    return;
+                }
+                case ast::NodeKind::BlockStmt: {
+                    auto *b = static_cast<const ast::BlockStmt *>(st);
+                    for (auto &s2: b->body) scan_read_stmt(s2.get());
+                    return;
+                }
+                case ast::NodeKind::VarDeclStmt: {
+                    auto *vd = static_cast<const ast::VarDeclStmt *>(st);
+                    if (vd->init) scan_read_expr(vd->init.get());
+                    return;
+                }
+                case ast::NodeKind::IfStmt: {
+                    auto *ifs = static_cast<const ast::IfStmt *>(st);
+                    scan_read_expr(ifs->cond.get());
+                    scan_read_stmt(ifs->then_branch.get());
+                    scan_read_stmt(ifs->else_branch.get());
+                    return;
+                }
+                case ast::NodeKind::WhileStmt: {
+                    auto *ws = static_cast<const ast::WhileStmt *>(st);
+                    scan_read_expr(ws->cond.get());
+                    scan_read_stmt(ws->body.get());
+                    return;
+                }
+                case ast::NodeKind::ForStmt: {
+                    auto *fs = static_cast<const ast::ForStmt *>(st);
+                    scan_read_stmt(fs->init.get());
+                    scan_read_expr(fs->cond.get());
+                    scan_read_expr(fs->step.get());
+                    scan_read_stmt(fs->body.get());
+                    return;
+                }
+                case ast::NodeKind::ReturnStmt: {
+                    auto *rs = static_cast<const ast::ReturnStmt *>(st);
+                    if (rs->value) scan_read_expr(rs->value.get());
+                    return;
+                }
+                case ast::NodeKind::ThrowStmt: {
+                    auto *ts = static_cast<const ast::ThrowStmt *>(st);
+                    if (ts->value) scan_read_expr(ts->value.get());
+                    return;
+                }
+                case ast::NodeKind::TryStmt: {
+                    auto *ts = static_cast<const ast::TryStmt *>(st);
+                    scan_read_stmt(ts->body.get());
+                    for (auto &cc: ts->catches) scan_read_stmt(cc.body.get());
+                    if (ts->finally_body) scan_read_stmt(ts->finally_body.get());
+                    return;
+                }
+                case ast::NodeKind::SynchronizedStmt: {
+                    auto *ss = static_cast<const ast::SynchronizedStmt *>(st);
+                    scan_read_expr(ss->target.get());
+                    scan_read_stmt(ss->body.get());
+                    return;
+                }
+                default: return;
+            }
+        };
+        for (const auto &cc: s->catches) scan_read_stmt(cc.body.get());
+        if (s->finally_body) scan_read_stmt(s->finally_body.get());
+
         // Reservar slots y guardar entry value para cada var asignada.
         // Save try_spill_slots_ previo (puede haber try anidado).
         auto saved_spill_slots = try_spill_slots_;
@@ -2655,9 +3358,16 @@ namespace vex {
             // STORE entry binding al slot (sera visible en catch via LOAD).
             auto it_e = entry_bindings.find(name);
             if (it_e != entry_bindings.end() && it_e->second != ir::IR_NO_VALUE) {
+                // Usar el tipo real del valor (no i64 hardcoded) para
+                // que la STORE coincida con la LOAD posterior y no haya
+                // ambiguedad sobre los bytes altos del slot 8-byte.
+                ir::IrType st_ty = ir::IrType::I64;
+                if (it_e->second < fn_->values.size()) {
+                    st_ty = fn_->values[it_e->second].type;
+                }
                 ir::IrInstr st{};
                 st.op          = ir::IrOp::STORE;
-                st.type        = ir::IrType::I64;
+                st.type        = st_ty;
                 st.dst         = ir::IR_NO_VALUE;
                 st.operands    = {it_e->second, v_slot};
                 st.source_line = s->loc.line;
@@ -2713,6 +3423,11 @@ namespace vex {
                 ra.operands    = {};
                 ra.func_name   = fc.str();
                 ra.source_line = cc.loc.line;
+                // Marca como call-site: el helper findclass usa r5/r6/r12
+                // como scratch internos.  El emitter envuelve con save/restore
+                // de los regs live a traves del raw_asm.  Sin esto, SSA values
+                // asignados por regalloc a esos regs son clobreados silenciosamente.
+                ra.is_call_site = true;
                 fn_->append(current_block_, std::move(ra));
             }
 
@@ -2865,6 +3580,10 @@ namespace vex {
                 fn_->append(current_block_, std::move(rap));
             }
             push_scope();
+            // CRITICO: la primera instruccion del catch debe ser el
+            // `mov {dst}, r0` que captura la excepcion -- r0 lleva el
+            // puntero al FatalError y CUALQUIER instruccion previa
+            // (LOAD desde stack, etc.) puede clobrearlo.
             if (!cc.var_name.empty()) {
                 const ir::IrValueId v_exc = fn_->new_value(ir::IrType::PTR);
                 ir::IrInstr         cap{};
@@ -2875,6 +3594,79 @@ namespace vex {
                 cap.source_line = cc.loc.line;
                 fn_->append(current_block_, std::move(cap));
                 bind(cc.var_name, v_exc);
+            }
+            // Recargar TODOS los nombres spilled desde su slot DESPUES
+            // del bind de la excepcion (para no clobrear r0).  Bindeamos
+            // en el scope OUTER (no en el inner del catch) para que:
+            //   1. El write_local del catch body actualice ese scope.
+            //   2. El binding sobreviva al pop_scope siguiente.
+            //   3. La rama finally+merge vea el ultimo valor.
+            // Sin esto, las vars spilled (incluido `this` y parametros)
+            // quedaban con valor stale tras el throw -- el regalloc
+            // clobreaba sus registros durante el unwind.
+            // Buscar el scope outer (penultimo); el inner es el catch
+            // que acabamos de pushear.
+            std::unordered_map<std::string, ir::IrValueId> *outer_scope =
+                (scopes_.size() >= 2) ? &scopes_[scopes_.size() - 2]
+                                      : &scopes_.back();
+            for (const auto &kv: try_spill_slots_) {
+                const std::string & name   = kv.first;
+                const ir::IrValueId v_slot = kv.second;
+                if (saved_spill_slots.count(name)
+                    && saved_spill_slots.at(name) == v_slot) {
+                    continue;  // slot heredado de try outer
+                }
+                ir::IrType ity = ir::IrType::I64;
+                auto it_e = entry_bindings.find(name);
+                if (it_e != entry_bindings.end()
+                    && it_e->second != ir::IR_NO_VALUE
+                    && it_e->second < fn_->values.size()) {
+                    ity = fn_->values[it_e->second].type;
+                }
+                ir::IrValueId v_load = fn_->new_value(ity);
+                ir::IrInstr   ld{};
+                ld.op          = ir::IrOp::LOAD;
+                // Usar el tipo REAL del valor (no i64 hardcoded).  Si
+                // el value era i32 pero leemos i64, los bytes altos del
+                // slot 8-byte alloca son basura no inicializada (la
+                // STORE inicial solo escribio 4 bytes) y corrompen la
+                // aritmetica posterior.
+                ld.type        = ity;
+                ld.dst         = v_load;
+                ld.operands    = {v_slot};
+                ld.source_line = cc.loc.line;
+                fn_->append(current_block_, std::move(ld));
+                // Propagar is_host_ptr / is_gc_object del entry_value
+                // si lo tenia, para que el catch maneje host pointers
+                // y GC objects correctamente sin perder los flags.
+                if (it_e != entry_bindings.end()
+                    && it_e->second != ir::IR_NO_VALUE
+                    && it_e->second < fn_->values.size()) {
+                    const auto &src_val = fn_->values[it_e->second];
+                    fn_->values[v_load].is_host_ptr =
+                        src_val.is_host_ptr;
+                    fn_->values[v_load].is_gc_object =
+                        src_val.is_gc_object;
+                    fn_->values[v_load].pointee_is_host_ptr =
+                        src_val.pointee_is_host_ptr;
+                }
+                // Buscar el scope (NO el inner del catch) donde el name
+                // vive y actualizarlo.  Si esta en multiples niveles,
+                // actualizamos el mas cercano al exterior (sin tocar
+                // el inner del catch).
+                bool updated = false;
+                if (scopes_.size() >= 2) {
+                    for (auto it = scopes_.rbegin() + 1; it != scopes_.rend(); ++it) {
+                        if (it->count(name)) {
+                            (*it)[name] = v_load;
+                            updated = true;
+                            break;
+                        }
+                    }
+                }
+                if (!updated) {
+                    (*outer_scope)[name] = v_load;
+                }
             }
             if (cc.body) lower_stmt(cc.body.get());
             pop_scope();
@@ -2993,11 +3785,25 @@ namespace vex {
             ir::IrValueId v_load = fn_->new_value(ity);
             ir::IrInstr   ld{};
             ld.op          = ir::IrOp::LOAD;
-            ld.type        = ir::IrType::I64;
+            // Usar el tipo real del valor (no i64 hardcoded) para
+            // evitar leer bytes basura del slot 8-byte alloca.
+            ld.type        = ity;
             ld.dst         = v_load;
             ld.operands    = {v_slot};
             ld.source_line = s->loc.line;
             fn_->append(current_block_, std::move(ld));
+            // Propagar flags is_host_ptr/is_gc_object del entry value.
+            if (it_e != entry_bindings.end()
+                && it_e->second != ir::IR_NO_VALUE
+                && it_e->second < fn_->values.size()) {
+                const auto &src_val = fn_->values[it_e->second];
+                fn_->values[v_load].is_host_ptr =
+                    src_val.is_host_ptr;
+                fn_->values[v_load].is_gc_object =
+                    src_val.is_gc_object;
+                fn_->values[v_load].pointee_is_host_ptr =
+                    src_val.pointee_is_host_ptr;
+            }
             scopes_.back()[name] = v_load;
         }
 
@@ -3236,6 +4042,188 @@ namespace vex {
                     cf.operands    = std::move(args);
                     cf.source_line = it->source_line;
                     fn_->append(current_block_, std::move(cf));
+                    break;
+                }
+                case CleanupAction::Kind::SMARTPTR_FREE: {
+                    // Cleanup de @c unique<T> en scope exit.
+                    //
+                    // Tier 1 layout: slot[+0]=ptr, slot[+8]=deleter_addr.
+                    //   deleter_addr == 0 -> sentinel: RAW_FREE(ptr).
+                    //   deleter_addr != 0 -> CALLVMR(deleter_addr, ptr).
+                    //
+                    // Si literal_deleter esta poblado (caso comun:
+                    // var-decl con init = unique_box/unique_with), usamos
+                    // ese conocimiento compile-time para emitir el cleanup
+                    // mas eficiente (RAW_FREE directo, CALLVM @Absolute
+                    // fijo, o CALLN @Method para extern wrappers).
+                    //
+                    // Si NO esta poblado (caso SRET: el unique vino de
+                    // una funcion que lo creo internamente), leemos el
+                    // deleter_addr del slot+8 y dispatchamos dinamicamente.
+                    const ir::IrValueId v_ptr = fn_->new_value(ir::IrType::PTR);
+                    fn_->values[v_ptr].is_host_ptr = true;
+                    ir::IrInstr ld{};
+                    ld.op          = ir::IrOp::LOAD;
+                    ld.type        = ir::IrType::I64;
+                    ld.dst         = v_ptr;
+                    ld.operands    = opnds;  // [v_slot]
+                    ld.source_line = it->source_line;
+                    fn_->append(current_block_, std::move(ld));
+
+                    if (it->literal_deleter.empty()) {
+                        // SRET case: el smart pointer vino de una funcion
+                        // (factory).  No tenemos info compile-time del
+                        // deleter; lo leemos dinamicamente del slot+8.
+                        // Si deleter_addr == 0 -> RAW_FREE; si != 0 ->
+                        // callvmr al puntero (deleter Vesta).
+                        const ir::IrValueId v_eight  = emit_const(ir::IrType::I64, 8, it->source_line);
+                        const ir::IrValueId v_slot8  = fn_->new_value(ir::IrType::PTR);
+                        {
+                            ir::IrInstr add{};
+                            add.op          = ir::IrOp::ADD;
+                            add.type        = ir::IrType::I64;
+                            add.dst         = v_slot8;
+                            add.operands    = {opnds[0], v_eight};
+                            add.source_line = it->source_line;
+                            fn_->append(current_block_, std::move(add));
+                        }
+                        const ir::IrValueId v_del = fn_->new_value(ir::IrType::I64);
+                        {
+                            ir::IrInstr ldd{};
+                            ldd.op          = ir::IrOp::LOAD;
+                            ldd.type        = ir::IrType::I64;
+                            ldd.dst         = v_del;
+                            ldd.operands    = {v_slot8};
+                            ldd.source_line = it->source_line;
+                            fn_->append(current_block_, std::move(ldd));
+                        }
+                        const uint32_t lbl = ++cleanup_label_seq_;
+                        const std::string default_lbl = "__sp_def_" + std::to_string(lbl);
+                        const std::string skip_lbl    = "__sp_skip_" + std::to_string(lbl);
+                        const std::string done_lbl    = "__sp_done_" + std::to_string(lbl);
+                        // cmpu ptr, 0; jmp.je done  (skip si moved)
+                        // cmpu deleter, 0; jmp.je default  (deleter=0 -> RAW_FREE)
+                        // mov r1, ptr; mov r15, 1; callvmr deleter; jmp done
+                        // default: mov r1, ptr; (RAW_FREE inline)
+                        // done:
+                        ir::IrInstr ra{};
+                        ra.op          = ir::IrOp::RAW_ASM;
+                        ra.type        = ir::IrType::VOID;
+                        ra.dst         = ir::IR_NO_VALUE;
+                        ra.operands    = {v_ptr, v_del};
+                        // Bug fix: si {src1} (deleter) esta en r1 (o el
+                        // regalloc lo asigna a r1 con CSE/SLF), el `mov r1,
+                        // {src0}` lo clobrea ANTES de callvmr.  Solucion:
+                        // staging via r14 (scratch) para garantizar que el
+                        // deleter sobrevive al setup de args.
+                        ra.func_name   = std::string(
+                            "// unique<T> cleanup (SRET): dispatch dinamico via slot+8\n"
+                            "cmpu {src0}, 0\n"
+                            "jmp.je ") + done_lbl + "\n"
+                            "cmpu {src1}, 0\n"
+                            "jmp.je " + default_lbl + "\n"
+                            "mov r14, {src1}\n"   // staging deleter
+                            "mov r1, {src0}\n"
+                            "mov r15, 1\n"
+                            "callvmr r14\n"
+                            "jmp.jmp " + done_lbl + "\n"
+                            + default_lbl + ":\n"
+                            "mov r1, {src0}\n"
+                            "free r1\n"
+                            + done_lbl + ":\n";
+                        ra.source_line = it->source_line;
+                        ra.is_call_site = true;
+                        fn_->append(current_block_, std::move(ra));
+                    } else if (it->literal_deleter == "free") {
+                        // Deleter por defecto: RAW_FREE (null-safe).
+                        ir::IrInstr fr{};
+                        fr.op          = ir::IrOp::RAW_FREE;
+                        fr.type        = ir::IrType::VOID;
+                        fr.dst         = ir::IR_NO_VALUE;
+                        fr.operands    = {v_ptr};
+                        fr.source_line = it->source_line;
+                        fn_->append(current_block_, std::move(fr));
+                    } else if (it->literal_deleter.rfind("@extern:", 0) == 0) {
+                        // CALLN al simbolo nativo.  Formato del literal:
+                        // "@extern:<lib>:<fn>".  Extraemos "<lib>:<fn>"
+                        // que es el formato directo de CALLN.func_name.
+                        // Skip null si ptr == 0 (el deleter nativo puede
+                        // crashear con ptr null).  Usamos RAW_ASM con
+                        // labels unicas para evitar colisiones.
+                        const std::string fn_label =
+                            it->literal_deleter.substr(8);  // skip "@extern:"
+                        const uint32_t lbl = ++cleanup_label_seq_;
+                        const std::string skip_lbl = "__sp_skip_" + std::to_string(lbl);
+                        // RAW_ASM: cmpu ptr, 0; jmp.je skip; mov r1, ptr; mov r15, 1;
+                        //          calln @Method("<lib>:<fn>"); skip:
+                        ir::IrInstr ra{};
+                        ra.op          = ir::IrOp::RAW_ASM;
+                        ra.type        = ir::IrType::VOID;
+                        ra.dst         = ir::IR_NO_VALUE;
+                        ra.operands    = {v_ptr};
+                        ra.func_name   = std::string(
+                            "// unique<T> cleanup (extern): CALLN deleter si ptr != 0\n"
+                            "cmpu {src0}, 0\n"
+                            "jmp.je ") + skip_lbl + "\n"
+                            "mov r1, {src0}\n"
+                            "mov r15, 1\n"
+                            "calln @Method(\"" + fn_label + "\")\n"
+                            + skip_lbl + ":\n";
+                        ra.source_line = it->source_line;
+                        ra.is_call_site = true;
+                        fn_->append(current_block_, std::move(ra));
+                    } else {
+                        // CALLVM al simbolo Vesta del usuario.  Igual que
+                        // CALLN pero con calling convention Vesta.  Skip
+                        // null por seguridad.
+                        const uint32_t lbl = ++cleanup_label_seq_;
+                        const std::string skip_lbl = "__sp_skip_" + std::to_string(lbl);
+                        ir::IrInstr ra{};
+                        ra.op          = ir::IrOp::RAW_ASM;
+                        ra.type        = ir::IrType::VOID;
+                        ra.dst         = ir::IR_NO_VALUE;
+                        ra.operands    = {v_ptr};
+                        ra.func_name   = std::string(
+                            "// unique<T> cleanup (vesta): CALLVM deleter si ptr != 0\n"
+                            "cmpu {src0}, 0\n"
+                            "jmp.je ") + skip_lbl + "\n"
+                            "mov r1, {src0}\n"
+                            "mov r15, 1\n"
+                            "callvm @Absolute(\"code." + it->literal_deleter + "\")\n"
+                            + skip_lbl + ":\n";
+                        ra.source_line = it->source_line;
+                        ra.is_call_site = true;
+                        fn_->append(current_block_, std::move(ra));
+                    }
+                    break;
+                }
+                case CleanupAction::Kind::SHAREDPTR_REL: {
+                    // Cleanup de @c shared<T> en scope exit: decrementa
+                    // refcount del control block.  El GC libera el bloque
+                    // cuando ya no haya roots.  Como el slot puede ser 0
+                    // (moved), comprobamos antes.
+                    //
+                    // Implementacion: LOAD ctrl; si ctrl != 0, LOAD rc; SUB 1; STORE rc.
+                    // No emitimos free explicito porque el GcHeap se encarga
+                    // de liberar bloques sin roots cuando se ejecuta major_gc.
+                    const uint32_t lbl = ++cleanup_label_seq_;
+                    const std::string lbl_str = "__sh_skip_" + std::to_string(lbl);
+                    ir::IrInstr ra{};
+                    ra.op          = ir::IrOp::RAW_ASM;
+                    ra.type        = ir::IrType::VOID;
+                    ra.dst         = ir::IR_NO_VALUE;
+                    ra.operands    = opnds;  // [v_slot]
+                    ra.func_name   = std::string(
+                        "// shared<T> cleanup: dec refcount\n"
+                        "mov r14, [{src0}]\n"                  // r14 = ctrl
+                        "cmpu r14, 0\n"
+                        "jmp.je ") + lbl_str + "\n"
+                        "mov r13, [r14]\n"                   // r13 = refcount
+                        "subs r13, 1\n"
+                        "mov [r14], r13\n"                   // STORE refcount-1
+                        + lbl_str + ":\n";
+                    ra.source_line = it->source_line;
+                    fn_->append(current_block_, std::move(ra));
                     break;
                 }
             }
@@ -3916,6 +4904,37 @@ namespace vex {
         const std::string fn_name = generate_lambda_helper(e);
         e->synthetic_name         = fn_name;
 
+        // marker: emitir MAKE_CLOSURE ANTES de la secuencia explicita
+        // de ALLOCA env + STOREs + ALLOCA fv + STORE fn + STORE env.
+        // Identifica la construccion completa para que el C2 JIT 
+        // pueda hacer escape analysis y eventualmente promover env a stack /
+        // eliminar la alocacion si la closure no escapa.  El IR emitter
+        // actual lo trata como no-op; las instrucciones siguientes hacen el
+        // trabajo real.  Capacidad de capturas marcadas como mutables: 16
+        // (caben en bits 1..16 del imm; >= 16 deja el sobrante sin marcar y
+        // el C2 cae al path conservativo).
+        {
+            uint64_t mutable_mask = 0;
+            for (size_t i = 0; i < N && i < 16; ++i) {
+                for (const auto &nm: e->mutable_captures) {
+                    if (nm == e->captures[i]) {
+                        mutable_mask |= (1ULL << i);
+                        break;
+                    }
+                }
+            }
+            ir::IrInstr mc{};
+            mc.op          = ir::IrOp::MAKE_CLOSURE;
+            mc.type        = ir::IrType::VOID;
+            mc.dst         = ir::IR_NO_VALUE;
+            mc.operands    = capture_vals;          // N captures como SSA values
+            mc.func_name   = fn_name;               // nombre del helper sintetico
+            mc.imm         = (e->env_in_heap ? 1ULL : 0ULL)  // bit 0: env_kind
+                           | (mutable_mask << 1);            // bits 1..16: mutable mask
+            mc.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(mc));
+        }
+
         // -------------------------------------------------------------
         // 1. Alocar env block (8*N bytes; un qword por capture sin huecos).
         //
@@ -3936,16 +4955,26 @@ namespace vex {
         if (N == 0) {
             env_addr = emit_const(ir::IrType::I64, 0, e->loc.line);
         } else if (e->env_in_heap) {
-            // Heap raw via RAW_ALLOC.  Marcamos is_host_ptr para que los
-            // STOREs siguientes emitan movh.  Sin free explicito (leak
-            // controlado: el env vive hasta el fin del proceso).
+            // Heap GC-tracked via GC_ALLOC.  El bloque entra en HandleTable
+            // y el GC ve el payload (mark_reachable lo escanea como qword
+            // array): si algun capture es un GcHandle vivo, se mantiene
+            // marcado transitivamente; cuando ningun root referencia el
+            // env (function value muere), se libera en el proximo major_gc.
+            //
+            // Marcamos is_host_ptr=true para que los STOREs siguientes (de
+            // los captures al env) emitan movh (memoria HOST), ya que el
+            // GcHeap usa ArenaManager con VirtualAlloc/mmap (host).
+            //
+            // Sustituye al RAW_ALLOC anterior (cerrado: gap O / leak en
+            // closures que escapan).  Coste vs RAW_ALLOC: 1 slot extra en
+            // HandleTable + zero-init del payload (que ya hacia rawalloc).
             env_addr                          = fn_->new_value(ir::IrType::PTR);
             fn_->values[env_addr].is_host_ptr = true;
             const ir::IrValueId v_size        = emit_const(ir::IrType::I64,
                                                            static_cast<uint64_t>(N * 8),
                                                            e->loc.line);
             ir::IrInstr ins{};
-            ins.op          = ir::IrOp::RAW_ALLOC;
+            ins.op          = ir::IrOp::GC_ALLOC;
             ins.type        = ir::IrType::PTR;
             ins.dst         = env_addr;
             ins.operands    = {v_size};
@@ -4108,6 +5137,42 @@ namespace vex {
             return ir::IR_NO_VALUE;
         }
 
+        // marker: MAKE_VARIANT identifica la construccion completa de
+        // un valor ADT.  Emitido ANTES de la secuencia ALLOCA + STOREs para
+        // que el C2 JIT (Phase D.8) pueda reconocer el patron y aplicar
+        // escape analysis (promocion del slot a regs si no escapa) +
+        // case-splitting eficiente del match downstream.  No produce SSA
+        // value; el emitter actual lo trata como no-op.
+        //
+        // Lower de los args ANTES del marker para que sus SSA values
+        // esten disponibles como operandos.
+        std::vector<ir::IrValueId> payload_vals;
+        payload_vals.reserve(args.size());
+        for (size_t i = 0; i < args.size() && i < var->field_types.size(); ++i) {
+            ir::IrValueId v = lower_expr(args[i].get());
+            if (v == ir::IR_NO_VALUE) {
+                v = emit_const(ir::IrType::I64, 0, loc.line);
+            }
+            // Promover a i64 si el tipo es mas estrecho (mismo trato que en
+            // las STOREs reales).  Para PTR / i64 es identidad.
+            ir::IrType vt = fn_->values[v].type;
+            if (vt != ir::IrType::I64 && vt != ir::IrType::PTR) {
+                v = cast_if_needed(v, vt, ir::IrType::I64, loc.line);
+            }
+            payload_vals.push_back(v);
+        }
+        {
+            ir::IrInstr mv{};
+            mv.op          = ir::IrOp::MAKE_VARIANT;
+            mv.type        = ir::IrType::VOID;
+            mv.dst         = ir::IR_NO_VALUE;
+            mv.operands    = payload_vals;
+            mv.func_name   = enum_name + "." + variant_name;
+            mv.imm         = static_cast<uint64_t>(var->tag);
+            mv.source_line = loc.line;
+            fn_->append(current_block_, std::move(mv));
+        }
+
         // 1. ALLOCA slot del enum (size_bytes = 8 + 8*max_payload_fields).
         const ir::IrValueId addr = fn_->new_value(ir::IrType::PTR); {
             ir::IrInstr al{};
@@ -4133,15 +5198,11 @@ namespace vex {
         }
 
         // 3. STORE de cada payload arg en offset 8 + 8*i (promovido a i64).
-        for (size_t i = 0; i < args.size() && i < var->field_types.size(); ++i) {
-            ir::IrValueId v = lower_expr(args[i].get());
+        // Reusa los payload_vals ya lowereados arriba (para el marker
+        // MAKE_VARIANT): evita doble-lowering de los args.
+        for (size_t i = 0; i < payload_vals.size(); ++i) {
+            ir::IrValueId v = payload_vals[i];
             if (v == ir::IR_NO_VALUE) continue;
-            // Promover a i64 si el tipo es mas estrecho.  Para PTR / i64
-            // es identidad.
-            ir::IrType vt = fn_->values[v].type;
-            if (vt != ir::IrType::I64 && vt != ir::IrType::PTR) {
-                v = cast_if_needed(v, vt, ir::IrType::I64, loc.line);
-            }
 
             // Calcular addr_i = addr + (8 + 8*i).
             const uint64_t off    = 8ULL + 8ULL * static_cast<uint64_t>(i);
@@ -4185,6 +5246,27 @@ namespace vex {
         // 1. Lower del scrutinee -> SSA PTR al slot.
         ir::IrValueId scrut_addr = lower_expr(e->scrutinee.get());
         if (scrut_addr == ir::IR_NO_VALUE) return ir::IR_NO_VALUE;
+
+        // marker: MATCH_VARIANT identifica el inicio del match.  Emitido
+        // ANTES del LOAD del tag + cadena cmp+br para que el C2 JIT
+        // reconozca el patron y emita dispatch eficiente
+        // (jumptable si tags densos, switch tree balanceado si dispersos).
+        // No produce SSA value; el emitter actual lo trata como no-op.
+        {
+            size_t n_concrete = 0;
+            for (const auto &arm: e->arms) {
+                if (arm.variant_name != "_") n_concrete++;
+            }
+            ir::IrInstr mt{};
+            mt.op          = ir::IrOp::MATCH_VARIANT;
+            mt.type        = ir::IrType::VOID;
+            mt.dst         = ir::IR_NO_VALUE;
+            mt.operands    = {scrut_addr};
+            mt.func_name   = st.struct_name;  // nombre del enum
+            mt.imm         = static_cast<uint64_t>(n_concrete);
+            mt.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(mt));
+        }
 
         // 2. LOAD i64 del tag en offset 0.
         ir::IrValueId tag_v = fn_->new_value(ir::IrType::I64); {
@@ -4547,6 +5629,27 @@ namespace vex {
         }
         const std::string helper_name = std::string("__async_") + fd->name;
 
+        // Mejora II optimizada: numero de parametros del usuario.  Pasamos
+        // los args al helper via @c spawnargs (R1..R[argc]) en lugar de
+        // serializarlos a un buffer y enviarlos via msgsend.  El handle
+        // del Future tambien viaja por R1 (slot 0 en la nueva calling
+        // convention del helper: arg[0] = future handle, arg[1..N] = args).
+        // Asi:
+        //   - Wrapper: emit args en R2..R[N+1] + R1=fut + R15=N+1 + spawnargs.
+        //     ~3 instr en lugar de ~12 (alloca + N+1 stores + msgsend).
+        //   - Helper:  los params estan ya en R1..R[N+1], NO necesita
+        //     ALLOCA + msgrecv + N+1 LOADs + casts.
+        // Total: ~26 instr -> ~3 instr por @Async call (~9x mas rapido).
+        const size_t n_params = fd->params.size();
+        if (n_params + 1 > 12) {
+            // Calling convention de spawnargs: R1..R[argc] con argc <= 12.
+            // Reservamos R1 para el handle del Future, asi quedan 11 slots
+            // para args del usuario.
+            error_at(fd->loc,
+                "@Async: numero de parametros excede el maximo (11)");
+            return;
+        }
+
         // ---------------------------------------------------------------
         // 1. Construir el SPAWN HELPER (lo encolamos en pending_spawn_helpers_
         //    para que se vuelque al final, despues de main).
@@ -4576,35 +5679,45 @@ namespace vex {
         host_bearing_locals_.clear();
         cleanup_stack_.clear();
 
-        // 1a. msgrecv -> my_fut.  Buffer en stack 8 bytes, msgrecv, load.
-        const ir::IrValueId v_buf = fn_->new_value(ir::IrType::PTR); {
-            ir::IrInstr al{};
-            al.op          = ir::IrOp::ALLOCA;
-            al.type        = ir::IrType::I8;
-            al.dst         = v_buf;
-            al.imm         = 8;
-            al.source_line = fd->loc.line;
-            fn_->append(current_block_, std::move(al));
+        // Mejora II optimizada: el helper recibe args directos en R1..R[N+1]
+        // gracias a @c spawnargs (sin msgrecv + buffer).  Calling convention:
+        //   R1         = handle del Future
+        //   R2..R[N+1] = parametros del usuario en el orden declarado
+        // Declarar formalmente los params como un IrFunction normal: el
+        // primer param es el handle (siempre I64), el resto son los del
+        // usuario con su tipo declarado.
+        ir::IrValueId v_my_fut;
+        {
+            // Primer parametro IR: future handle (I64).
+            v_my_fut = fn_->new_value(ir::IrType::I64, "__async_fut");
+            fn_->values[v_my_fut].is_param = true;
+            fn_->params.push_back(v_my_fut);
         }
-        const ir::IrValueId v_max = emit_const(ir::IrType::I64, 8, fd->loc.line); {
-            ir::IrInstr ra{};
-            ra.op        = ir::IrOp::RAW_ASM;
-            ra.type      = ir::IrType::VOID;
-            ra.dst       = ir::IR_NO_VALUE;
-            ra.operands  = {v_buf, v_max};
-            ra.func_name = std::string("// @Async helper: recibir handle del Future\n"
-                "msgrecv {src0}, {src1}\n");
-            ra.source_line = fd->loc.line;
-            fn_->append(current_block_, std::move(ra));
-        }
-        const ir::IrValueId v_my_fut = fn_->new_value(ir::IrType::I64); {
-            ir::IrInstr ld{};
-            ld.op          = ir::IrOp::LOAD;
-            ld.type        = ir::IrType::I64;
-            ld.dst         = v_my_fut;
-            ld.operands    = {v_buf};
-            ld.source_line = fd->loc.line;
-            fn_->append(current_block_, std::move(ld));
+        for (size_t pi = 0; pi < n_params; ++pi) {
+            auto &p = fd->params[pi];
+            // Determinar el IrType del param segun el tipo declarado.
+            ir::IrType pt_ir = ir::IrType::I64;
+            if (p->type) {
+                if (auto *prim = dynamic_cast<ast::NamedTypeNode *>(p->type.get())) {
+                    const std::string &nm = prim->name;
+                    if      (nm == "i8")    pt_ir = ir::IrType::I8;
+                    else if (nm == "i16")   pt_ir = ir::IrType::I16;
+                    else if (nm == "i32" || nm == "int32_t")  pt_ir = ir::IrType::I32;
+                    else if (nm == "i64" || nm == "int64_t")  pt_ir = ir::IrType::I64;
+                    else if (nm == "u8")    pt_ir = ir::IrType::U8;
+                    else if (nm == "u16")   pt_ir = ir::IrType::U16;
+                    else if (nm == "u32" || nm == "uint32_t") pt_ir = ir::IrType::U32;
+                    else if (nm == "u64" || nm == "uint64_t") pt_ir = ir::IrType::U64;
+                    else if (nm == "f32" || nm == "float")    pt_ir = ir::IrType::F32;
+                    else if (nm == "f64" || nm == "double")   pt_ir = ir::IrType::F64;
+                    else if (nm == "bool")  pt_ir = ir::IrType::BOOL;
+                    else if (nm == "char")  pt_ir = ir::IrType::I8;
+                }
+            }
+            ir::IrValueId pv = fn_->new_value(pt_ir, p->name);
+            fn_->values[pv].is_param = true;
+            fn_->params.push_back(pv);
+            bind(p->name, pv);
         }
 
         // 1b. Activar interception de return en lower_return.
@@ -4614,7 +5727,8 @@ namespace vex {
         lower_block(fd->body.get());
 
         // 1d. Fallback: si el body cae naturalmente sin return, emitir
-        //     un fulfill default (0) + hlt para terminar el child.
+        //     fulfillhlt(my_fut, 0) para terminar el child con valor 0.
+        //     Optimizado: 1 instr en lugar de fulfill+hlt separados.
         if (!block_terminated_) {
             const ir::IrValueId v_zero = emit_const(ir::IrType::I64, 0, fd->loc.line);
             ir::IrInstr         ra{};
@@ -4622,9 +5736,8 @@ namespace vex {
             ra.type      = ir::IrType::VOID;
             ra.dst       = ir::IR_NO_VALUE;
             ra.operands  = {v_my_fut, v_zero};
-            ra.func_name = std::string("// @Async helper: sin return -> fulfill(0) + hlt\n"
-                "fulfill {src0}, {src1}\n"
-                "hlt\n");
+            ra.func_name = std::string("// @Async helper: sin return -> fulfillhlt(0)\n"
+                "fulfillhlt {src0}, {src1}\n");
             ra.source_line = fd->loc.line;
             fn_->append(current_block_, std::move(ra));
             block_terminated_ = true;
@@ -4646,10 +5759,14 @@ namespace vex {
 
         // ---------------------------------------------------------------
         // 2. Construir el WRAPPER publico con el nombre de la funcion.
+        //    El wrapper recibe los args del usuario via la calling convention
+        //    normal CALLVM (R1..R12), aloca un Future, spawnea el helper,
+        //    serializa (handle, args) en un buffer y los envia al helper
+        //    via msgsend.  Devuelve el handle del Future al caller.
         // ---------------------------------------------------------------
         ir::IrFunction wrapper_fn;
         wrapper_fn.name             = fd->name;
-        wrapper_fn.ret_type         = ir::IrType::I64;
+        wrapper_fn.ret_type         = ir::IrType::I64; // bytecode level: handle
         const ir::IrBlockId w_entry = wrapper_fn.new_block("entry");
 
         fn_               = &wrapper_fn;
@@ -4661,6 +5778,39 @@ namespace vex {
         host_bearing_locals_.clear();
         cleanup_stack_.clear();
         async_fut_id_ = ir::IR_NO_VALUE; // wrapper NO es async body
+
+        // Mejora II: declarar los parametros del wrapper igual que en una
+        // funcion normal.  Cada param se mapea a un IrType y se vincula
+        // con su nombre para que su SSA value se pueda leer mas abajo
+        // cuando serializamos los args al buffer.
+        std::vector<ir::IrValueId> param_vals;
+        param_vals.reserve(n_params);
+        for (size_t pi = 0; pi < n_params; ++pi) {
+            auto &p = fd->params[pi];
+            ir::IrType pt_ir = ir::IrType::I64;
+            if (p->type) {
+                if (auto *prim = dynamic_cast<ast::NamedTypeNode *>(p->type.get())) {
+                    const std::string &nm = prim->name;
+                    if      (nm == "i8")    pt_ir = ir::IrType::I8;
+                    else if (nm == "i16")   pt_ir = ir::IrType::I16;
+                    else if (nm == "i32" || nm == "int32_t")  pt_ir = ir::IrType::I32;
+                    else if (nm == "i64" || nm == "int64_t")  pt_ir = ir::IrType::I64;
+                    else if (nm == "u8")    pt_ir = ir::IrType::U8;
+                    else if (nm == "u16")   pt_ir = ir::IrType::U16;
+                    else if (nm == "u32" || nm == "uint32_t") pt_ir = ir::IrType::U32;
+                    else if (nm == "u64" || nm == "uint64_t") pt_ir = ir::IrType::U64;
+                    else if (nm == "f32" || nm == "float")    pt_ir = ir::IrType::F32;
+                    else if (nm == "f64" || nm == "double")   pt_ir = ir::IrType::F64;
+                    else if (nm == "bool")  pt_ir = ir::IrType::BOOL;
+                    else if (nm == "char")  pt_ir = ir::IrType::I8;
+                }
+            }
+            const ir::IrValueId pv = fn_->new_value(pt_ir, p->name);
+            fn_->values[pv].is_param = true;
+            fn_->params.push_back(pv);
+            bind(p->name, pv);
+            param_vals.push_back(pv);
+        }
 
         // 2a. fut = future_alloc().
         const ir::IrValueId v_fut = fn_->new_value(ir::IrType::I64); {
@@ -4675,7 +5825,55 @@ namespace vex {
             fn_->append(current_block_, std::move(ra));
         }
 
-        // 2b. child = spawn helper.
+        // Mejora II optimizada: el wrapper usa IrOp::SPAWN_ARGS que aprovecha
+        // el parallel-move del regalloc para colocar args correctamente en
+        // R1..R[N+1] sin conflictos.  Calling convention:
+        //   R1            = handle del Future
+        //   R2..R[N+1]    = parametros del usuario coerced a i64
+        //   R15           = N+1 (argc total, lo setea el emisor IR)
+        //   spawnargs r_pc -> child PID encoded en R0 (devuelto al caller)
+        //
+        // Esto reemplaza la version previa con buffer + msgsend (~12 instr)
+        // por ~2-3 instr fijas + N moves resueltos por parallel-move +
+        // 1 spawnargs.  Elimina la contencion del lock del mailbox y la
+        // copia de buffer.
+
+        // 2b.1: Coerce cada param del usuario a i64 preservando bits.
+        std::vector<ir::IrValueId> qword_args;
+        qword_args.reserve(n_params);
+        for (size_t pi = 0; pi < n_params; ++pi) {
+            const ir::IrValueId v_param = param_vals[pi];
+            const ir::IrType    pt_ir   = fn_->values[v_param].type;
+            ir::IrValueId       v_qword = v_param;
+            if (pt_ir == ir::IrType::F64) {
+                v_qword = fn_->new_value(ir::IrType::I64);
+                ir::IrInstr bc{};
+                bc.op = ir::IrOp::BITCAST;
+                bc.type = ir::IrType::I64;
+                bc.dst = v_qword;
+                bc.operands = {v_param};
+                bc.source_line = fd->loc.line;
+                fn_->append(current_block_, std::move(bc));
+            } else if (pt_ir == ir::IrType::F32) {
+                ir::IrValueId v_i32 = fn_->new_value(ir::IrType::I32);
+                ir::IrInstr bc{};
+                bc.op = ir::IrOp::BITCAST;
+                bc.type = ir::IrType::I32;
+                bc.dst = v_i32;
+                bc.operands = {v_param};
+                bc.source_line = fd->loc.line;
+                fn_->append(current_block_, std::move(bc));
+                v_qword = cast_if_needed(v_i32, ir::IrType::I32, ir::IrType::I64,
+                                          fd->loc.line);
+            } else if (pt_ir != ir::IrType::I64 && pt_ir != ir::IrType::U64
+                    && pt_ir != ir::IrType::PTR) {
+                v_qword = cast_if_needed(v_param, pt_ir, ir::IrType::I64,
+                                          fd->loc.line);
+            }
+            qword_args.push_back(v_qword);
+        }
+
+        // 2b.2: Cargar la direccion del helper en un SSA value PTR.
         const ir::IrValueId v_pc = fn_->new_value(ir::IrType::PTR); {
             ir::IrInstr ra{};
             ra.op        = ir::IrOp::RAW_ASM;
@@ -4687,49 +5885,27 @@ namespace vex {
             ra.source_line = fd->loc.line;
             fn_->append(current_block_, std::move(ra));
         }
-        const ir::IrValueId v_child = fn_->new_value(ir::IrType::I64); {
-            ir::IrInstr ra{};
-            ra.op        = ir::IrOp::RAW_ASM;
-            ra.type      = ir::IrType::I64;
-            ra.dst       = v_child;
-            ra.operands  = {v_pc};
-            ra.func_name = std::string("// @Async wrapper: spawn child\n"
-                "spawn {src0}\n"
-                "mov {dst}, r0\n");
-            ra.source_line = fd->loc.line;
-            fn_->append(current_block_, std::move(ra));
-        }
 
-        // 2c. msgsend(child, fut).  Buffer + store + msgsend.
-        const ir::IrValueId v_sbuf = fn_->new_value(ir::IrType::PTR); {
-            ir::IrInstr al{};
-            al.op          = ir::IrOp::ALLOCA;
-            al.type        = ir::IrType::I8;
-            al.dst         = v_sbuf;
-            al.imm         = 8;
-            al.source_line = fd->loc.line;
-            fn_->append(current_block_, std::move(al));
-        } {
-            ir::IrInstr st{};
-            st.op          = ir::IrOp::STORE;
-            st.type        = ir::IrType::I64;
-            st.operands    = {v_fut, v_sbuf};
-            st.source_line = fd->loc.line;
-            fn_->append(current_block_, std::move(st));
+        // SPAWN_ARGS dedicado.  El emisor IR usa parallel-move para
+        // resolver conflictos al colocar args en sus regs destino.
+        // Operands: [r_pc, fut, arg1, arg2, ..., argN]
+        const ir::IrValueId v_child = fn_->new_value(ir::IrType::I64);
+        {
+            ir::IrInstr ins{};
+            ins.op          = ir::IrOp::SPAWN_ARGS;
+            ins.type        = ir::IrType::I64;
+            ins.dst         = v_child;
+            ins.operands.reserve(2 + n_params);
+            ins.operands.push_back(v_pc);   // r_pc
+            ins.operands.push_back(v_fut);  // R1 = fut
+            for (auto v : qword_args)        // R2..R[N+1] = args
+                ins.operands.push_back(v);
+            ins.source_line = fd->loc.line;
+            fn_->append(current_block_, std::move(ins));
         }
-        const ir::IrValueId v_len = emit_const(ir::IrType::I64, 8, fd->loc.line); {
-            ir::IrInstr ra{};
-            ra.op        = ir::IrOp::RAW_ASM;
-            ra.type      = ir::IrType::VOID;
-            ra.dst       = ir::IR_NO_VALUE;
-            ra.operands  = {v_child, v_sbuf, v_len};
-            ra.func_name = std::string("// @Async wrapper: msgsend(child, fut)\n"
-                "msgsend {src0}, {src1}, {src2}\n");
-            ra.source_line = fd->loc.line;
-            fn_->append(current_block_, std::move(ra));
-        }
+        (void)v_child; // no usado mas; el child ya esta ejecutando
 
-        // 2d. return fut.
+        // 2c. return fut.
         {
             ir::IrInstr ret{};
             ret.op          = ir::IrOp::RET;
@@ -4741,6 +5917,7 @@ namespace vex {
         }
 
         pop_scope();
+        propagate_is_gc_object_through_phis(wrapper_fn);
         out.add_function(std::move(wrapper_fn));
 
         // Restaurar el contexto (aunque ya estamos al final de la funcion).
@@ -4843,10 +6020,105 @@ namespace vex {
                 return lower_lambda_expr(static_cast<ast::LambdaExpr *>(e));
             case ast::NodeKind::MatchExpr:
                 return lower_match_expr(static_cast<ast::MatchExpr *>(e));
+            case ast::NodeKind::CastExpr:
+                return lower_cast_expr(static_cast<ast::CastExpr *>(e));
             default:
                 unsupported(e->loc, "expresion no soportada en A.1");
                 return ir::IR_NO_VALUE;
         }
+    }
+
+    ir::IrValueId Lowering::lower_cast_expr(ast::CastExpr *e) {
+        if (!e || !e->operand) return ir::IR_NO_VALUE;
+        const ir::IrValueId v_op = lower_expr(e->operand.get());
+        if (v_op == ir::IR_NO_VALUE) return ir::IR_NO_VALUE;
+
+        const Type &dst_type = e->result_type;          // tipo destino del cast
+        const Type &src_type = e->operand->result_type; // tipo del operando
+
+        // Categorias.  PTR/ARRAY se tratan como pointer-like.
+        auto is_ptr_like = [](const Type &t) {
+            return t.kind == PrimitiveKind::PTR
+                || t.kind == PrimitiveKind::ARRAY;
+        };
+        const bool dst_ptr = is_ptr_like(dst_type);
+        const bool src_ptr = is_ptr_like(src_type);
+
+        // ptr <-> ptr: el bit-pattern es identico, solo cambia la
+        // interpretacion (host vs virtual, pointee).  No emitimos
+        // ninguna instruccion IR; reusamos el SSA value tras propagar
+        // los flags is_host_ptr/pointee_is_host_ptr al destino.
+        if (dst_ptr && src_ptr) {
+            // El SSA value sigue siendo el mismo bit-pattern.  Para
+            // que LOAD/STORE posteriores emitan mov vs movh segun el
+            // tipo DESTINO, marcamos el bit en el value resultante.
+            // Convencion: VirtualPtr<T> -> is_host_ptr=false (memoria VM).
+            //             T* (sin is_virtual) -> is_host_ptr=true (host).
+            // Si el bit-pattern original era host_ptr=true y el destino
+            // es VirtualPtr (is_virtual=true), el cast cambia la
+            // interpretacion: el lowering ahora emitira mov en lugar
+            // de movh.  El usuario asume las consecuencias.
+            //
+            // No clonamos el SSA value (eso obligaria a un MOV inutil);
+            // creamos un nuevo SSA value vacio que comparte el reg con
+            // el original via copy-prop natural del IR optimizer.  Para
+            // ello emitimos un BITCAST de PTR a PTR (no-op a nivel
+            // bytecode: se baja a `mov rd, rs` y la siguiente fase de
+            // copy-prop suele eliminarlo).
+            const ir::IrValueId dst = fn_->new_value(ir::IrType::PTR);
+            ir::IrInstr ins{};
+            ins.op          = ir::IrOp::BITCAST;
+            ins.type        = ir::IrType::PTR;
+            ins.dst         = dst;
+            ins.operands    = {v_op};
+            ins.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(ins));
+            // Propagar flags segun el tipo destino.
+            fn_->values[dst].is_host_ptr = !dst_type.is_virtual;
+            // pointee_is_host_ptr: si el destino apunta a otro puntero
+            // host (e.g. T**), el slot apuntado lleva un host_ptr.  Sin
+            // tipo pointee accesible aqui, replicamos el flag del
+            // operando original como aproximacion conservadora.
+            fn_->values[dst].pointee_is_host_ptr =
+                fn_->values[v_op].pointee_is_host_ptr;
+            return dst;
+        }
+
+        // ptr <-> int: BITCAST.  El IR_OP::BITCAST esta diseñado para
+        // exactamente este caso (preserva bits sin conversion numerica).
+        if (dst_ptr || src_ptr) {
+            const ir::IrType ir_dst = ir_type_from_primitive(dst_type.kind);
+            const ir::IrType ir_use = (ir_dst == ir::IrType::VOID)
+                                         ? (dst_ptr ? ir::IrType::PTR : ir::IrType::I64)
+                                         : ir_dst;
+            const ir::IrValueId dst = fn_->new_value(ir_use);
+            ir::IrInstr ins{};
+            ins.op          = ir::IrOp::BITCAST;
+            ins.type        = ir_use;
+            ins.dst         = dst;
+            ins.operands    = {v_op};
+            ins.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(ins));
+            if (dst_ptr) {
+                fn_->values[dst].is_host_ptr = !dst_type.is_virtual;
+            }
+            return dst;
+        }
+
+        // num <-> num: delegar al helper existente.  Maneja int<->int
+        // (TRUNC/ZEXT/SEXT/CAST), int<->float (ITOF/UITOF/FTOI/FTOUI) y
+        // float<->float (F32TOF64/F64TOF32).  Pasamos @c is_explicit=true
+        // para silenciar el warning de cast implicito (el usuario opto
+        // por el cast explicitamente).
+        const ir::IrType ir_from = ir_type_from_primitive(src_type.kind);
+        const ir::IrType ir_to   = ir_type_from_primitive(dst_type.kind);
+        if (ir_from == ir::IrType::VOID || ir_to == ir::IrType::VOID) {
+            // Sin tipos validos en alguno de los lados, devolvemos el
+            // operando sin convertir.  El type checker ya emitio el
+            // error correspondiente.
+            return v_op;
+        }
+        return cast_if_needed(v_op, ir_from, ir_to, e->loc.line, /*is_explicit=*/true);
     }
 
     // ---------------------------------------------------------------------
@@ -5100,37 +6372,204 @@ namespace vex {
 
     ir::IrValueId Lowering::lower_string_literal_to_string_object(
         ast::StringLitExpr *slit) {
-        // 1. Registrar bytes en static_data + STR_LIT_ADDR.
-        std::vector<uint8_t> bytes(slit->value.begin(), slit->value.end());
-        const uint64_t       lit_idx = out_mod_->intern_static_data(std::move(bytes));
-        const uint64_t       lit_len = (uint64_t) slit->value.size();
+        // Helper local: emite STRMAKE de un trozo literal y devuelve
+        // el handle StringObject resultante.
+        auto make_part_handle = [&](const std::string &part_text,
+                                     int line) -> ir::IrValueId {
+            std::vector<uint8_t> pbytes(part_text.begin(), part_text.end());
+            const uint64_t       p_idx = out_mod_->intern_static_data(
+                std::move(pbytes));
+            const uint64_t       p_len = (uint64_t) part_text.size();
+            ir::IrValueId v_addr = fn_->new_value(ir::IrType::PTR); {
+                ir::IrInstr is{};
+                is.op          = ir::IrOp::STR_LIT_ADDR;
+                is.type        = ir::IrType::PTR;
+                is.dst         = v_addr;
+                is.imm         = p_idx;
+                is.source_line = line;
+                fn_->append(current_block_, std::move(is));
+            }
+            ir::IrValueId v_len    = emit_const(ir::IrType::I64, p_len, line);
+            ir::IrValueId v_handle = fn_->new_value(ir::IrType::I64);
+            ir::IrInstr   ra{};
+            ra.op           = ir::IrOp::RAW_ASM;
+            ra.type         = ir::IrType::I64;
+            ra.dst          = v_handle;
+            ra.operands     = {v_addr, v_len};
+            ra.func_name    = std::string("strmake {dst}, {src0}, {src1}\n");
+            ra.source_line  = line;
+            ra.is_call_site = true;
+            fn_->append(current_block_, std::move(ra));
+            return v_handle;
+        };
 
-        ir::IrValueId v_addr = fn_->new_value(ir::IrType::PTR); {
-            ir::IrInstr is{};
-            is.op          = ir::IrOp::STR_LIT_ADDR;
-            is.type        = ir::IrType::PTR;
-            is.dst         = v_addr;
-            is.imm         = lit_idx;
-            is.source_line = slit->loc.line;
-            fn_->append(current_block_, std::move(is));
+        // Fast path: string literal SIN interpolacion -> 1 sola STRMAKE.
+        if (!slit->is_interpolated()) {
+            return make_part_handle(slit->value, slit->loc.line);
         }
-        ir::IrValueId v_len = emit_const(ir::IrType::I64, lit_len,
-                                         slit->loc.line);
 
-        // 2. Emitir strmake via RAW_ASM con substitucion {src0}=v_addr,
-        //    {src1}=v_len, {dst}=handle.  El opcode strmake actualmente
-        //    asume encoding UTF-8 internamente; la compactacion auto
-        //    detecta ASCII puro y reduce.
-        ir::IrValueId v_handle = fn_->new_value(ir::IrType::I64);
-        ir::IrInstr   ra{};
-        ra.op          = ir::IrOp::RAW_ASM;
-        ra.type        = ir::IrType::I64;
-        ra.dst         = v_handle;
-        ra.operands    = {v_addr, v_len};
-        ra.func_name   = std::string("strmake {dst}, {src0}, {src1}\n");
-        ra.source_line = slit->loc.line;
-        fn_->append(current_block_, std::move(ra));
-        return v_handle;
+        // Path interpolado: construimos el StringObject final como
+        // cadena de STRCATs sobre los parts literales y los exprs
+        // interpolados.  Layout: parts[0] + exprs[0] + parts[1] + ...
+        // + parts[N] (siempre N+1 parts para N exprs).
+        //
+        // Cada `${expr}` se baja a un StringObject handle.  Strings
+        // pasan tal cual; tipos primitivos (int/uint/bool/char/ptr/gc)
+        // se pasan por un helper nativo que escribe su representacion
+        // ASCII en un buffer VM y luego construimos el StringObject
+        // via STRMAKE desde ese buffer.
+        const int line = slit->loc.line;
+
+        // Helper: emite la secuencia ALLOCA + CALLN(stringify_to_vmbuf)
+        // + STRMAKE para un valor primitivo.  El `native_fn` es el nombre
+        // de la funcion en `stdlib/native/io/vesta_io` que toma
+        // (proc_ptr, vm_addr, value) y devuelve la longitud escrita.
+        // El buffer VM es ALLOCA de 32 bytes (suficiente para todos los
+        // tipos: i64=20+signo, hex=18, "false"=5, char UTF-8=4).
+        auto stringify_primitive = [&](ir::IrValueId v_val,
+                                        const char *native_fn,
+                                        int ln) -> ir::IrValueId {
+            // 1. ALLOCA 32 bytes (buffer en stack VM).
+            ir::IrValueId v_buf = fn_->new_value(ir::IrType::PTR); {
+                ir::IrInstr al{};
+                al.op          = ir::IrOp::ALLOCA;
+                al.type        = ir::IrType::I8;
+                al.dst         = v_buf;
+                al.imm         = 32;
+                al.source_line = ln;
+                fn_->append(current_block_, std::move(al));
+            }
+            // 2. proc_ptr via getproc.
+            ir::IrValueId v_proc = fn_->new_value(ir::IrType::PTR); {
+                ir::IrInstr gp{};
+                gp.op          = ir::IrOp::GETPROC;
+                gp.type        = ir::IrType::PTR;
+                gp.dst         = v_proc;
+                gp.source_line = ln;
+                fn_->append(current_block_, std::move(gp));
+            }
+            // 3. CALLN al stringify nativo: returns length escrita en buf.
+            //    Registramos el import con el linker para que la
+            //    relocation se resuelva contra el plugin nativo.
+            out_mod_->register_native_import(
+                std::string("stdlib/native/io/vesta_io"), native_fn);
+            ir::IrValueId v_len = fn_->new_value(ir::IrType::I64); {
+                ir::IrInstr cl{};
+                cl.op          = ir::IrOp::CALLN;
+                cl.type        = ir::IrType::I64;
+                cl.dst         = v_len;
+                cl.func_name   = std::string("stdlib/native/io/vesta_io:")
+                              + native_fn;
+                cl.operands    = {v_proc, v_buf, v_val};
+                cl.source_line = ln;
+                fn_->append(current_block_, std::move(cl));
+            }
+            // 4. STRMAKE desde el buffer VM.  El opcode strmake (no _h)
+            //    lee de vm_mem que es exactamente donde el helper escribio.
+            ir::IrValueId v_h = fn_->new_value(ir::IrType::I64); {
+                ir::IrInstr ra{};
+                ra.op           = ir::IrOp::RAW_ASM;
+                ra.type         = ir::IrType::I64;
+                ra.dst          = v_h;
+                ra.operands     = {v_buf, v_len};
+                ra.func_name    = std::string("strmake {dst}, {src0}, {src1}\n");
+                ra.source_line  = ln;
+                ra.is_call_site = true;
+                fn_->append(current_block_, std::move(ra));
+            }
+            return v_h;
+        };
+
+        auto coerce_to_string_handle = [&](ast::Expr *ex) -> ir::IrValueId {
+            if (!ex) return ir::IR_NO_VALUE;
+            if (ex->kind == ast::NodeKind::StringLitExpr) {
+                auto *sl = static_cast<ast::StringLitExpr *>(ex);
+                return lower_string_literal_to_string_object(sl);
+            }
+            ir::IrValueId v = lower_expr(ex);
+            if (v == ir::IR_NO_VALUE) return v;
+            const PrimitiveKind ek = ex->result_type.kind;
+            const int           ln = ex->loc.line;
+            // Strings: pasan directamente.
+            if (ek == PrimitiveKind::STRING) return v;
+            // Stringify por tipo primitivo.  Cada categoria mapea a un
+            // helper nativo en vesta_io.
+            switch (ek) {
+                case PrimitiveKind::I8:
+                case PrimitiveKind::I16:
+                case PrimitiveKind::I32:
+                case PrimitiveKind::I64:
+                    return stringify_primitive(v, "vio_int_to_vmbuf", ln);
+                case PrimitiveKind::U8:
+                case PrimitiveKind::U16:
+                case PrimitiveKind::U32:
+                case PrimitiveKind::U64:
+                    return stringify_primitive(v, "vio_uint_to_vmbuf", ln);
+                case PrimitiveKind::BOOL:
+                    return stringify_primitive(v, "vio_bool_to_vmbuf", ln);
+                case PrimitiveKind::CHAR:
+                    return stringify_primitive(v, "vio_char_to_vmbuf", ln);
+                case PrimitiveKind::PTR:
+                case PrimitiveKind::ARRAY:
+                    return stringify_primitive(v, "vio_ptr_to_vmbuf", ln);
+                default: break;
+            }
+            error_at(ex->loc,
+                     "interpolacion `${expr}` en contexto string: tipo "
+                     "no soportado todavia (struct/class/enum/optional/result/float). "
+                     "Construye el mensaje con `print` o usa los builtins "
+                     "de stringify explicito por ahora.");
+            return ir::IR_NO_VALUE;
+        };
+
+        auto make_strcat = [&](ir::IrValueId a, ir::IrValueId b,
+                                int ln) -> ir::IrValueId {
+            ir::IrValueId v_dst = fn_->new_value(ir::IrType::I64);
+            ir::IrInstr   ra{};
+            ra.op           = ir::IrOp::RAW_ASM;
+            ra.type         = ir::IrType::I64;
+            ra.dst          = v_dst;
+            ra.operands     = {a, b};
+            ra.func_name    = std::string("strcat {dst}, {src0}, {src1}\n");
+            ra.source_line  = ln;
+            ra.is_call_site = true;
+            fn_->append(current_block_, std::move(ra));
+            return v_dst;
+        };
+
+        const size_t ne = slit->interp_exprs.size();
+        const size_t np = slit->interp_parts.size();
+        ir::IrValueId acc = ir::IR_NO_VALUE;
+
+        // Parte literal inicial (parts[0]).  La emitimos siempre (incluso
+        // si es vacia) cuando ne > 0 porque necesitamos un acumulador
+        // para los STRCAT subsiguientes; si es vacia, el primer STRCAT
+        // se evita anclando el acc al primer expr handle.
+        if (np > 0 && !slit->interp_parts[0].empty()) {
+            acc = make_part_handle(slit->interp_parts[0], line);
+        }
+        for (size_t i = 0; i < ne; ++i) {
+            ir::IrValueId expr_h = coerce_to_string_handle(
+                slit->interp_exprs[i].get());
+            if (expr_h == ir::IR_NO_VALUE) return ir::IR_NO_VALUE;
+            if (acc == ir::IR_NO_VALUE) {
+                acc = expr_h;
+            } else {
+                acc = make_strcat(acc, expr_h, line);
+            }
+            if (i + 1 < np && !slit->interp_parts[i + 1].empty()) {
+                ir::IrValueId p_h = make_part_handle(
+                    slit->interp_parts[i + 1], line);
+                acc = make_strcat(acc, p_h, line);
+            }
+        }
+        if (acc == ir::IR_NO_VALUE) {
+            // Edge case: todas las partes vacias y sin exprs.  Devolvemos
+            // un StringObject vacio para mantener el contrato (handle
+            // valido siempre).
+            acc = make_part_handle(std::string(), line);
+        }
+        return acc;
     }
 
     ir::IrValueId Lowering::emit_topfn_value(const std::string &fn_name, int line) {
@@ -5482,6 +6921,10 @@ namespace vex {
                 ra.operands    = {v_a, v_b};
                 ra.func_name   = std::string("strcat {dst}, {src0}, {src1}\n");
                 ra.source_line = e->loc.line;
+                // strcat aloca un nuevo ROPE StringObject; igual que strmake
+                // puede disparar GC.  Marcar is_call_site para preservar
+                // host_ptrs vivos a traves de la alocacion.
+                ra.is_call_site = true;
                 fn_->append(current_block_, std::move(ra));
                 return v_dst;
             }
@@ -5821,6 +7264,18 @@ namespace vex {
         if (e->op == ast::UnOp::Deref) {
             const ir::IrValueId p = lower_expr(e->operand.get());
             if (p == ir::IR_NO_VALUE) return ir::IR_NO_VALUE;
+            // Fix defensivo VirtualPtr: un VirtualPtr<T> es por definicion una
+            // direccion en el espacio de memoria virtual de la VM.  Si por
+            // propagacion de is_host_ptr (emit_field_addr, copy-prop del IR
+            // optimizer, etc.) el flag quedo marcado en el SSA value del
+            // puntero, limpiarlo aqui antes de emitir el LOAD.  Sin esto,
+            // el emitter IR elige 'movh' (acceso a memoria host) en lugar
+            // de 'mov' (acceso VM) y causa SIGSEGV al intentar desreferenciar
+            // una direccion virtual de la VM como si fuera puntero del host.
+            if (e->operand && e->operand->result_type.is_virtual) {
+                fn_->values[p].is_host_ptr        = false;
+                fn_->values[p].pointee_is_host_ptr = false;
+            }
             const ir::IrType    ft  = ir_type_from_primitive(e->result_type.kind);
             const ir::IrValueId dst = fn_->new_value(ft);
             ir::IrInstr         ins{};
@@ -5839,6 +7294,30 @@ namespace vex {
             // @c write_local en el SSA value del slot.
             if (fn_->values[p].pointee_is_host_ptr) {
                 fn_->values[dst].is_host_ptr = true;
+            }
+            // Multi-nivel de punteros host (i64****, etc.): cada deref
+            // devuelve un valor que ES OTRO puntero host (apunta a una
+            // celda en memoria del host malloc'eado).  Sin propagar el
+            // bit, el siguiente deref emitiria mov (memoria VM) en
+            // lugar de movh (memoria host) y leeria garbage.
+            //
+            // Heuristica: si el operando es un puntero host (is_host_ptr)
+            // Y el tipo de resultado del deref es OTRO puntero (PTR no
+            // virtual), entonces el valor cargado tambien es host_ptr.
+            // Lo mismo simetricamente para VirtualPtr<VirtualPtr<...>>:
+            // si el operando es VirtualPtr y el resultado es OTRO
+            // VirtualPtr, el valor cargado es una direccion VM (NO
+            // host_ptr).
+            if (e->result_type.kind == PrimitiveKind::PTR
+             || e->result_type.kind == PrimitiveKind::ARRAY) {
+                if (e->result_type.is_virtual) {
+                    fn_->values[dst].is_host_ptr = false;
+                } else if (fn_->values[p].is_host_ptr) {
+                    // El resultado del deref de un host_ptr es OTRO
+                    // host_ptr.  Asi p4=host_ptr -> *p4 = i64*** que
+                    // apunta a celda host -> tambien host_ptr.
+                    fn_->values[dst].is_host_ptr = true;
+                }
             }
             return dst;
         }
@@ -5900,19 +7379,70 @@ namespace vex {
                 // future esta PENDING (state -> WAIT_IO, blocking=true).  Al
                 // ser resuelto via fulfill desde otro proceso, el waiter se
                 // re-planifica y await re-ejecuta, devolviendo r0 = result.
-                // Capturamos r0 a {dst} para que el resultado sea un SSA value.
-                const ir::IrValueId v_dst = fn_->new_value(ir::IrType::I64);
-                ir::IrInstr         ra{};
-                ra.op        = ir::IrOp::RAW_ASM;
-                ra.type      = ir::IrType::I64;
-                ra.dst       = v_dst;
-                ra.operands  = {v};
-                ra.func_name = std::string("// await {src0}\n"
-                    "await {src0}\n"
-                    "mov {dst}, r0\n");
-                ra.source_line = e->loc.line;
-                fn_->append(current_block_, std::move(ra));
-                return v_dst;
+                // Capturamos r0 a {dst} como i64 (el bytecode siempre devuelve
+                // i64 raw; el frontend hace cast/bitcast al tipo logico T).
+                const ir::IrValueId v_raw = fn_->new_value(ir::IrType::I64); {
+                    ir::IrInstr ra{};
+                    ra.op        = ir::IrOp::RAW_ASM;
+                    ra.type      = ir::IrType::I64;
+                    ra.dst       = v_raw;
+                    ra.operands  = {v};
+                    ra.func_name = std::string("// await {src0}\n"
+                        "await {src0}\n"
+                        "mov {dst}, r0\n");
+                    ra.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(ra));
+                }
+                // Mejora II: si el operando del await es Future<T>, el frontend
+                // sabe el tipo T y puede convertir el i64 raw al tipo logico
+                // adecuado.  Para tipos < 8 bytes hace TRUNC; para floats hace
+                // BITCAST (no FTOI que cambia el valor).  Si el operando NO
+                // es Future<T> (legacy: i64/i32/u64/u32 directos), devolvemos
+                // el v_raw sin cast.
+                const Type op_type = e->operand ? e->operand->result_type : Type{};
+                if (op_type.kind == PrimitiveKind::FUTURE && op_type.pointee) {
+                    const PrimitiveKind tk = op_type.pointee->kind;
+                    if (tk == PrimitiveKind::F64) {
+                        ir::IrValueId v_dst = fn_->new_value(ir::IrType::F64);
+                        ir::IrInstr bc{};
+                        bc.op = ir::IrOp::BITCAST;
+                        bc.type = ir::IrType::F64;
+                        bc.dst = v_dst;
+                        bc.operands = {v_raw};
+                        bc.source_line = e->loc.line;
+                        fn_->append(current_block_, std::move(bc));
+                        return v_dst;
+                    }
+                    if (tk == PrimitiveKind::F32) {
+                        // i64 -> trunc i32 -> bitcast f32.
+                        ir::IrValueId v_i32 = fn_->new_value(ir::IrType::I32); {
+                            ir::IrInstr tr{};
+                            tr.op = ir::IrOp::TRUNC;
+                            tr.type = ir::IrType::I32;
+                            tr.dst = v_i32;
+                            tr.operands = {v_raw};
+                            tr.source_line = e->loc.line;
+                            fn_->append(current_block_, std::move(tr));
+                        }
+                        ir::IrValueId v_dst = fn_->new_value(ir::IrType::F32);
+                        ir::IrInstr bc{};
+                        bc.op = ir::IrOp::BITCAST;
+                        bc.type = ir::IrType::F32;
+                        bc.dst = v_dst;
+                        bc.operands = {v_i32};
+                        bc.source_line = e->loc.line;
+                        fn_->append(current_block_, std::move(bc));
+                        return v_dst;
+                    }
+                    // Tipos enteros mas estrechos (i8..i32, u8..u32, bool, char):
+                    // cast_if_needed selecciona TRUNC con la mascara correcta.
+                    const ir::IrType pt_ir = ir_type_from_primitive(tk);
+                    if (pt_ir != ir::IrType::I64) {
+                        return cast_if_needed(v_raw, ir::IrType::I64, pt_ir,
+                                              e->loc.line);
+                    }
+                }
+                return v_raw;
             }
             default:
                 // PreInc/PostInc/PreDec/PostDec ya filtrados arriba.
@@ -5996,6 +7526,62 @@ namespace vex {
                         if (ok) return out;
                     }
                 }
+            }
+            // Reflexion OO: dispatch ergonomico cuando el type checker
+            // marco el FieldAccessExpr con property_kind 100..106.
+            // Reescribe el call al builtin standalone equivalente.
+            //   100: forName(name)               estatico, no toma self
+            //   101: getMethod(cls, name)
+            //   102: getField(cls, name)
+            //   103: newInstance(cls)
+            //   104: getMethods(cls)            (placeholder; no impl runtime aun)
+            //   105: invoke(method, this, args...)
+            //   106: getClass(obj)
+            if (fa->property_kind >= 100 && fa->property_kind <= 106) {
+                static const char *KIND_TO_BUILTIN[] = {
+                    "forName",     // 100
+                    "getMethod",   // 101
+                    "getField",    // 102
+                    "newInstance", // 103
+                    "getMethods",  // 104
+                    "invoke",      // 105
+                    "getClass",    // 106
+                };
+                const char *bn = KIND_TO_BUILTIN[fa->property_kind - 100];
+                ast::CallExpr synth;
+                synth.loc       = e->loc;
+                auto id         = std::make_unique<ast::IdentExpr>();
+                id->loc         = e->loc;
+                id->name        = bn;
+                synth.callee    = std::move(id);
+                // Para los metodos de instancia (101..103, 105, 106) prepend
+                // el base (self) como primer argumento.  Para forName (100)
+                // solo los args originales.  El base original sera devuelto
+                // tras la lower.
+                std::vector<std::unique_ptr<ast::Expr>> saved_args;
+                const bool prepend_self = (fa->property_kind != 100);
+                saved_args.reserve(e->args.size() + (prepend_self ? 1 : 0));
+                if (prepend_self) {
+                    saved_args.push_back(std::move(fa->base));
+                }
+                for (auto &a : e->args) saved_args.push_back(std::move(a));
+                synth.args = std::move(saved_args);
+                ir::IrValueId out;
+                const bool ok = try_lower_builtin_call(&synth, out);
+                // Restaurar args originales para no afectar el AST.
+                size_t k = 0;
+                if (prepend_self) {
+                    fa->base = std::move(synth.args[k++]);
+                }
+                for (size_t i = 0; i < e->args.size(); ++i, ++k) {
+                    e->args[i] = std::move(synth.args[k]);
+                }
+                if (ok) return out;
+                // try_lower_builtin_call devolvio false (e.g. argumento
+                // ausente o mal formado); el error ya se reporto.  Devolvemos
+                // un valor invalido para que el caller no use un IrValueId
+                // basura.
+                return ir::IR_NO_VALUE;
             }
             if (fa->base && fa->base->result_type.kind == PrimitiveKind::CLASS) {
                 return lower_class_method_call(e);
@@ -6216,10 +7802,15 @@ namespace vex {
         // fn_returns_function_; el slot tiene siempre 16 bytes.
         const bool callee_is_function_sret =
                 (fn_returns_function_.find(id->name) != fn_returns_function_.end());
+        // Smart pointers: detectar funcion que retorna unique<T>/shared<T>
+        // via fn_returns_smartptr_; el slot tiene 8 bytes (host_ptr).
+        const bool callee_is_smartptr_sret =
+                (fn_returns_smartptr_.find(id->name) != fn_returns_smartptr_.end());
         const bool callee_is_sret = (callee_kind == PrimitiveKind::OPTIONAL
             || callee_kind == PrimitiveKind::RESULT
             || callee_is_enum_sret
-            || callee_is_function_sret);
+            || callee_is_function_sret
+            || callee_is_smartptr_sret);
         ir::IrValueId v_call_retbuf = ir::IR_NO_VALUE;
         if (callee_is_sret) {
             uint64_t buf_bytes = 16ULL; // default Optional
@@ -6233,6 +7824,12 @@ namespace vex {
                 buf_bytes = 24ULL;
             } else if (callee_is_function_sret) {
                 buf_bytes = 16ULL; // function value: fn_addr + env_addr
+            } else if (callee_is_smartptr_sret) {
+                // unique<T> Tier 1 = 16 bytes (ptr+deleter); shared<T> = 8 (ctrl_ptr).
+                // No tenemos info del kind aqui sin parsear la firma; usamos 16
+                // que cubre ambos (shared solo usa los primeros 8 bytes; la
+                // segunda mitad del slot es padding).
+                buf_bytes = 16ULL;
             }
             v_call_retbuf = fn_->new_value(ir::IrType::PTR);
             ir::IrInstr al{};
@@ -6266,10 +7863,10 @@ namespace vex {
                 && callee_sig->param_types[i].kind == PrimitiveKind::STRING
                 && ae && ae->kind == ast::NodeKind::StringLitExpr) {
                 auto *sl = static_cast<ast::StringLitExpr *>(ae);
-                if (!sl->is_interpolated()) {
-                    arg_ids.push_back(lower_string_literal_to_string_object(sl));
-                    promote_to_string = true;
-                }
+                // Tanto literales puros como interpolados: el helper
+                // construye el StringObject correcto.
+                arg_ids.push_back(lower_string_literal_to_string_object(sl));
+                promote_to_string = true;
             }
             if (!promote_to_string) {
                 arg_ids.push_back(lower_expr(ae));
@@ -6449,17 +8046,18 @@ namespace vex {
                     && fa->base
                     && fa->base->result_type.kind == PrimitiveKind::CLASS) {
                     auto *slit = static_cast<ast::StringLitExpr *>(e->value.get());
-                    if (!slit->is_interpolated()) {
-                        auto it_cls = tc_.class_layouts().find(
-                            fa->base->result_type.struct_name);
-                        if (it_cls != tc_.class_layouts().end()) {
-                            for (const auto &f: it_cls->second.fields) {
-                                if (f.name == fa->field_name
-                                    && f.type.kind == PrimitiveKind::STRING) {
-                                    rhs      = lower_string_literal_to_string_object(slit);
-                                    promoted = true;
-                                    break;
-                                }
+                    // Promovemos tanto literales puros como interpolados:
+                    // el helper detecta el caso y emite STRMAKE simple
+                    // (puro) o cadena STRMAKE+STRCAT (interpolado).
+                    auto it_cls = tc_.class_layouts().find(
+                        fa->base->result_type.struct_name);
+                    if (it_cls != tc_.class_layouts().end()) {
+                        for (const auto &f: it_cls->second.fields) {
+                            if (f.name == fa->field_name
+                                && f.type.kind == PrimitiveKind::STRING) {
+                                rhs      = lower_string_literal_to_string_object(slit);
+                                promoted = true;
+                                break;
                             }
                         }
                     }
@@ -6815,7 +8413,25 @@ namespace vex {
         const bool is_print_bool  = (name == "print_bool");
         const bool is_print_char  = (name == "print_char");
         const bool is_print_color = (name == "print_color");
-        const bool is_print_cstr  = (name == "print_cstr"); 
+        const bool is_print_cstr  = (name == "print_cstr");
+        // formatos numericos alternativos (binario / octal) y impresion
+        // de punteros / handles de objetos GC + padding para alineacion.
+        const bool is_print_bin      = (name == "print_bin");
+        const bool is_print_oct      = (name == "print_oct");
+        const bool is_print_ptr      = (name == "print_ptr");
+        const bool is_print_gchandle = (name == "print_gchandle");
+        const bool is_print_pad      = (name == "print_pad");
+        // Builtins de terminal/ANSI (azucar para escapes VT100 comunes).
+        // Cada uno emite secuencias estaticas via vio_print sin necesitar
+        // hardcodear los escapes en el codigo del usuario.
+        const bool is_term_clear         = (name == "term_clear");
+        const bool is_term_clear_line    = (name == "term_clear_line");
+        const bool is_term_move          = (name == "term_move");
+        const bool is_term_save_cursor   = (name == "term_save_cursor");
+        const bool is_term_restore_cursor= (name == "term_restore_cursor");
+        const bool is_term_hide_cursor   = (name == "term_hide_cursor");
+        const bool is_term_show_cursor   = (name == "term_show_cursor");
+        const bool is_term_reset         = (name == "term_reset");
         const bool is_fopen       = (name == "fopen");
         const bool is_fwrite      = (name == "fwrite");
         const bool is_fclose      = (name == "fclose");
@@ -6848,11 +8464,20 @@ namespace vex {
         const bool is_pid     = (name == "pid");
         const bool is_msgsend = (name == "msgsend");
         const bool is_msgrecv = (name == "msgrecv");
+        // argv del script: bajan a getargc/getarg.
+        const bool is_args_count = (name == "args_count");
+        const bool is_args_get   = (name == "args_get");
+        // Introspeccion runtime: enumeracion de miembros de clase.
+        const bool is_getMethods    = (name == "getMethods");
+        const bool is_getMethodAt   = (name == "getMethodAt");
+        const bool is_getFields     = (name == "getFields");
+        const bool is_getFieldAt    = (name == "getFieldAt");
         // futures builtins.
         const bool is_future_alloc = (name == "future_alloc");
         const bool is_fulfill      = (name == "fulfill");
         // carga dinamica de modulos.
-        const bool is_loadmodule = (name == "loadmodule");
+        const bool is_loadmodule   = (name == "loadmodule");
+        const bool is_unloadmodule = (name == "unloadmodule");
         const bool is_dispose    = (name == "dispose");
         // constructor de tipo coleccion primitivo (arraylist, hashmap,
         // hashset, queue, deque, treemap, treeset, stack).  Si find_col_ctor
@@ -6894,6 +8519,23 @@ namespace vex {
                 || is_math_sin || is_math_cos || is_math_tan
                 || is_math_abs || is_math_imin || is_math_imax
                 || is_math_clamp;
+        // smart pointers builtins (unique<T> y shared<T>).
+        const bool is_unique_box  = (name == "unique_box");
+        const bool is_shared_box  = (name == "shared_box");
+        const bool is_unique_with = (name == "unique_with");
+        const bool is_shared_with = (name == "shared_with");
+        // Borrow builtins: lend/lend_mut son operaciones zero-overhead
+        // que devuelven el ptr_of del owner (slot+0).  El borrow checker
+        // ya valido las reglas en compile-time, asi que aqui solo emitimos
+        // la lectura del puntero.  read_borrow/write_borrow son
+        // *p y *p=v respectivamente.
+        const bool is_lend         = (name == "lend");
+        const bool is_lend_mut     = (name == "lend_mut");
+        const bool is_read_borrow  = (name == "read_borrow");
+        const bool is_write_borrow = (name == "write_borrow");
+        const bool is_move       = (name == "move");
+        const bool is_get        = (name == "ptr_of");
+        const bool is_use_count  = (name == "use_count");
         // A.18 - builtins de string.
         const bool is_str_length  = (name == "str_length");
         const bool is_str_bytes   = (name == "str_bytes");
@@ -6911,6 +8553,8 @@ namespace vex {
                 || is_print_float || is_print_bool
                 || is_print_char || is_print_color
                 || is_print_cstr
+                || is_print_bin || is_print_oct
+                || is_print_ptr || is_print_gchandle || is_print_pad
                 || is_fopen || is_fwrite || is_fclose
                 || is_malloc || is_free
                 || is_forName || is_getClass || is_getField
@@ -6922,8 +8566,14 @@ namespace vex {
                 || is_value || is_error
                 || is_wait || is_notify || is_notifyAll
                 || is_pid || is_msgsend || is_msgrecv
+                || is_args_count || is_args_get
+                || is_getMethods || is_getMethodAt
+                || is_getFields || is_getFieldAt
+                || is_term_clear || is_term_clear_line || is_term_move
+                || is_term_save_cursor || is_term_restore_cursor
+                || is_term_hide_cursor || is_term_show_cursor || is_term_reset
                 || is_future_alloc || is_fulfill
-                || is_loadmodule
+                || is_loadmodule || is_unloadmodule
                 || is_ffi_open || is_ffi_sym || is_ffi_call
                 || is_panic
                 || is_str_length || is_str_bytes
@@ -6933,7 +8583,12 @@ namespace vex {
                 || is_str_make || is_str_convert
                 || is_any_math
                 || is_col_ctor
-                || is_dispose;
+                || is_dispose
+                || is_unique_box || is_shared_box
+                || is_unique_with || is_shared_with
+                || is_move || is_get || is_use_count
+                || is_lend || is_lend_mut
+                || is_read_borrow || is_write_borrow;
         if (!is_any_builtin) return false;
 
         // Helper interno para registrar un literal de string en static_data
@@ -7051,9 +8706,96 @@ namespace vex {
                     {"CURSOR_HOME", "\x1b[H"},
                 };
 
-        auto emit_print_typed_value = [&](ast::Expr *ex) {
+        // Helper local: parsea una cadena de formato `${expr:fmt}` en
+        // secciones separadas por `:`.  Devuelve un struct con kind
+        // (hex/bin/oct/dec/ptr/gc/char/bool/auto), align (left/right/none),
+        // width y fill char.  La forma sin `:` (formato vacio) deja todo
+        // en defaults (auto + sin alineacion).
+        struct FmtSpec {
+            enum class Kind {
+                AUTO,   // dispatch por tipo (comportamiento default)
+                DEC,    // entero decimal con signo correcto
+                HEX,    // 0x + 16 hex fixed
+                BIN,    // 0b + bits compactos
+                OCT,    // 0o + dig compactos
+                PTR,    // 0x + hex compacto
+                GC,     // <gc:N>
+                CHAR,   // codepoint -> UTF-8
+                BOOL    // "true"/"false"
+            };
+            enum class Align { NONE, LEFT, RIGHT };
+            Kind     kind   = Kind::AUTO;
+            Align    align  = Align::NONE;
+            uint32_t width  = 0;
+            uint32_t fill_cp = 32; // espacio por defecto
+        };
+        auto parse_fmt_spec = [&](const std::string &s,
+                                   const SourceLoc &loc) -> FmtSpec {
+            FmtSpec out;
+            size_t i = 0;
+            while (i < s.size()) {
+                // Saltar espacios.
+                while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+                if (i >= s.size()) break;
+                // Detectar alineacion: primer caracter '<' / '>' = left/right,
+                // seguido de digitos para el width, y opcionalmente un char
+                // de fill.
+                if (s[i] == '<' || s[i] == '>') {
+                    out.align = (s[i] == '<') ? FmtSpec::Align::LEFT
+                                              : FmtSpec::Align::RIGHT;
+                    ++i;
+                    uint32_t w = 0;
+                    while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+                        w = w * 10 + (uint32_t)(s[i] - '0');
+                        ++i;
+                    }
+                    out.width = w;
+                    // Optional fill char (cualquier caracter no `:` ni final).
+                    if (i < s.size() && s[i] != ':') {
+                        // tomar UN char (asumimos ASCII; multibyte no
+                        // soportado en este parser simple).
+                        out.fill_cp = (uint32_t)(uint8_t)s[i];
+                        ++i;
+                    }
+                } else {
+                    // Detectar keyword.
+                    size_t start = i;
+                    while (i < s.size() && s[i] != ':' && s[i] != ' '
+                                          && s[i] != '\t') ++i;
+                    std::string kw = s.substr(start, i - start);
+                    if      (kw == "hex")  out.kind = FmtSpec::Kind::HEX;
+                    else if (kw == "bin")  out.kind = FmtSpec::Kind::BIN;
+                    else if (kw == "oct")  out.kind = FmtSpec::Kind::OCT;
+                    else if (kw == "dec")  out.kind = FmtSpec::Kind::DEC;
+                    else if (kw == "ptr")  out.kind = FmtSpec::Kind::PTR;
+                    else if (kw == "gc")   out.kind = FmtSpec::Kind::GC;
+                    else if (kw == "char") out.kind = FmtSpec::Kind::CHAR;
+                    else if (kw == "bool") out.kind = FmtSpec::Kind::BOOL;
+                    else {
+                        diags_.warning(loc,
+                            std::string("formato '") + kw +
+                            "' desconocido en ${...:fmt}; usando default");
+                    }
+                }
+                // Saltar separador `:`.
+                while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+                if (i < s.size() && s[i] == ':') ++i;
+            }
+            return out;
+        };
+
+        auto emit_print_typed_value = [&](ast::Expr *ex,
+                                            const std::string &fmt_str) {
             if (!ex) return;
             const Type t = ex->result_type;
+            // Parsear formato y, si hay alineacion right, calcular y emitir
+            // padding ANTES del valor (para left-align se emite DESPUES).
+            // Como no medimos el ancho exacto del valor a emitir (eso
+            // requeriria itoa+len al vuelo), aceptamos un sub-set: el
+            // usuario pasa un ancho que va a quedar como margen superior
+            // al ancho real.  Para alineacion exacta de columnas con
+            // valores variables, usar print_pad explicito.
+            FmtSpec fs = parse_fmt_spec(fmt_str, ex->loc);
             // Caso especial: identificador ANSI magico -> emit la cadena
             // directamente como string literal (sin pasar por print_int).
             if (ex->kind == ast::NodeKind::IdentExpr) {
@@ -7083,6 +8825,117 @@ namespace vex {
             ir::IrValueId v = lower_expr(ex);
             if (v == ir::IR_NO_VALUE) return;
             const ir::IrType vt = fn_->values[v].type;
+
+            // Format spec ${expr:fmt}: si el formato pide un kind concreto
+            // (hex/bin/oct/dec/ptr/gc/char/bool) o alineacion, usamos el
+            // helper unificado @c vio_print_fmt(value, kind, width,
+            // fill, align) que combina formateo + padding en un solo
+            // CALLN.  Sin formato (default), caemos al dispatch normal
+            // por tipo abajo.
+            const bool has_fmt = fs.kind != FmtSpec::Kind::AUTO
+                              || fs.align != FmtSpec::Align::NONE;
+            if (has_fmt && t.kind != PrimitiveKind::STRING) {
+                // Determinar el kind code para vio_print_fmt.  Si AUTO,
+                // derivar del tipo de la expresion.  La logica es la
+                // misma del switch de abajo.
+                int kind_code = -1;
+                if (fs.kind == FmtSpec::Kind::HEX)       kind_code = 2;
+                else if (fs.kind == FmtSpec::Kind::BIN)  kind_code = 3;
+                else if (fs.kind == FmtSpec::Kind::OCT)  kind_code = 4;
+                else if (fs.kind == FmtSpec::Kind::PTR)  kind_code = 5;
+                else if (fs.kind == FmtSpec::Kind::GC)   kind_code = 6;
+                else if (fs.kind == FmtSpec::Kind::BOOL) kind_code = 7;
+                else if (fs.kind == FmtSpec::Kind::CHAR) kind_code = 8;
+                else if (fs.kind == FmtSpec::Kind::DEC) {
+                    const bool unsigned_t = (t.kind == PrimitiveKind::CHAR
+                            || t.kind == PrimitiveKind::U8
+                            || t.kind == PrimitiveKind::U16
+                            || t.kind == PrimitiveKind::U32
+                            || t.kind == PrimitiveKind::U64);
+                    kind_code = unsigned_t ? 1 : 0;
+                } else {
+                    // AUTO: dispatch por tipo del operando.
+                    switch (t.kind) {
+                        case PrimitiveKind::BOOL: kind_code = 7; break;
+                        case PrimitiveKind::CHAR:
+                        case PrimitiveKind::U8: case PrimitiveKind::U16:
+                        case PrimitiveKind::U32: case PrimitiveKind::U64:
+                            kind_code = 1; break;
+                        case PrimitiveKind::I8: case PrimitiveKind::I16:
+                        case PrimitiveKind::I32: case PrimitiveKind::I64:
+                            kind_code = 0; break;
+                        case PrimitiveKind::F32:
+                        case PrimitiveKind::F64: kind_code = 9; break;
+                        case PrimitiveKind::PTR:
+                        case PrimitiveKind::ARRAY: kind_code = 5; break;
+                        case PrimitiveKind::CLASS: kind_code = 6; break;
+                        default: kind_code = 1; break;
+                    }
+                }
+                // Convertir el valor al uint64 que espera vio_print_fmt.
+                ir::IrValueId v_arg = v;
+                if (t.kind == PrimitiveKind::F32) {
+                    // F32 -> F64 (re-encoding) -> i64 bits.
+                    ir::IrValueId f64v = fn_->new_value(ir::IrType::F64);
+                    ir::IrInstr ext{};
+                    ext.op = ir::IrOp::F32TOF64; ext.type = ir::IrType::F64;
+                    ext.dst = f64v; ext.operands = {v_arg};
+                    ext.source_line = ex->loc.line;
+                    fn_->append(current_block_, std::move(ext));
+                    ir::IrValueId bits = fn_->new_value(ir::IrType::I64);
+                    ir::IrInstr bc{};
+                    bc.op = ir::IrOp::BITCAST; bc.type = ir::IrType::I64;
+                    bc.dst = bits; bc.operands = {f64v};
+                    bc.source_line = ex->loc.line;
+                    fn_->append(current_block_, std::move(bc));
+                    v_arg = bits;
+                } else if (t.kind == PrimitiveKind::F64 && vt != ir::IrType::I64) {
+                    ir::IrValueId bits = fn_->new_value(ir::IrType::I64);
+                    ir::IrInstr bc{};
+                    bc.op = ir::IrOp::BITCAST; bc.type = ir::IrType::I64;
+                    bc.dst = bits; bc.operands = {v_arg};
+                    bc.source_line = ex->loc.line;
+                    fn_->append(current_block_, std::move(bc));
+                    v_arg = bits;
+                } else if (t.kind == PrimitiveKind::CLASS) {
+                    // CLASS -> GcHandle via instruccion `gchandle`.
+                    ir::IrValueId v_h = fn_->new_value(ir::IrType::I64);
+                    ir::IrInstr ra{};
+                    ra.op = ir::IrOp::RAW_ASM; ra.type = ir::IrType::I64;
+                    ra.dst = v_h; ra.operands = {v_arg};
+                    ra.func_name = std::string("gchandle {dst}, {src0}\n");
+                    ra.source_line = ex->loc.line;
+                    fn_->append(current_block_, std::move(ra));
+                    v_arg = v_h;
+                } else {
+                    // Numeros enteros y punteros: cast (silencioso) a I64.
+                    v_arg = cast_if_needed(v_arg, vt, ir::IrType::I64,
+                                           ex->loc.line, /*is_explicit=*/true);
+                }
+                // Constantes para kind, width, fill, align.
+                ir::IrValueId v_kind  = emit_const(ir::IrType::I64,
+                        (uint64_t)(uint32_t)kind_code, ex->loc.line);
+                ir::IrValueId v_width = emit_const(ir::IrType::I64,
+                        (uint64_t)fs.width, ex->loc.line);
+                ir::IrValueId v_fill  = emit_const(ir::IrType::I64,
+                        (uint64_t)fs.fill_cp, ex->loc.line);
+                int align_code = (fs.align == FmtSpec::Align::LEFT) ? 1
+                                : (fs.align == FmtSpec::Align::RIGHT) ? 2
+                                : 0;
+                ir::IrValueId v_align = emit_const(ir::IrType::I64,
+                        (uint64_t)align_code, ex->loc.line);
+                out_mod_->register_native_import(lib, "vio_print_fmt");
+                ir::IrInstr ins{};
+                ins.op          = ir::IrOp::CALLN;
+                ins.type        = ir::IrType::VOID;
+                ins.dst         = ir::IR_NO_VALUE;
+                ins.func_name   = lib + ":vio_print_fmt";
+                ins.operands    = {v_arg, v_kind, v_width, v_fill, v_align};
+                ins.source_line = ex->loc.line;
+                fn_->append(current_block_, std::move(ins));
+                return;
+            }
+
             // Caso STRING: el valor es GcHandle a un StringObject.  Emitir
             // STRRAW para obtener host_ptr al buffer + STRGETBYTES para la
             // longitud en bytes, y usar vio_print_buf para emitir el bloque
@@ -7141,6 +8994,21 @@ namespace vex {
                 case PrimitiveKind::F64:
                     func = "vio_print_float";
                     break;
+                case PrimitiveKind::PTR:
+                case PrimitiveKind::ARRAY:
+                    // Imprime "0x<hex>" compacto sin ceros lider.  El
+                    // mismo formato funciona tanto para punteros host
+                    // como virtuales: el numero es la direccion bruta.
+                    func = "vio_print_ptr";
+                    break;
+                case PrimitiveKind::CLASS:
+                    // Para CLASS imprimimos el GcHandle como "<gc:N>".
+                    // Antes del CALLN debemos convertir el host_ptr al
+                    // handle via la instruccion @c gchandle.  Esto se
+                    // hace abajo en el bloque de F32/F64; aqui solo
+                    // marcamos el func.
+                    func = "vio_print_gchandle";
+                    break;
                 default:
                     // Fallback: trata como puntero a cstring (no len).
                     // Por ahora no soportado; reportar error claro.
@@ -7183,8 +9051,28 @@ namespace vex {
                     fn_->append(current_block_, std::move(bc));
                     v = bits;
                 }
+            } else if (t.kind == PrimitiveKind::CLASS) {
+                // El SSA value `v` es un host_ptr al objeto.  Convertir
+                // a GcHandle (uint32) via la instruccion @c gchandle
+                // antes de pasar al native.  vio_print_gchandle espera
+                // el handle como uint64 zero-extended.
+                ir::IrValueId v_h = fn_->new_value(ir::IrType::I64);
+                ir::IrInstr ra{};
+                ra.op          = ir::IrOp::RAW_ASM;
+                ra.type        = ir::IrType::I64;
+                ra.dst         = v_h;
+                ra.operands    = {v};
+                ra.func_name   = std::string("gchandle {dst}, {src0}\n");
+                ra.source_line = ex->loc.line;
+                fn_->append(current_block_, std::move(ra));
+                v = v_h;
+            } else if (t.kind == PrimitiveKind::PTR
+                    || t.kind == PrimitiveKind::ARRAY) {
+                // Punteros pasan tal cual; el ABI uint64 de
+                // vio_print_ptr ya espera la direccion bruta.  Sin
+                // cast_if_needed para no emitir un mov espureo.
             } else {
-                v = cast_if_needed(v, vt, promote, ex->loc.line);
+                v = cast_if_needed(v, vt, promote, ex->loc.line, /*is_explicit=*/true);
             }
             out_mod_->register_native_import(lib, func);
             ir::IrInstr ins{};
@@ -7203,15 +9091,22 @@ namespace vex {
                 auto *sl = static_cast<ast::StringLitExpr *>(ex);
                 if (sl->is_interpolated()) {
                     // Iteracion: parts[0] + exprs[0] + parts[1] + exprs[1]
-                    // + ... + parts[N].  Cada fragmento -> 1 CALLN.
+                    // + ... + parts[N].  Cada fragmento -> 1 CALLN.  Si
+                    // hay format spec por interpolacion (interp_formats[i]
+                    // no vacio), se pasa al typed_value para dispatch a
+                    // vio_print_fmt.
                     const size_t ne = sl->interp_exprs.size();
                     const size_t np = sl->interp_parts.size();
+                    const size_t nf = sl->interp_formats.size();
                     for (size_t i = 0; i < ne; ++i) {
                         if (i < np && !sl->interp_parts[i].empty()) {
                             emit_print_string_literal(sl->interp_parts[i],
                                                       ex->loc.line);
                         }
-                        emit_print_typed_value(sl->interp_exprs[i].get());
+                        const std::string &fmt = (i < nf)
+                                ? sl->interp_formats[i]
+                                : std::string();
+                        emit_print_typed_value(sl->interp_exprs[i].get(), fmt);
                     }
                     if (np > ne) {
                         const auto &last = sl->interp_parts.back();
@@ -7224,7 +9119,7 @@ namespace vex {
                 emit_print_string_literal(sl->value, ex->loc.line);
                 return;
             }
-            emit_print_typed_value(ex);
+            emit_print_typed_value(ex, std::string());
         };
 
         // ----- print(arg) / echo(arg) / println(arg) -----
@@ -7272,7 +9167,9 @@ namespace vex {
         // print_int sigue funcionando (rama mas abajo) por compat.
         if (is_print_uint || is_print_hex || is_print_float
             || is_print_bool || is_print_char || is_print_color
-            || is_print_cstr) {
+            || is_print_cstr
+            || is_print_bin || is_print_oct
+            || is_print_ptr || is_print_gchandle) {
             if (e->args.size() != 1) {
                 error_at(e->loc,
                          std::string("'") + name +
@@ -7285,8 +9182,24 @@ namespace vex {
                 out_value = ir::IR_NO_VALUE;
                 return true;
             }
+            // Caso especial: print_gchandle recibe un objeto CLASS y debe
+            // emitir la instruccion @c gchandle r_dst, r_src para
+            // convertir el host_ptr al GcHandle (uint32) antes de
+            // pasarlo al native como uint64 zero-extended.
+            if (is_print_gchandle && e->args[0]->result_type.kind == PrimitiveKind::CLASS) {
+                ir::IrValueId v_h = fn_->new_value(ir::IrType::I64);
+                ir::IrInstr ra{};
+                ra.op          = ir::IrOp::RAW_ASM;
+                ra.type        = ir::IrType::I64;
+                ra.dst         = v_h;
+                ra.operands    = {v};
+                ra.func_name   = std::string("gchandle {dst}, {src0}\n");
+                ra.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(ra));
+                v = v_h;
+            }
             v = cast_if_needed(v, fn_->values[v].type, ir::IrType::I64,
-                               e->loc.line);
+                               e->loc.line, /*is_explicit=*/true);
             std::string func;
             if (is_print_uint) func = "vio_print_uint";
             else if (is_print_hex) func = "vio_print_hex";
@@ -7294,6 +9207,10 @@ namespace vex {
             else if (is_print_bool) func = "vio_print_bool";
             else if (is_print_char) func = "vio_print_char";
             else if (is_print_color) func = "vio_print_color";
+            else if (is_print_bin) func = "vio_print_bin";
+            else if (is_print_oct) func = "vio_print_oct";
+            else if (is_print_ptr) func = "vio_print_ptr";
+            else if (is_print_gchandle) func = "vio_print_gchandle";
             else func                     = "vio_print_cstr"; // host_ptr -> bytes hasta NUL
             out_mod_->register_native_import(lib, func);
             ir::IrInstr ins{};
@@ -7302,6 +9219,38 @@ namespace vex {
             ins.dst         = ir::IR_NO_VALUE;
             ins.func_name   = lib + ":" + func;
             ins.operands    = {v};
+            ins.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(ins));
+            out_value = ir::IR_NO_VALUE;
+            return true;
+        }
+        // ----- print_pad(fill_cp, width) -----
+        // Emite @p width copias del codepoint @p fill_cp al buffer.  Util
+        // para construir alineacion manual de columnas (TUI / tablas).
+        if (is_print_pad) {
+            if (e->args.size() != 2) {
+                error_at(e->loc,
+                         "'print_pad' requiere (fill_cp, width)");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            ir::IrValueId v_fill = lower_expr(e->args[0].get());
+            ir::IrValueId v_w    = lower_expr(e->args[1].get());
+            if (v_fill == ir::IR_NO_VALUE || v_w == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            v_fill = cast_if_needed(v_fill, fn_->values[v_fill].type,
+                                    ir::IrType::I64, e->loc.line, true);
+            v_w    = cast_if_needed(v_w, fn_->values[v_w].type,
+                                    ir::IrType::I64, e->loc.line, true);
+            out_mod_->register_native_import(lib, "vio_print_pad");
+            ir::IrInstr ins{};
+            ins.op          = ir::IrOp::CALLN;
+            ins.type        = ir::IrType::VOID;
+            ins.dst         = ir::IR_NO_VALUE;
+            ins.func_name   = lib + ":vio_print_pad";
+            ins.operands    = {v_fill, v_w};
             ins.source_line = e->loc.line;
             fn_->append(current_block_, std::move(ins));
             out_value = ir::IR_NO_VALUE;
@@ -7529,6 +9478,44 @@ namespace vex {
             ir::IrInstr         ra{};
             ra.op          = ir::IrOp::RAW_ASM;
             ra.type        = ir::IrType::I64;
+            ra.dst         = v_dst;
+            ra.func_name   = oss.str();
+            ra.source_line = e->loc.line;
+            // loadmod ejecuta el main del plugin como sub-llamada.  El plugin
+            // puede clobrear los regs caller-saved (R0..R12, R14, R15) antes
+            // de retornar.  Marcamos como call site para que el emitter
+            // emita save/restore de los locales vivos.
+            ra.is_call_site = true;
+            fn_->append(current_block_, std::move(ra));
+            out_value = v_dst;
+            return true;
+        }
+
+        // ----- unloadmodule(string_lit) -> i32 -----
+        // Descarga modulo dinamico previamente cargado.  Mismo patron que
+        // loadmodule: path interned en static_data, opcode unloadmod r_addr, r_len.
+        // Devuelve 1 si descargado, 0 si no encontrado.
+        if (is_unloadmodule) {
+            if (e->args.size() != 1
+                || !e->args[0]
+                || e->args[0]->kind != ast::NodeKind::StringLitExpr) {
+                error_at(e->loc,
+                         "unloadmodule: requiere un string literal con la ruta al .velb");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            auto *             slit     = static_cast<ast::StringLitExpr *>(e->args[0].get());
+            const uint64_t     path_idx = intern_class_name(*out_mod_, slit->value);
+            const uint32_t     path_len = static_cast<uint32_t>(slit->value.size());
+            std::ostringstream oss;
+            oss << "mov r12, @Absolute(\"code.s_" << path_idx << "\")\n";
+            oss << "mov r11, " << path_len << "\n";
+            oss << "unloadmod r12, r11\n";
+            oss << "mov {dst}, r0\n";
+            const ir::IrValueId v_dst = fn_->new_value(ir::IrType::I32);
+            ir::IrInstr         ra{};
+            ra.op          = ir::IrOp::RAW_ASM;
+            ra.type        = ir::IrType::I32;
             ra.dst         = v_dst;
             ra.func_name   = oss.str();
             ra.source_line = e->loc.line;
@@ -7932,11 +9919,9 @@ namespace vex {
             ir::IrValueId v_str;
             if (ae && ae->kind == ast::NodeKind::StringLitExpr) {
                 auto *sl = static_cast<ast::StringLitExpr *>(ae);
-                if (!sl->is_interpolated()) {
-                    v_str = lower_string_literal_to_string_object(sl);
-                } else {
-                    v_str = lower_expr(ae);
-                }
+                // Tanto literales puros como interpolados: el helper
+                // construye el StringObject correcto.
+                v_str = lower_string_literal_to_string_object(sl);
             } else {
                 v_str = lower_expr(ae);
             }
@@ -7954,6 +9939,8 @@ namespace vex {
                 cv.operands    = {v_str};
                 cv.func_name   = std::string("strconv {dst}, {src0}, 3\n");
                 cv.source_line = e->loc.line;
+                // strconv aloca un nuevo StringObject con el encoding pedido.
+                cv.is_call_site = true;
                 fn_->append(current_block_, std::move(cv));
                 ir::IrValueId v_raw            = fn_->new_value(ir::IrType::PTR);
                 fn_->values[v_raw].is_host_ptr = true;
@@ -8012,9 +9999,8 @@ namespace vex {
             auto coerce_to_string_handle = [&](ast::Expr *ex) -> ir::IrValueId {
                 if (ex && ex->kind == ast::NodeKind::StringLitExpr) {
                     auto *sl = static_cast<ast::StringLitExpr *>(ex);
-                    if (!sl->is_interpolated()) {
-                        return lower_string_literal_to_string_object(sl);
-                    }
+                    // Tanto literales puros como interpolados.
+                    return lower_string_literal_to_string_object(sl);
                 }
                 return lower_expr(ex);
             };
@@ -8033,6 +10019,14 @@ namespace vex {
             ra.operands    = {v_a, v_b};
             ra.func_name   = std::string(op) + " {dst}, {src0}, {src1}\n";
             ra.source_line = e->loc.line;
+            // strcat aloca ROPE StringObject; strcmp NO aloca pero marcamos
+            // por uniformidad y porque strcmp es no-allocating asi que el
+            // save/restore es cero-coste si live_regs_through_call devuelve
+            // vacio.  Esencial para strcat (sin esto, GC durante alocacion
+            // del rope deja host_ptrs vivos invalidos).
+            if (is_str_concat) {
+                ra.is_call_site = true;
+            }
             fn_->append(current_block_, std::move(ra));
             // str_equals returns -1/0/1 (strcmp).  Convertir a bool: 0 == equal.
             if (is_str_equals) {
@@ -8064,14 +10058,30 @@ namespace vex {
                 out_value = ir::IR_NO_VALUE;
                 return true;
             }
+            // Auto-detect: si el puntero proviene de memoria HOST (malloc,
+            // str_cstr, gcallocp, etc.) emitimos `strmake_h` que lee bytes
+            // del host.  Si es VM (subsp+&local, STR_LIT_ADDR, etc.) usamos
+            // `strmake` original que lee de vm_mem.  Esto cierra el bug
+            // historico en el que `str_make(buffer.data, len)` con `data`
+            // mallocado retornaba zeros
+            const bool ptr_is_host =
+                static_cast<size_t>(v_ptr) < fn_->values.size()
+             && fn_->values[v_ptr].is_host_ptr;
+            const char *mnemonic = ptr_is_host ? "strmake_h" : "strmake";
             ir::IrValueId v_h = fn_->new_value(ir::IrType::I64);
             ir::IrInstr   ra{};
             ra.op          = ir::IrOp::RAW_ASM;
             ra.type        = ir::IrType::I64;
             ra.dst         = v_h;
             ra.operands    = {v_ptr, v_len};
-            ra.func_name   = std::string("strmake {dst}, {src0}, {src1}\n");
+            ra.func_name   = std::string(mnemonic) + " {dst}, {src0}, {src1}\n";
             ra.source_line = e->loc.line;
+            // strmake / strmake_h alocan un StringObject GC-managed via
+            // gc_heap.alloc_pinned, lo que puede disparar minor/major GC
+            // que mueva otros objetos vivos.  Marcamos como call_site para
+            // que el regalloc envuelva con save_live_regs / restore_live_regs
+            // (gchandle pre-call, gcderef post-call para is_gc_object).
+            ra.is_call_site = true;
             fn_->append(current_block_, std::move(ra));
             out_value = v_h;
             return true;
@@ -8130,6 +10140,8 @@ namespace vex {
             ra.func_name = std::string("strconv {dst}, {src0}, ")
                     + std::to_string(enc_val) + "\n";
             ra.source_line = e->loc.line;
+            // strconv aloca un nuevo StringObject; preservar host_ptrs vivos.
+            ra.is_call_site = true;
             fn_->append(current_block_, std::move(ra));
             out_value = v_h;
             return true;
@@ -8168,6 +10180,9 @@ namespace vex {
             ra.dst         = v_dst;
             ra.func_name   = oss.str();
             ra.source_line = e->loc.line;
+            // findclass clobera r5/r6/r12 -- marca como call site
+            // para que el emitter save/restore regs vivos.
+            ra.is_call_site = true;
             fn_->append(current_block_, std::move(ra));
             out_value = v_dst;
             return true;
@@ -8482,6 +10497,35 @@ namespace vex {
                          "newInstance: requiere un argumento (i64 cls)");
                 out_value = ir::IR_NO_VALUE;
                 return true;
+            }
+            // Fix #1 (caso estatico): si el arg es un IdentExpr con origen
+            // conocido (`Class cls = Class.forName("X")`), emitir `new X()`
+            // que invoca el constructor via `__new_<X>` synthetic.  Cero
+            // overhead vs newInstance directo (mismo bytecode que el frontend
+            // genera para `new X()`).  Para casos dinamicos donde el origen
+            // no se conoce, fallback a NEWOBJ raw (sin ctor; documentado).
+            if (e->args[0]->kind == ast::NodeKind::IdentExpr) {
+                auto *id = static_cast<ast::IdentExpr *>(e->args[0].get());
+                auto it = class_origin_of_local_.find(id->name);
+                if (it != class_origin_of_local_.end()) {
+                    const std::string &class_name = it->second;
+                    // Verificar que la clase existe en class_layouts y
+                    // tiene un constructor sin argumentos.  Si no, fallback.
+                    const auto &layouts = tc_.class_layouts();
+                    auto it2 = layouts.find(class_name);
+                    if (it2 != layouts.end()) {
+                        // Sintetizar NewExpr equivalente a `new X()` y
+                        // delegar en lower_new_expr (que invoca el helper
+                        // sintetico __new_X que SI llama al ctor).
+                        ast::NewExpr nx;
+                        nx.loc        = e->loc;
+                        nx.class_name = class_name;
+                        // Sin args (no-arg constructor).
+                        out_value = lower_new_expr(&nx);
+                        if (out_value != ir::IR_NO_VALUE) return true;
+                        // Si lower_new_expr fallo, caer al path NEWOBJ raw.
+                    }
+                }
             }
             const ir::IrValueId v_cls = lower_expr(e->args[0].get());
             if (v_cls == ir::IR_NO_VALUE) {
@@ -8975,6 +11019,546 @@ namespace vex {
             return true;
         }
 
+        // =====================================================================
+        // Smart pointers builtins: unique<T> / shared<T>.
+        // =====================================================================
+        //
+        // Modelo de slot: una variable @c unique<T> p esta bound a un SSA
+        // value que es la DIRECCION de un slot stack de 8 bytes que
+        // contiene el host_ptr al recurso.  Todas las operaciones acceden
+        // al recurso via ese slot:
+        //   get(p)            -> LOAD [slot]
+        //   move(p) -> q      -> mvtake [q_slot], [p_slot]  (1 instr VM)
+        //   cleanup scope exit -> LOAD ptr; CMP_EQ 0; CALL free(ptr) si no-null
+        //
+        // Para shared<T> el slot contiene un host_ptr al control block
+        // gestionado por GC.  El control block tiene refcount@0, deleter@8,
+        // payload inline desde +16.
+
+        // ----- unique_box(value) -----  unique<T> Tier 0 con deleter=free.
+        // Layout: ALLOCA 8 bytes (slot) + malloc(sizeof(T)) (host) +
+        // STORE value en host + STORE host_ptr en slot.  Cleanup al exit
+        // del scope: LOAD slot; CMP_EQ 0; CALL free(ptr) si no-null.
+        if (is_unique_box || is_shared_box) {
+            if (e->args.size() != 1) {
+                error_at(e->loc, name + ": requiere 1 argumento");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_payload = lower_expr(e->args[0].get());
+            if (v_payload == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrType payload_t = fn_->values[v_payload].type;
+            // sizeof(T) - usamos un tamano conservador de 8 bytes para
+            // todos los tipos primitivos.  Para clases/structs, el tipo
+            // del valor pasado debe coincidir con el sizeof del recurso.
+            const uint64_t payload_size = 8;
+            if (is_unique_box) {
+                // unique<T> Tier 1 (16 bytes):
+                //   [+0 i64 ptr][+8 i64 deleter_addr]
+                // deleter_addr = 0 (sentinel) -> cleanup hace RAW_FREE.
+                // Layout 16 bytes para que el deleter info sobreviva
+                // cuando la funcion devuelve el unique<T> via SRET.
+                const ir::IrValueId v_slot = stack_alloc_buf(16, e->loc.line);
+                // RAW_ALLOC(payload_size) -> v_payload_ptr (host ptr).
+                const ir::IrValueId v_size = emit_const(ir::IrType::I64,
+                    static_cast<int64_t>(payload_size), e->loc.line);
+                const ir::IrValueId v_payload_ptr = fn_->new_value(ir::IrType::PTR);
+                fn_->values[v_payload_ptr].is_host_ptr = true;
+                {
+                    ir::IrInstr ins{};
+                    ins.op          = ir::IrOp::RAW_ALLOC;
+                    ins.type        = ir::IrType::PTR;
+                    ins.dst         = v_payload_ptr;
+                    ins.operands    = {v_size};
+                    ins.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(ins));
+                }
+                // STORE payload at [v_payload_ptr] (host memory).
+                {
+                    ir::IrInstr st{};
+                    st.op          = ir::IrOp::STORE;
+                    st.type        = payload_t;
+                    st.operands    = {v_payload, v_payload_ptr};
+                    st.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(st));
+                }
+                // STORE host_ptr at [v_slot+0].
+                {
+                    ir::IrInstr st{};
+                    st.op          = ir::IrOp::STORE;
+                    st.type        = ir::IrType::I64;
+                    st.operands    = {v_payload_ptr, v_slot};
+                    st.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(st));
+                }
+                // STORE deleter=0 at [v_slot+8] (sentinel = RAW_FREE).
+                {
+                    const ir::IrValueId v_eight = emit_const(ir::IrType::I64, 8, e->loc.line);
+                    const ir::IrValueId v_slot8 = fn_->new_value(ir::IrType::PTR);
+                    ir::IrInstr add{};
+                    add.op          = ir::IrOp::ADD;
+                    add.type        = ir::IrType::I64;
+                    add.dst         = v_slot8;
+                    add.operands    = {v_slot, v_eight};
+                    add.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(add));
+                    const ir::IrValueId v_zero = emit_const(ir::IrType::I64, 0, e->loc.line);
+                    ir::IrInstr st{};
+                    st.op          = ir::IrOp::STORE;
+                    st.type        = ir::IrType::I64;
+                    st.operands    = {v_zero, v_slot8};
+                    st.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(st));
+                }
+                fn_->values[v_slot].pointee_is_host_ptr = true;
+                out_value = v_slot;
+                return true;
+            } else {
+                // shared<T>: gcallocp(16 + 8) - control block + payload inline.
+                // Layout: [+0 i64 refcount=1][+8 u64 deleter=0][+16 T payload].
+                // El slot stack guarda host_ptr al control block.
+                const ir::IrValueId v_slot = stack_alloc_buf(8, e->loc.line);
+                const ir::IrValueId v_ctrl_size = emit_const(ir::IrType::I64,
+                    16 + 8, e->loc.line); // 24 bytes total
+                const ir::IrValueId v_ctrl = fn_->new_value(ir::IrType::PTR);
+                fn_->values[v_ctrl].is_host_ptr = true;
+                {
+                    // gcallocp r_dst, r_size  -> r_dst = host_ptr a payload
+                    ir::IrInstr ra{};
+                    ra.op          = ir::IrOp::RAW_ASM;
+                    ra.type        = ir::IrType::PTR;
+                    ra.dst         = v_ctrl;
+                    ra.operands    = {v_ctrl_size};
+                    ra.func_name   = "gcallocp {dst}, {src0}\n";
+                    ra.source_line = e->loc.line;
+                    ra.is_call_site = true;
+                    fn_->append(current_block_, std::move(ra));
+                }
+                // STORE refcount=1 at [v_ctrl + 0].
+                {
+                    const ir::IrValueId v_one = emit_const(ir::IrType::I64, 1, e->loc.line);
+                    ir::IrInstr st{};
+                    st.op          = ir::IrOp::STORE;
+                    st.type        = ir::IrType::I64;
+                    st.operands    = {v_one, v_ctrl};
+                    st.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(st));
+                }
+                // STORE deleter=0 at [v_ctrl + 8] (placeholder; cleanup usa free literal).
+                {
+                    const ir::IrValueId v_eight = emit_const(ir::IrType::I64, 8, e->loc.line);
+                    const ir::IrValueId v_ctrl8 = fn_->new_value(ir::IrType::PTR);
+                    fn_->values[v_ctrl8].is_host_ptr = true;
+                    ir::IrInstr add{};
+                    add.op          = ir::IrOp::ADD;
+                    add.type        = ir::IrType::I64;
+                    add.dst         = v_ctrl8;
+                    add.operands    = {v_ctrl, v_eight};
+                    add.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(add));
+                    const ir::IrValueId v_zero = emit_const(ir::IrType::I64, 0, e->loc.line);
+                    ir::IrInstr st{};
+                    st.op          = ir::IrOp::STORE;
+                    st.type        = ir::IrType::I64;
+                    st.operands    = {v_zero, v_ctrl8};
+                    st.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(st));
+                }
+                // STORE payload at [v_ctrl + 16].
+                {
+                    const ir::IrValueId v_sixteen = emit_const(ir::IrType::I64, 16, e->loc.line);
+                    const ir::IrValueId v_ctrl16  = fn_->new_value(ir::IrType::PTR);
+                    fn_->values[v_ctrl16].is_host_ptr = true;
+                    ir::IrInstr add{};
+                    add.op          = ir::IrOp::ADD;
+                    add.type        = ir::IrType::I64;
+                    add.dst         = v_ctrl16;
+                    add.operands    = {v_ctrl, v_sixteen};
+                    add.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(add));
+                    ir::IrInstr st{};
+                    st.op          = ir::IrOp::STORE;
+                    st.type        = payload_t;
+                    st.operands    = {v_payload, v_ctrl16};
+                    st.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(st));
+                }
+                // STORE v_ctrl at [v_slot] (VM memory).
+                {
+                    ir::IrInstr st{};
+                    st.op          = ir::IrOp::STORE;
+                    st.type        = ir::IrType::I64;
+                    st.operands    = {v_ctrl, v_slot};
+                    st.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(st));
+                }
+                fn_->values[v_slot].pointee_is_host_ptr = true;
+                out_value = v_slot;
+                return true;
+            }
+        }
+
+        // ----- unique_with(value, deleter_fn) / shared_with(...) -----
+        // Forma generica donde el programador especifica el deleter.
+        // No se hace alloc: el value es el RESULTADO de una alocacion ya
+        // hecha (VirtualAlloc, malloc, fopen, socket(), etc.).  El
+        // cleanup en scope exit invoca deleter_fn(value) automaticamente.
+        //
+        // Layout: ALLOCA 8 (slot) + STORE value at [slot].  Cleanup:
+        // LOAD ptr; if (ptr != 0) CALL deleter(ptr); zero slot.
+        //
+        // El nombre del deleter se almacena en CleanupAction::literal_deleter
+        // con prefijo "@extern:lib:fn" si es extern, o el nombre puro si
+        // es Vesta.  El emit_cleanups_all elige CALLN o CALLVM.
+        if (is_unique_with || is_shared_with) {
+            if (e->args.size() != 2) {
+                error_at(e->loc, name + ": requiere 2 argumentos");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_payload = lower_expr(e->args[0].get());
+            if (v_payload == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            // Validar que arg[1] sea IdentExpr (type_checker ya lo verifico).
+            if (e->args[1]->kind != ast::NodeKind::IdentExpr) {
+                error_at(e->args[1]->loc,
+                    name + ": el deleter debe ser un identificador de funcion");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const auto *deleter_id = static_cast<const ast::IdentExpr *>(e->args[1].get());
+            // Capturamos el nombre del deleter; el cleanup lo usara.
+            std::string deleter_label = tc_.lookup_extern_qualified(deleter_id->name);
+            if (deleter_label.empty()) {
+                // No es extern -> es funcion Vesta.  Usamos el nombre puro;
+                // el cleanup emitira CALLVM @Absolute("code.<name>").
+                deleter_label = deleter_id->name;
+            } // else: ya viene con prefijo "@extern:lib:fn".
+            // Tier 1: ALLOCA 16 + STORE value@+0 + STORE deleter_addr@+8.
+            // El deleter_addr se materializa via RAW_ASM que captura
+            // `@Absolute("code.<name>")` (Vesta) o un puntero null marcador
+            // (extern, no soportado en SRET return aun).
+            const ir::IrValueId v_slot = stack_alloc_buf(16, e->loc.line);
+            {
+                ir::IrInstr st{};
+                st.op          = ir::IrOp::STORE;
+                st.type        = ir::IrType::I64;
+                st.operands    = {v_payload, v_slot};
+                st.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(st));
+            }
+            // STORE deleter address en slot+8.  Materializamos la
+            // direccion via RAW_ASM: `mov {dst}, @Absolute("code.<fn>")`.
+            // El assembler resuelve la direccion al linker time.
+            //
+            // Limitacion: para deleters extern no podemos obtener una
+            // direccion vesta-callable, por lo que usamos 0 (sentinel)
+            // y el cleanup local conoce el deleter por compile-time via
+            // literal_deleter.  SRET return con extern deleter no
+            // preserva la info (futuro: anyadir tabla de deleter ids).
+            const ir::IrValueId v_deleter_addr = fn_->new_value(ir::IrType::I64);
+            if (deleter_label.rfind("@extern:", 0) == 0) {
+                // Extern: no podemos materializar direccion como Vesta
+                // function; almacenamos 0 y dependemos del literal_deleter
+                // local para hacer el call correcto.  No sobrevive SRET.
+                const ir::IrValueId v_zero = emit_const(ir::IrType::I64, 0, e->loc.line);
+                ir::IrInstr mov{};
+                mov.op          = ir::IrOp::MOV;
+                mov.type        = ir::IrType::I64;
+                mov.dst         = v_deleter_addr;
+                mov.operands    = {v_zero};
+                mov.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(mov));
+            } else {
+                // Vesta: emitir `mov {dst}, @Absolute("code.<deleter_name>")`.
+                ir::IrInstr ra{};
+                ra.op          = ir::IrOp::RAW_ASM;
+                ra.type        = ir::IrType::I64;
+                ra.dst         = v_deleter_addr;
+                ra.func_name   = std::string("mov {dst}, @Absolute(\"code.")
+                                + deleter_label + "\")\n";
+                ra.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(ra));
+            }
+            // STORE deleter_addr en slot+8.
+            {
+                const ir::IrValueId v_eight = emit_const(ir::IrType::I64, 8, e->loc.line);
+                const ir::IrValueId v_slot8 = fn_->new_value(ir::IrType::PTR);
+                ir::IrInstr add{};
+                add.op          = ir::IrOp::ADD;
+                add.type        = ir::IrType::I64;
+                add.dst         = v_slot8;
+                add.operands    = {v_slot, v_eight};
+                add.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(add));
+                ir::IrInstr st{};
+                st.op          = ir::IrOp::STORE;
+                st.type        = ir::IrType::I64;
+                st.operands    = {v_deleter_addr, v_slot8};
+                st.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(st));
+            }
+            // El slot contiene un valor con semantica de host_ptr / handle.
+            fn_->values[v_slot].pointee_is_host_ptr = true;
+            // Anotamos la accion de cleanup pendiente para que el cleanup
+            // local pueda usar el deleter por compile-time (cero overhead).
+            // El cleanup dinamico via slot+8 solo se activa cuando se
+            // accede al smart pointer tras SRET (no tenemos info compile-time).
+            pending_smartptr_deleter_ = deleter_label;
+            out_value = v_slot;
+            return true;
+        }
+
+        // ----- move(p) -----  transfer ownership.
+        // El destino de move es el LHS del var-decl o de la asignacion;
+        // este builtin SOLO marca el SSA value como "consumed".  El
+        // codigo del mvtake real se emite en lower_var_decl cuando ve
+        // que el init es CallExpr(move(...)).  Aqui devolvemos el slot
+        // del origen tal cual: el lower_var_decl tomara responsabilidad
+        // de emitir mvtake y zerificar el slot del origen.
+        if (is_move) {
+            if (e->args.size() != 1) {
+                error_at(e->loc, "move: requiere 1 argumento");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_arg = lower_expr(e->args[0].get());
+            // No emitimos mvtake aqui; lower_var_decl detecta el patron
+            // CallExpr(move(...)) y emite la secuencia correcta.
+            out_value = v_arg;
+            return true;
+        }
+
+        // ----- ptr_of(p) -----  T* host, sin consumir el smart pointer.
+        // unique<T>: LOAD ptr from [slot]; resultado is_host_ptr.
+        // shared<T>: LOAD ctrl from [slot]; ADD 16; resultado is_host_ptr.
+        if (is_get) {
+            if (e->args.size() != 1) {
+                error_at(e->loc, "ptr_of: requiere 1 argumento");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const Type        arg_t = e->args[0]->result_type;
+            const ir::IrValueId v_slot = lower_expr(e->args[0].get());
+            if (v_slot == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            // LOAD ptr from [v_slot].
+            const ir::IrValueId v_ptr = fn_->new_value(ir::IrType::PTR);
+            fn_->values[v_ptr].is_host_ptr = true;
+            {
+                ir::IrInstr ld{};
+                ld.op          = ir::IrOp::LOAD;
+                ld.type        = ir::IrType::I64;
+                ld.dst         = v_ptr;
+                ld.operands    = {v_slot};
+                ld.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(ld));
+            }
+            if (arg_t.kind == PrimitiveKind::SHARED_PTR) {
+                // shared<T>: payload esta en +16 del control block.
+                const ir::IrValueId v_sixteen = emit_const(ir::IrType::I64, 16, e->loc.line);
+                const ir::IrValueId v_pay = fn_->new_value(ir::IrType::PTR);
+                fn_->values[v_pay].is_host_ptr = true;
+                ir::IrInstr add{};
+                add.op          = ir::IrOp::ADD;
+                add.type        = ir::IrType::I64;
+                add.dst         = v_pay;
+                add.operands    = {v_ptr, v_sixteen};
+                add.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(add));
+                out_value = v_pay;
+                return true;
+            }
+            // unique<T>: ptr ES el payload.
+            out_value = v_ptr;
+            return true;
+        }
+
+        // ----- use_count(s) -----  i64 refcount del shared<T>.
+        if (is_use_count) {
+            if (e->args.size() != 1) {
+                error_at(e->loc, "use_count: requiere 1 argumento");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_slot = lower_expr(e->args[0].get());
+            if (v_slot == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            // LOAD ctrl from [slot].
+            const ir::IrValueId v_ctrl = fn_->new_value(ir::IrType::PTR);
+            fn_->values[v_ctrl].is_host_ptr = true;
+            {
+                ir::IrInstr ld{};
+                ld.op          = ir::IrOp::LOAD;
+                ld.type        = ir::IrType::I64;
+                ld.dst         = v_ctrl;
+                ld.operands    = {v_slot};
+                ld.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(ld));
+            }
+            // LOAD refcount from [ctrl + 0] (host memory).
+            const ir::IrValueId v_rc = fn_->new_value(ir::IrType::I64);
+            {
+                ir::IrInstr ld{};
+                ld.op          = ir::IrOp::LOAD;
+                ld.type        = ir::IrType::I64;
+                ld.dst         = v_rc;
+                ld.operands    = {v_ctrl};
+                ld.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(ld));
+            }
+            out_value = v_rc;
+            return true;
+        }
+
+        // =====================================================================
+        // Borrow checker builtins: lend / lend_mut / read_borrow / write_borrow.
+        // =====================================================================
+        //
+        // El borrow checker compile-time ya valido las reglas R1-R4.  El
+        // lowering solo emite el codigo correspondiente con cero overhead
+        // vs un raw pointer:
+        //
+        //   lend(owner)       -> ptr_of equivalente al unique<T>/shared<T>.
+        //                        Para owner que NO es smart pointer (var
+        //                        local plain), emite &owner via slot stack.
+        //   lend_mut(owner)   -> mismo bytecode que lend; la distincion
+        //                        es puramente compile-time.
+        //   read_borrow(b)    -> LOAD a traves del host_ptr (movh).
+        //   write_borrow(m,v) -> STORE a traves del host_ptr (movh).
+        if (is_lend || is_lend_mut) {
+            if (e->args.size() != 1) {
+                error_at(e->loc, name + ": requiere 1 argumento (owner)");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            // Si el owner es unique<T>/shared<T>, equivale a ptr_of(owner)
+            // que carga slot+0.  Si es una variable plain, devolvemos
+            // &owner (su SSA value, que ya tiene is_host_ptr correcto via
+            // address-taken promotion del A.3.4.a).
+            const Type owner_t = e->args[0]->result_type;
+            // F3 reborrow: si el arg ES un borrow/borrow_mut (var o param),
+            // su SSA value YA ES el host_ptr al payload.  No queremos
+            // emitir LOAD via read_local (eso es para slots de unique).
+            // Bypass: usar lookup directamente cuando el arg es un
+            // IdentExpr cuyo tipo es borrow.
+            if (e->args[0]->kind == ast::NodeKind::IdentExpr
+             && (owner_t.kind == PrimitiveKind::BORROW
+              || owner_t.kind == PrimitiveKind::BORROW_MUT)) {
+                auto *id = static_cast<ast::IdentExpr *>(e->args[0].get());
+                const ir::IrValueId v = lookup(id->name);
+                if (v != ir::IR_NO_VALUE) {
+                    // El borrow_var ya es host_ptr; lo devolvemos tal cual.
+                    // (read_borrow/write_borrow lo usaran con movh.)
+                    out_value = v;
+                    return true;
+                }
+            }
+            const ir::IrValueId v_arg = lower_expr(e->args[0].get());
+            if (v_arg == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            if (owner_t.kind == PrimitiveKind::UNIQUE_PTR
+             || owner_t.kind == PrimitiveKind::SHARED_PTR) {
+                // LOAD slot+0 (para unique) o ctrl+16 (shared payload).
+                const ir::IrValueId v_ptr = fn_->new_value(ir::IrType::PTR);
+                fn_->values[v_ptr].is_host_ptr = true;
+                ir::IrInstr ld{};
+                ld.op          = ir::IrOp::LOAD;
+                ld.type        = ir::IrType::I64;
+                ld.dst         = v_ptr;
+                ld.operands    = {v_arg};
+                ld.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(ld));
+                if (owner_t.kind == PrimitiveKind::SHARED_PTR) {
+                    // Para shared, sumar 16 (offset del payload inline en
+                    // ctrl_block: refcount@0 + deleter@8 + payload@16).
+                    const ir::IrValueId v_sixteen =
+                        emit_const(ir::IrType::I64, 16, e->loc.line);
+                    const ir::IrValueId v_pay = fn_->new_value(ir::IrType::PTR);
+                    fn_->values[v_pay].is_host_ptr = true;
+                    ir::IrInstr add{};
+                    add.op          = ir::IrOp::ADD;
+                    add.type        = ir::IrType::I64;
+                    add.dst         = v_pay;
+                    add.operands    = {v_ptr, v_sixteen};
+                    add.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(add));
+                    out_value = v_pay;
+                    return true;
+                }
+                out_value = v_ptr;
+                return true;
+            }
+            // owner plain: el SSA value ya es la direccion (address-taken).
+            // Lo devolvemos tal cual.
+            out_value = v_arg;
+            return true;
+        }
+        if (is_read_borrow) {
+            if (e->args.size() != 1) {
+                error_at(e->loc, "read_borrow: requiere 1 argumento (borrow)");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_b = lower_expr(e->args[0].get());
+            if (v_b == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            // El borrow es un host_ptr.  Marcamos is_host_ptr=true.
+            fn_->values[v_b].is_host_ptr = true;
+            // LOAD T from [v_b].
+            const Type inner = e->args[0]->result_type.pointee
+                ? *e->args[0]->result_type.pointee : Type{};
+            const ir::IrType payload_t = ir_type_from_primitive(inner.kind);
+            const ir::IrValueId v_dst = fn_->new_value(payload_t);
+            ir::IrInstr ld{};
+            ld.op          = ir::IrOp::LOAD;
+            ld.type        = payload_t;
+            ld.dst         = v_dst;
+            ld.operands    = {v_b};
+            ld.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(ld));
+            out_value = v_dst;
+            return true;
+        }
+        if (is_write_borrow) {
+            if (e->args.size() != 2) {
+                error_at(e->loc, "write_borrow: requiere 2 argumentos (borrow_mut, value)");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_b = lower_expr(e->args[0].get());
+            const ir::IrValueId v_v = lower_expr(e->args[1].get());
+            if (v_b == ir::IR_NO_VALUE || v_v == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            fn_->values[v_b].is_host_ptr = true;
+            const Type inner = e->args[0]->result_type.pointee
+                ? *e->args[0]->result_type.pointee : Type{};
+            const ir::IrType payload_t = ir_type_from_primitive(inner.kind);
+            ir::IrInstr st{};
+            st.op          = ir::IrOp::STORE;
+            st.type        = payload_t;
+            st.operands    = {v_v, v_b};
+            st.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(st));
+            out_value = ir::IR_NO_VALUE;
+            return true;
+        }
+
         // ----- pid() -----
         // Devuelve el PID encoded del proceso actual via getpid r_dst.
         if (is_pid) {
@@ -8993,6 +11577,219 @@ namespace vex {
             ra.source_line = e->loc.line;
             fn_->append(current_block_, std::move(ra));
             out_value = v_pid;
+            return true;
+        }
+
+        // ----- args_count() -> i32 -----
+        // Devuelve el numero de argumentos del script (vm->script_args.size()).
+        // Baja a `getargc r_dst`, deposita uint64 que el caller trunca a i32.
+        if (is_args_count) {
+            if (!e->args.empty()) {
+                error_at(e->loc, "args_count: no acepta argumentos");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_n = fn_->new_value(ir::IrType::I32);
+            ir::IrInstr         ra{};
+            ra.op          = ir::IrOp::RAW_ASM;
+            ra.type        = ir::IrType::I32;
+            ra.dst         = v_n;
+            ra.func_name   = std::string("// args_count() -> getargc {dst}\n"
+                                         "getargc {dst}\n");
+            ra.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(ra));
+            out_value = v_n;
+            return true;
+        }
+
+        // ----- Builtins de terminal / VT100 -----
+        // Cada uno emite via vio_print una secuencia ANSI estatica.
+        // term_move(row, col) requiere format dinamico: emite la secuencia
+        // como una mezcla de prints y print_int.  Sin overhead extra
+        // gracias al buffer global de 64 KB del plugin vesta_io (todos
+        // los prints en una misma frame se agrupan en 1 syscall).
+        if (is_term_clear) {
+            if (!e->args.empty()) {
+                error_at(e->loc, "term_clear: no acepta argumentos");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            emit_print_string_literal("\x1b[2J\x1b[H", e->loc.line);
+            out_value = ir::IR_NO_VALUE;
+            return true;
+        }
+        if (is_term_clear_line) {
+            if (!e->args.empty()) {
+                error_at(e->loc, "term_clear_line: no acepta argumentos");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            emit_print_string_literal("\x1b[2K", e->loc.line);
+            out_value = ir::IR_NO_VALUE;
+            return true;
+        }
+        if (is_term_save_cursor) {
+            emit_print_string_literal("\x1b[s", e->loc.line);
+            out_value = ir::IR_NO_VALUE;
+            return true;
+        }
+        if (is_term_restore_cursor) {
+            emit_print_string_literal("\x1b[u", e->loc.line);
+            out_value = ir::IR_NO_VALUE;
+            return true;
+        }
+        if (is_term_hide_cursor) {
+            emit_print_string_literal("\x1b[?25l", e->loc.line);
+            out_value = ir::IR_NO_VALUE;
+            return true;
+        }
+        if (is_term_show_cursor) {
+            emit_print_string_literal("\x1b[?25h", e->loc.line);
+            out_value = ir::IR_NO_VALUE;
+            return true;
+        }
+        if (is_term_reset) {
+            // Reset all attributes (color, style, bg, fg).
+            emit_print_string_literal("\x1b[0m", e->loc.line);
+            out_value = ir::IR_NO_VALUE;
+            return true;
+        }
+        if (is_term_move) {
+            if (e->args.size() != 2 || !e->args[0] || !e->args[1]) {
+                error_at(e->loc, "term_move: requiere 2 argumentos (row, col)");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            // Emite "\x1b[" + row + ";" + col + "H" usando print + print_int.
+            emit_print_string_literal("\x1b[", e->loc.line);
+            // Sintetizar print_int(row) y print_int(col) reusando
+            // try_lower_builtin_call con args sintetizados.
+            for (int i = 0; i < 2; ++i) {
+                const ir::IrValueId v = lower_expr(e->args[i].get());
+                if (v == ir::IR_NO_VALUE) {
+                    out_value = ir::IR_NO_VALUE;
+                    return true;
+                }
+                // CALLN vio_print_int(v).
+                out_mod_->register_native_import(
+                    std::string("stdlib/native/io/vesta_io"), "vio_print_int");
+                ir::IrInstr ins{};
+                ins.op          = ir::IrOp::CALLN;
+                ins.type        = ir::IrType::VOID;
+                ins.dst         = ir::IR_NO_VALUE;
+                ins.func_name   = "stdlib/native/io/vesta_io:vio_print_int";
+                ins.operands.push_back(v);
+                ins.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(ins));
+                if (i == 0) {
+                    emit_print_string_literal(";", e->loc.line);
+                }
+            }
+            emit_print_string_literal("H", e->loc.line);
+            out_value = ir::IR_NO_VALUE;
+            return true;
+        }
+
+        // ----- getMethods(cls) / getFields(cls) -> i32 -----
+        // Devuelve el numero de metodos / fields de instancia de la clase
+        // via los opcodes existentes methodcount (0xDB) / fieldcount (0xDA).
+        // Ambos depositan el count en R00 (no toman r_dst); capturamos a SSA.
+        if (is_getMethods || is_getFields) {
+            if (e->args.size() != 1 || !e->args[0]) {
+                error_at(e->loc, std::string(is_getMethods ? "getMethods" : "getFields")
+                    + ": requiere 1 argumento (cls)");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_cls = lower_expr(e->args[0].get());
+            if (v_cls == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const char *mnem = is_getMethods ? "methodcount" : "fieldcount";
+            const ir::IrValueId v_dst = fn_->new_value(ir::IrType::I32);
+            ir::IrInstr ra{};
+            ra.op   = ir::IrOp::RAW_ASM;
+            ra.type = ir::IrType::I32;
+            ra.dst  = v_dst;
+            ra.operands.push_back(v_cls);
+            std::ostringstream oss;
+            oss << "// " << (is_getMethods ? "getMethods" : "getFields")
+                << "(cls) -> R0\n";
+            oss << mnem << " {src0}\n";
+            oss << "mov {dst}, r0\n";
+            ra.func_name   = oss.str();
+            ra.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(ra));
+            out_value = v_dst;
+            return true;
+        }
+
+        // ----- getMethodAt(cls, i) / getFieldAt(cls, i) -> i64 -----
+        // Devuelve &cls->methods[i] / &cls->fields[i] via los opcodes nuevos
+        // getmethat / getfldat (0x6E / 0x6F, variante reg-reg de getmethod /
+        // getfield).  Ambos depositan el puntero (MethodInfo* / FieldInfo*)
+        // en R00, o 0 si i fuera de rango / cls nulo.
+        if (is_getMethodAt || is_getFieldAt) {
+            if (e->args.size() != 2 || !e->args[0] || !e->args[1]) {
+                error_at(e->loc, std::string(is_getMethodAt ? "getMethodAt" : "getFieldAt")
+                    + ": requiere 2 argumentos (cls, i)");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_cls = lower_expr(e->args[0].get());
+            const ir::IrValueId v_idx = lower_expr(e->args[1].get());
+            if (v_cls == ir::IR_NO_VALUE || v_idx == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const char *mnem = is_getMethodAt ? "getmethat" : "getfldat";
+            const ir::IrValueId v_dst = fn_->new_value(ir::IrType::I64);
+            ir::IrInstr ra{};
+            ra.op   = ir::IrOp::RAW_ASM;
+            ra.type = ir::IrType::I64;
+            ra.dst  = v_dst;
+            ra.operands.push_back(v_cls);
+            ra.operands.push_back(v_idx);
+            std::ostringstream oss;
+            oss << "// " << (is_getMethodAt ? "getMethodAt" : "getFieldAt")
+                << "(cls, i) -> R0\n";
+            oss << mnem << " {src0}, {src1}\n";
+            oss << "mov {dst}, r0\n";
+            ra.func_name   = oss.str();
+            ra.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(ra));
+            out_value = v_dst;
+            return true;
+        }
+
+        // ----- args_get(i) -> string -----
+        // Devuelve un StringObject GC-managed con el contenido de args[i].
+        // Baja a `getarg r_dst, r_idx`.  Si i fuera de rango, devuelve
+        // GC_NULL_HANDLE = 0 (que el frontend trata como string nulo).
+        if (is_args_get) {
+            if (e->args.size() != 1 || !e->args[0]) {
+                error_at(e->loc,
+                         "args_get: requiere 1 argumento (i32 indice)");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_idx = lower_expr(e->args[0].get());
+            if (v_idx == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_dst = fn_->new_value(ir::IrType::I64);
+            ir::IrInstr         ra{};
+            ra.op          = ir::IrOp::RAW_ASM;
+            ra.type        = ir::IrType::I64;
+            ra.dst         = v_dst;
+            ra.operands.push_back(v_idx);
+            ra.func_name   = std::string("// args_get(i) -> getarg {dst}, {src0}\n"
+                                         "getarg {dst}, {src0}\n");
+            ra.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(ra));
+            out_value = v_dst;
             return true;
         }
 
@@ -9295,6 +12092,18 @@ namespace vex {
             const std::string saved_class = current_class_lowering_;
             current_class_lowering_       = cd->name;
 
+            // Instrumentacion: vex_trace:enter al inicio del metodo
+            // (igual filtro que en lower_function -- saltamos solo helpers
+            // sinteticos; los ctors/dtors/metodos normales se instrumentan).
+            if (instrument_mode_ != "none" && instrument_mode_ != ""
+                && fn.name != "__module_init"
+                && fn.name.compare(0, 6, "__new_") != 0
+                && fn.name.compare(0, 8, "__async_") != 0
+                && fn.name.compare(0, 9, "__lambda_") != 0
+                && fn.name.compare(0, 8, "__spawn_") != 0) {
+                emit_instrument_enter(fn.name, m->loc.line);
+            }
+
             lower_block(m->body.get());
 
             current_class_lowering_ = saved_class;
@@ -9404,6 +12213,15 @@ namespace vex {
 
             // Cierre: anadir RET por defecto si el body no termino con uno.
             if (!block_terminated_) {
+                // Instrumentacion: vex_trace:leave antes del RET implicito.
+                if (instrument_mode_ != "none" && instrument_mode_ != ""
+                    && fn.name != "__module_init"
+                    && fn.name.compare(0, 6, "__new_") != 0
+                    && fn.name.compare(0, 8, "__async_") != 0
+                    && fn.name.compare(0, 9, "__lambda_") != 0
+                    && fn.name.compare(0, 8, "__spawn_") != 0) {
+                    emit_instrument_exit(fn.name, ir::IR_NO_VALUE, m->loc.line);
+                }
                 ir::IrInstr ret{};
                 ret.op   = ir::IrOp::RET;
                 ret.type = fn.ret_type;
@@ -9417,6 +12235,18 @@ namespace vex {
             }
 
             pop_scope();
+            propagate_is_gc_object_through_phis(fn);
+
+            // B.3 contract: si la clase es una instanciacion generica
+            // (e.g., `Box_i32` viene de `class Box<T>`), marcar la
+            // IrFunction con el template + type args legibles.  Util
+            // para C2 / AOT (dedup de specializations) y para tools
+            // (mostrar "Box<i32>::get" en stack traces vs "Box_i32__get").
+            if (const auto *mi = tc_.monomorph_info(cd->name)) {
+                fn.generic_template_name = mi->template_name;
+                fn.generic_type_args     = mi->type_args;
+            }
+
             out.add_function(std::move(fn));
             fn_ = nullptr;
         }
@@ -9457,21 +12287,93 @@ namespace vex {
     }
 
     /**
+     * @brief Estado del cluster de stores (base + ultimo offset).  Permite
+     *        que las llamadas consecutivas a @c emit_store_qword_vm con el
+     *        mismo base salten el `mov r5, base; addu r5, offset` y emitan
+     *        solo `addu r5, delta` -- el caller mantiene el StoreCluster
+     *        durante toda la secuencia de campos.
+     */
+    struct StoreCluster {
+        std::string base;
+        uint32_t    offset = 0;
+        bool        init   = false;
+    };
+
+    /**
+     * @brief Determina si @p val_expr puede emitirse directamente como segundo
+     *        operando de `mov [r5], <val>` (SIB o INMED), evitando el
+     *        intermediario via r6.  Acepta:
+     *        - registros generales `rN` o `rNN` (con sufijos opcionales).
+     *        - anotaciones `@Absolute(...)`, `@Relative(...)`, `@Method(...)`.
+     *        - literales numericos decimales/hex/bin/octal (positivos).
+     */
+    static bool is_inline_store_value(const std::string &val_expr) {
+        if (val_expr.empty()) return false;
+        // anotaciones siempre validas
+        if (val_expr[0] == '@') return true;
+        // registros: 'r' seguido de digitos (rN o rNN, opcional sufijo b/w/d/q)
+        if (val_expr[0] == 'r' && val_expr.size() >= 2) {
+            size_t i = 1;
+            while (i < val_expr.size() && val_expr[i] >= '0' && val_expr[i] <= '9') ++i;
+            if (i == 1) return false; // no digitos -> no es registro general
+            // resto: vacio, o un solo char de sufijo (b/w/d/q)
+            if (i == val_expr.size()) return true;
+            if (i + 1 == val_expr.size()) {
+                char c = val_expr[i];
+                if (c == 'b' || c == 'w' || c == 'd' || c == 'q') return true;
+            }
+            return false; // identificadores que empiezan con r pero no son regs
+        }
+        // literales numericos: empieza con digito o '-'/'+' o '0x'/'0b'/'0o'
+        char c0 = val_expr[0];
+        if ((c0 >= '0' && c0 <= '9') || c0 == '-' || c0 == '+') return true;
+        return false;
+    }
+
+    /**
      * @brief Emite el ASM que escribe un qword en una direccion de memoria
      *        VM @c base+offset usando @c mov [reg], reg64.  Las structs
      *        DefXxxParams viven en stack (memoria VM), por lo que NO se
      *        usa @c writecur (que escribe en memoria HOST a traves de un
      *        cursor) sino el MOV con direccionamiento SIB simple.
+     *
+     * @param state  Opcional: si != nullptr, el helper aprovecha que r5 ya
+     *               apunta a base+last_offset y emite solo `addu r5, delta`.
+     *               Llamadas con state=nullptr emiten siempre `mov r5, base;
+     *               addu r5, offset` (modo conservador para callers que
+     *               comparten r5 con otro codigo).
      */
     static void emit_store_qword_vm(std::ostringstream &asm_,
                                     const std::string & base_reg,
                                     uint32_t            offset,
-                                    const std::string & val_expr) {
-        // Usamos r5 como puntero efectivo; r6 como valor a escribir.
-        asm_ << "mov r5, " << base_reg << "\n";
-        if (offset > 0) asm_ << "addu r5, " << offset << "\n";
-        asm_ << "mov r6, " << val_expr << "\n";
-        asm_ << "mov [r5], r6\n";
+                                    const std::string & val_expr,
+                                    StoreCluster *      state = nullptr) {
+        if (state != nullptr && state->init && state->base == base_reg) {
+            int32_t delta = static_cast<int32_t>(offset)
+                          - static_cast<int32_t>(state->offset);
+            if (delta > 0)      asm_ << "addu r5, "  <<  delta << "\n";
+            else if (delta < 0) asm_ << "subu r5, "  << -delta << "\n";
+            // delta == 0: r5 ya apunta al offset correcto.
+        } else {
+            asm_ << "mov r5, " << base_reg << "\n";
+            if (offset > 0) asm_ << "addu r5, " << offset << "\n";
+        }
+        // Direct memory store: si val_expr es un registro general (rN), una
+        // anotacion @Absolute/@Relative o un literal numerico, podemos saltar
+        // el intermediario `mov r6, val; mov [r5], r6` y emitir `mov [r5], val`
+        // directamente (SIB para regs, INMED para literales/anotaciones).  Ahorra
+        // 1 instr completa (~4-11 bytes) por cada store del cluster.
+        if (is_inline_store_value(val_expr)) {
+            asm_ << "mov [r5], " << val_expr << "\n";
+        } else {
+            asm_ << "mov r6, " << val_expr << "\n";
+            asm_ << "mov [r5], r6\n";
+        }
+        if (state != nullptr) {
+            state->base   = base_reg;
+            state->offset = offset;
+            state->init   = true;
+        }
     }
 
     /**
@@ -9483,15 +12385,18 @@ namespace vex {
                                       uint32_t            name_len) {
         asm_ << "subsp rsp, 16\n";
         asm_ << "mov r12, rsp\n";
+        StoreCluster sc;
         // [+0] name_addr = @Absolute("code.s_<idx>")
         emit_store_qword_vm(asm_, "r12", 0,
-                            "@Absolute(\"code.s_" + std::to_string(name_idx) + "\")");
+                            "@Absolute(\"code.s_" + std::to_string(name_idx) + "\")",
+                            &sc);
         // [+8] name_len|0
-        emit_store_qword_vm(asm_, "r12", 8, std::to_string(name_len));
+        emit_store_qword_vm(asm_, "r12", 8, std::to_string(name_len), &sc);
         // findclass
         asm_ << "findclass r12, r12\n";
         asm_ << "addsp rsp, 16\n";
     }
+
 
     void Lowering::generate_new_helpers(ir::IrModule &out) {
         // Para cada clase declarada en el modulo, generamos una funcion
@@ -9657,6 +12562,18 @@ namespace vex {
             ret.source_line = cd->loc.line;
             fn.append(entry, std::move(ret));
 
+            propagate_is_gc_object_through_phis(fn);
+
+            // B.3 contract: el helper @c __new_<Class> tambien lleva
+            // metadata de monomorphizacion cuando la clase es una
+            // instanciacion generica.  Asi C2/AOT pueden agrupar todas
+            // las funciones (metodos + helpers) de una specialization
+            // como una unidad.
+            if (const auto *mi = tc_.monomorph_info(cd->name)) {
+                fn.generic_template_name = mi->template_name;
+                fn.generic_type_args     = mi->type_args;
+            }
+
             out.add_function(std::move(fn));
         }
     }
@@ -9708,18 +12625,20 @@ namespace vex {
 
             asm_ << "subsp rsp, 32\n";
             asm_ << "mov r3, rsp\n";
-            // [+0] name_addr
-            emit_store_qword_vm(asm_, "r3", 0,
-                                "@Absolute(\"code.s_" + std::to_string(cname_idx) + "\")");
-            // [+8] (flags<<32)|name_len = (1<<32)|len  con flags=CLASS_VIS_PUBLIC=1
             {
+                StoreCluster sc;
+                // [+0] name_addr
+                emit_store_qword_vm(asm_, "r3", 0,
+                                    "@Absolute(\"code.s_" + std::to_string(cname_idx) + "\")",
+                                    &sc);
+                // [+8] (flags<<32)|name_len = (1<<32)|len  con flags=CLASS_VIS_PUBLIC=1
                 uint64_t packed = (uint64_t(1) << 32) | uint64_t(cname_len);
-                emit_store_qword_vm(asm_, "r3", 8, std::to_string(packed));
+                emit_store_qword_vm(asm_, "r3", 8, std::to_string(packed), &sc);
+                // [+16] super_class: 0 si sin herencia, o el ClassInfo* del super.
+                emit_store_qword_vm(asm_, "r3", 16, super_reg, &sc);
+                // [+24] reserved = 0
+                emit_store_qword_vm(asm_, "r3", 24, "0", &sc);
             }
-            // [+16] super_class: 0 si sin herencia, o el ClassInfo* del super.
-            emit_store_qword_vm(asm_, "r3", 16, super_reg);
-            // [+24] reserved = 0
-            emit_store_qword_vm(asm_, "r3", 24, "0");
 
             asm_ << "defclass r1, r3\n";
             asm_ << "addsp rsp, 32\n";
@@ -9745,25 +12664,23 @@ namespace vex {
                 asm_ << "// deffield " << f.name << "\n";
                 asm_ << "subsp rsp, 32\n";
                 asm_ << "mov r3, rsp\n";
-                // [+0] name_addr
-                emit_store_qword_vm(asm_, "r3", 0,
-                                    "@Absolute(\"code.s_" + std::to_string(fname_idx) + "\")");
-                // [+8] (kind|access<<8|is_static<<16|0)<<32 | name_len
-                // Empaquetamos: name_len en lo bajo y los flags / kind /
-                // access / is_static en la palabra alta.  Nuestro layout C
-                // espera bytes individuales en +12, +13, +14, +15, asi que
-                // ponemos: (name_len) | (kind<<32) | (access<<40) | (is_static<<48).
                 {
+                    StoreCluster sc;
+                    // [+0] name_addr
+                    emit_store_qword_vm(asm_, "r3", 0,
+                                        "@Absolute(\"code.s_" + std::to_string(fname_idx) + "\")",
+                                        &sc);
+                    // [+8] packed: (name_len) | (kind<<32) | (access<<40) | (is_static<<48).
                     uint64_t packed = uint64_t(fname_len);
                     packed |= (uint64_t(0)) << 32; // kind = FIELD_PRIMITIVE
                     packed |= (uint64_t(0)) << 40; // access = FIELD_PUBLIC
                     packed |= (uint64_t(0)) << 48; // is_static = false
-                    emit_store_qword_vm(asm_, "r3", 8, std::to_string(packed));
+                    emit_store_qword_vm(asm_, "r3", 8, std::to_string(packed), &sc);
+                    // [+16] (size_bytes) | (_pad2<<32)
+                    emit_store_qword_vm(asm_, "r3", 16, "8", &sc); // 8 bytes por slot
+                    // [+24] type_class = 0 (primitive)
+                    emit_store_qword_vm(asm_, "r3", 24, "0", &sc);
                 }
-                // [+16] (size_bytes) | (_pad2<<32)
-                emit_store_qword_vm(asm_, "r3", 16, "8"); // 8 bytes por slot
-                // [+24] type_class = 0 (primitive)
-                emit_store_qword_vm(asm_, "r3", 24, "0");
 
                 asm_ << "deffield r12, r3\n";
                 asm_ << "addsp rsp, 32\n";
@@ -9782,16 +12699,19 @@ namespace vex {
                 asm_ << "// deffield static " << f.name << "\n";
                 asm_ << "subsp rsp, 32\n";
                 asm_ << "mov r3, rsp\n";
-                emit_store_qword_vm(asm_, "r3", 0,
-                                    "@Absolute(\"code.s_" + std::to_string(fname_idx) + "\")"); {
+                {
+                    StoreCluster sc;
+                    emit_store_qword_vm(asm_, "r3", 0,
+                                        "@Absolute(\"code.s_" + std::to_string(fname_idx) + "\")",
+                                        &sc);
                     uint64_t packed = uint64_t(fname_len);
                     packed |= (uint64_t(0)) << 32; // kind = FIELD_PRIMITIVE
                     packed |= (uint64_t(0)) << 40; // access = FIELD_PUBLIC
                     packed |= (uint64_t(1)) << 48; // is_static = TRUE
-                    emit_store_qword_vm(asm_, "r3", 8, std::to_string(packed));
+                    emit_store_qword_vm(asm_, "r3", 8, std::to_string(packed), &sc);
+                    emit_store_qword_vm(asm_, "r3", 16, "8", &sc); // 8 bytes por slot
+                    emit_store_qword_vm(asm_, "r3", 24, "0", &sc); // type_class = 0
                 }
-                emit_store_qword_vm(asm_, "r3", 16, "8"); // 8 bytes por slot
-                emit_store_qword_vm(asm_, "r3", 24, "0"); // type_class = 0
                 asm_ << "deffield r12, r3\n";
                 asm_ << "addsp rsp, 32\n";
             }
@@ -9836,23 +12756,27 @@ namespace vex {
                 asm_ << "// defmethod " << method_label << "\n";
                 asm_ << "subsp rsp, 40\n";
                 asm_ << "mov r3, rsp\n";
-                // [+0] name_addr
-                emit_store_qword_vm(asm_, "r3", 0,
-                                    "@Absolute(\"code.s_" + std::to_string(mname_idx) + "\")");
-                // [+8] (descriptor_len<<32)|name_len
                 {
+                    StoreCluster sc;
+                    // [+0] name_addr
+                    emit_store_qword_vm(asm_, "r3", 0,
+                                        "@Absolute(\"code.s_" + std::to_string(mname_idx) + "\")",
+                                        &sc);
+                    // [+8] (descriptor_len<<32)|name_len
                     uint64_t packed = uint64_t(mname_len)
                             | (uint64_t(desc_len) << 32);
-                    emit_store_qword_vm(asm_, "r3", 8, std::to_string(packed));
+                    emit_store_qword_vm(asm_, "r3", 8, std::to_string(packed), &sc);
+                    // [+16] descriptor_addr
+                    emit_store_qword_vm(asm_, "r3", 16,
+                                        "@Absolute(\"code.s_" + std::to_string(desc_idx) + "\")",
+                                        &sc);
+                    // [+24] code_vaddr = label del metodo
+                    emit_store_qword_vm(asm_, "r3", 24,
+                                        "@Absolute(\"code." + method_label + "\")",
+                                        &sc);
+                    // [+32] flags
+                    emit_store_qword_vm(asm_, "r3", 32, std::to_string(mflags), &sc);
                 }
-                // [+16] descriptor_addr
-                emit_store_qword_vm(asm_, "r3", 16,
-                                    "@Absolute(\"code.s_" + std::to_string(desc_idx) + "\")");
-                // [+24] code_vaddr = label del metodo
-                emit_store_qword_vm(asm_, "r3", 24,
-                                    "@Absolute(\"code." + method_label + "\")");
-                // [+32] flags
-                emit_store_qword_vm(asm_, "r3", 32, std::to_string(mflags));
 
                 asm_ << "defmethod r12, r3\n";
                 asm_ << "addsp rsp, 40\n";
@@ -9873,13 +12797,14 @@ namespace vex {
                     //    clobrea r5 y r6 internamente.
                     asm_ << "subsp rsp, 24\n";
                     asm_ << "mov r4, rsp\n";
-                    emit_store_qword_vm(asm_, "r4", 0, "r12"); // class_ptr
-                    emit_store_qword_vm(asm_, "r4", 8,
-                                        "@Absolute(\"code.s_" + std::to_string(mname_idx) + "\")"); {
+                    {
+                        StoreCluster sc;
+                        emit_store_qword_vm(asm_, "r4", 0, "r12", &sc); // class_ptr
+                        emit_store_qword_vm(asm_, "r4", 8,
+                                            "@Absolute(\"code.s_" + std::to_string(mname_idx) + "\")",
+                                            &sc);
                         // [+16] name_len (i32, padding superior libre).
-                        std::ostringstream tmp;
-                        tmp << mname_len;
-                        emit_store_qword_vm(asm_, "r4", 16, tmp.str());
+                        emit_store_qword_vm(asm_, "r4", 16, std::to_string(mname_len), &sc);
                     }
                     asm_ << "findmethod r5, r4\n";
                     asm_ << "addsp rsp, 24\n";
@@ -9892,15 +12817,16 @@ namespace vex {
                     //    como base para no clobrear r3 (method_ptr).
                     asm_ << "subsp rsp, 24\n";
                     asm_ << "mov r4, rsp\n";
-                    emit_store_qword_vm(asm_, "r4", 0, "r3"); // method_ptr
-                    emit_store_qword_vm(asm_, "r4", 8,
-                                        "@Absolute(\"code.s_" + std::to_string(fname_idx) + "\")"); {
+                    {
+                        StoreCluster sc;
+                        emit_store_qword_vm(asm_, "r4", 0, "r3", &sc); // method_ptr
+                        emit_store_qword_vm(asm_, "r4", 8,
+                                            "@Absolute(\"code.s_" + std::to_string(fname_idx) + "\")",
+                                            &sc);
                         // [+16] file_len (i32) | [+20] start_line (i32).
                         const uint64_t packed = uint64_t(fname_len)
                                 | (uint64_t(m.source_line) << 32);
-                        std::ostringstream tmp;
-                        tmp << packed;
-                        emit_store_qword_vm(asm_, "r4", 16, tmp.str());
+                        emit_store_qword_vm(asm_, "r4", 16, std::to_string(packed), &sc);
                     }
                     asm_ << "setmethdbg r3, r4\n";
                     asm_ << "addsp rsp, 24\n";
@@ -9958,10 +12884,14 @@ namespace vex {
                 const uint32_t tmeth_len = static_cast<uint32_t>(tmeth.size());
                 asm_ << "subsp rsp, 24\n";
                 asm_ << "mov r3, rsp\n";
-                emit_store_qword_vm(asm_, "r3", 0, "r10"); // class_ptr
-                emit_store_qword_vm(asm_, "r3", 8,
-                                    "@Absolute(\"code.s_" + std::to_string(tmeth_idx) + "\")");
-                emit_store_qword_vm(asm_, "r3", 16, std::to_string(tmeth_len));
+                {
+                    StoreCluster sc;
+                    emit_store_qword_vm(asm_, "r3", 0, "r10", &sc); // class_ptr
+                    emit_store_qword_vm(asm_, "r3", 8,
+                                        "@Absolute(\"code.s_" + std::to_string(tmeth_idx) + "\")",
+                                        &sc);
+                    emit_store_qword_vm(asm_, "r3", 16, std::to_string(tmeth_len), &sc);
+                }
                 asm_ << "findmethod r9, r3\n";
                 asm_ << "addsp rsp, 24\n";
 
@@ -9976,10 +12906,14 @@ namespace vex {
                 const uint32_t adm_len = static_cast<uint32_t>(m->name.size());
                 asm_ << "subsp rsp, 24\n";
                 asm_ << "mov r3, rsp\n";
-                emit_store_qword_vm(asm_, "r3", 0, "r8");
-                emit_store_qword_vm(asm_, "r3", 8,
-                                    "@Absolute(\"code.s_" + std::to_string(adm_idx) + "\")");
-                emit_store_qword_vm(asm_, "r3", 16, std::to_string(adm_len));
+                {
+                    StoreCluster sc;
+                    emit_store_qword_vm(asm_, "r3", 0, "r8", &sc);
+                    emit_store_qword_vm(asm_, "r3", 8,
+                                        "@Absolute(\"code.s_" + std::to_string(adm_idx) + "\")",
+                                        &sc);
+                    emit_store_qword_vm(asm_, "r3", 16, std::to_string(adm_len), &sc);
+                }
                 asm_ << "findmethod r7, r3\n";
                 asm_ << "addsp rsp, 24\n";
 
@@ -10002,6 +12936,7 @@ namespace vex {
         ret.source_line = 0;
         fn.append(entry, std::move(ret));
 
+        propagate_is_gc_object_through_phis(fn);
         out.add_function(std::move(fn));
     }
 
@@ -10038,6 +12973,9 @@ namespace vex {
         ins.operands    = std::move(arg_vals);
         ins.source_line = e->loc.line;
         fn_->append(current_block_, std::move(ins));
+        // Trackear tipo concreto del resultado para devirtualizacion
+        // de calls via interface receiver en compile time.
+        ssa_concrete_class_[dst] = e->class_name;
         return dst;
     }
 
@@ -10144,6 +13082,7 @@ namespace vex {
                 fc.dst         = v_cls;
                 fc.func_name   = fc_oss.str();
                 fc.source_line = e->loc.line;
+                fc.is_call_site = true;  // findclass clobera r5/r6/r12
                 fn_->append(current_block_, std::move(fc));
             }
             // 2) getstatic {dst}, {src0}, offset_imm  -> v_val.
@@ -10347,6 +13286,7 @@ namespace vex {
                 fc.dst         = v_cls;
                 fc.func_name   = fc_oss.str();
                 fc.source_line = loc.line;
+                fc.is_call_site = true;  // findclass clobera r5/r6/r12
                 fn_->append(current_block_, std::move(fc));
             }
             // 2) setstatic {src0}, {src1}, offset_imm  (sin dst).
@@ -10499,7 +13439,28 @@ namespace vex {
         if (obj == ir::IR_NO_VALUE) return ir::IR_NO_VALUE;
         std::vector<ir::IrValueId> arg_vals;
         arg_vals.reserve(e->args.size());
-        for (auto &a: e->args) {
+        for (size_t ai = 0; ai < e->args.size(); ++ai) {
+            auto &a = e->args[ai];
+            if (!a) return ir::IR_NO_VALUE;
+            // Auto-promocion literal -> StringObject cuando el parametro
+            // espera STRING y el arg es un StringLit no interpolado.
+            // Mismo patron que lower_call para funciones libres (A.34.fix).
+            // Sin esto, str_cstr/str_bytes dentro del metodo trataban el
+            // PTR del literal como GcHandle invalido y leian garbage.
+            const bool param_is_string =
+                ai < mtd->param_types.size()
+                && mtd->param_types[ai].kind == PrimitiveKind::STRING;
+            if (param_is_string
+                && a->kind == ast::NodeKind::StringLitExpr) {
+                auto *slit = static_cast<ast::StringLitExpr *>(a.get());
+                // Tanto literales puros como interpolados: el helper
+                // construye el StringObject correcto.
+                const ir::IrValueId av =
+                    lower_string_literal_to_string_object(slit);
+                if (av == ir::IR_NO_VALUE) return ir::IR_NO_VALUE;
+                arg_vals.push_back(av);
+                continue;
+            }
             const ir::IrValueId av = lower_expr(a.get());
             if (av == ir::IR_NO_VALUE) return ir::IR_NO_VALUE;
             arg_vals.push_back(av);
@@ -10556,22 +13517,45 @@ namespace vex {
                                       : fn_->new_value(ret_ir);
 
         // -----------------------------------------------------------------
-        // Polimorfismo via interface type.
+        // Devirtualizacion compile-time: si el tipo concreto del receptor
+        // es estaticamente conocido (via @c ssa_concrete_class_), reescribir
+        // el dispatch a CALLVIRT directo usando el vtable_idx del metodo en
+        // la clase concreta.  Tanto port C como JIT consumen este CALLVIRT
+        // como direct call, sin coste runtime de findmethod/callm.
         //
-        // Si el receptor esta tipado como interfaz, el vtable_index del
-        // metodo en la INTERFAZ no necesariamente coincide con el slot del
-        // mismo metodo en la CLASE concreta del objeto receptor (cada
-        // clase puede tener su propio orden de metodos).  Para resolver
-        // correctamente, hacemos lookup por nombre en runtime:
-        //   1. getclass r12, obj            ; ClassInfo* del objeto real
-        //   2. findmethod r_method, params  ; busca metodo por nombre
-        //   3. callm r1=obj, r_method       ; dispatch dinamico
-        //
-        // Coste: ~3-4 instrucciones extra por llamada vs CALLVIRT directo,
-        // pero garantiza correctness sin requerir method packing entre
-        // implementadoras.  Las llamadas a clases concretas (no-interfaz)
-        // siguen usando CALLVIRT con vtable_idx -> overhead cero.
+        // Aplica cuando el receptor es una variable interface tipada pero
+        // su SSA value viene directamente de un @c new ConcreteClass()
+        // (caso comun: @c IServicio s = new ImplA();).
         // -----------------------------------------------------------------
+        if (lay.is_interface) {
+            auto it_conc = ssa_concrete_class_.find(obj);
+            if (it_conc != ssa_concrete_class_.end()) {
+                const std::string &concrete_name = it_conc->second;
+                auto it_lay = tc_.class_layouts().find(concrete_name);
+                if (it_lay != tc_.class_layouts().end()) {
+                    const auto &conc_lay = it_lay->second;
+                    // Buscar metodo por nombre en la clase concreta.
+                    for (const auto &cm: conc_lay.methods) {
+                        if (cm.name == mtd->name && !cm.is_constructor) {
+                            // CALLVIRT directo con el vtable_idx de la
+                            // clase concreta -> backend devirtaliza.
+                            ir::IrInstr cv{};
+                            cv.op   = ir::IrOp::CALLVIRT;
+                            cv.type = ret_ir;
+                            cv.dst  = dst;
+                            cv.imm  = static_cast<uint64_t>(cm.vtable_index);
+                            cv.operands.push_back(obj);
+                            for (auto av: arg_vals) cv.operands.push_back(av);
+                            cv.source_line = e->loc.line;
+                            fn_->append(current_block_, std::move(cv));
+                            // Propagar tipo concreto del retorno si es
+                            // tambien tipo class conocido.
+                            return dst;
+                        }
+                    }
+                }
+            }
+        }
         if (lay.is_interface) {
             // Marcar obj como host_ptr (instancia GC-derivada).
             fn_->values[obj].is_host_ptr = true;
@@ -10736,8 +13720,71 @@ namespace vex {
 
     ir::IrValueId Lowering::cast_if_needed(ir::IrValueId v,
                                            ir::IrType    from, ir::IrType to,
-                                           uint32_t      source_line) {
+                                           uint32_t      source_line,
+                                           bool          is_explicit) {
         if (from == to || v == ir::IR_NO_VALUE) return v;
+        // Warning de seguridad para casts implicitos que pueden perder
+        // informacion: narrowing entero, float -> int, int -> float (los
+        // grandes pierden mantissa).  Solo se emite cuando el usuario NO
+        // escribio el cast explicitamente: `i32 x = i64_val` avisa, pero
+        // `i32 x = (i32) i64_val` no.  Misma politica que -Wconversion en
+        // GCC/Clang.
+        if (!is_explicit) {
+            auto bytes_for = [](ir::IrType t) -> int {
+                switch (t) {
+                    case ir::IrType::I8:  case ir::IrType::U8:
+                    case ir::IrType::BOOL:                       return 1;
+                    case ir::IrType::I16: case ir::IrType::U16:  return 2;
+                    case ir::IrType::I32: case ir::IrType::U32:
+                    case ir::IrType::F32:                        return 4;
+                    default:                                      return 8;
+                }
+            };
+            const bool from_is_float = (from == ir::IrType::F32 || from == ir::IrType::F64);
+            const bool to_is_float   = (to   == ir::IrType::F32 || to   == ir::IrType::F64);
+            const bool from_is_int = (from == ir::IrType::I8  || from == ir::IrType::I16
+                                   || from == ir::IrType::I32 || from == ir::IrType::I64
+                                   || from == ir::IrType::U8  || from == ir::IrType::U16
+                                   || from == ir::IrType::U32 || from == ir::IrType::U64
+                                   || from == ir::IrType::BOOL);
+            const bool to_is_int   = (to   == ir::IrType::I8  || to   == ir::IrType::I16
+                                   || to   == ir::IrType::I32 || to   == ir::IrType::I64
+                                   || to   == ir::IrType::U8  || to   == ir::IrType::U16
+                                   || to   == ir::IrType::U32 || to   == ir::IrType::U64
+                                   || to   == ir::IrType::BOOL);
+            const int from_bytes = bytes_for(from);
+            const int to_bytes   = bytes_for(to);
+            std::string warn_msg;
+            if (from_is_float && to_is_int) {
+                warn_msg = "conversion implicita float -> int trunca la parte fraccionaria; "
+                           "usa cast explicito si es intencional";
+            } else if (from_is_int && to_is_float) {
+                // Solo avisar para enteros grandes a f32 (perdida de mantissa).
+                // i64/u64 -> f32: ~24 bits de mantissa, perdida garantizada para magnitudes >2^24.
+                // i32/u32 -> f32: tambien puede perder.  i*->f64 es exacto hasta 2^53.
+                if (to == ir::IrType::F32 && from_bytes >= 4) {
+                    warn_msg = "conversion implicita int -> f32 puede perder precision; "
+                               "usa cast explicito si es intencional";
+                }
+            } else if (from_is_int && to_is_int) {
+                if (to_bytes < from_bytes) {
+                    warn_msg = "conversion implicita reduce el ancho del entero "
+                               "(narrowing); usa cast explicito si es intencional";
+                }
+            } else if (from_is_float && to_is_float) {
+                if (to == ir::IrType::F32 && from == ir::IrType::F64) {
+                    warn_msg = "conversion implicita f64 -> f32 reduce precision; "
+                               "usa cast explicito si es intencional";
+                }
+            }
+            if (!warn_msg.empty()) {
+                SourceLoc loc;
+                loc.file   = current_file_;
+                loc.line   = source_line;
+                loc.column = 1;
+                diags_.warning(loc, warn_msg);
+            }
+        }
 
         // Elegir el opcode de conversion correcto segun categoria.
         ir::IrOp   op         = ir::IrOp::CAST;
@@ -10759,9 +13806,37 @@ namespace vex {
                 || from == ir::IrType::I32 || from == ir::IrType::I64);
             op = from_signed ? ir::IrOp::ITOF : ir::IrOp::UITOF;
         } else {
-            // Entero -> entero: TRUNC si reduce ancho, ZEXT si amplia unsigned,
-            // SEXT si amplia signed.  CAST funciona como fallback generico.
-            op = ir::IrOp::CAST;
+            // Entero -> entero: elegir TRUNC, ZEXT o SEXT segun el cambio
+            // de ancho y la signedness de la fuente.  Sin esto, el
+            // emitter recibia siempre CAST y emitia un mov plano que NO
+            // truncaba ni extendia: `i32 x = i64_value` dejaba los 8
+            // bytes originales en el registro (bug de truncacion).
+            auto bytes_of = [](ir::IrType t) -> int {
+                switch (t) {
+                    case ir::IrType::I8:  case ir::IrType::U8:
+                    case ir::IrType::BOOL:                       return 1;
+                    case ir::IrType::I16: case ir::IrType::U16:  return 2;
+                    case ir::IrType::I32: case ir::IrType::U32:  return 4;
+                    default:                                      return 8;
+                }
+            };
+            const int from_b = bytes_of(from);
+            const int to_b   = bytes_of(to);
+            const bool from_signed = (from == ir::IrType::I8
+                                   || from == ir::IrType::I16
+                                   || from == ir::IrType::I32
+                                   || from == ir::IrType::I64);
+            if (to_b < from_b) {
+                op = ir::IrOp::TRUNC;
+            } else if (to_b > from_b) {
+                op = from_signed ? ir::IrOp::SEXT : ir::IrOp::ZEXT;
+            } else {
+                // Mismo ancho: nada que extender ni truncar; un BITCAST
+                // (mov plano) es lo correcto a nivel de bytecode.  Esto
+                // cubre cambios de signedness sin reinterpretacion (e.g.
+                // i32 -> u32) y casts entre PTR e i64.
+                op = ir::IrOp::BITCAST;
+            }
         }
 
         const ir::IrValueId dst = fn_->new_value(to);
@@ -10879,6 +13954,33 @@ namespace vex {
                 }
                 case ast::NodeKind::CallExpr: {
                     auto *c = static_cast<ast::CallExpr *>(e);
+                    // Borrow checker (A.36): lend(x) / lend_mut(x) sobre
+                    // una variable local plain requiere tomar su direccion
+                    // (el borrow ES un host_ptr al slot del local).
+                    // Forzamos address-taken promotion para que el lowering
+                    // deje el local en stack via ALLOCA + LOAD/STORE en
+                    // lugar de en registro SSA puro.  Sin esto, lend(local)
+                    // devuelve un valor (no una direccion) y read_borrow/
+                    // write_borrow dereferencian basura.  EXCEPCION: si la
+                    // var ya es de tipo borrow<T>/borrow_mut<T> (es un
+                    // borrow_var, no un local plain), NO la promocionamos
+                    // (su SSA value ya es host_ptr; el lend lo bypassa).
+                    if (c->callee
+                     && c->callee->kind == ast::NodeKind::IdentExpr
+                     && c->args.size() == 1
+                     && c->args[0]->kind == ast::NodeKind::IdentExpr) {
+                        auto *cid = static_cast<ast::IdentExpr *>(c->callee.get());
+                        if (cid->name == "lend" || cid->name == "lend_mut") {
+                            auto *aid = static_cast<ast::IdentExpr *>(c->args[0].get());
+                            const Type at = aid->result_type;
+                            if (at.kind != PrimitiveKind::BORROW
+                             && at.kind != PrimitiveKind::BORROW_MUT
+                             && at.kind != PrimitiveKind::UNIQUE_PTR
+                             && at.kind != PrimitiveKind::SHARED_PTR) {
+                                address_taken_locals_.insert(aid->name);
+                            }
+                        }
+                    }
                     visit_expr(c->callee.get());
                     for (auto &arg: c->args) visit_expr(arg.get());
                     return;
@@ -10944,9 +14046,29 @@ namespace vex {
                     visit_stmt(f->body.get());
                     return;
                 }
+                case ast::NodeKind::TryStmt: {
+                    // Sin esta rama, las variables declaradas dentro de un
+                    // try/catch/finally no se promocionan a address-taken
+                    // aunque aparezca `&var` en el body (error: '&x' sobre
+                    // variable no promocionada).  Y el cascade de errores
+                    // "nombre no resuelto" surge porque el lowering del
+                    // var-decl falla al evaluar `&var` y deja el binding
+                    // sin registrar.
+                    auto *ts = static_cast<ast::TryStmt *>(st);
+                    visit_stmt(ts->body.get());
+                    for (auto &cc: ts->catches) visit_stmt(cc.body.get());
+                    if (ts->finally_body) visit_stmt(ts->finally_body.get());
+                    return;
+                }
                 case ast::NodeKind::ReturnStmt: {
                     auto *r = static_cast<ast::ReturnStmt *>(st);
                     visit_expr(r->value.get());
+                    return;
+                }
+                case ast::NodeKind::SynchronizedStmt: {
+                    auto *sy = static_cast<ast::SynchronizedStmt *>(st);
+                    visit_expr(sy->target.get());
+                    visit_stmt(sy->body.get());
                     return;
                 }
                 default:
@@ -10981,6 +14103,13 @@ namespace vex {
         std::function<void(ast::Expr *)> visit_expr;
         std::function<void(ast::Stmt *)> visit_stmt;
 
+        // Grafo de aliasing local-to-local: alias_graph[A] = {B, C, ...}
+        // significa "A puede contener un valor que vino de B, C, ..." (a
+        // traves de asignaciones `A = B;`).  Tras la primera pasada
+        // propagamos el escape hacia atras: si A es escaping, todos los
+        // que feed-en a A tambien escapan.
+        std::unordered_map<std::string, std::vector<std::string>> alias_graph;
+
         // Helper: si @p e es IdentExpr, marca el nombre como escaping.
         auto mark_if_ident = [&](ast::Expr *e) {
             if (e && e->kind == ast::NodeKind::IdentExpr) {
@@ -11009,6 +14138,19 @@ namespace vex {
                                 auto *u = static_cast<ast::UnaryExpr *>(a->target.get());
                                 if (u->op == ast::UnOp::Deref) {
                                     mark_if_ident(a->value.get());
+                                }
+                                break;
+                            }
+                            case ast::NodeKind::IdentExpr: {
+                                // Asignacion local-a-local: `target = source`.
+                                // No marcamos escape ahora; registramos en el
+                                // grafo de alias para propagacion transitiva.
+                                // Si `target` resulta escaping al final, `source`
+                                // tambien lo sera.
+                                auto *id_t = static_cast<ast::IdentExpr *>(a->target.get());
+                                if (a->value && a->value->kind == ast::NodeKind::IdentExpr) {
+                                    auto *id_v = static_cast<ast::IdentExpr *>(a->value.get());
+                                    alias_graph[id_t->name].push_back(id_v->name);
                                 }
                                 break;
                             }
@@ -11061,6 +14203,11 @@ namespace vex {
                 }
                 case ast::NodeKind::VarDeclStmt: {
                     auto *vd = static_cast<ast::VarDeclStmt *>(st);
+                    // `T target = source;` propaga alias para tracking transitivo.
+                    if (vd->init && vd->init->kind == ast::NodeKind::IdentExpr) {
+                        auto *id_v = static_cast<ast::IdentExpr *>(vd->init.get());
+                        alias_graph[vd->name].push_back(id_v->name);
+                    }
                     if (vd->init) visit_expr(vd->init.get());
                     return;
                 }
@@ -11096,6 +14243,21 @@ namespace vex {
                     visit_stmt(f->body.get());
                     return;
                 }
+                case ast::NodeKind::TryStmt: {
+                    // Recursar tambien en try para detectar escapes de
+                    // locales dentro de body, catches y finally.
+                    auto *ts = static_cast<ast::TryStmt *>(st);
+                    visit_stmt(ts->body.get());
+                    for (auto &cc: ts->catches) visit_stmt(cc.body.get());
+                    if (ts->finally_body) visit_stmt(ts->finally_body.get());
+                    return;
+                }
+                case ast::NodeKind::SynchronizedStmt: {
+                    auto *sy = static_cast<ast::SynchronizedStmt *>(st);
+                    visit_expr(sy->target.get());
+                    visit_stmt(sy->body.get());
+                    return;
+                }
                 case ast::NodeKind::ReturnStmt: {
                     auto *r = static_cast<ast::ReturnStmt *>(st);
                     // return ident; -> ident escapa.
@@ -11107,6 +14269,25 @@ namespace vex {
             }
         };
         visit_stmt(body);
+
+        // ----- Propagacion transitiva del escape via alias_graph -----
+        // Si `target = source` y target ya esta marcado como escaping, source
+        // tambien debe estarlo (aliasing semantico).  Iteramos hasta punto fijo.
+        // Coste: O(N*M) donde N=#locales escaping, M=longitud cadena alias.
+        // En la practica las cadenas son cortas (1-3 hops); converge rapido.
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto &kv : alias_graph) {
+                const std::string &target = kv.first;
+                if (escaping_locals_.count(target) == 0) continue;
+                for (const std::string &source : kv.second) {
+                    if (escaping_locals_.insert(source).second) {
+                        changed = true;
+                    }
+                }
+            }
+        }
     }
 
     ir::IrValueId Lowering::read_local(const std::string &name, ir::IrType ir_ty,
@@ -11144,9 +14325,16 @@ namespace vex {
             // valor escrito incluso tras corrupcion de registros.
             auto it_slot = try_spill_slots_.find(name);
             if (it_slot != try_spill_slots_.end()) {
+                // Usar el tipo real del valor para que el STORE escriba
+                // exactamente N bytes y no contamine los bytes altos
+                // del slot 8-byte alloca.
+                ir::IrType st_ty = ir_ty;
+                if (v < fn_->values.size()) {
+                    st_ty = fn_->values[v].type;
+                }
                 ir::IrInstr st{};
                 st.op          = ir::IrOp::STORE;
-                st.type        = ir::IrType::I64;
+                st.type        = st_ty;
                 st.dst         = ir::IR_NO_VALUE;
                 st.operands    = {v, it_slot->second};
                 st.source_line = source_line;
@@ -11193,5 +14381,107 @@ namespace vex {
 
     void Lowering::error_at(SourceLoc loc, std::string msg) {
         diags_.error(std::move(loc), std::move(msg));
+    }
+
+    // ---------------------------------------------------------------------
+    // Exportacion de metadata POO al IrModule (para port transpilers).
+    // ---------------------------------------------------------------------
+
+    void Lowering::export_classes_to_ir(ir::IrModule &out) {
+        const auto &layouts = tc_.class_layouts();
+        out.classes.reserve(layouts.size());
+        for (const auto &kv : layouts) {
+            const auto &cl = kv.second;
+            // Saltar clases predefinidas en runtime (e.g. FatalError):
+            // el port no debe re-emitirlas; el runtime las provee.
+            if (cl.is_runtime_predefined) continue;
+
+            ir::IrClass icls;
+            icls.name           = cl.name;
+            icls.super_name     = cl.super_name;
+            icls.interfaces     = cl.interface_names;
+            icls.size_bytes     = cl.size_bytes;
+            icls.is_final       = false; /* Vex frontend lo trackea por metodo;
+                                            agregado lo deducimos en transpiler
+                                            via hierarchy analysis cuando es
+                                            necesario.  Default false = seguro. */
+            icls.is_interface   = cl.is_interface;
+            icls.is_aspect      = cl.is_aspect;
+            icls.has_destructor = cl.has_destructor;
+            icls.has_destructible_field = cl.has_destructible_field;
+            icls.is_runtime_predefined  = false;
+
+            // Convertir fields de instancia.  Mantenemos el orden del
+            // ClassLayout (heredados primero, luego propios) -- el
+            // transpiler los emite tal cual en el struct C.
+            icls.fields.reserve(cl.fields.size());
+            for (const auto &f : cl.fields) {
+                ir::IrField ifld;
+                ifld.name        = f.name;
+                ifld.type        = ir_type_from_primitive(f.type.kind);
+                ifld.offset      = f.offset;
+                ifld.size_bytes  = f.size;
+                ifld.is_static   = false;
+                /* Si el tipo del field es CLASS, registrar el nombre de la
+                 * clase apuntada -- el transpiler lo necesita para emitir
+                 * el tipo C correcto (`ClassY *` vs `void *`). */
+                if (f.type.kind == PrimitiveKind::CLASS) {
+                    ifld.class_type_name = f.type.struct_name;
+                }
+                icls.fields.push_back(std::move(ifld));
+            }
+
+            // Static fields.
+            icls.static_fields.reserve(cl.static_fields.size());
+            for (const auto &f : cl.static_fields) {
+                ir::IrField ifld;
+                ifld.name        = f.name;
+                ifld.type        = ir_type_from_primitive(f.type.kind);
+                ifld.offset      = f.offset;
+                ifld.size_bytes  = f.size;
+                ifld.is_static   = true;
+                if (f.type.kind == PrimitiveKind::CLASS) {
+                    ifld.class_type_name = f.type.struct_name;
+                }
+                icls.static_fields.push_back(std::move(ifld));
+            }
+
+            // Convertir metodos.  El @c ir_fn_name sigue el mangling de
+            // @c lower_class_methods: "<Class>__ctor" para constructores,
+            // "<Class>__<name>" para el resto (destructor usa name="__dtor"
+            // -> ir_fn_name="<Class>____dtor" con 4 underscores).
+            icls.methods.reserve(cl.methods.size());
+            for (const auto &m : cl.methods) {
+                ir::IrMethod imeth;
+                imeth.name           = m.name;
+                if (m.is_constructor) {
+                    imeth.ir_fn_name = cl.name + "__ctor";
+                } else {
+                    // Si el metodo es heredado puro (no override), apuntar al
+                    // simbolo del defining_class para evitar emitir referencia
+                    // a un Class__method que no existe.  El transpiler C usa
+                    // este nombre como label de funcion.
+                    const std::string &defc = m.defining_class;
+                    const std::string &owner = (!defc.empty() && defc != cl.name)
+                                                   ? defc : cl.name;
+                    imeth.ir_fn_name = owner + "__" + m.name;
+                }
+                imeth.return_type     = ir_type_from_primitive(m.return_type.kind);
+                imeth.param_types.reserve(m.param_types.size());
+                for (const auto &pt : m.param_types) {
+                    imeth.param_types.push_back(ir_type_from_primitive(pt.kind));
+                }
+                imeth.vtable_index   = static_cast<int32_t>(m.vtable_index);
+                imeth.is_static      = m.is_static;
+                imeth.is_final       = m.is_final;
+                imeth.is_constructor = m.is_constructor;
+                imeth.is_destructor  = m.is_destructor;
+                imeth.is_inline      = m.is_inline;
+                imeth.defining_class = m.defining_class;
+                icls.methods.push_back(std::move(imeth));
+            }
+
+            out.classes.push_back(std::move(icls));
+        }
     }
 } // namespace vex

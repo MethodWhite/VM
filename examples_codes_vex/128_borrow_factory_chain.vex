@@ -1,0 +1,40 @@
+// Patron Rust: chain de transformaciones via factory que devuelven
+// borrows.  F4 lifetime elision: una funcion 1-input-borrow ->
+// 1-output-borrow propaga el lifetime automaticamente.
+//
+//   fn first_view(p: &i64) -> &i64 { p }
+//   fn second_view(p: &i64) -> &i64 { first_view(p) }
+//   let data = Box::new(42);
+//   let view = second_view(&data);
+//   // El borrow checker sabe que view tiene lifetime de data.
+
+borrow<i64> first_view(borrow<i64> p) {
+    return p;
+}
+
+borrow<i64> second_view(borrow<i64> p) {
+    // F4: el output de first_view hereda el owner_source de p.
+    return first_view(p);
+}
+
+borrow<i64> third_view(borrow<i64> p) {
+    return second_view(p);
+}
+
+// Compose lectura via 3-niveles de elision:
+i64 deep_read(borrow<i64> p) {
+    borrow<i64> v1 = first_view(p);
+    borrow<i64> v2 = second_view(v1);
+    borrow<i64> v3 = third_view(v2);
+    return read_borrow(v3);
+}
+
+i32 main() {
+    unique<i64> data = unique_box(42);
+
+    borrow<i64> root = lend(data);
+    i64 v = deep_read(root);
+
+    if (v != 42) return 99;
+    return (i32)v;
+}

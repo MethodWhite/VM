@@ -1,609 +1,368 @@
+<div align="center">
+  <img src="./Component 1.svg" width="180" height="180" alt="VestaVM logo" />
+
 # VestaVM
 
-<div style="display: flex; align-items: center; gap: 20px;">
-  <img src="./Component 1.svg" width="250" height="250" />
-  <p>
-    Vesta es una VM de bajo nivel y distribuida que está siendo desarrollada para un lenguaje de programación.
-    Esta VM se basa en el concepto de registros y memoria. Puede encontrar más información y documentación en el repositorio:<br><br>
-    <a href="https://github.com/desmonHak/VMdoc">https://github.com/desmonHak/VMdoc</a>
-  </p>
+**Una máquina virtual distribuida y un lenguaje moderno, diseñados juntos desde cero.**
+
+[![Licencia](https://img.shields.io/badge/licencia-VMProject-blue.svg)](./LICENSE.md)
+[![Estado](https://img.shields.io/badge/estado-Phase%20A%20Complete-brightgreen.svg)](./doc/ROADMAP.md)
+[![Tests](https://img.shields.io/badge/tests-200%2F200%20PASS-brightgreen.svg)](./tests/vex/)
+[![JIT](https://img.shields.io/badge/JIT-C1%20baseline%2013×-orange.svg)](./doc/BENCHMARKS.md)
+[![Plataformas](https://img.shields.io/badge/plataformas-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#inicio-r%C3%A1pido)
+
+[**Inicio rápido**](./doc/QUICKSTART.md) · [**El lenguaje Vex**](./doc/LANGUAGE.md) · [**Arquitectura**](./doc/ARCHITECTURE.md) · [**Benchmarks**](./doc/BENCHMARKS.md) · [**Roadmap**](./doc/ROADMAP.md)
+
 </div>
 
-----
+---
 
-## Enlaces de interes
+## ¿Qué es VestaVM?
 
-- [Licencia del proyecto](./LICENSE.md)  
-  Aqui puede encontrar que puede y que no puede hacer con el codigo.
+**VestaVM** es una plataforma completa de ejecución de programas que integra tres
+componentes diseñados desde cero para trabajar juntos:
 
-- [Como contribuir de forma correcta](./doc/CONTRIBUTING.md)  
-  Guia para aportar al proyecto de manera ordenada y segura.
+1. **[Vex](./doc/LANGUAGE.md)** — un lenguaje multi-paradigma estáticamente tipado
+   con sintaxis C/Java/Python combinada. Soporta clases con herencia/interfaces/AOP,
+   genéricos, async/await, pattern matching, borrow checker estilo Rust, smart
+   pointers (`unique<T>`/`shared<T>`), FFI nativo declarativo, y reflexión runtime.
 
-- [Informacion sobre el gitflow que manejamos](./doc/github_work.md)  
-  Explicacion del flujo de trabajo con ramas y versiones.
+2. **Compilador y runtime** — pipeline `Vex -> SSA IR -> bytecode .velb -> VM`. Más
+   de 15 pasadas de optimización SSA, dispatcher threaded computed-goto, GC
+   generacional con stack scanning conservativo + stackmaps precisos, y JIT C1
+   template-based que da ~13× speedup sobre el intérprete.
 
-- [Que dependencias usamos](./doc/DEPENDENCIES.md)  
-  Lista de librerias y herramientas necesarias para compilar.
+3. **Sistema distribuido nativo (VDP)** — protocolo propio sobre TCP/TLS para
+   `rspawn` (spawn remoto), mensajería entre nodos, descubrimiento UDP en LAN,
+   y autenticación token/mTLS. La distribución es parte del bytecode, no RPC
+   externo.
 
-- [Guia de la terminal interactiva (REPL)](./doc/CLI_REPL.md)  
-  Edicion de linea, historial, TAB completion, Ctrl+R, aliases, variables de
-  entorno, scripts de inicio (`~/.vestarc`), bloques multilinea y configuracion.
+El proyecto incluye también una shell interactiva (REPL), un lenguaje de scripting
+embebido (VestaShellScript `.vsh`), un debugger TCP, y un editor TUI escrito
+en el propio Vex.
 
-- [Referencia completa de comandos del REPL](./doc/CLI_COMMANDS.md)  
-  Todos los comandos con sintaxis detallada y ejemplos: archivos, compilacion,
-  ejecucion de VMs, aliases, entorno, jobs, watch, type y mas.
+---
 
-- [Runtime distribuido — comandos del REPL](./doc/CLI_DIST.md)  
-  Subcomando `dist`: crear nodos, conectar pares, autenticacion TLS/token,
-  descubrimiento UDP y envio de bytecode a nodos remotos.
+## Ejemplo: cómo se ve Vex
 
-- [VestaShell — lenguaje de scripting (.vsh)](./doc/CLI_VSH.md)  
-  Referencia completa del lenguaje de scripting embebido: tipos, control de
-  flujo, funciones con closures, listas, mapas, try/catch, importacion de
-  modulos, funciones integradas e integracion con el REPL.
+```vex
+// Pattern matching, genéricos, smart pointers y borrow checker en 20 líneas.
 
+enum Result<V, E> {
+    Ok(V),
+    Err(E)
+}
 
-----
+unique<HashMap> safe_divide(i32[] nums, i32 divisor) -> Result<unique<HashMap>, string> {
+    if (divisor == 0) return Err("division by zero");
+    
+    unique<HashMap> result = unique_box(hashmap(16));
+    borrow_mut<HashMap> view = lend_mut(result);
+    
+    for (i32 n in nums) {
+        write_borrow(view).put(n, n / divisor);
+    }
+    return Ok(move(result));
+}
 
-## Compilacion
-
-clonar usando:
-
-```bash
-git clone  --recursive https://github.com/desmonHak/VM.git
+i32 main() {
+    i32[] data = {10, 20, 30, 40};
+    match safe_divide(data, 2) {
+        case Ok(map)  => println("Got ${map.size()} entries");
+        case Err(msg) => println("Error: ${msg}");
+    }
+    return 0;
+}
 ```
 
-## Instalacion en linux
+Más ejemplos completos en [`examples_codes_vex/`](./examples_codes_vex/) (~140
+programas) y showcase curado en [doc/EXAMPLES.md](./doc/EXAMPLES.md).
+
+---
+
+## Características destacadas
+
+### Lenguaje (Vex)
+
+- **Multi-paradigma**: imperativo + POO + funcional ligero. Sin envoltura
+  `class` obligatoria.
+- **Tipado estático con inferencia local** y nullability explícita
+  (`Optional<T>`, `Result<V,E>`, `nonnull T`, `T !!name`).
+- **POO completa**: clases, herencia simple + interfaces, propiedades get/set,
+  modificadores `public`/`private`/`protected`/`static`/`final`, destructores
+  RAII.
+- **AOP nativo**: `@Aspect` con `@Before`/`@After`/`@Around` y `proceed()`.
+- **Reflexión runtime**: `forName`, `getClass`, `getField`, `getMethod`,
+  `invoke`, `newInstance`.
+- **Genéricos** por monomorphización compile-time + fallback runtime con
+  `specialize`.
+- **Async / concurrencia**: `@Async`/`await`/`Future<T>`, `spawn`/`spawn here`/
+  `spawn on(N)`/`rspawn`, mailboxes (`msgsend`/`msgrecv`), `synchronized` con
+  cleanup automático.
+- **Pattern matching** exhaustivo (`match`/`case` con bindings).
+- **Smart pointers** zero-overhead: `unique<T>`, `shared<T>` con deleters custom
+  para adoptar cualquier recurso del SO.
+- **Borrow checker** compile-time estilo Rust con 4 reglas + NLL + reborrow con
+  suspend stack + lifetime elision.
+- **FFI** declarativo a DLLs (`extern "lib.dll" { fn ...; }`) y runtime
+  (`ffi_open`/`ffi_sym`/`ffi_call`).
+- **Strings** UTF-8/16/32, interpolación `${expr}`, format specifiers
+  `${expr:hex:>20}`, triple-quoted.
+
+### Runtime y compilador
+
+- **Pipeline SSA completo**: ~15 pasadas (DCE, CSE, copy-prop, const-fold, TCO,
+  LICM, DSE+SLF, devirt+inline, load_narrow, list scheduling para ILP).
+- **Asignador de registros linear scan** con register hinting / coalesce
+  (steal-from-active).
+- **Dispatcher threaded computed-goto** + inline del icache hit path
+  (intérprete ~340 MIPS promedio).
+- **JIT C1** baseline (template-based, sin regalloc) con stackmaps precisos
+  para GC. Speedup ~13× sobre intérprete en métodos hot.
+- **Super-instrucciones**: `cmpjmp`/`cmpjmpu`, `decjnz`, `alu3` (9 variantes
+  fusionando `mov+OP`), `loadz`/`loadzh` (zero-extend LOAD), `mvtake`,
+  `gcallocp`, `spawnargs`, `fulfillhlt`.
+- **GC generacional** Young/Old con stack scanning conservativo + interior
+  pointer scanning + write barriers para colecciones externas.
+- **Multi-threading** real opcional con scheduler placement (`spawn here`,
+  `spawn on(N)`).
+
+### Sistema distribuido
+
+- **Protocolo VDP** nativo sobre TCP, opcionalmente cifrado con TLS (mTLS o
+  token CRAM SHA-256).
+- **Descubrimiento UDP** automático de nodos en LAN.
+- **rspawn** transparente: el bytecode envía procesos a nodos remotos como si
+  fueran locales; `Future<T>` resuelve cross-node automáticamente.
+- **memsync** para sincronización de regiones de memoria entre nodos.
+
+### Herramientas
+
+- **REPL** con TAB completion, historial, búsqueda incremental Ctrl+R, aliases,
+  variables de entorno, scripts de inicio (`~/.vestarc`).
+- **VestaShellScript (.vsh)** — lenguaje embebido para scripting del REPL.
+- **Debugger TCP** con protocolo JSON: breakpoints (por addr o `file.vex:line`),
+  step/continue, inspección de registros/memoria/stack, GC stats, source-aware.
+- **Diagramas Mermaid** del pipeline: `--diagram-vex/ir/vel/all` para AST, SSA
+  IR, bytecode visualizado.
+- **Ensamblador/desensamblador nativo** integrado (Keystone + Capstone) para
+  x86, x86_64, ARM, AArch64.
+
+---
+
+## Inicio rápido
 
 ```bash
-sudo apt install build-essential cmake libssl-dev
-```
+# Clonar (incluye submódulos: Keystone, Capstone, LibPEparse)
+git clone --recursive https://github.com/desmonHak/VM.git
+cd VM
 
-### Arch linux
-
-```bash
-sudo pacman -S openssl
-```
-
-## Compilacion en linux
-
-compilacion con CMAKE:
-```bash
-mkdir build
-cd build
-cmake -Wno-dev ..
-cmake --build .
-```
-> En caso de que CMAKE le de error por usar una version no compatible con la version CMAKE de Keystone, puede intentar forzar el uso
-> de la version que usted use añadiendo la flag ``-DCMAKE_POLICY_VERSION_MINIMUM=3.5`` para cambiar la version minima.
-> Si compila en Windows, debe Mingw32/64 o TDM-GCC, y usar la flag ``-G "MinGW Makefiles"``
-
-Si prefiere usar XMAKE:
-```bash
-curl -fsSL https://xmake.io/shget.text | bash
-xmake f --toolchain=clang -m debug -v
-xmake run
-```
-
-En caso de un error similar a este en linux:
-
-```c
-Enabling CAPSTONE_ARC_SUPPORT
-: not foundskF/C/VM/libs/SourceCode/keystone/llvm/cmake/config.guess: 6:
-: not foundskF/C/VM/libs/SourceCode/keystone/llvm/cmake/config.guess: 8:
-: not foundskF/C/VM/libs/SourceCode/keystone/llvm/cmake/config.guess: 28:
-: not foundskF/C/VM/libs/SourceCode/keystone/llvm/cmake/config.guess: 29:
-: not foundskF/C/VM/libs/SourceCode/keystone/llvm/cmake/config.guess: 40:
-: not foundskF/C/VM/libs/SourceCode/keystone/llvm/cmake/config.guess: 42:
-: not foundskF/C/VM/libs/SourceCode/keystone/llvm/cmake/config.guess: 54:
-: not foundskF/C/VM/libs/SourceCode/keystone/llvm/cmake/config.guess: 65:
-: not foundskF/C/VM/libs/SourceCode/keystone/llvm/cmake/config.guess: 68:
-/root/WinDiskF/C/VM/libs/SourceCode/keystone/llvm/cmake/config.guess: 71: Syntax error: word unexpected (expecting "in")
-CMake Error at libs/SourceCode/keystone/llvm/cmake/modules/GetHostTriple.cmake:24 (message):
-  Failed to execute
-  /root/WinDiskF/C/VM/libs/SourceCode/keystone/llvm/cmake/config.guess
-Call Stack (most recent call first):
-  libs/SourceCode/keystone/llvm/cmake/config-ix.cmake:293 (get_host_triple)
-  libs/SourceCode/keystone/llvm/CMakeLists.txt:325 (include)
-```
-
-puede necesitar convertir los CRLF de Windows en LF de linux usando el siguiente comandos:
-
-```bash
-find ../libs/SourceCode -type f -exec dos2unix {} \;
-```
-
-generalmente esto permite que el proyecto se compile correctamente si ocurre el anterior error.
-
-### Elegir modo 'Debug' o 'Release'
-
-debug:
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
-```
-
-release:
-
-```bash
+# Compilar (CMake + GCC/Clang)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+
+# Hola Mundo en Vex
+cat > hola.vex << 'EOF'
+i32 main() {
+    println("Hola desde Vex ${1 + 1}!");
+    return 0;
+}
+EOF
+
+./build/vm --vex hola.vex -o hola
+./build/vm --run hola.velb
+# -> Hola desde Vex 2!
 ```
 
-Valgrind/profiling:
+Guía completa: [**doc/QUICKSTART.md**](./doc/QUICKSTART.md) (5 minutos).
+
+---
+
+## Estado del proyecto
+
+VestaVM está en **Phase A completa** (frontend Vex + intérprete + GC + distribuido)
+y **Phase C/D parcial** (libvesta_rt + JIT C1 con cobertura ~52% de métodos
+reales).
+
+**Suite de tests E2E**: **200/200 PASS** (`tests/vex/test_vex_e2e.sh`), cubriendo
+los 140+ ejemplos del repo + 6 tests negativos del borrow checker.
+
+**Performance del intérprete** (best-of-3, hardware moderno):
+
+| Benchmark | Wall time | MIPS |
+|---|---:|---:|
+| `bench_tight_loop` (50M iter ALU) | 1.11 s | 358 |
+| `bench_array_sum` (10M loads i32) | 374 ms | 323 |
+| `bench_polymorphic` (3 impls × 10M dispatch) | 683 ms | 331 |
+| `bench_callvirt_hot` (30M callvirt) | 317 ms | 347 |
+| `bench_jit_method` (30M iter en método) | 415 ms | 359 |
+
+Speedup acumulado tras el sprint de optimizaciones 2026-05-17: **-25% a -81%
+wall time**, MIPS de ~150 a ~340 promedio. Detalles en
+[doc/BENCHMARKS.md](./doc/BENCHMARKS.md).
+
+**Roadmap completo** (Phases B -> H, hasta AOT con ejecutables `.exe` nativos):
+[doc/ROADMAP.md](./doc/ROADMAP.md).
+
+---
+
+## Documentación
+
+### Para empezar
+
+| Documento | Para qué sirve |
+|---|---|
+| [QUICKSTART](./doc/QUICKSTART.md) | Instalación + primer programa en 5 minutos |
+| [LANGUAGE](./doc/LANGUAGE.md) | Visión general del lenguaje Vex |
+| [EXAMPLES](./doc/EXAMPLES.md) | Catálogo curado de ejemplos por tema |
+| [ARCHITECTURE](./doc/ARCHITECTURE.md) | Arquitectura interna de la VM |
+| [BENCHMARKS](./doc/BENCHMARKS.md) | Performance comparada + metodología |
+| [ROADMAP](./doc/ROADMAP.md) | Plan de fases A-H, estado actual |
+
+### Referencia del lenguaje (doc/VMdoc/Vex/)
+
+| Sintaxis y semántica | Modelo de programación |
+|---|---|
+| [TiposDatos](./doc/VMdoc/Vex/TiposDatos.md) | [OOP](./doc/VMdoc/Vex/OOP.md) |
+| [Operadores](./doc/VMdoc/Vex/Operadores.md) | [Generics](./doc/VMdoc/Vex/Generics.md) |
+| [ControlFlow](./doc/VMdoc/Vex/ControlFlow.md) | [ReflexionAOP](./doc/VMdoc/Vex/ReflexionAOP.md) |
+| [Strings](./doc/VMdoc/Vex/Strings.md) | [Colecciones](./doc/VMdoc/Vex/Colecciones.md) |
+| [OptionalResult](./doc/VMdoc/Vex/OptionalResult.md) | [Excepciones](./doc/VMdoc/Vex/Excepciones.md) |
+| [Closures](./doc/VMdoc/Vex/Closures.md) | |
+
+| Memoria y seguridad | Concurrencia y FFI |
+|---|---|
+| [SmartPointers](./doc/VMdoc/Vex/SmartPointers.md) | [Async](./doc/VMdoc/Vex/Async.md) |
+| [BorrowChecker](./doc/VMdoc/Vex/BorrowChecker.md) | [Sincronizacion](./doc/VMdoc/Vex/Sincronizacion.md) |
+| | [FFI](./doc/VMdoc/Vex/FFI.md) |
+
+### Referencia de la VM (doc/VMdoc/)
+
+- [SSA IR](./doc/VMdoc/IR/SSA.md) — formato intermedio + ~15 pasadas de optimización
+- [SetInstruccionesVM/](./doc/VMdoc/SetInstruccionesVM/) — 50+ docs por familia
+  de opcodes bytecode
+- [SUPER_INSTRUCCIONES](./doc/VMdoc/SetInstruccionesVM/SUPER_INSTRUCCIONES.md) —
+  opcodes fusionados (alu3, loadz/loadzh, cmpjmp, decjnz, mvtake, etc.)
+- [runtime/](./doc/VMdoc/runtime/) — ProcessVM, scheduler, GC, plugins nativos
+- [Generics](./doc/VMdoc/Generics/Generics.md), [Debug](./doc/VMdoc/Debug/),
+  [Hilos](./doc/VMdoc/Hilos/), [Distribuido](./doc/VMdoc/Distribuido/)
+
+### Herramientas y CLI
+
+- [CLI_REPL](./doc/CLI_REPL.md) — REPL interactivo (edición de línea, historial,
+  aliases, scripts)
+- [CLI_COMMANDS](./doc/CLI_COMMANDS.md) — referencia completa de comandos
+- [CLI_DIST](./doc/CLI_DIST.md) — runtime distribuido desde el REPL
+- [CLI_VSH](./doc/CLI_VSH.md) — VestaShellScript (.vsh)
+
+### Proyecto
+
+- [LICENSE](./LICENSE.md) — licencia VMProject
+- [CONTRIBUTING](./doc/CONTRIBUTING.md) — cómo contribuir
+- [DEPENDENCIES](./doc/DEPENDENCIES.md) — librerías necesarias
+- [github_work](./doc/github_work.md) — GitFlow del proyecto
+
+---
+
+## Construir desde código fuente
+
+### Dependencias
+
+| Plataforma | Comando |
+|---|---|
+| Linux (apt) | `sudo apt install build-essential cmake libssl-dev` |
+| Arch Linux | `sudo pacman -S base-devel cmake openssl` |
+| macOS | `brew install cmake openssl` |
+| Windows | TDM-GCC-64 o MinGW + [precompiled OpenSSL](https://slproweb.com/products/Win32OpenSSL.html) |
+
+Submódulos vendored (Keystone, Capstone, LibPEparse) se clonan automáticamente
+con `--recursive`. Cero deps externas adicionales.
+
+### Build
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build
-valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes ./vm```
+# Release (recomendado)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+# Debug (con símbolos + asserts)
+cmake -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j
+
+# Windows MinGW
+cmake -G "MinGW Makefiles" -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 ```
 
-----
+Si la versión de CMake instalada es ≥ 4.x y falla por las versiones mínimas de
+Keystone, añadir `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`.
 
-## Uso del binario principal
+Detalles completos (Valgrind, ASan, errores comunes, XMake alternativo) en
+[doc/QUICKSTART.md](./doc/QUICKSTART.md).
 
-El ejecutable `vm` (o `vm.exe` en Windows) acepta distintos modos de operacion mediante flags.
-Los modos son mutuamente excluyentes: solo uno es activo por invocacion.
+---
 
-### Compilacion de fuentes Vesta (`.vel` → `.velb`)
+## Casos de uso
 
-```bash
-# Compilar un unico archivo fuente
-vm --worker src/main.vel -o programa
-vm --build  src/main.vel -o programa        # alias de --worker
+- **Investigación**: prototipado rápido de runtimes, optimizaciones IR,
+  esquemas de GC, JITs y sistemas distribuidos sin pelearse con LLVM.
+- **Servicios distribuidos**: ejecutar workloads que cruzan nodos LAN con
+  `rspawn` + `Future<T>` sin RPC manual.
+- **Aplicaciones embebidas**: la VM compila a un único binario estático ~15 MB,
+  sin dependencias dinámicas en Release.
+- **Aprendizaje de lenguajes**: el código del frontend Vex (~30K LOC) está
+  diseñado para ser legible, con cada feature documentada y comentada
+  exhaustivamente en español ASCII.
 
-# Compilar un directorio completo en paralelo
-vm --driver src/ -j 8 -o programa.velb      # 8 hilos
-vm --driver src/ -j 0 -o programa.velb      # todos los nucleos disponibles
-```
+---
 
-El compilador realiza tres pasadas sobre el fuente: recoleccion de simbolos,
-evaluacion de expresiones y generacion de bytecode `.velb`.
+## Filosofía del proyecto
 
-### Ejecucion de bytecode (`.velb`)
+VestaVM no busca competir con JVM/CLR/Cranelift en madurez ni con C/Rust en
+performance bruta. Su valor está en ser un **ecosistema completo y autocontenido**
+donde lenguaje, runtime, distribución y herramientas se diseñan juntos:
 
-```bash
-# Ejecucion basica
-vm --run programa.velb
+- **Decisiones cohesionadas**: el GC sabe del JIT, el JIT sabe del bytecode, el
+  bytecode sabe del lenguaje. No hay "impedance mismatch".
+- **Hand-rolled cuando importa**: encoder x86-64 propio (10× más rápido que
+  Keystone para JIT), object emitter PE/COFF/ELF integrado, linker propio.
+  Sin dependencias externas en el path crítico.
+- **Documentación binding**: cada feature del lenguaje y cada opcode del
+  bytecode tienen doc autoritativa en español. 
+  referencia para futuras decisiones).
+- **Tests no negociables**: 200/200 e2e antes de cada commit. Cada nueva feature
+  ships con su test en `tests/vex/`.
 
-# Con varios schedulers (hilos de ejecucion)
-vm --run programa.velb --schedulers 4
+---
 
-# Con estadisticas al finalizar (tiempo, instrucciones, MIPS)
-vm --run programa.velb --stats
-```
+## Comunidad
 
-Cada scheduler ejecuta procesos virtuales de forma cooperativa.
-La VM arranca con un DistRuntime minimo que permite IPC local
-(instrucciones `msgsend`/`msgrecv`) sin abrir ningun puerto de red.
+- **Repositorio principal**: [github.com/desmonHak/VM](https://github.com/desmonHak/VM)
+- **Documentación Obsidian-friendly**: [github.com/desmonHak/VMdoc](https://github.com/desmonHak/VMdoc)
+- **Issues y feature requests**: [GitHub Issues](https://github.com/desmonHak/VM/issues)
+- **Cómo contribuir**: [doc/CONTRIBUTING.md](./doc/CONTRIBUTING.md)
 
-### Scripting VestaShell (`.vsh`)
+---
 
-```bash
-# Ejecutar un script .vsh sin abrir el REPL interactivo
-vm --script mi_script.vsh
-```
+## Licencia
 
-Los scripts `.vsh` tienen acceso a las mismas funciones integradas que el REPL
-(filesystem, matematicas, shell, import) ademas de poder llamar a cualquier
-comando interno de la terminal. Ver [doc/CLI_VSH.md](./doc/CLI_VSH.md) para
-la referencia completa del lenguaje.
+VestaVM se distribuye bajo la **licencia VMProject**. Lee
+[LICENSE.md](./LICENSE.md) para los términos completos.
 
-### Ensamblado y desensamblado nativo (Keystone / Capstone)
+Submódulos con licencias propias:
+- **Keystone** y **Capstone**: BSD 3-Clause.
+- **LibPEparse**: ver `libs/SourceCode/LibPEparse/LICENSE`.
+- **OpenSSL**: Apache 2.0 / OpenSSL License (según versión).
+- **nlohmann/json**: MIT.
+- **cxxopts**: MIT.
+- **FTXUI**: MIT.
 
-```bash
-# Ensamblar un archivo .asm nativo (x86, ARM, etc.) con Keystone
-vm --asm-file src/main.asm --arch X86-64 -o salida
+---
 
-# Desensamblar un binario con Capstone
-vm --disasm-file programa.bin --arch X86-64
+<div align="center">
 
-# Ver arquitecturas soportadas
-vm --list-arch
-```
+**VestaVM** · una máquina virtual diseñada como ecosistema.
 
-Arquitecturas soportadas: `X86-32`, `X86-64`, `ARM`, `AArch64` (y mas segun Capstone/Keystone).
+Hecho con C++17, GCC y mucho café por [desmonHak](https://github.com/desmonHak).
 
-### Preprocesador (solo con `VESTA_BUILD_PREPROCESSOR=ON`)
-
-```bash
-# Expandir macros y directivas sin compilar
-vm --preprocess-only src/main.vel -o resultado.vel
-vm --preprocess-only src/main.vel                   # imprime a stdout
-```
-
-----
-
-## Runtime distribuido — flags de linea de comandos
-
-VestaVM implementa un protocolo propio llamado **VDP** (Vesta Distribution Protocol)
-sobre TCP (con o sin TLS) para comunicar instancias VM entre si.
-Cada nodo puede enviar procesos remotos (`rspawn`), intercambiar mensajes (`msgsend`/`msgrecv`)
-y sincronizar regiones de memoria (`memsync`).
-
-### Modo servidor distribuido puro
-
-Arranca un nodo VDP que acepta conexiones entrantes sin ejecutar bytecode propio.
-Util para servidores de infraestructura o nodos de computo dedicados.
-
-```bash
-# Servidor sin cifrado
-vm --dist-server --dist-port 7789 --dist-name nodo-1
-
-# Servidor con descubrimiento UDP automatico de pares en la LAN
-vm --dist-server --dist-port 7789 --dist-discover --dist-name nodo-1
-
-# Servidor con autenticacion por token
-vm --dist-server --dist-port 7789 --dist-token mi-secreto
-
-# Servidor con TLS (certificados en formato PEM)
-vm --dist-server --dist-port 7789 \
-   --dist-tls --dist-cert cert.pem --dist-key key.pem --dist-ca ca.pem
-
-# Servidor que ademas conecta a un nodo estatico al arrancar
-vm --dist-server --dist-port 7789 --dist-add-node 192.168.1.100:7789
-```
-
-El proceso queda esperando conexiones indefinidamente hasta recibir `Ctrl+C`.
-
-### Ejecutar bytecode en modo distribuido
-
-Combina `--run` con los flags `--dist-*` para que el programa Vesta pueda
-usar las instrucciones distribuidas (`rspawn`, `msgsend`, `msgrecv`, `memsync`).
-
-```bash
-# Ejecutar y conectarse a un nodo remoto
-vm --run programa.velb --dist-add-node 192.168.1.100:7789
-
-# Ser servidor Y cliente a la vez
-vm --run programa.velb --dist-port 7789 --dist-add-node 192.168.1.100:7789
-
-# Con autenticacion y descubrimiento
-vm --run programa.velb \
-   --dist-port 7789 \
-   --dist-token mi-secreto \
-   --dist-discover \
-   --schedulers 4
-```
-
-### Referencia de todos los flags `--dist-*`
-
-| Flag | Tipo | Valor por defecto | Descripcion |
-|------|------|-------------------|-------------|
-| `--dist-server` | bool | — | Modo servidor puro; espera conexiones VDP sin bytecode |
-| `--dist-port N` | uint16 | 0 | Puerto TCP del servidor VDP local (0 = sin servidor) |
-| `--dist-discover` | bool | — | Activa descubrimiento UDP de nodos en la LAN |
-| `--dist-discover-port N` | uint16 | 7790 | Puerto UDP para el descubrimiento |
-| `--dist-name NOMBRE` | string | `""` | Nombre legible del nodo (para logs y registros) |
-| `--dist-node-id ID` | uint64 | 0 | ID de 64 bits del nodo (0 = generar automaticamente) |
-| `--dist-add-node IP:PUERTO` | string | — | Nodo estatico a registrar y conectar al arrancar (repetible) |
-| `--dist-token TOKEN` | string | `""` | Token de autenticacion en texto plano (se almacena como SHA-256) |
-| `--dist-tls` | bool | — | Usar TLS en conexiones VDP salientes y entrantes |
-| `--dist-cert RUTA` | string | `""` | Ruta al certificado TLS del nodo local (PEM) |
-| `--dist-key RUTA` | string | `""` | Ruta a la clave privada TLS (PEM) |
-| `--dist-ca RUTA` | string | `""` | Ruta al CA bundle para verificar pares (PEM) |
-
-**Autenticacion:** si se usa `--dist-token`, el token se hashea con SHA-256 y se
-intercambia via CRAM durante el handshake VDP. Si se usa `--dist-tls`, el handshake
-TLS ocurre antes del handshake VDP. Ambos mecanismos son combinables (mTLS + token).
-
-**Descubrimiento UDP:** con `--dist-discover` cada nodo emite broadcasts `NODE_DISCOVER`
-periodicamente y escucha respuestas `NODE_ANNOUNCE`. Los nodos descubiertos se conectan
-automaticamente. Requiere acceso de red a la LAN.
-
-----
-
-## Terminal interactiva (REPL)
-
-Ejecutar `vm` sin argumentos abre el interprete interactivo:
-
-```bash
-./vm
-vesta [directorio]>
-```
-
-El prompt muestra dinamicamente el directorio de trabajo actual.
-Para una guia completa de uso, edicion de linea, aliases y todas las funciones
-consulta la documentacion detallada:
-
-- **[Guia de la terminal (CLI_REPL.md)](./doc/CLI_REPL.md)** — edicion de linea,
-  historial, TAB completion, Ctrl+R, aliases, variables de entorno, scripts de inicio
-- **[Referencia de comandos (CLI_COMMANDS.md)](./doc/CLI_COMMANDS.md)** — todos los
-  comandos con su sintaxis completa y ejemplos
-- **[Runtime distribuido — REPL (CLI_DIST.md)](./doc/CLI_DIST.md)** — subcomando
-  `dist` con todos los flujos y opciones de seguridad
-- **[VestaShell (.vsh) (CLI_VSH.md)](./doc/CLI_VSH.md)** — lenguaje de scripting
-  embebido: tipos, funciones, closures, listas, mapas, try/catch, import, builtins
-
-### Edicion de linea y navegacion
-
-| Tecla | Accion |
-|-------|--------|
-| Flechas arriba/abajo | Navegar por el historial |
-| `Ctrl+R` | Busqueda incremental inversa en el historial |
-| `TAB` | Completar nombre de comando o ruta de archivo |
-| `Ctrl+A` / `Ctrl+E` | Inicio / fin de linea |
-| `Ctrl+K` / `Ctrl+U` | Borrar hasta fin / hasta inicio de linea |
-| `Ctrl+W` | Borrar la palabra anterior |
-| `Ctrl+L` | Limpiar pantalla |
-
-### Resumen de comandos disponibles
-
-| Categoria | Comandos |
-|-----------|----------|
-| Navegacion | `ls`, `cd`, `pwd`, `cls` / `clear` |
-| Archivos | `touch`, `cp`, `mv`, `rm`, `mkdir`, `cat`, `head`, `tail`, `echo` |
-| Compilacion | `build`, `vpp`, `disasm` |
-| Ejecucion VM | `exec`, `run`, `vms`, `kill`, `mgrinfo`, `vmstat`, `schedtop`, `procinfo` |
-| Aliases | `alias`, `unalias` |
-| Entorno | `env` |
-| REPL | `set`, `source`, `type`, `watch`, `jobs`, `wait`, `cmd` |
-| Scripting | `script` (VestaShell `.vsh`) |
-| Distribuido | `dist` |
-
-Los comandos no reconocidos se ejecutan directamente como comandos del sistema
-operativo, lo que permite usar aliases que apunten a herramientas externas:
-
-```
-vesta [src]> alias ll="ls -la"
-vesta [src]> ll              # ejecuta: ls -la
-vesta [src]> git status      # ejecutado como comando del SO
-```
-
-----
-
-## Runtime distribuido — comandos del REPL
-
-> Referencia completa en [doc/CLI_DIST.md](./doc/CLI_DIST.md).
-
-Los comandos `dist` permiten gestionar el runtime distribuido de cualquier VM
-activa desde el propio REPL, sin necesidad de reiniciar el proceso.
-
-> **Nota:** `<mgr_id>` es el numero que muestra `vms`. El `vm_id` por defecto es `1`
-> (el primer VM creado en un manager). Usar `--vm-id N` para apuntar a otro VM.
-
-### Crear un nodo servidor (forma mas directa)
-
-```
-dist new [--port PUERTO] [--discover] [--discover-port PUERTO]
-         [--name NOMBRE] [--node-id ID] [--schedulers N]
-         [--token TOKEN] [--tls] [--cert C] [--key K] [--ca CA]
-```
-
-Crea un manager nuevo con una VM, configura y arranca el DistRuntime.
-El manager persiste hasta que el usuario lo elimine con `kill <id>`.
-Imprime el `mgr_id` asignado para usarlo con los demas subcomandos.
-
-```
-vesta> dist new --port 7789 --name servidor-local
-[dist] Nodo creado (mgr_id=1 vm_id=1) puerto=7789
-  dist info 1           -> estado
-  dist add-node 1 <ip> <p>  -> conectar nodo
-  dist stop 1           -> detener servidor VDP
-  kill 1                -> eliminar
-```
-
-### Iniciar DistRuntime en un manager existente
-
-```
-dist start <mgr_id> [--port P] [--discover] [--discover-port P]
-           [--name N] [--node-id ID] [--vm-id N]
-           [--token T] [--tls] [--cert C] [--key K] [--ca CA]
-```
-
-Reconfigura y arranca el DistRuntime de la VM indicada.
-Util cuando se lanza un programa con `run` y luego se quiere activar la red.
-Si el DistRuntime ya estaba activo, lo detiene y lo reemplaza con la nueva configuracion.
-
-```
-vesta> run mi-app programa.velb
-[run] 'mi-app' lanzado en background (id=1)
-vesta> dist start 1 --port 7789 --token secreto
-[dist] DistRuntime iniciado en puerto 7789
-```
-
-### Detener el servidor VDP
-
-```
-dist stop <mgr_id> [--vm-id N]
-```
-
-Cierra el servidor TCP, todas las sesiones activas y el hilo de descubrimiento UDP.
-El manager y la VM siguen existiendo; solo se desactiva la red distribuida.
-
-### Inspeccionar el estado
-
-```
-dist info <mgr_id> [--vm-id N]
-```
-
-Muestra el ID de nodo local (64 bits), el puerto, y un resumen de todos los nodos
-del registro con su estado actual (`ACTIVO`, `DESCONECTADO`, etc.).
-
-```
-vesta> dist info 1
-=== DistRuntime | mgr=1  vm=1 ===
-  Node ID local : 0x7614fed977ada27f
-  Nodos en registro : 2
-    [0] 192.168.1.100:7789  ACTIVO  (nodo-remoto)
-    [1] 192.168.1.101:7789  DESCONECTADO  (nodo-caido)
-```
-
-### Listar nodos
-
-```
-dist list <mgr_id> [--vm-id N]
-```
-
-Tabla completa con indice, IP:puerto, nombre, estado y tipo (estatico/dinamico)
-de cada nodo del registro.
-
-```
-vesta> dist list 1
-IDX  IP:PUERTO              NOMBRE             ESTADO          TIPO
-----------------------------------------------------------------------
-0    192.168.1.100:7789     nodo-remoto        ACTIVO          estatico
-1    192.168.1.101:7789     nodo-caido         DESCONECTADO    estatico
-```
-
-### Registrar y conectar un nodo
-
-```
-dist add-node <mgr_id> <ip> <puerto>
-             [--name NOMBRE] [--vm-id N]
-             [--token TOKEN] [--tls] [--cert C] [--key K] [--ca CA]
-```
-
-Agrega un nodo al registro de forma estatica e intenta conectarse de inmediato.
-La autenticacion (token y/o TLS) debe coincidir con la configuracion del servidor remoto.
-El indice asignado (`idx`) se usa en `dist connect` y en las instrucciones de bytecode.
-
-```
-vesta> dist add-node 1 192.168.1.100 7789 --name servidor-A --token secreto
-[dist] Nodo registrado: 192.168.1.100:7789  (idx=0)
-```
-
-### Reconectar a un nodo ya registrado
-
-```
-dist connect <mgr_id> <node_idx> [--vm-id N]
-```
-
-Intenta reconectar a un nodo que ya existe en el registro (por su indice).
-Util cuando un nodo se desconecto y volvio a estar disponible.
-
-### Descubrimiento de nodos en la LAN
-
-```
-dist discover <mgr_id> [--vm-id N]
-```
-
-Emite un broadcast UDP `NODE_DISCOVER` de forma inmediata (sin esperar al ciclo
-periodico). Los nodos que escuchan en el puerto de descubrimiento responden con
-`NODE_ANNOUNCE` y quedan registrados automaticamente.
-Requiere que el DistRuntime haya sido iniciado con `--discover` o `dist start --discover`.
-
-### Enviar bytecode a ejecutar en un nodo remoto
-
-```
-dist run <mgr_id> <node_idx> <archivo.velb> [--vm-id N]
-```
-
-Carga el archivo `.velb` en la VM local, mapea su bytecode en la memoria virtual de la VM
-y lo envia al nodo remoto indicado por `node_idx` mediante el protocolo VDP (`VDP_RSPAWN`).
-
-El nodo remoto recibe el bytecode, crea un proceso local y lo ejecuta.
-La respuesta llega de forma asincrona: `dist run` devuelve de inmediato un `GcHandle`
-de un `FutureObject` que quedara resuelto cuando el nodo remoto termine y envie `VDP_RSPAWN_ACK`.
-
-**Requisitos previos:**
-- El nodo (`node_idx`) debe estar en estado `ACTIVO` en `dist list`.
-- La VM local debe tener un `dist_runtime` activo (creado con `dist new` o `dist start`).
-- El archivo `.velb` debe ser un ejecutable VestaLangBinary valido.
-
-**Ejemplo:**
-
-```
-# Compilar el programa
-vesta> build src/tarea.vel -o tarea.velb
-
-# Arrancar nodo local y conectar al remoto
-vesta> dist new --port 7790 --name nodo-local
-[dist] Nodo creado (mgr_id=1 vm_id=1) puerto=7790
-vesta> dist add-node 1 192.168.1.100 7789 --name nodo-remoto
-[dist] Nodo registrado: 192.168.1.100:7789  (idx=0)
-
-# Enviar ejecucion al nodo remoto (idx=0)
-vesta> dist run 1 0 tarea.velb
-[dist run] Bytecode enviado a nodo[0] desde tarea.velb
-  FutureObject GcHandle = 0x0000001a
-  Usa 'await' en bytecode para obtener el resultado cuando el nodo responda.
-```
-
-El `GcHandle` devuelto puede ser referenciado desde bytecode `.vel` con la instruccion
-`await` para bloquear el proceso actual hasta que el nodo remoto complete la tarea:
-
-```asm
-; En el proceso que lanzo dist run (GcHandle = 0x1a en este ejemplo)
-mov  r1, 0x1a
-await r1          ; bloquea hasta recibir VDP_RSPAWN_ACK; r0 = resultado del proceso remoto
-```
-
-### Ayuda del subcomando dist
-
-```
-dist help
-```
-
-### Referencia rapida de subcomandos `dist`
-
-| Subcomando | Argumentos | Descripcion |
-|------------|------------|-------------|
-| `dist new` | `[--port P] [--name N] [--token T] [--tls] ...` | Crea y arranca un nodo servidor persistente |
-| `dist start` | `<mgr_id> [--port P] [--discover] ...` | Configura y arranca DistRuntime en VM existente |
-| `dist stop` | `<mgr_id> [--vm-id N]` | Detiene el servidor VDP y sesiones |
-| `dist info` | `<mgr_id> [--vm-id N]` | Estado del nodo: ID, puerto, lista de pares |
-| `dist list` | `<mgr_id> [--vm-id N]` | Tabla de nodos registrados con su estado |
-| `dist add-node` | `<mgr_id> <ip> <puerto> [--name N] [--token T] ...` | Registra y conecta un nodo estatico |
-| `dist connect` | `<mgr_id> <node_idx> [--vm-id N]` | Reconecta a un nodo ya registrado |
-| `dist discover` | `<mgr_id> [--vm-id N]` | Emite broadcast UDP de descubrimiento |
-| `dist run` | `<mgr_id> <node_idx> <archivo.velb> [--vm-id N]` | Carga .velb y lo envia a ejecutar en nodo remoto |
-| `dist help` | — | Muestra la ayuda completa |
-
-### Flujo tipico: dos nodos locales
-
-```bash
-# Terminal 1: arrancar el servidor
-vm --dist-server --dist-port 7789 --dist-name servidor-A
-
-# Terminal 2: REPL que se conecta al servidor
-vm
-vesta> dist new --port 7790 --name cliente-B
-[dist] Nodo creado (mgr_id=1 vm_id=1) puerto=7790
-vesta> dist add-node 1 127.0.0.1 7789 --name servidor-A
-[dist] Nodo registrado: 127.0.0.1:7789  (idx=0)
-vesta> dist list 1
-IDX  IP:PUERTO         NOMBRE      ESTADO   TIPO
---------------------------------------------------
-0    127.0.0.1:7789    servidor-A  ACTIVO   estatico
-```
-
-### Flujo tipico: nodo con TLS y token
-
-```bash
-# Generar certificados (ejemplo con openssl)
-openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
-
-# Servidor con TLS + token
-vm --dist-server --dist-port 7789 \
-   --dist-tls --dist-cert cert.pem --dist-key key.pem \
-   --dist-token mi-secreto-compartido
-
-# Cliente que se conecta
-vesta> dist new --port 7790 --name cliente
-vesta> dist add-node 1 192.168.1.100 7789 --name servidor \
-       --tls --cert cert.pem --ca cert.pem --token mi-secreto-compartido
-```
-
-### Instrucciones de bytecode distribuidas
-
-Desde codigo Vesta (`.vel`) se accede a la red distribuida mediante estas instrucciones:
-
-| Instruccion | Descripcion |
-|-------------|-------------|
-| `rspawn r_fn, r_node` | Crear un proceso en el nodo remoto `r_node`; devuelve un FutureObject en R0 |
-| `msgsend r_pid, r_addr, r_len` | Enviar un mensaje al proceso `r_pid` (local o remoto); R0 = 1 si OK |
-| `msgrecv r_buf, r_max` | Recibir del propio mailbox; bloquea hasta que llegue un mensaje |
-| `memsync r_params` | Sincronizar una region de memoria VM con un nodo remoto |
-
-El indice de nodo que usan estas instrucciones (`node_idx`) es el que asigna
-`dist add-node` o `dist new`. Se puede consultar con `dist list`.
-
-----
-
-## Forma de trabajo
-
-Siga lellendo en: [github_work.md](./doc/github_work.md)
-
-----
+</div>

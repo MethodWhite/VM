@@ -266,6 +266,34 @@ namespace vm {
      *       el metodo privado @c error() que imprime el diagnostico en @c stderr.
      */
     class Lexer {
+    public:
+        /**
+         * @brief Numero de linea fuente Vex marcada por el ultimo
+         *        comentario `// @line N` visto por el lexer.
+         *
+         * El IR emitter puede emitir comentarios `// @line N` antes de
+         * cada instruccion para indicar la linea Vex que la genero
+         * (ver opt CompileOptions::emit_debug).  El lexer NORMALMENTE
+         * los descarta como comentarios, pero `skip_whitespace` actualiza
+         * este campo cuando los detecta.  El parser puede leerlo tras
+         * cada `next_token()` para asociar la instruccion entrante a la
+         * linea Vex correcta y poblar la tabla de debug del .velb.
+         *
+         * 0 = no hay info de linea para el siguiente token.
+         */
+        int last_src_line = 0;
+
+        /**
+         * @brief Path del archivo fuente Vex marcado por el comentario
+         *        `// @file <path>` (tipicamente al inicio del .vel).
+         *
+         * El compilador Vex inserta esa linea en el .vel cuando
+         * --vex-debug esta activo, para que el linker sepa que archivo
+         * es la fuente original.  El lexer captura el primer match en
+         * skip_whitespace.
+         */
+        std::string last_src_file;
+
     private:
         std::string source;     ///< Codigo fuente completo almacenado en memoria.
         size_t      pos    = 0; ///< Posicion actual del cursor en @c source.

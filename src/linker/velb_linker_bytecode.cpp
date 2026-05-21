@@ -22,7 +22,10 @@
  */
 #include "linker/velb_linker_bytecode.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <unordered_map>
 #include "emmit/bytereader.h"
 #include "emmit/parser_to_bytecode.h"
@@ -30,6 +33,57 @@
 #include "debug/debug_info.h"
 
 namespace Assembly::Bytecode::Linker {
+    /* Profiler interno del linker (opt-in via env VESTA_LINKER_PROFILE=1).
+     * Instrumenta cada fase de build_executable para identificar el hot path real
+     * antes de optimizar a ciegas.  Cero overhead cuando el env var no esta seteado. */
+    static bool linker_profile_enabled() {
+        static int cached = -1;
+        if (cached < 0) {
+            const char *v = std::getenv("VESTA_LINKER_PROFILE");
+            cached = (v && v[0] == '1') ? 1 : 0;
+        }
+        return cached == 1;
+    }
+
+    struct LinkerPhaseTimer {
+        const char *name;
+        std::chrono::steady_clock::time_point t0;
+        bool enabled;
+        LinkerPhaseTimer(const char *n)
+            : name(n), enabled(linker_profile_enabled()) {
+            if (enabled) t0 = std::chrono::steady_clock::now();
+        }
+        ~LinkerPhaseTimer() {
+            if (!enabled) return;
+            auto t1 = std::chrono::steady_clock::now();
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            std::fprintf(stderr, "[linker-prof] %-24s %8lld us\n",
+                         name, static_cast<long long>(us));
+            std::fflush(stderr);
+        }
+    };
+
+    /* RAII para medir tamano emitido por una fase.  Reporta delta de output.size()
+     * para detectar fases que escriben muchos bytes (candidatos a pre-reserve). */
+    struct LinkerPhaseSize {
+        const char *name;
+        const std::vector<uint8_t> &buf;
+        size_t start_size;
+        bool enabled;
+        LinkerPhaseSize(const char *n, const std::vector<uint8_t> &b)
+            : name(n), buf(b), start_size(b.size()),
+              enabled(linker_profile_enabled()) {}
+        ~LinkerPhaseSize() {
+            if (!enabled) return;
+            size_t delta = buf.size() - start_size;
+            if (delta > 0) {
+                std::fprintf(stderr, "[linker-prof]   %-22s +%8zu bytes\n",
+                             name, delta);
+                std::fflush(stderr);
+            }
+        }
+    };
+
     // cambiar en un futuro, por ahora para pruebas me vale
     static uint64_t simple_checksum(const std::vector<uint8_t> &data) {
         uint64_t sum = 0;
@@ -265,6 +319,20 @@ namespace Assembly::Bytecode::Linker {
     void Linker::resolve_symbols() {
         global_symbols.clear();
         symbol_info.clear();
+        if (linker_profile_enabled()) {
+            size_t total_labels = 0;
+            for (const auto &mod : modules) {
+                for (const auto &[sp, space] : mod.ctx.space_address) {
+                    for (const auto &[sn, sec] : space.table_section) {
+                        total_labels += sec.table_label.size();
+                    }
+                }
+            }
+            std::fprintf(stderr,
+                "[linker-prof]   resolve_symbols: modulos=%zu, total_labels=%zu\n",
+                modules.size(), total_labels);
+            std::fflush(stderr);
+        }
 
         // iteramos sobre cada modulo
         for (auto &mod: modules) {
@@ -346,6 +414,16 @@ namespace Assembly::Bytecode::Linker {
         // limpiar la tabla de relocations capturadas (por si se llama
         // mas de una vez en un mismo Linker).
         applied_relocations_.clear();
+        if (linker_profile_enabled()) {
+            size_t total_relocs = 0;
+            for (const auto &mod : modules) total_relocs += mod.relocations.size();
+            std::fprintf(stderr,
+                "[linker-prof]   apply_relocations: modulos=%zu, total_relocs=%zu, "
+                "global_symbols=%zu, import_lookup=%zu\n",
+                modules.size(), total_relocs,
+                global_symbols.size(), import_lookup.size());
+            std::fflush(stderr);
+        }
 
         // cuando se concatenan bytecodes en `merge_sections`, cada
         // modulo se anade en orden.  Aqui llevamos un acumulador del offset
@@ -903,15 +981,21 @@ namespace Assembly::Bytecode::Linker {
 
 
     std::vector<uint8_t> Linker::build_executable() {
+        LinkerPhaseTimer __t_total("TOTAL build_executable");
+        if (linker_profile_enabled()) {
+            std::fprintf(stderr, "[linker-prof] === inicio build_executable: modulos=%zu, libs=%zu, ir_bytes=%zu ===\n",
+                         modules.size(), libraries.size(), ir_section_bytes.size());
+            std::fflush(stderr);
+        }
         result->output.reserve(4096); // evita realocaciones
-        resolve_symbols();
-        apply_relocations();
-        optimize_modules();
-        merge_address_spaces();
-        merge_sections();
+        { LinkerPhaseTimer __t("resolve_symbols");        resolve_symbols(); }
+        { LinkerPhaseTimer __t("apply_relocations");      apply_relocations(); }
+        { LinkerPhaseTimer __t("optimize_modules");       optimize_modules(); }
+        { LinkerPhaseTimer __t("merge_address_spaces");   merge_address_spaces(); }
+        { LinkerPhaseTimer __t("merge_sections");         merge_sections(); }
 
-        build_header();
-        build_section_table();
+        { LinkerPhaseTimer __t("build_header");           build_header(); }
+        { LinkerPhaseTimer __t("build_section_table");    build_section_table(); }
 
         // escribir tabla de espacio de direcciones
         auto write_space_address = [&](HeaderVELB &v) {
@@ -928,6 +1012,8 @@ namespace Assembly::Bytecode::Linker {
             }
         };
 
+        LinkerPhaseTimer __t_emit_header("emit_header_fields");
+        LinkerPhaseSize __s_emit_header("emit_header_fields", result->output);
         result->emit32(final_header.magic.firma);
         result->emit32(final_header.format_v);
 
@@ -1036,14 +1122,22 @@ namespace Assembly::Bytecode::Linker {
         }
 
         // anadir el bytecode al final
-        result->output.insert(result->output.end(), final_bytecode.begin(), final_bytecode.end());
+        {
+            LinkerPhaseTimer __t("emit_bytecode_insert");
+            LinkerPhaseSize __s("emit_bytecode_insert", result->output);
+            result->output.insert(result->output.end(), final_bytecode.begin(), final_bytecode.end());
+        }
 
+        {
+        LinkerPhaseTimer __t_imp("emit_import_table");
+        LinkerPhaseSize __s_imp("emit_import_table", result->output);
         for (auto &entry: table_import_method) {
             result->emit32(entry.offset_module_string);
             result->emit32(entry.offset_function_string);
             result->emit32(entry.offset_signature_string);
             result->emit32(entry.offset_bytecode);
         }
+        } // fin emit_import_table
 
         // emitir la tabla de relocations al final del archivo.
         // Cada entry son 24 bytes packed: bytecode_offset (u64) + target_value
@@ -1055,6 +1149,13 @@ namespace Assembly::Bytecode::Linker {
         // asi que NO refleja la posicion real del cursor en el archivo.
         // Usar `output.size()` que SI es la posicion real al final del buffer.
         if (!applied_relocations_.empty()) {
+            LinkerPhaseTimer __t_rel("emit_reloc_table");
+            LinkerPhaseSize __s_rel("emit_reloc_table", result->output);
+            if (linker_profile_enabled()) {
+                std::fprintf(stderr, "[linker-prof]   reloc_entries=%zu\n",
+                             applied_relocations_.size());
+                std::fflush(stderr);
+            }
             // Alineacion 8 bytes para acceso eficiente.
             while (result->output.size() % 8 != 0) {
                 result->output.push_back(0x00);
@@ -1100,6 +1201,8 @@ namespace Assembly::Bytecode::Linker {
         // (compilacion sin --vex-debug), no escribimos nada y los campos
         // quedan a 0 (loader detecta size==0 y omite la carga).
         {
+            LinkerPhaseTimer __t_dbg("emit_debug_section");
+            LinkerPhaseSize __s_dbg("emit_debug_section", result->output);
             // Recolectar todas las entradas de todos los modulos.
             // Mismo loop que apply_relocations: module_base_offset se
             // incrementa por mod.bytecode.size() en orden.
@@ -1212,6 +1315,13 @@ namespace Assembly::Bytecode::Linker {
          * via @c ir::emit_ir_section.  El linker simplemente los
          * appendea al final y patchea offset/size en el header. */
         if (!ir_section_bytes.empty()) {
+            LinkerPhaseTimer __t_ir("emit_ir_and_sym");
+            LinkerPhaseSize __s_ir("emit_ir_and_sym", result->output);
+            if (linker_profile_enabled()) {
+                std::fprintf(stderr, "[linker-prof]   ir_bytes=%zu\n",
+                             ir_section_bytes.size());
+                std::fflush(stderr);
+            }
             const uint64_t ir_offset = result->output.size();
             result->output.insert(result->output.end(),
                                    ir_section_bytes.begin(),

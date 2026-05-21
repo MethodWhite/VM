@@ -136,7 +136,56 @@ namespace debug {
         LIST_WATCHES = 33, ///< listar watchpoints activos
         TRACE_MSGS   = 34, ///< toggle de tracing de msgsend/msgrecv del proceso
         BREAK_MON    = 35, ///< toggle de break-on-monitor-contention global
+        // Comandos del modo --server-mode (servidor persistente).
+        // Permiten que un cliente cargue .velb, los ejecute como nuevos
+        // procesos, los mate y obtenga informacion del servidor sin
+        // necesidad de reiniciar la VM entre programas.
+        LOAD_VELB       = 36, ///< cargar un .velb desde el filesystem del server; arranca un nuevo proceso (opcional pause_at_start)
+        KILL_PROC       = 37, ///< marcar un proceso como DEAD para que el scheduler lo libere
+        SERVER_INFO     = 38, ///< informacion del servidor (uptime, schedulers, num_procesos, persistente, etc.)
+        SERVER_SHUTDOWN = 39, ///< apagar la VM persistente y salir del modo --server-mode
+
+        // Comandos de autenticacion (DEVELOPMENT siempre publicos)
+        AUTH_LOGIN       = 40, ///< credenciales -> session_token
+        AUTH_LOGOUT      = 41, ///< invalidar session_token
+        AUTH_WHOAMI      = 42, ///< devolver usuario + rol de la sesion actual
+        // Comandos de gestion de usuarios (ADMIN)
+        AUTH_CREATE_USER = 43, ///< crear un usuario nuevo
+        AUTH_DELETE_USER = 44, ///< eliminar un usuario
+        AUTH_LIST_USERS  = 45, ///< listar usuarios + roles
+        AUTH_CHANGE_PASS = 46, ///< cambiar contrasenya (propia o de otro si admin)
+
+        // Comandos de transferencia de archivos (DEVELOPER / ADMIN)
+        FS_WRITE         = 50, ///< escribir bytes base64 a un archivo del server
+        FS_READ          = 51, ///< leer bytes base64 de un archivo del server
+        FS_LIST          = 52, ///< listar contenido de un directorio
+        FS_STAT          = 53, ///< metadatos de un fichero (size, mtime, kind)
+        FS_DELETE        = 54, ///< borrar fichero/directorio (recursivo opcional)
+        FS_MKDIR         = 55, ///< crear directorio (recursivo opcional)
+        FS_RENAME        = 56, ///< renombrar/mover fichero
+
+        // Carga directa desde bytes base64 (sin escribir a disco)
+        LOAD_VELB_BYTES  = 57, ///< igual que LOAD_VELB pero recibe content_b64
+
+        // Pasa una linea cruda al REPL real del servidor
+        // (runtime::run_command_async).  Devuelve {output} con la salida
+        // capturada.  Permite que el cliente Electron exponga el mismo
+        // REPL que se ejecuta localmente con `vesta` sin argumentos.
+        REPL_EXEC        = 58, ///< wrap de runtime::run_command_async
+        MEM_WRITE        = 59, ///< escribir bytes en memoria VM (hex editor)
     };
+
+    /**
+     * @brief Registra un puntero atomic que se pondra a false cuando se
+     *        ejecute el comando SERVER_SHUTDOWN del debugger.
+     *
+     * Usado por @c main.cpp en modo @c --server-mode para que el bucle de
+     * espera (Ctrl+C) tambien pueda terminarse remotamente desde el cliente.
+     *
+     * @param flag Puntero al @c std::atomic<bool> a actualizar (o nullptr
+     *             para desactivar el hook).
+     */
+    void set_server_shutdown_flag(std::atomic<bool> *flag);
 
     /**
      * @brief Convierte una cadena de nombre de comando a DebugCmd.
@@ -360,6 +409,43 @@ namespace debug {
                                    uint64_t owner);
 
         /**
+         * @brief Configura el directorio raiz del sandbox de filesystem.
+         *
+         * Cuando esta configurado, todas las rutas usadas por los comandos
+         * @c fs_* y @c load_velb se resuelven contra este directorio y se
+         * rechaza cualquier intento de salir de el via @c ".." o rutas
+         * absolutas.  Cuando es vacio, no hay sandbox (compatibilidad
+         * hacia atras: el operador asume el riesgo).
+         */
+        void set_server_root(const std::string &root) { server_root_ = root; }
+
+        /**
+         * @brief Recalcula @c has_hooks de TODOS los schedulers en funcion
+         * del estado actual de breakpoints / step / watch / tracing.
+         *
+         * Cuando ninguno de esos flags esta activo, los schedulers vuelven
+         * al fast path (threaded computed-goto) y no llaman a
+         * @c on_before_exec.  Esto significa que un servidor en
+         * @c --server-mode tiene **coste cero de runtime** cuando ningun
+         * cliente ha pedido aun romper en breakpoint o pausar -- el
+         * usuario que pide rendimiento solo paga el overhead del FSM
+         * cuando realmente esta depurando.
+         *
+         * Es seguro llamarla desde cualquier hilo: solo escribe un
+         * atomic bool por scheduler.  Coste ~10 ns.
+         */
+        void refresh_scheduler_hooks();
+
+        /**
+         * @brief Activa o desactiva el requisito de autenticacion.
+         *
+         * Cuando esta activo, los comandos distintos de @c auth_login,
+         * @c auth_logout y @c server_info exigen un campo
+         * @c session_token valido.  El token se obtiene via @c auth_login.
+         */
+        void set_auth_required(bool enabled) { auth_required_ = enabled; }
+
+        /**
          * @brief Marca @p pid como PAUSADO antes de ejecutar su primera
          *        instruccion.
          *
@@ -377,6 +463,8 @@ namespace debug {
     private:
         runtime::VM &vm_;     ///< referencia a la instancia VM
         uint16_t     port_;   ///< puerto TCP del servidor
+        std::string  server_root_;            ///< sandbox de filesystem (vacio = sin sandbox)
+        bool         auth_required_ = false;  ///< exigir session_token en comandos no publicos
 
         std::atomic<bool> running_{false};  ///< estado del servidor
         std::atomic<bool> any_bp_{false};   ///< hay breakpoints activos (fast path)

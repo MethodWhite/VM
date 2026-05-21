@@ -179,7 +179,8 @@ namespace asm_multi_process {
                    const std::string &output_prefix,
                    bool skip_preprocessor = false,
                    bool keep_labels       = false,
-                   const std::vector<uint8_t> *ir_section_bytes = nullptr);
+                   const std::vector<uint8_t> *ir_section_bytes = nullptr,
+                   bool emit_map          = false);
 
     /**
      * @brief Ejecuta un comando externo y captura toda su salida estandar.

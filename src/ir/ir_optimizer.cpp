@@ -909,9 +909,9 @@ bool ir_pass_dce(IrFunction &fn) {
             // via operands), asi que DCE debe contarlo como uso para que el
             // SSA value que produjo el puntero (e.g. RAW_ASM `mov rN, @Abs(...)`
             // o LOAD del slot del function value) NO sea eliminado.  Sin
-            // esto, A.10 closures rompen porque el optimizer purga la
-            // instruccion que materializa fn_addr y el regalloc deja r14
-            // (asignado a fn_addr_v) sin inicializar -> callvmr salta a 0.
+            // esto, las closures se rompen: el optimizer purga la instr que
+            // materializa fn_addr y el regalloc deja r14 (asignado a
+            // fn_addr_v) sin inicializar -> callvmr salta a 0 y crash.
             if ((ins.op == IrOp::CALLIND || ins.op == IrOp::CALLCLOSURE)
              && ins.func_ptr != IR_NO_VALUE) {
                 used.insert(ins.func_ptr);
@@ -1935,11 +1935,17 @@ bool ir_pass_inline_loop_header(IrFunction &fn) {
 
 bool ir_pass_inline(IrModule &mod) {
     /* Threshold de tamano del body del callee para inlinar.
-     * Subido de 8 a 12 (2026-05-17) para capturar getters/setters un poco
-     * mas grandes como Triangle__area (10 instrs: 2 loads + mul + div + ret).
-     * El overhead del CALLVM (push/pop ~24 instrs + framing) supera el cuerpo
-     * para cualquier callee razonable; el unico riesgo es bloat del .velb,
-     * minor en programas tipicos. */
+     *
+     * Por que 12 (en lugar de 8 o 16): el overhead del CALLVM (push regs vivos,
+     * mov r1..rN args, callvm, pop regs, mov dst r0) en el peor caso son ~24
+     * instrucciones VM.  Cualquier callee cuyo cuerpo cabe en menos de eso es
+     * candidato directo a inline ya que ahorramos mas de lo que crece el
+     * caller.  12 es el balance que captura getters, setters y helpers
+     * aritmeticos pequenos (ej. computos como ladominos lados, 2 LOADs + MUL
+     * + DIV + RET) sin causar bloat material en el .velb de programas
+     * tipicos.  Subir el limite por encima de ~16 empieza a inflar el binario
+     * sin ganancia neta porque los callees grandes ya son rentables como
+     * subrutina compartida. */
     constexpr size_t INLINE_THRESHOLD = 12;
     bool changed = false;
 

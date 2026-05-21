@@ -88,6 +88,19 @@ namespace runtime {
     ProcessVM::~ProcessVM() {
         state = DEAD;                // marcar estado terminal
         manager_mem_priv.free_all(); // liberar toda la memoria privada del proceso
+        // Liberar @c ExceptionFrames del free list (reciclados por
+        // @c tryleave).  El @c exc_frame_stack activo solo deberia tener
+        // frames si el proceso muere mid-try (no normal, pero defensivo).
+        while (exc_frame_stack != nullptr) {
+            ExceptionFrame *tmp = exc_frame_stack;
+            exc_frame_stack = tmp->prev;
+            delete tmp;
+        }
+        while (exc_free_list != nullptr) {
+            ExceptionFrame *tmp = exc_free_list;
+            exc_free_list = tmp->prev;
+            delete tmp;
+        }
     }
 
     /**

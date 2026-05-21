@@ -747,6 +747,14 @@ namespace loader {
              *     bytecode interpreta R14 como VM vaddr). */
             bool skip_main_jit = false;
             bool has_closures = false;
+            bool main_has_try = false;
+            /* Recorrer SOLO la funcion 'main' para detectar try/catch raw_asm:
+             * el cross-boundary throw (JIT main + interp callee que throw)
+             * salta a handler_pc en bytecode VM address, lo cual NO funciona
+             * desde dentro del host frame del JIT main.  Workaround v1: si
+             * main tiene tryenter, skip eager-compile (su interp dispatch
+             * maneja el throw correctamente).  Phase D.13 (native unwinding)
+             * eliminara esta restriccion. */
             for (const auto &irf : last_exe->ir_functions) {
                 for (const auto &block : irf.blocks) {
                     for (const auto &ins : block.instrs) {
@@ -760,6 +768,12 @@ namespace loader {
                             skip_main_jit = true;
                             has_closures = true;
                             break;
+                        }
+                        /* Detectar tryenter en main especificamente. */
+                        if (irf.name == "main"
+                         && ins.op == ir::IrOp::RAW_ASM
+                         && ins.func_name.find("tryenter") != std::string::npos) {
+                            main_has_try = true;
                         }
                     }
                     if (skip_main_jit) break;
@@ -782,7 +796,7 @@ namespace loader {
                 }
             }
             auto it = last_exe->ir_lookup.find("main");
-            if (!has_aop
+            if (!has_aop && !main_has_try
              && it != last_exe->ir_lookup.end()
              && it->second < last_exe->ir_functions.size()) {
                 const ir::IrFunction &ir_main = last_exe->ir_functions[it->second];
@@ -822,10 +836,31 @@ namespace loader {
                         return 0;
                     }
                 };
+                /* Computar offsets de exc_frame_stack + exc_free_list para
+                 * inline tryleave en codigo JIT-eated (7 instr sin leak,
+                 * vs runtime call de ~25 instr). */
+                int32_t exc_off = 0, exc_free_off = 0;
+                {
+                    const int64_t off64 =
+                        reinterpret_cast<int64_t>(&proccess->exc_frame_stack)
+                        - reinterpret_cast<int64_t>(proccess);
+                    const int64_t free64 =
+                        reinterpret_cast<int64_t>(&proccess->exc_free_list)
+                        - reinterpret_cast<int64_t>(proccess);
+                    if (off64 >= INT32_MIN && off64 <= INT32_MAX) {
+                        exc_off = static_cast<int32_t>(off64);
+                    }
+                    if (free64 >= INT32_MIN && free64 <= INT32_MAX) {
+                        exc_free_off = static_cast<int32_t>(free64);
+                    }
+                }
+                const uint64_t jit_counter_addr = reinterpret_cast<uint64_t>(
+                    &proccess->scheduler.profiler_jit_instr_counter);
                 try {
                     jit::CompileResult res = jit::eager_compile_function(
                         ir_main, &last_exe->ir_lookup, &last_exe->ir_functions,
-                        &last_exe->symbol_table, resolve_native, read_vmem_cb);
+                        &last_exe->symbol_table, resolve_native, read_vmem_cb,
+                        exc_off, exc_free_off, jit_counter_addr);
                     if (res.fn != nullptr) {
                         proccess->jit_entry_fn = reinterpret_cast<void *>(res.fn);
                         if (jit::g_jit_warn_unsupported) {

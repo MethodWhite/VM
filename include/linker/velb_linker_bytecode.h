@@ -250,7 +250,7 @@ typedef struct PACKED HeaderVELB {
     uint8_t _debug_pad[3] = {}; // 3, offset 117 (reservado, debe ser 0)
 
     /**
-     * @brief A.9: offset al inicio de la tabla de relocations dentro del .velb.
+     * @brief Offset al inicio de la tabla de relocations dentro del .velb.
      *
      * Cada entry registra un slot de bytecode que contiene una direccion
      * absoluta (e.g. resultado de @c @Absolute("code.foo")).  Permite al
@@ -263,7 +263,7 @@ typedef struct PACKED HeaderVELB {
     uint64_t offset_reloc_table = 0; // 8, offset 120
 
     /**
-     * @brief A.9: numero de entries en la tabla de relocations.
+     * @brief Numero de entries en la tabla de relocations.
      */
     uint32_t size_reloc_table = 0;   // 4, offset 128
 
@@ -339,8 +339,10 @@ typedef struct PACKED entry_label_table {
  *                                puede comparar contra el rango VA del modulo
  *                                para decidir si patchear o no.
  *  +16  type             (u8)   Tipo de relocation: 1=Absolute64, 2=Relative32,
- *                                3=Relative64.  Para A.9 MVP solo se usa
- *                                Absolute64 (lo que produce @c @Absolute(...)).
+ *                                3=Relative64, 4=Absolute32.  El linker
+ *                                emite tipicamente Absolute64 (lo que produce
+ *                                @c @Absolute(...)) y Absolute32 para
+ *                                instrucciones fusion @c cmpjmp / @c decjnz.
  *  +17  _pad             (u8x7) Relleno hasta 24 bytes.
  */
 typedef struct PACKED entry_relocation_table {

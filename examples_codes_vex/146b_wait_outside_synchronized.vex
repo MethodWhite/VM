@@ -1,0 +1,9 @@
+// negativo -- wait fuera de synchronized debe fallar al compilar.
+class Lock {
+    public Lock() {}
+}
+i32 main() {
+    Lock l = new Lock();
+    wait(l);   // ERROR: 'wait' debe estar dentro de synchronized
+    return 0;
+}

@@ -31,18 +31,28 @@
  */
 
 #include "debug/debugger.h"
+#include "debug/auth.h"
 #include "runtime/proceso_runtime.h"
 #include "runtime/runtime.h"
+#include "runtime/manager_runtime.h"
 #include "runtime/scheduler.h"
 #include "loader/loader.h"
 #include "emmit/emmit_decl.h"
 #include "runtime/decode_instruction.h"
 #include "loader/oop_types.h"
+#include "cli/runtime_api_commands.h"
+#include "cli/cli.h"
 
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>   // std::getenv para diagnostico VESTA_DBG_BP_TRACE
 #include <sstream>
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <unordered_set>
 
 // Tablas externas de decodificacion (definidas en src/runtime/decode_table.cpp).
 namespace runtime {
@@ -75,6 +85,170 @@ namespace runtime {
 #endif
 
 namespace debug {
+
+    /* =====================================================================
+     * Flag global de apagado del servidor persistente.
+     *
+     * En modo --server-mode, main.cpp registra un puntero a su atomic<bool>
+     * g_server_running aqui via set_server_shutdown_flag().  El comando
+     * SERVER_SHUTDOWN del protocolo lo pone a false para que el bucle de
+     * espera del main termine y la VM se cierre limpiamente sin necesidad
+     * de Ctrl+C en el lado del servidor.  Si el puntero es nullptr (el
+     * caso por defecto fuera de --server-mode), el comando responde con
+     * error explicativo.
+     * ===================================================================== */
+    static std::atomic<bool> *g_server_shutdown_flag = nullptr;
+
+    void set_server_shutdown_flag(std::atomic<bool> *flag) {
+        g_server_shutdown_flag = flag;
+    }
+
+    /* =====================================================================
+     * Marca de tiempo de inicio del servidor (para SERVER_INFO::uptime).
+     * Se actualiza la primera vez que Debugger::start() se llama.
+     * ===================================================================== */
+    static std::chrono::steady_clock::time_point g_server_start_time =
+        std::chrono::steady_clock::now();
+
+    /* =====================================================================
+     * Codificacion / decodificacion base64 (sin dependencias externas).
+     *
+     * El protocolo de file-transfer empaqueta el contenido binario como
+     * base64 dentro del JSON.  Se eligio base64 frente a un frame binario
+     * dedicado porque (a) preserva el framing actual length-prefix +
+     * JSON, (b) sobrevive a clientes que escriben JSON pretty-printed y
+     * (c) la sobrecarga del ~33% es aceptable para archivos < 16 MB que
+     * son el caso esperado (codigo, .velb pequenos, configuracion).
+     * ===================================================================== */
+
+    static const char *B64_CHARS =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    static std::string b64_encode(const uint8_t *data, size_t len) {
+        std::string out;
+        out.reserve(((len + 2) / 3) * 4);
+        size_t i = 0;
+        while (i + 3 <= len) {
+            uint32_t n = (uint32_t(data[i]) << 16) |
+                         (uint32_t(data[i+1]) << 8) |
+                          uint32_t(data[i+2]);
+            out.push_back(B64_CHARS[(n >> 18) & 0x3F]);
+            out.push_back(B64_CHARS[(n >> 12) & 0x3F]);
+            out.push_back(B64_CHARS[(n >> 6) & 0x3F]);
+            out.push_back(B64_CHARS[n & 0x3F]);
+            i += 3;
+        }
+        // padding del resto (0, 1 o 2 bytes restantes)
+        if (i < len) {
+            uint32_t n = uint32_t(data[i]) << 16;
+            if (i + 1 < len) n |= uint32_t(data[i+1]) << 8;
+            out.push_back(B64_CHARS[(n >> 18) & 0x3F]);
+            out.push_back(B64_CHARS[(n >> 12) & 0x3F]);
+            out.push_back((i + 1 < len) ? B64_CHARS[(n >> 6) & 0x3F] : '=');
+            out.push_back('=');
+        }
+        return out;
+    }
+
+    static int b64_char_index(char c) {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    }
+
+    /**
+     * @brief Decodifica una cadena base64 a bytes.
+     *
+     * Tolerante a whitespace (espacios y saltos de linea) que algunos
+     * clientes incluyen al formatear el JSON.  Devuelve false si encuentra
+     * caracteres invalidos distintos del padding @c '='.
+     */
+    static bool b64_decode(const std::string &in, std::vector<uint8_t> &out) {
+        out.clear();
+        out.reserve((in.size() / 4) * 3);
+        uint32_t buf = 0;
+        int bits = 0;
+        for (char c : in) {
+            if (c == '=' || std::isspace(static_cast<unsigned char>(c))) continue;
+            int v = b64_char_index(c);
+            if (v < 0) return false;
+            buf = (buf << 6) | static_cast<uint32_t>(v);
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                out.push_back(static_cast<uint8_t>((buf >> bits) & 0xFF));
+            }
+        }
+        return true;
+    }
+
+    /* =====================================================================
+     * Resolucion segura de rutas contra el sandbox @c server_root_.
+     *
+     * Si @p root es vacio se permite cualquier ruta (modo back-compat),
+     * pero la ruta debe seguir siendo absoluta para no depender del cwd
+     * del proceso VM (que es impredecible cuando se invoca como servicio).
+     *
+     * Si @p root no es vacio:
+     *   1. La ruta del cliente se trata como RELATIVA al root.  Cualquier
+     *      prefijo absoluto del cliente se descarta y se reanchora al root.
+     *   2. Tras canonicalizar (collapse de ".." y links) se verifica que
+     *      el resultado siga dentro del root.  Si no, se rechaza.
+     *
+     * Devuelve true si la ruta resultante (@p out) es segura.  En caso
+     * de error escribe el motivo en @p err_msg.
+     * ===================================================================== */
+    static bool resolve_sandbox_path(const std::string &root,
+                                     const std::string &requested,
+                                     std::filesystem::path &out,
+                                     std::string &err_msg) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        if (root.empty()) {
+            // Sin sandbox: aceptamos la ruta tal cual, pero exigimos algo no vacio.
+            if (requested.empty()) {
+                err_msg = "path vacio";
+                return false;
+            }
+            out = fs::weakly_canonical(fs::path(requested), ec);
+            if (ec) out = fs::path(requested);
+            return true;
+        }
+        fs::path root_path = fs::weakly_canonical(fs::path(root), ec);
+        if (ec) root_path = fs::path(root);
+
+        // Reanclar la ruta del cliente en el root, eliminando cualquier
+        // raiz absoluta para que no se pueda especificar "C:/Windows".
+        fs::path rel = fs::path(requested);
+        if (rel.is_absolute()) {
+            // tomar solo el "relative_path()" para colapsar el drive/root
+            rel = rel.relative_path();
+        }
+        fs::path combined = root_path / rel;
+        fs::path canon    = fs::weakly_canonical(combined, ec);
+        if (ec) canon = combined;
+
+        // Verificacion de contencion: canon debe empezar con root_path.
+        auto root_it = root_path.begin();
+        auto canon_it = canon.begin();
+        for (; root_it != root_path.end() && canon_it != canon.end();
+             ++root_it, ++canon_it) {
+            if (*root_it != *canon_it) {
+                err_msg = "path fuera del sandbox";
+                return false;
+            }
+        }
+        if (root_it != root_path.end()) {
+            err_msg = "path fuera del sandbox";
+            return false;
+        }
+
+        out = canon;
+        return true;
+    }
 
     /* =====================================================================
      * Inicializacion de Winsock (no-op en POSIX)
@@ -213,6 +387,28 @@ namespace debug {
             {"list_watches",  DebugCmd::LIST_WATCHES},
             {"trace_msgs",    DebugCmd::TRACE_MSGS},
             {"break_mon",     DebugCmd::BREAK_MON},
+            {"load_velb",       DebugCmd::LOAD_VELB},
+            {"kill_proc",       DebugCmd::KILL_PROC},
+            {"server_info",     DebugCmd::SERVER_INFO},
+            {"server_shutdown", DebugCmd::SERVER_SHUTDOWN},
+            {"auth_login",       DebugCmd::AUTH_LOGIN},
+            {"auth_logout",      DebugCmd::AUTH_LOGOUT},
+            {"auth_whoami",      DebugCmd::AUTH_WHOAMI},
+            {"auth_create_user", DebugCmd::AUTH_CREATE_USER},
+            {"auth_delete_user", DebugCmd::AUTH_DELETE_USER},
+            {"auth_list_users",  DebugCmd::AUTH_LIST_USERS},
+            {"auth_change_pass", DebugCmd::AUTH_CHANGE_PASS},
+            {"fs_write",        DebugCmd::FS_WRITE},
+            {"fs_read",         DebugCmd::FS_READ},
+            {"fs_list",         DebugCmd::FS_LIST},
+            {"fs_stat",         DebugCmd::FS_STAT},
+            {"fs_delete",       DebugCmd::FS_DELETE},
+            {"fs_mkdir",        DebugCmd::FS_MKDIR},
+            {"fs_rename",       DebugCmd::FS_RENAME},
+            {"load_velb_bytes", DebugCmd::LOAD_VELB_BYTES},
+            {"repl_exec",       DebugCmd::REPL_EXEC},
+            {"repl",            DebugCmd::REPL_EXEC},
+            {"mem_write",       DebugCmd::MEM_WRITE},
         };
         for (const auto &e : table) {
             if (name == e.n) return e.c;
@@ -499,6 +695,28 @@ namespace debug {
      * ===================================================================== */
 
     Breakpoint *Debugger::find_breakpoint(uint64_t pc, uint64_t pid) {
+        // Diagnostico temporal: si VESTA_DBG_BP_TRACE=1, log cada lookup.
+        // Activable solo bajo demanda para no spammear el stderr en prod.
+        static const bool trace = []() {
+            const char *e = std::getenv("VESTA_DBG_BP_TRACE");
+            return e && (*e == '1' || *e == 't' || *e == 'T');
+        }();
+        if (trace) {
+            std::fprintf(stderr,
+                "[bp-trace] find_breakpoint(pc=0x%llx, pid=%llu) breakpoints=%zu\n",
+                (unsigned long long)pc, (unsigned long long)pid,
+                breakpoints_.size());
+            for (auto &bp : breakpoints_) {
+                std::fprintf(stderr,
+                    "[bp-trace]   #%u enabled=%d addr=0x%llx pid=%llu %s\n",
+                    bp.id, bp.enabled ? 1 : 0,
+                    (unsigned long long)bp.addr,
+                    (unsigned long long)bp.pid,
+                    (bp.enabled && bp.addr == pc &&
+                     (bp.pid == 0 || bp.pid == pid)) ? "<-- MATCH" : "");
+            }
+            std::fflush(stderr);
+        }
         for (auto &bp : breakpoints_) {
             if (!bp.enabled) continue;
             if (bp.addr != pc) continue;
@@ -684,8 +902,24 @@ namespace debug {
         // El loop se repite hasta que no haya bp/step pendiente, momento
         // en el que retornamos para ejecutar la instruccion.
         uint64_t pid = proc->pid.local_pid; // PID local del proceso
+        // Diagnostico temporal: si VESTA_DBG_BP_TRACE=1, log cada slow path.
+        static const bool _bp_trace = []() {
+            const char *e = std::getenv("VESTA_DBG_BP_TRACE");
+            return e && (*e == '1' || *e == 't' || *e == 'T');
+        }();
+        int _recheck_iter = 0;
     recheck:
         uint64_t pc  = proc->registers.rip.raw(); // Program Counter actual
+        if (_bp_trace) {
+            std::fprintf(stderr,
+                "[bp-trace] on_before_exec ENTER pid=%llu pc=0x%llx iter=%d "
+                "any_bp=%d any_step=%d\n",
+                (unsigned long long)pid, (unsigned long long)pc, _recheck_iter,
+                any_bp_.load(std::memory_order_relaxed) ? 1 : 0,
+                any_step_.load(std::memory_order_relaxed) ? 1 : 0);
+            std::fflush(stderr);
+        }
+        _recheck_iter++;
 
         // slow path: verificar breakpoints y step mode
         bool should_pause = false;
@@ -822,6 +1056,14 @@ namespace debug {
         if (!should_pause) return;
 
         // pausar el proceso hasta que el depurador emita continue/step
+        if (_bp_trace) {
+            std::fprintf(stderr,
+                "[bp-trace] on_before_exec PAUSE pid=%llu pc=0x%llx "
+                "reason='%s'\n",
+                (unsigned long long)pid, (unsigned long long)pc,
+                pause_reason.c_str());
+            std::fflush(stderr);
+        }
         {
             std::unique_lock<std::mutex> lk(proc_mutex_);
             DbgProcCtx &ctx = get_or_create_ctx(pid);
@@ -832,6 +1074,17 @@ namespace debug {
             ctx.pause_cv.wait(lk, [&ctx]() {
                 return ctx.state != DbgProcState::PAUSED;
             });
+            if (_bp_trace) {
+                const char *st = "OTHER";
+                if (ctx.state == DbgProcState::RUNNING)  st = "RUNNING";
+                if (ctx.state == DbgProcState::DETACHED) st = "DETACHED";
+                std::fprintf(stderr,
+                    "[bp-trace] on_before_exec RESUME pid=%llu state=%s "
+                    "step_mode=%d\n",
+                    (unsigned long long)pid, st,
+                    ctx.step_mode ? 1 : 0);
+                std::fflush(stderr);
+            }
             // Tras despertar (el cliente envio CONTINUE/STEP), recompute
             // any_step_: si quedan otros procesos en PAUSED o step_mode,
             // sigue true; si no, vuelve a false y el fast path retorna.
@@ -878,11 +1131,17 @@ namespace debug {
         // setea state=RUNNING + notifica el cv y el proceso sigue.
         // Entre tanto el cliente puede setear breakpoints, listar
         // procesos, leer registros, etc.
-        std::lock_guard<std::mutex> lk(proc_mutex_);
-        DbgProcCtx &ctx = get_or_create_ctx(pid);
-        ctx.state     = DbgProcState::PAUSED;
-        ctx.step_mode = true;
-        any_step_.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(proc_mutex_);
+            DbgProcCtx &ctx = get_or_create_ctx(pid);
+            ctx.state     = DbgProcState::PAUSED;
+            ctx.step_mode = true;
+            any_step_.store(true, std::memory_order_release);
+        }
+        // pause_at_start activa el step_mode: los schedulers necesitan
+        // has_hooks=true para que on_before_exec se invoque y haga la
+        // pausa real.
+        refresh_scheduler_hooks();
     }
 
     void Debugger::on_process_spawn(uint64_t parent_pid, uint64_t child_pid) {
@@ -949,11 +1208,24 @@ namespace debug {
             if (i) o << ",";
             o << "\"r" << i << "\":" << proc->registers.regs[i].qword();
         }
-        // PC, SP, BP
+        // cursor regs cur0..cur3 (registros internos del intérprete)
+        for (int i = 0; i < 4; i++) {
+            o << ",\"cur" << i << "\":" << proc->registers.cur[i].qword();
+        }
+        // PC, SP, BP, FL
         o << ",\"pc\":" << proc->registers.rip.raw();
         o << ",\"sp\":" << proc->registers.stack_pointer.raw();
         o << ",\"bp\":" << proc->registers.base_pointer.raw();
         o << ",\"flags\":" << proc->registers.flags.raw;
+        // Tambien expongo PID y reductions actuales: utiles para el cliente
+        // y caben de sobra en el mismo JSON.
+        o << ",\"pid\":" << proc->pid.local_pid;
+        o << ",\"reductions\":" << proc->reductions_remaining;
+        // Numero de frames OOP encolados (depth aproximado del stack VM).
+        uint32_t depth = 0;
+        for (loader::FrameHeader *f = proc->frame_stack;
+             f != nullptr && depth < 1024; f = f->prev, ++depth) {}
+        o << ",\"frame_depth\":" << depth;
         o << "}";
         return o.str();
     }
@@ -1010,6 +1282,96 @@ namespace debug {
               << ",\"error\":\"" << json_escape(msg) << "\"}";
             send_msg(client_fd, r.str());
         };
+
+        /* ----------------------------------------------------------------
+         * Gate de autenticacion.
+         *
+         * Si auth_required_ esta activo:
+         *   - Los comandos AUTH_LOGIN, AUTH_LOGOUT y SERVER_INFO son
+         *     publicos (cualquiera puede consultar uptime / hacer login).
+         *   - El resto exige un campo "session_token" valido en el JSON.
+         *   - Los comandos sensibles (definidos abajo) exigen ademas un
+         *     rol minimo: ADMIN o DEVELOPER segun el caso.
+         *
+         * Si auth_required_ esta desactivado, se mantiene el comportamiento
+         * anterior (cualquier cliente puede ejecutar cualquier comando).
+         * ---------------------------------------------------------------- */
+        auto requires_min_role = [](DebugCmd c) -> Role {
+            switch (c) {
+                // ADMIN
+                case DebugCmd::SERVER_SHUTDOWN:
+                case DebugCmd::AUTH_CREATE_USER:
+                case DebugCmd::AUTH_DELETE_USER:
+                case DebugCmd::AUTH_LIST_USERS:
+                case DebugCmd::FS_WRITE:
+                case DebugCmd::FS_DELETE:
+                case DebugCmd::FS_MKDIR:
+                case DebugCmd::FS_RENAME:
+                    return Role::ADMIN;
+                // DEVELOPER
+                case DebugCmd::LOAD_VELB:
+                case DebugCmd::LOAD_VELB_BYTES:
+                case DebugCmd::KILL_PROC:
+                case DebugCmd::SET_BREAK:
+                case DebugCmd::SET_BREAK_SRC:
+                case DebugCmd::DEL_BREAK:
+                case DebugCmd::SET_WATCH:
+                case DebugCmd::DEL_WATCH:
+                case DebugCmd::STEP:
+                case DebugCmd::NEXT:
+                case DebugCmd::CONTINUE:
+                case DebugCmd::PAUSE:
+                case DebugCmd::STEP_OUT:
+                case DebugCmd::STEP_UNTIL:
+                case DebugCmd::GC_RUN:
+                case DebugCmd::TRACE_MSGS:
+                case DebugCmd::BREAK_MON:
+                    return Role::DEVELOPER;
+                // VIEWER (default para todo lo demas)
+                default:
+                    return Role::VIEWER;
+            }
+        };
+        if (auth_required_) {
+            // Lista blanca: comandos publicos que NO requieren token.
+            bool is_public =
+                cmd == DebugCmd::AUTH_LOGIN  ||
+                cmd == DebugCmd::AUTH_LOGOUT ||
+                cmd == DebugCmd::SERVER_INFO ||
+                cmd == DebugCmd::UNKNOWN; /* dejar pasar para err_resp */
+            // Bootstrap: si la BD esta vacia (cero usuarios), aceptamos UNA
+            // sola llamada a AUTH_CREATE_USER sin token para que el IDE/
+            // operador pueda crear el primer admin.  Tras eso la cuenta
+            // existe y vuelve a aplicarse la regla normal.  Esto evita
+            // el callejon sin salida de "auth-on + DB vacia => imposible
+            // crear el primer usuario".
+            if (cmd == DebugCmd::AUTH_CREATE_USER &&
+                AuthManager::instance().list_users().empty()) {
+                is_public = true;
+            }
+            if (!is_public) {
+                std::string tok = json_get(json_msg, "session_token");
+                if (tok.empty()) tok = json_get(json_msg, "token");
+                if (tok.empty()) {
+                    err_resp("auth required: falta campo 'session_token'");
+                    return;
+                }
+                Session sess;
+                if (!AuthManager::instance().validate_token(tok, &sess)) {
+                    err_resp("auth required: session_token invalido o expirado");
+                    return;
+                }
+                Role need = requires_min_role(cmd);
+                if (static_cast<uint8_t>(sess.role) < static_cast<uint8_t>(need)) {
+                    std::ostringstream m;
+                    m << "permiso denegado: se requiere rol >= "
+                      << role_to_string(need)
+                      << " (tu rol: " << role_to_string(sess.role) << ")";
+                    err_resp(m.str());
+                    return;
+                }
+            }
+        }
 
         switch (cmd) {
 
@@ -1300,23 +1662,54 @@ namespace debug {
                 std::string cond_s = json_get(json_msg, "cond");
                 std::string one_s  = json_get(json_msg, "one_shot");
                 Breakpoint bp{};
+                uint64_t bp_pid_v = pid_s.empty() ? 0 : std::stoull(pid_s);
+                bool collides = false;
+                uint32_t existing_id = 0;
                 {
                     std::lock_guard<std::mutex> lk(bp_mutex_);
-                    bp.id        = next_bp_id_++;
-                    bp.addr      = best_off;
-                    bp.pid       = pid_s.empty() ? 0 : std::stoull(pid_s);
-                    bp.enabled   = true;
-                    bp.hit_count = 0;
-                    bp.condition = cond_s;
-                    bp.one_shot  = (one_s == "true" || one_s == "1");
-                    breakpoints_.push_back(bp);
-                    any_bp_.store(true, std::memory_order_relaxed);
+                    // Defensa contra colisiones: si ya existe un BP en
+                    // ESTE addr para el mismo pid (o pid=0=global), NO
+                    // creamos un duplicado.  Dos BPs al mismo addr causan
+                    // que solo el primero registrado dispare (el segundo
+                    // queda enmascarado por last_bp_pc tras un continue),
+                    // dando la falsa sensacion de que "ese BP no funciona".
+                    for (const auto &eb : breakpoints_) {
+                        if (eb.enabled && eb.addr == best_off
+                         && (eb.pid == 0 || bp_pid_v == 0 || eb.pid == bp_pid_v)) {
+                            collides = true;
+                            existing_id = eb.id;
+                            break;
+                        }
+                    }
+                    if (!collides) {
+                        bp.id        = next_bp_id_++;
+                        bp.addr      = best_off;
+                        bp.pid       = bp_pid_v;
+                        bp.enabled   = true;
+                        bp.hit_count = 0;
+                        bp.condition = cond_s;
+                        bp.one_shot  = (one_s == "true" || one_s == "1");
+                        breakpoints_.push_back(bp);
+                        any_bp_.store(true, std::memory_order_relaxed);
+                    }
                 }
                 std::ostringstream d;
-                d << "{\"id\":" << bp.id
-                  << ",\"addr\":" << bp.addr
-                  << ",\"file\":\"" << json_escape(file_s) << "\""
-                  << ",\"line\":" << target_line << "}";
+                if (collides) {
+                    // Reportamos OK porque, semanticamente, ya hay un BP
+                    // que dispara en ese punto -- equivale al BP solicitado.
+                    // Devolvemos `aliased_to` para que el cliente sepa que
+                    // no se creo entry nuevo y pueda mostrarlo claro al user.
+                    d << "{\"id\":" << existing_id
+                      << ",\"addr\":" << best_off
+                      << ",\"file\":\"" << json_escape(file_s) << "\""
+                      << ",\"line\":" << target_line
+                      << ",\"aliased_to\":" << existing_id << "}";
+                } else {
+                    d << "{\"id\":" << bp.id
+                      << ",\"addr\":" << bp.addr
+                      << ",\"file\":\"" << json_escape(file_s) << "\""
+                      << ",\"line\":" << target_line << "}";
+                }
                 ok_resp(d.str());
                 break;
             }
@@ -1528,7 +1921,7 @@ namespace debug {
                     // bytes bajos = double scalar; los emitimos como bits
                     // y como valor f64.  El cliente decide formato.  El
                     // banco ZMM tiene 64 bytes; nos quedamos con los 8
-                    // primeros (representacion f64 escalar segun A.20).
+                    // primeros (representacion f64 escalar en bytes bajos).
                     uint64_t bits = 0;
                     const uint8_t *raw = p->registers.zmm[i].raw();
                     if (raw) std::memcpy(&bits, raw, sizeof(uint64_t));
@@ -1680,12 +2073,17 @@ namespace debug {
                 std::ostringstream d;
                 d << "{\"start\":" << addr << ",\"items\":[";
                 bool first = true;
+                // Si encontramos varios opcodes invalidos consecutivos
+                // (placeholders edmw4/edmw6 con decode==null) cortamos el
+                // walk: estamos leyendo fuera de codigo valido.
+                int invalid_streak = 0;
                 for (uint32_t i = 0; i < count; ++i) {
                     uint8_t b0 = 0;
                     p->vm_mem.read_bytes(addr, &b0, 1);
                     runtime::InstrFormat *fmt = nullptr;
                     uint8_t op_ext = 0;
-                    if (b0 == 0x00) {
+                    bool ext = (b0 == 0x00);
+                    if (ext) {
                         p->vm_mem.read_bytes(addr + 1, &op_ext, 1);
                         fmt = &runtime::decode_table_extended[op_ext];
                     } else {
@@ -1693,7 +2091,24 @@ namespace debug {
                     }
                     size_t sz = 1;
                     int sm = static_cast<int>(fmt->size);
-                    if (sm >= 0 && sm < (int)(sizeof(size_bytes_table)/sizeof(size_bytes_table[0]))) {
+                    if (fmt->size ==
+                        Assembly::Bytecode::InstrSizeMode::MIXED_SIZE) {
+                        // MIXED_SIZE: el ctrl byte tras el header lleva el
+                        // ancho del inmediato en sus bits 7-6
+                        //   00=8b 01=16b 10=32b 11=64b -> 1/2/4/8 bytes.
+                        // Tamano total = header (1 o 2) + ctrl + reg? + imm.
+                        // Para primary: [op][ctrl][imm...]      -> 2 + N
+                        // Para extended:[0x00][op2][ctrl][imm..] -> 3 + N
+                        const uint8_t hdr = ext ? 2 : 1;
+                        uint8_t ctrl = 0;
+                        p->vm_mem.read_bytes(addr + hdr, &ctrl, 1);
+                        const uint8_t mode_bits = (ctrl >> 6) & 0x3;
+                        const size_t imm_n =
+                            (mode_bits == 0) ? 1 :
+                            (mode_bits == 1) ? 2 :
+                            (mode_bits == 2) ? 4 : 8;
+                        sz = static_cast<size_t>(hdr) + 1 + imm_n;
+                    } else if (sm >= 0 && sm < (int)(sizeof(size_bytes_table)/sizeof(size_bytes_table[0]))) {
                         sz = size_bytes_table[sm];
                     }
                     if (sz < 1) sz = 1;
@@ -1702,11 +2117,288 @@ namespace debug {
                     p->vm_mem.read_bytes(addr, bytes, sz);
                     if (!first) d << ",";
                     first = false;
+                    const std::string mnemonic =
+                        fmt && fmt->name ? std::string(fmt->name) : "?";
+
+                    // ----------------------------------------------------
+                    // Decodificacion semantica de operandos.
+                    //
+                    // El bytecode VM tiene 7 layouts fisicos posibles
+                    // (FIXED_1..FIXED_11) y varias "convenciones" para
+                    // el orden de regs/ctrl/imm.  Aqui los decodificamos
+                    // sin invocar el decoder real (que requiere un PC
+                    // mutable y avanza el cursor).
+                    //
+                    // Formato comun:
+                    //   - prefijo: 1 byte (primaria) o 2 bytes (extendida)
+                    //   - despues vienen N bytes (regs / ctrl / imm)
+                    //
+                    // Convenciones de bytes tras el prefijo:
+                    //   A. ALU (add/sub/mul/...): [ctrl][regs]  donde
+                    //      ctrl tiene mode/signed/dir y regs = (r2<<4)|r1.
+                    //   B. String/setcc/tryenter/etc.: [regs1][regs2_o_extra].
+                    //   C. SIB (FIXED_6): [ctrl][regs] + 4 bytes mas (extra).
+                    //   D. INMED (MIXED): [ctrl_o_reg][imm de N bytes].
+                    //
+                    // Decodificamos por NOMBRE de instruccion + tamano,
+                    // que es lo mas robusto contra esta heterogeneidad.
+                    // ----------------------------------------------------
+                    std::string operands;
+                    uint64_t jump_target = 0;
+                    bool has_jump = false;
+
+                    auto read_imm_le = [&](size_t off, size_t width) -> uint64_t {
+                        uint64_t v = 0;
+                        for (size_t k = 0; k < width && off + k < sz; ++k)
+                            v |= static_cast<uint64_t>(bytes[off + k]) << (8 * k);
+                        return v;
+                    };
+
+                    const uint8_t hdr_len = ext ? 2 : 1;
+                    auto reg_name = [](uint8_t n) -> std::string {
+                        return "r" + std::to_string(static_cast<int>(n & 0xF));
+                    };
+                    // Convention A (ALU): byte tras el header es ctrl,
+                    // el siguiente son regs con nibbles (r2<<4)|r1.
+                    auto regs_alu = [&]() -> std::pair<int, int> {
+                        if (sz <= hdr_len + 1) return { 0, 0 };
+                        const uint8_t regs = bytes[hdr_len + 1];
+                        return { regs & 0xF, (regs >> 4) & 0xF };
+                    };
+                    // Convention B (string/setcc/etc.): primer byte tras el
+                    // header ya tiene los regs con nibbles (r2<<4)|r1, el
+                    // segundo es "extra" (encoding, cond, etc.).
+                    auto regs_b = [&]() -> std::pair<int, int> {
+                        if (sz <= hdr_len) return { 0, 0 };
+                        const uint8_t regs = bytes[hdr_len];
+                        return { regs & 0xF, (regs >> 4) & 0xF };
+                    };
+                    auto width_for_mode = [](uint8_t mode_bits) -> int {
+                        switch (mode_bits & 0x3) {
+                            case 0: return 8;   case 1: return 16;
+                            case 2: return 32;  case 3: return 64;
+                        }
+                        return 64;
+                    };
+
+                    // ============== Decodificacion por nombre =============
+
+                    // ALU reg-reg (FIXED_4, Convention A): add/sub/mul/div/
+                    // cmp/and/or/xor/shl/shr/sar/mods/mov/movc + variantes
+                    // signed/unsigned.  Suelen tener size 4.
+                    static const std::unordered_set<std::string> ALU_REG_REG = {
+                        "adds", "addu", "subs", "subu", "muls", "mulu",
+                        "divs", "divu", "mods", "modu",
+                        "cmps", "cmpu", "cmp",
+                        "and", "or", "xor", "not",
+                        "shl", "shr", "sar",
+                        "neg",
+                        "mov", "movc",
+                        "add", "sub", "mul", "div",
+                    };
+                    // ALU 3-operandos (FIXED_4, Convention B): byte2=(r_src1<<4)|r_dst,
+                    // byte3=(r_src2<<4)|flags.
+                    static const std::unordered_set<std::string> ALU_3OP = {
+                        "adds3", "subs3", "muls3",
+                        "addu3", "subu3", "mulu3",
+                        "and3", "or3", "xor3",
+                    };
+                    // String / setcc / tryenter / etc. (FIXED_4, Convention B).
+                    static const std::unordered_set<std::string> CONV_B_REG_REG = {
+                        "strmake", "strcat", "strcmp", "strconv", "strlen",
+                        "strraw", "strgetbytes", "strgetkind", "strgetenc",
+                        "strslice", "strflat", "strhash", "strintern",
+                        "strreserve", "strfinalize", "strflag",
+                        "setcc", "tryenter",
+                        "gchandle", "loadz", "loadzh",
+                        "callvirt", "callm",
+                        "defclass", "deffield", "defmethod",
+                        "findclass", "findmethod", "findfield",
+                        "addadvice",
+                        "msgsend", "msgrecv", "memsync",
+                        "spawnon", "spawnargs",
+                        "weakref", "deref_weak", "free_weak",
+                        "monenter", "monexit", "monwait", "monnoti", "monnota",
+                        "specialize", "rspawn",
+                        "future", "await", "fulfill", "reject", "fulfillhlt",
+                        "panic", "setmethdbg",
+                        "loadmod",
+                        "fextend", "fnarrow",
+                        "dlopen", "dlsym", "callni",
+                        "gcallocp",
+                        "checkcast", "instanceof",
+                        "newobj", "alloc", "free",
+                        "fadd", "fsub", "fmul", "fdiv", "fmin", "fmax",
+                        "fcmp", "fsqrt", "fabs", "fneg", "fcvt", "fmov",
+                        "fload", "fstore",
+                        "ldarg", "starg",
+                        "mvtake",
+                        "jumptable", "typeswitch",
+                        "mkclosure", "callclosure", "tailcall",
+                        "mkrawclosure", "callrawclosure",
+                        "isnull", "unwrap",
+                        "decjnz",
+                    };
+
+                    // Deteccion de opcodes invalidos / placeholders.
+                    // edmw4 / edmw6 son entradas de relleno en la tabla
+                    // extendida (decode_table_extended[0x00..0x01]), no
+                    // representan instrucciones reales.  Si hay 3 o mas
+                    // consecutivos asumimos que cruzamos la frontera del
+                    // codigo valido y abortamos el desensamblado.
+                    const bool is_invalid_placeholder =
+                        (mnemonic == "edmw4" || mnemonic == "edmw6" ||
+                         mnemonic == "?" ||
+                         fmt->mode == Assembly::Bytecode::AddressingMode::COUNT);
+                    if (is_invalid_placeholder) {
+                        ++invalid_streak;
+                        if (invalid_streak >= 3) {
+                            // El comma + first=false ya se emitieron arriba
+                            // (justo despues de leer bytes); aqui solo
+                            // anyadimos el item sentinel y rompemos el walk.
+                            d << "{\"addr\":" << addr
+                              << ",\"opcode\":0,\"ext\":false,"
+                              << "\"name\":\"(fin)\",\"size\":0,"
+                              << "\"bytes\":\"\","
+                              << "\"operands\":\"--- fin de codigo valido ---\"}";
+                            break;
+                        }
+                    } else {
+                        invalid_streak = 0;
+                    }
+
+                    // Atajo: instrucciones sin operandos segun InstrFormat.
+                    // Cubre vminfo, vminfomanager, hlt, ret, nop, proceed,
+                    // tryleave, getproc/getvm/getmgr/getpid y futuras
+                    // sin necesidad de mantener una lista de mnemonics.
+                    if (fmt->mode == Assembly::Bytecode::AddressingMode::NONE) {
+                        // sin operandos visibles
+                    }
+                    // Saltos.
+                    else if (mnemonic == "jmpr") {
+                        // jmpr rN: 2 bytes [0x15][reg]
+                        if (sz >= 2) {
+                            operands = reg_name(bytes[1]);
+                        }
+                    } else if (mnemonic.rfind("jmp", 0) == 0 && mnemonic != "jmpr") {
+                        // jmp.cc target_imm: el imm sigue al header.  Su
+                        // tamano depende del FIXED_*: para FIXED_2 es u8,
+                        // FIXED_4 -> u16/u32, FIXED_8 -> u32/u64, ...
+                        const size_t imm_n = sz > hdr_len ? sz - hdr_len : 0;
+                        if (imm_n > 0) {
+                            jump_target = read_imm_le(hdr_len, imm_n);
+                            has_jump = true;
+                        }
+                    } else if (mnemonic == "callvm" || mnemonic == "callvmr") {
+                        // callvm @Absolute(...): u64 en bytes[hdr_len..]
+                        if (sz >= hdr_len + 8) {
+                            jump_target = read_imm_le(hdr_len, 8);
+                            has_jump = true;
+                        }
+                    } else if (mnemonic.rfind("cmpjmp", 0) == 0 && sz >= hdr_len + 6) {
+                        // [hdr][b2=(r_a<<4)|r_b][cond][target_u32_LE]
+                        const uint8_t b2 = bytes[hdr_len];
+                        const uint8_t cond = bytes[hdr_len + 1];
+                        jump_target = read_imm_le(hdr_len + 2, 4);
+                        has_jump = true;
+                        std::ostringstream s;
+                        s << "r" << (b2 & 0xF) << ", r" << ((b2 >> 4) & 0xF)
+                          << ", cc=" << (int)cond;
+                        operands = s.str();
+                    } else if (mnemonic == "subsp" || mnemonic == "addsp") {
+                        if (sz >= hdr_len + 1 + 8) {
+                            const uint8_t ctrl = bytes[hdr_len];
+                            const uint64_t imm = read_imm_le(hdr_len + 1, 8);
+                            const char *which = (ctrl & 1) ? "rbp" : "rsp";
+                            std::ostringstream s;
+                            s << which << ", 0x" << std::hex << imm << std::dec;
+                            operands = s.str();
+                        }
+                    } else if (mnemonic == "push" || mnemonic == "pop") {
+                        if (sz >= 2) operands = reg_name(bytes[1]);
+                    } else if (mnemonic == "getstatic" || mnemonic == "setstatic") {
+                        if (sz >= hdr_len + 6) {
+                            const uint8_t regs = bytes[hdr_len];
+                            const uint64_t off = read_imm_le(hdr_len + 2, 4);
+                            std::ostringstream s;
+                            s << "r" << (regs & 0xF) << ", r" << ((regs >> 4) & 0xF)
+                              << ", +0x" << std::hex << off << std::dec;
+                            operands = s.str();
+                        }
+                    } else if (ALU_REG_REG.count(mnemonic) > 0 && sz >= hdr_len + 2) {
+                        // Convention A: byte ctrl + byte regs.
+                        const uint8_t ctrl = bytes[hdr_len];
+                        const auto rr = regs_alu();
+                        const int w = width_for_mode((ctrl >> 6) & 0x3);
+                        std::ostringstream s;
+                        s << "r" << rr.first << ", r" << rr.second << "  (w=" << w << ")";
+                        operands = s.str();
+                    } else if (ALU_3OP.count(mnemonic) > 0 && sz >= hdr_len + 2) {
+                        // [hdr][b2=(r_src1<<4)|r_dst][b3=(r_src2<<4)|flags]
+                        const uint8_t b2 = bytes[hdr_len];
+                        const uint8_t b3 = bytes[hdr_len + 1];
+                        std::ostringstream s;
+                        s << "r" << (b2 & 0xF) << ", r" << ((b2 >> 4) & 0xF)
+                          << ", r" << ((b3 >> 4) & 0xF);
+                        operands = s.str();
+                    } else if (CONV_B_REG_REG.count(mnemonic) > 0 && sz >= hdr_len + 1) {
+                        // Convention B: regs = (r2<<4)|r1 en byte tras hdr.
+                        const auto rr = regs_b();
+                        std::ostringstream s;
+                        s << "r" << rr.first << ", r" << rr.second;
+                        if (sz >= hdr_len + 2) {
+                            const uint8_t extra = bytes[hdr_len + 1];
+                            if (extra != 0) {
+                                s << ", 0x" << std::hex << static_cast<int>(extra) << std::dec;
+                            }
+                        }
+                        operands = s.str();
+                    }
+
+                    // Caso especial: ALU con immediate (MIXED_SIZE).
+                    // El primer byte tras hdr es ctrl, le sigue el reg, luego imm.
+                    if (operands.empty() && sz >= hdr_len + 3 && sz <= 11) {
+                        // Heuristica generica para los formatos largos:
+                        //   [hdr][ctrl][reg_byte][imm de N bytes]
+                        const uint8_t ctrl = bytes[hdr_len];
+                        const uint8_t reg  = bytes[hdr_len + 1];
+                        const size_t imm_n = sz - hdr_len - 2;
+                        if (imm_n >= 1 && imm_n <= 8) {
+                            const uint64_t imm = read_imm_le(hdr_len + 2, imm_n);
+                            const int w = width_for_mode((ctrl >> 6) & 0x3);
+                            std::ostringstream s;
+                            s << "r" << (reg & 0xF)
+                              << ", 0x" << std::hex << imm << std::dec
+                              << "  (w=" << w << ")";
+                            operands = s.str();
+                        }
+                    }
+
+                    // Salida final: si quedo vacio, al menos volcamos los
+                    // bytes raw post-header para que NO se vea linea pelada.
+                    if (operands.empty() && sz > hdr_len) {
+                        std::ostringstream s;
+                        s << "raw=";
+                        for (size_t k = hdr_len; k < sz; ++k) {
+                            char buf[4];
+                            std::snprintf(buf, sizeof(buf), "%02x", bytes[k]);
+                            s << buf;
+                        }
+                        operands = s.str();
+                    }
+
+                    if (has_jump) {
+                        std::ostringstream s;
+                        s << "-> 0x" << std::hex << jump_target << std::dec;
+                        if (operands.empty()) operands = s.str();
+                        else                  operands += "   " + s.str();
+                    }
+
                     d << "{\"addr\":" << addr
-                      << ",\"opcode\":" << (b0 == 0x00 ? (int)op_ext : (int)b0)
-                      << ",\"ext\":" << (b0 == 0x00 ? "true" : "false")
+                      << ",\"opcode\":" << (ext ? (int)op_ext : (int)b0)
+                      << ",\"ext\":" << (ext ? "true" : "false")
                       << ",\"name\":\""
-                      << json_escape(fmt && fmt->name ? fmt->name : "?")
+                      << json_escape(mnemonic)
                       << "\",\"size\":" << sz
                       << ",\"bytes\":\"";
                     for (size_t k = 0; k < sz; ++k) {
@@ -1714,7 +2406,15 @@ namespace debug {
                         std::snprintf(buf, sizeof(buf), "%02x", bytes[k]);
                         d << buf;
                     }
-                    d << "\"}";
+                    d << "\"";
+                    if (!operands.empty()) {
+                        d << ",\"operands\":\""
+                          << json_escape(operands) << "\"";
+                    }
+                    if (has_jump) {
+                        d << ",\"jump_target\":" << jump_target;
+                    }
+                    d << "}";
                     addr += sz;
                 }
                 d << "]}";
@@ -2009,10 +2709,696 @@ namespace debug {
                 break;
             }
 
+            /* ============================================================
+             * Comandos del modo --server-mode (servidor persistente).
+             *
+             * Estos comandos solo tienen sentido cuando la VM se arranca
+             * con --server-mode (vm_persistent=true), pero son seguros de
+             * invocar en cualquier modo: load_velb anyade un nuevo proceso
+             * a un scheduler existente y kill_proc marca uno DEAD.
+             * ============================================================ */
+
+            case DebugCmd::LOAD_VELB: {
+                // Cargar un .velb desde el filesystem del servidor.
+                // Campos JSON:
+                //   path       (string, requerido) - ruta al .velb
+                //   start      (bool, opcional, default true) - si true,
+                //              hace make_ready inmediatamente; si false,
+                //              el proceso queda en NEW para que el cliente
+                //              pueda preparar breakpoints antes de arrancar
+                //   pause      (bool, opcional, default false) - si true,
+                //              ademas marca pause_at_start (state=PAUSED
+                //              en el primer on_before_exec).
+                //   args       (array de strings, opcional) - se pasan al
+                //              programa como script_args (vm->script_args).
+                std::string path = json_get(json_msg, "path");
+                if (path.empty()) {
+                    err_resp("falta campo 'path'"); return;
+                }
+                std::string start_s = json_get(json_msg, "start");
+                bool do_start = (start_s.empty() ||
+                                 start_s == "true" || start_s == "1");
+                std::string pause_s = json_get(json_msg, "pause");
+                bool do_pause = (pause_s == "true" || pause_s == "1");
+
+                // Resolver el path a traves del sandbox.  Si no hay
+                // sandbox, se mantiene la ruta tal cual (back-compat).
+                std::filesystem::path resolved_path;
+                std::string sb_err;
+                if (!resolve_sandbox_path(server_root_, path,
+                                          resolved_path, sb_err)) {
+                    err_resp(sb_err);
+                    return;
+                }
+                try {
+                    runtime::ProcessVM *p =
+                        vm_.mgr_vm.loader.load_executable(
+                            vm_, resolved_path.string());
+                    if (!p) {
+                        err_resp("load_executable devolvio nullptr");
+                        return;
+                    }
+                    if (do_pause) {
+                        // PAUSE_AT_START antes de make_ready: cuando el
+                        // scheduler invoque on_before_exec por primera vez,
+                        // el proceso quedara bloqueado en cv.wait hasta que
+                        // el cliente emita 'continue <pid>'.
+                        pause_at_start(p->pid.local_pid);
+                    }
+                    if (do_start) {
+                        vm_.make_ready(p->pid);
+                    }
+                    std::ostringstream d;
+                    d << "{\"pid\":" << p->pid.local_pid
+                      << ",\"sched_id\":" << p->pid.scheduler_id
+                      << ",\"state\":\""
+                      << runtime::vm_state_to_str(p->state.load())
+                      << "\",\"started\":" << (do_start ? "true" : "false")
+                      << ",\"paused\":" << (do_pause ? "true" : "false")
+                      << ",\"path\":\""
+                      << json_escape(resolved_path.string()) << "\"}";
+                    ok_resp(d.str());
+                } catch (const std::exception &e) {
+                    err_resp(std::string("load_velb fallo: ") + e.what());
+                }
+                break;
+            }
+
+            case DebugCmd::KILL_PROC: {
+                // Marca el proceso indicado como DEAD para que el scheduler
+                // lo libere en su proxima iteracion.  Si esta pausado en el
+                // debugger, ademas notifica su pause_cv para que salga del
+                // cv.wait y observe que esta DEAD/DETACHED.
+                std::string pid_s = json_get(json_msg, "pid");
+                if (pid_s.empty()) { err_resp("falta campo 'pid'"); return; }
+                uint64_t pid = std::stoull(pid_s);
+                runtime::ProcessVM *p = find_process_by_pid(vm_, pid);
+                if (!p) { err_resp("proceso no encontrado"); return; }
+                // Transicion directa a DEAD via store atomico.  El
+                // scheduler ve el estado en su proxima vuelta y lo deja de
+                // ejecutar.  El recurso se libera cuando el scheduler
+                // limpie la lista de procesos.
+                p->state.store(runtime::DEAD, std::memory_order_release);
+                // Despertar el cv.wait del debugger si el proceso esta
+                // pausado en breakpoint o step.
+                {
+                    std::lock_guard<std::mutex> lk(proc_mutex_);
+                    auto it = proc_ctx_.find(pid);
+                    if (it != proc_ctx_.end()) {
+                        it->second.state = DbgProcState::DETACHED;
+                        it->second.step_mode = false;
+                        it->second.pause_cv.notify_all();
+                    }
+                }
+                // Si el scheduler estaba bloqueado en su semaforo (no
+                // tenia procesos READY), tambien lo despertamos por si
+                // este era el unico proceso vivo y debe re-evaluar.
+                for (auto &sched : vm_.schedulers) {
+                    if (sched && sched->is_waiting) {
+                        sched->sem.release();
+                    }
+                }
+                ok_resp("{\"pid\":" + pid_s + ",\"state\":\"DEAD\"}");
+                break;
+            }
+
+            case DebugCmd::SERVER_INFO: {
+                // Informacion del servidor: uptime, numero de schedulers,
+                // numero de procesos en cada estado, modo persistente.
+                using namespace std::chrono;
+                auto uptime = duration_cast<seconds>(
+                    steady_clock::now() - g_server_start_time).count();
+                size_t n_procs = 0;
+                size_t n_alive = 0;
+                size_t n_dead  = 0;
+                size_t n_halt  = 0;
+                for (auto &sched : vm_.schedulers) {
+                    for (auto &p : sched->processes) {
+                        if (!p) continue;
+                        ++n_procs;
+                        auto st = p->state.load();
+                        if (st == runtime::DEAD) ++n_dead;
+                        else if (st == runtime::HALT) ++n_halt;
+                        else ++n_alive;
+                    }
+                }
+                std::ostringstream d;
+                d << "{\"uptime_sec\":" << uptime
+                  << ",\"schedulers\":" << vm_.schedulers.size()
+                  << ",\"persistent\":"
+                  << (vm_.vm_persistent.load() ? "true" : "false")
+                  << ",\"vm_running\":"
+                  << (vm_.vm_running.load() ? "true" : "false")
+                  << ",\"clients\":" ;
+                {
+                    std::lock_guard<std::mutex> lk(client_mutex_);
+                    d << client_fds_.size();
+                }
+                d << ",\"procs\":{"
+                  << "\"total\":" << n_procs
+                  << ",\"alive\":" << n_alive
+                  << ",\"halt\":"  << n_halt
+                  << ",\"dead\":"  << n_dead
+                  << "},\"port\":" << port_
+                  << ",\"shutdown_hooked\":"
+                  << (g_server_shutdown_flag != nullptr ? "true" : "false")
+                  << ",\"auth_required\":"
+                  << (auth_required_ ? "true" : "false")
+                  << ",\"auth_enabled\":"
+                  << (AuthManager::instance().is_enabled() ? "true" : "false")
+                  << ",\"sandbox\":\""
+                  << (server_root_.empty() ? "" : json_escape(server_root_))
+                  << "\"}";
+                ok_resp(d.str());
+                break;
+            }
+
+            case DebugCmd::SERVER_SHUTDOWN: {
+                // Apagar el servidor persistente.  Si el hook esta
+                // registrado (main.cpp lo hace en --server-mode), pone el
+                // atomic a false y el bucle de espera del main termina.
+                // Si NO esta registrado, devolvemos error claro -- la VM
+                // no se cerraria sola y dejariamos al cliente colgado.
+                if (g_server_shutdown_flag == nullptr) {
+                    err_resp("server_shutdown solo es valido en modo "
+                             "--server-mode (hook no registrado)");
+                    return;
+                }
+                ok_resp("{\"shutdown\":true}");
+                g_server_shutdown_flag->store(false,
+                                              std::memory_order_release);
+                break;
+            }
+
+            /* ============================================================
+             * Autenticacion y gestion de usuarios.
+             * ============================================================ */
+
+            case DebugCmd::AUTH_LOGIN: {
+                if (!AuthManager::instance().is_enabled()) {
+                    err_resp("auth no esta habilitado en este servidor");
+                    return;
+                }
+                std::string user = json_get(json_msg, "username");
+                std::string pass = json_get(json_msg, "password");
+                std::string ttl_s = json_get(json_msg, "ttl");
+                uint32_t ttl = 3600;
+                if (!ttl_s.empty()) {
+                    try { ttl = static_cast<uint32_t>(std::stoul(ttl_s)); }
+                    catch (...) { /* ignore, mantener default */ }
+                }
+                AuthResult r = AuthManager::instance().login(user, pass, ttl);
+                if (!r.ok) { err_resp(r.error); return; }
+                std::ostringstream d;
+                d << "{\"token\":\"" << json_escape(r.token) << "\""
+                  << ",\"username\":\"" << json_escape(r.username) << "\""
+                  << ",\"role\":\"" << role_to_string(r.role) << "\""
+                  << ",\"ttl_sec\":" << ttl << "}";
+                ok_resp(d.str());
+                break;
+            }
+
+            case DebugCmd::AUTH_LOGOUT: {
+                std::string tok = json_get(json_msg, "session_token");
+                if (tok.empty()) tok = json_get(json_msg, "token");
+                if (tok.empty()) { err_resp("falta campo 'session_token'"); return; }
+                AuthManager::instance().logout(tok);
+                ok_resp("{\"logged_out\":true}");
+                break;
+            }
+
+            case DebugCmd::AUTH_WHOAMI: {
+                std::string tok = json_get(json_msg, "session_token");
+                if (tok.empty()) tok = json_get(json_msg, "token");
+                Session sess;
+                if (!AuthManager::instance().validate_token(tok, &sess)) {
+                    err_resp("session_token invalido o expirado");
+                    return;
+                }
+                std::ostringstream d;
+                d << "{\"username\":\"" << json_escape(sess.username) << "\""
+                  << ",\"role\":\"" << role_to_string(sess.role) << "\"}";
+                ok_resp(d.str());
+                break;
+            }
+
+            case DebugCmd::AUTH_CREATE_USER: {
+                std::string user = json_get(json_msg, "username");
+                std::string pass = json_get(json_msg, "password");
+                std::string role_s = json_get(json_msg, "role");
+                if (user.empty() || pass.empty()) {
+                    err_resp("faltan 'username' y/o 'password'"); return;
+                }
+                Role role = role_s.empty() ? Role::VIEWER : role_from_string(role_s);
+                std::string e;
+                if (!AuthManager::instance().create_user(user, pass, role, &e)) {
+                    err_resp("no se pudo crear usuario: " + e); return;
+                }
+                std::ostringstream d;
+                d << "{\"username\":\"" << json_escape(user) << "\""
+                  << ",\"role\":\"" << role_to_string(role) << "\"}";
+                ok_resp(d.str());
+                break;
+            }
+
+            case DebugCmd::AUTH_DELETE_USER: {
+                std::string user = json_get(json_msg, "username");
+                if (user.empty()) { err_resp("falta 'username'"); return; }
+                std::string e;
+                if (!AuthManager::instance().delete_user(user, &e)) {
+                    err_resp("no se pudo eliminar: " + e); return;
+                }
+                ok_resp("{\"deleted\":true}");
+                break;
+            }
+
+            case DebugCmd::AUTH_LIST_USERS: {
+                auto users = AuthManager::instance().list_users();
+                std::ostringstream d;
+                d << "[";
+                bool first = true;
+                for (auto &u : users) {
+                    if (!first) d << ",";
+                    first = false;
+                    d << "{\"username\":\"" << json_escape(u.first) << "\""
+                      << ",\"role\":\"" << role_to_string(u.second) << "\"}";
+                }
+                d << "]";
+                ok_resp(d.str());
+                break;
+            }
+
+            case DebugCmd::AUTH_CHANGE_PASS: {
+                // Si el cliente pasa "username", debe tener rol ADMIN
+                // (ya verificado por el gate).  Si no, cambia su propia
+                // contrasenya leyendo el username de la sesion.
+                std::string user = json_get(json_msg, "username");
+                std::string pass = json_get(json_msg, "password");
+                if (pass.empty()) { err_resp("falta 'password'"); return; }
+                if (user.empty()) {
+                    // sin username explicito: la propia
+                    std::string tok = json_get(json_msg, "session_token");
+                    if (tok.empty()) tok = json_get(json_msg, "token");
+                    Session s;
+                    if (!AuthManager::instance().validate_token(tok, &s)) {
+                        err_resp("falta 'username' o session valida"); return;
+                    }
+                    user = s.username;
+                }
+                std::string e;
+                if (!AuthManager::instance().change_password(user, pass, &e)) {
+                    err_resp("no se pudo cambiar: " + e); return;
+                }
+                ok_resp("{\"changed\":true,\"username\":\"" +
+                        json_escape(user) + "\"}");
+                break;
+            }
+
+            /* ============================================================
+             * Transferencia de archivos.
+             *
+             * Todas las rutas pasan por resolve_sandbox_path() que valida
+             * el sandbox @c server_root_.  El contenido binario se
+             * empaqueta en base64 dentro del JSON.
+             * ============================================================ */
+
+            case DebugCmd::FS_WRITE: {
+                std::string path  = json_get(json_msg, "path");
+                std::string b64   = json_get(json_msg, "content_b64");
+                std::string app_s = json_get(json_msg, "append");
+                if (path.empty()) { err_resp("falta 'path'"); return; }
+                std::filesystem::path resolved;
+                std::string e;
+                if (!resolve_sandbox_path(server_root_, path, resolved, e)) {
+                    err_resp(e); return;
+                }
+                std::vector<uint8_t> bytes;
+                if (!b64.empty() && !b64_decode(b64, bytes)) {
+                    err_resp("content_b64 invalido"); return;
+                }
+                bool append = (app_s == "true" || app_s == "1");
+                std::error_code ec;
+                std::filesystem::create_directories(resolved.parent_path(), ec);
+                std::ofstream ofs(resolved,
+                    std::ios::binary | (append ? std::ios::app : std::ios::trunc));
+                if (!ofs) { err_resp("no se pudo abrir para escritura"); return; }
+                if (!bytes.empty()) {
+                    ofs.write(reinterpret_cast<const char *>(bytes.data()),
+                              static_cast<std::streamsize>(bytes.size()));
+                }
+                ofs.close();
+                std::ostringstream d;
+                d << "{\"path\":\"" << json_escape(resolved.string()) << "\""
+                  << ",\"bytes\":" << bytes.size()
+                  << ",\"append\":" << (append ? "true" : "false") << "}";
+                ok_resp(d.str());
+                break;
+            }
+
+            case DebugCmd::FS_READ: {
+                std::string path = json_get(json_msg, "path");
+                std::string off_s = json_get(json_msg, "offset");
+                std::string len_s = json_get(json_msg, "length");
+                if (path.empty()) { err_resp("falta 'path'"); return; }
+                std::filesystem::path resolved;
+                std::string e;
+                if (!resolve_sandbox_path(server_root_, path, resolved, e)) {
+                    err_resp(e); return;
+                }
+                std::ifstream ifs(resolved, std::ios::binary);
+                if (!ifs) { err_resp("no se pudo abrir para lectura"); return; }
+                ifs.seekg(0, std::ios::end);
+                std::streamsize total = ifs.tellg();
+                if (total < 0) { err_resp("tamano invalido"); return; }
+                uint64_t off = 0, len = static_cast<uint64_t>(total);
+                if (!off_s.empty()) { try { off = std::stoull(off_s); } catch(...) {} }
+                if (!len_s.empty()) { try { len = std::stoull(len_s); } catch(...) {} }
+                if (off > static_cast<uint64_t>(total)) off = total;
+                uint64_t avail = static_cast<uint64_t>(total) - off;
+                if (len > avail) len = avail;
+                // Limite defensivo: 16 MB por lectura (clientes mayores hacen chunks).
+                constexpr uint64_t MAX_READ = 16ull * 1024 * 1024;
+                if (len > MAX_READ) {
+                    err_resp("length > 16MB; usa chunks (offset/length)"); return;
+                }
+                ifs.seekg(static_cast<std::streamoff>(off), std::ios::beg);
+                std::vector<uint8_t> buf(static_cast<size_t>(len));
+                if (len > 0) ifs.read(reinterpret_cast<char *>(buf.data()),
+                                      static_cast<std::streamsize>(len));
+                std::string enc = b64_encode(buf.data(), buf.size());
+                std::ostringstream d;
+                d << "{\"path\":\"" << json_escape(resolved.string()) << "\""
+                  << ",\"total_size\":" << total
+                  << ",\"offset\":" << off
+                  << ",\"length\":" << len
+                  << ",\"content_b64\":\"" << enc << "\"}";
+                ok_resp(d.str());
+                break;
+            }
+
+            case DebugCmd::FS_LIST: {
+                std::string path = json_get(json_msg, "path");
+                if (path.empty()) path = ".";
+                std::filesystem::path resolved;
+                std::string e;
+                if (!resolve_sandbox_path(server_root_, path, resolved, e)) {
+                    err_resp(e); return;
+                }
+                std::error_code ec;
+                if (!std::filesystem::is_directory(resolved, ec)) {
+                    err_resp("no es un directorio"); return;
+                }
+                std::ostringstream d;
+                d << "{\"path\":\"" << json_escape(resolved.string()) << "\""
+                  << ",\"entries\":[";
+                bool first = true;
+                for (auto &ent : std::filesystem::directory_iterator(resolved, ec)) {
+                    if (!first) d << ",";
+                    first = false;
+                    std::error_code lec;
+                    auto status = ent.status(lec);
+                    const char *kind = "other";
+                    if (std::filesystem::is_directory(status))      kind = "dir";
+                    else if (std::filesystem::is_regular_file(status)) kind = "file";
+                    else if (std::filesystem::is_symlink(status))   kind = "symlink";
+                    uintmax_t sz = 0;
+                    if (std::filesystem::is_regular_file(status)) {
+                        sz = std::filesystem::file_size(ent.path(), lec);
+                        if (lec) sz = 0;
+                    }
+                    d << "{\"name\":\""
+                      << json_escape(ent.path().filename().string()) << "\""
+                      << ",\"kind\":\"" << kind << "\""
+                      << ",\"size\":" << sz << "}";
+                }
+                d << "]}";
+                ok_resp(d.str());
+                break;
+            }
+
+            case DebugCmd::FS_STAT: {
+                std::string path = json_get(json_msg, "path");
+                if (path.empty()) { err_resp("falta 'path'"); return; }
+                std::filesystem::path resolved;
+                std::string e;
+                if (!resolve_sandbox_path(server_root_, path, resolved, e)) {
+                    err_resp(e); return;
+                }
+                std::error_code ec;
+                bool exists = std::filesystem::exists(resolved, ec);
+                std::ostringstream d;
+                d << "{\"path\":\"" << json_escape(resolved.string()) << "\""
+                  << ",\"exists\":" << (exists ? "true" : "false");
+                if (exists) {
+                    auto st = std::filesystem::status(resolved, ec);
+                    const char *kind = "other";
+                    if (std::filesystem::is_directory(st))    kind = "dir";
+                    else if (std::filesystem::is_regular_file(st)) kind = "file";
+                    else if (std::filesystem::is_symlink(st)) kind = "symlink";
+                    uintmax_t sz = 0;
+                    if (std::filesystem::is_regular_file(st)) {
+                        sz = std::filesystem::file_size(resolved, ec);
+                        if (ec) sz = 0;
+                    }
+                    d << ",\"kind\":\"" << kind << "\""
+                      << ",\"size\":" << sz;
+                }
+                d << "}";
+                ok_resp(d.str());
+                break;
+            }
+
+            case DebugCmd::FS_DELETE: {
+                std::string path = json_get(json_msg, "path");
+                std::string rec_s = json_get(json_msg, "recursive");
+                if (path.empty()) { err_resp("falta 'path'"); return; }
+                std::filesystem::path resolved;
+                std::string e;
+                if (!resolve_sandbox_path(server_root_, path, resolved, e)) {
+                    err_resp(e); return;
+                }
+                std::error_code ec;
+                uintmax_t removed = 0;
+                if (rec_s == "true" || rec_s == "1") {
+                    removed = std::filesystem::remove_all(resolved, ec);
+                } else {
+                    removed = std::filesystem::remove(resolved, ec) ? 1 : 0;
+                }
+                if (ec) { err_resp("remove fallo: " + ec.message()); return; }
+                std::ostringstream d;
+                d << "{\"removed\":" << removed << "}";
+                ok_resp(d.str());
+                break;
+            }
+
+            case DebugCmd::FS_MKDIR: {
+                std::string path = json_get(json_msg, "path");
+                std::string rec_s = json_get(json_msg, "recursive");
+                if (path.empty()) { err_resp("falta 'path'"); return; }
+                std::filesystem::path resolved;
+                std::string e;
+                if (!resolve_sandbox_path(server_root_, path, resolved, e)) {
+                    err_resp(e); return;
+                }
+                std::error_code ec;
+                bool ok2 = false;
+                if (rec_s == "true" || rec_s == "1") {
+                    ok2 = std::filesystem::create_directories(resolved, ec);
+                } else {
+                    ok2 = std::filesystem::create_directory(resolved, ec);
+                }
+                if (ec) { err_resp("mkdir fallo: " + ec.message()); return; }
+                std::ostringstream d;
+                d << "{\"created\":" << (ok2 ? "true" : "false")
+                  << ",\"path\":\"" << json_escape(resolved.string()) << "\"}";
+                ok_resp(d.str());
+                break;
+            }
+
+            case DebugCmd::FS_RENAME: {
+                std::string src = json_get(json_msg, "src");
+                std::string dst = json_get(json_msg, "dst");
+                if (src.empty() || dst.empty()) {
+                    err_resp("faltan 'src' y/o 'dst'"); return;
+                }
+                std::filesystem::path rs, rd;
+                std::string e;
+                if (!resolve_sandbox_path(server_root_, src, rs, e)) {
+                    err_resp("src: " + e); return;
+                }
+                if (!resolve_sandbox_path(server_root_, dst, rd, e)) {
+                    err_resp("dst: " + e); return;
+                }
+                std::error_code ec;
+                std::filesystem::rename(rs, rd, ec);
+                if (ec) { err_resp("rename fallo: " + ec.message()); return; }
+                ok_resp("{\"renamed\":true}");
+                break;
+            }
+
+            case DebugCmd::LOAD_VELB_BYTES: {
+                // Identico a LOAD_VELB pero el contenido viene en
+                // content_b64; no se escribe a disco.  Util cuando el
+                // cliente (IDE Electron) quiere ejecutar codigo recien
+                // compilado sin pasar por el filesystem del server.
+                std::string b64   = json_get(json_msg, "content_b64");
+                std::string start_s = json_get(json_msg, "start");
+                std::string pause_s = json_get(json_msg, "pause");
+                if (b64.empty()) { err_resp("falta 'content_b64'"); return; }
+                std::vector<uint8_t> bytes;
+                if (!b64_decode(b64, bytes)) {
+                    err_resp("content_b64 invalido"); return;
+                }
+                bool do_start = (start_s.empty() ||
+                                 start_s == "true" || start_s == "1");
+                bool do_pause = (pause_s == "true" || pause_s == "1");
+                try {
+                    runtime::ProcessVM *p =
+                        vm_.mgr_vm.loader.load_executable(vm_, std::move(bytes));
+                    if (!p) { err_resp("load_executable devolvio nullptr"); return; }
+                    if (do_pause) pause_at_start(p->pid.local_pid);
+                    if (do_start) vm_.make_ready(p->pid);
+                    std::ostringstream d;
+                    d << "{\"pid\":" << p->pid.local_pid
+                      << ",\"sched_id\":" << p->pid.scheduler_id
+                      << ",\"state\":\""
+                      << runtime::vm_state_to_str(p->state.load())
+                      << "\",\"started\":" << (do_start ? "true" : "false")
+                      << ",\"paused\":"  << (do_pause ? "true" : "false") << "}";
+                    ok_resp(d.str());
+                } catch (const std::exception &ex) {
+                    err_resp(std::string("load_velb_bytes fallo: ") + ex.what());
+                }
+                break;
+            }
+
+            case DebugCmd::MEM_WRITE: {
+                // Escribe bytes a memoria VM (hex editor del debugger).
+                // Campos:
+                //   pid   (requerido)
+                //   addr  (requerido) - direccion VM absoluta
+                //   bytes (requerido) - string hex sin espacios, ej "deadbeef"
+                std::string pid_s   = json_get(json_msg, "pid");
+                std::string addr_s  = json_get(json_msg, "addr");
+                std::string bytes_s = json_get(json_msg, "bytes");
+                if (pid_s.empty() || addr_s.empty() || bytes_s.empty()) {
+                    err_resp("mem_write requiere pid, addr y bytes");
+                    return;
+                }
+                uint64_t pid  = std::stoull(pid_s);
+                uint64_t addr = std::stoull(addr_s);
+                runtime::ProcessVM *p = find_process_by_pid(vm_, pid);
+                if (!p) { err_resp("proceso no encontrado"); return; }
+                if (bytes_s.size() % 2 != 0) {
+                    err_resp("bytes debe tener longitud par (hex sin espacios)");
+                    return;
+                }
+                std::vector<uint8_t> buf;
+                buf.reserve(bytes_s.size() / 2);
+                for (size_t k = 0; k + 1 < bytes_s.size(); k += 2) {
+                    auto hexval = [](char c) -> int {
+                        if (c >= '0' && c <= '9') return c - '0';
+                        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                        return -1;
+                    };
+                    int hi = hexval(bytes_s[k]);
+                    int lo = hexval(bytes_s[k + 1]);
+                    if (hi < 0 || lo < 0) {
+                        err_resp("bytes contiene caracteres no hex"); return;
+                    }
+                    buf.push_back(static_cast<uint8_t>((hi << 4) | lo));
+                }
+                // Limite defensivo de 4 KiB por write.
+                if (buf.size() > 4096) {
+                    err_resp("max 4096 bytes por mem_write"); return;
+                }
+                p->vm_mem.write_bytes(addr, buf.data(), buf.size());
+                std::ostringstream d;
+                d << "{\"written\":" << buf.size()
+                  << ",\"addr\":"   << addr << "}";
+                ok_resp(d.str());
+                break;
+            }
+
+            case DebugCmd::REPL_EXEC: {
+                // Enruta una linea cruda al REPL real del servidor
+                // (runtime::run_command_async).  Es el mismo motor que
+                // ejecuta los comandos del prompt `vesta>` cuando el
+                // operador esta en consola local.
+                //
+                // Campos:
+                //   line     (string, requerido) - linea cruda a ejecutar
+                //   timeout_ms (number, opcional) - default 10000ms.  Si
+                //              expira devolvemos error con la salida
+                //              parcial que haya llegado.
+                //
+                // Respuesta: { output: string }
+                std::string line = json_get(json_msg, "line");
+                if (line.empty()) line = json_get(json_msg, "cmd_line");
+                if (line.empty()) { err_resp("falta 'line'"); return; }
+                std::string to_s = json_get(json_msg, "timeout_ms");
+                uint32_t timeout_ms = 10000;
+                if (!to_s.empty()) {
+                    try { timeout_ms = static_cast<uint32_t>(std::stoul(to_s)); }
+                    catch (...) { /* default */ }
+                }
+                std::string output;
+                try {
+                    // Ejecutar la linea en otro thread via std::async para
+                    // no bloquear el hilo del cliente si un comando
+                    // tarda (build/disasm de un .velb grande).
+                    auto fut = std::async(std::launch::async,
+                        [line]() { return cli::execute_repl_line(line); });
+                    if (fut.wait_for(std::chrono::milliseconds(timeout_ms))
+                        == std::future_status::ready) {
+                        output = fut.get();
+                    } else {
+                        // Timeout: abandonamos el future (el codigo del
+                        // REPL terminara y descartara su salida).
+                        output = "(timeout " + std::to_string(timeout_ms) +
+                                 "ms; el comando sigue ejecutandose en segundo plano)";
+                    }
+                } catch (const std::exception &ex) {
+                    err_resp(std::string("repl_exec fallo: ") + ex.what());
+                    return;
+                }
+                // Escapar el output para el JSON de respuesta.
+                std::ostringstream d;
+                d << "{\"output\":\"" << json_escape(output) << "\"}";
+                ok_resp(d.str());
+                break;
+            }
+
             case DebugCmd::UNKNOWN:
             default:
                 err_resp("comando desconocido: " + cmd_name);
                 break;
+        }
+
+        // Tras cualquier comando, asegurar que has_hooks de los
+        // schedulers refleja el estado actual de breakpoints/step/watch.
+        // Asi cuando el cliente termina su sesion (sin breakpoints, todos
+        // los procesos en RUNNING, ningun watch ni tracing) los
+        // schedulers vuelven al fast path automaticamente, sin coste
+        // adicional para el codigo de produccion.
+        refresh_scheduler_hooks();
+    }
+
+    void Debugger::refresh_scheduler_hooks() {
+        // El gate cubre los 5 caminos que pueden disparar on_before_exec.
+        // break_on_mon_ aplica desde monenter (no desde on_before_exec)
+        // pero se incluye para coherencia: si alguno cambia, los
+        // schedulers deben estar dispuestos a recibir hooks.
+        const bool needed =
+            any_bp_.load(std::memory_order_relaxed) ||
+            any_step_.load(std::memory_order_relaxed) ||
+            any_watch_.load(std::memory_order_relaxed) ||
+            any_msg_trace_.load(std::memory_order_relaxed) ||
+            break_on_mon_.load(std::memory_order_relaxed);
+        for (auto &sched : vm_.schedulers) {
+            if (!sched) continue;
+            sched->has_hooks = needed;
         }
     }
 

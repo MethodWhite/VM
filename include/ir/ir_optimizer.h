@@ -9,18 +9,51 @@
  * @file ir_optimizer.h
  * @brief Optimizador de la SSA IR de VestaVM con niveles O0-O3.
  *
- * Cada nivel activa un conjunto acumulativo de pases de transformacion:
+ * Catalogo completo de pases implementados.  Cada nivel activa un
+ * subconjunto acumulativo, ejecutado hasta punto fijo (max 8 iter) para
+ * capturar oportunidades encadenadas (p.ej. un DCE expone CSE nuevo, que
+ * a su vez expone simplificaciones algebraicas, etc.).
  *
- *   O0: sin optimizacion (utl para depuracion)
- *   O1: eliminacion de codigo muerto (DCE) + propagacion de copias
- *   O2: O1 + plegado de constantes + eliminacion de bloques inalcanzables
- *   O3: O2 + eliminacion de subexpresiones comunes (CSE)
+ * Pases por nivel:
  *
- * Todos los pases operan directamente sobre IrFunction o IrModule en memoria.
- * No generan texto ni bytecode; son transformaciones puras sobre la IR.
+ *   O0: ninguno (util para depuracion: el bytecode emitido es 1:1 con el
+ *       IR generado por el frontend, sin reordenar ni eliminar nada).
  *
- * Los pases son seguros para SSA: no rompen la propiedad de asignacion
- * unica, salvo que se eliminen instrucciones completas.
+ *   O1: pases puramente locales y baratos (lineales en numero de instrs):
+ *         - ir_pass_dce             elimina instrs puras sin usos
+ *         - ir_pass_copy_prop       propaga MOVs trivials
+ *         - ir_pass_simplify        identidades algebraicas + cast-fold + phi-fold
+ *         - ir_pass_dead_alloc_elim purga news cuyo resultado no se usa
+ *
+ *   O2: anyade analisis de flujo + transformaciones globales:
+ *         - ir_pass_const_fold      pliega aritmetica con operandos constantes
+ *         - ir_pass_unreachable     poda bloques no alcanzables desde entry
+ *         - ir_pass_strength_reduction  MUL/DIV/MOD por 2^k -> SHL/SHR/AND
+ *         - ir_pass_reassoc         (x+c1)+c2 -> x+(c1+c2)  (y otras assoc ops)
+ *         - ir_pass_tailcall        CALL+RET -> TAILCALL (libera frame OOP)
+ *         - ir_pass_licm            sube invariantes fuera del loop
+ *         - ir_pass_load_narrow     elide sign-extend redundante tras LOAD i8/16/32
+ *         - ir_pass_dse             elimina STOREs consecutivos a misma direccion
+ *         - ir_pass_devirt_monomorphic  CALLVIRT con clase conocida -> CALL directo
+ *
+ *   O3: anyade pases de duplicacion / reordenacion mas agresivos:
+ *         - ir_pass_cse             dedup de subexpresiones comunes (intra-block)
+ *         - ir_pass_const_cse_entry hoist de CONSTs a entry block
+ *         - ir_pass_inline          inlining cross-function (modulo)
+ *         - ir_pass_schedule        list scheduling para exponer ILP al host CPU
+ *
+ * Todos los pases operan sobre IrFunction o IrModule en memoria.  No
+ * generan texto ni bytecode; son transformaciones puras sobre la IR.
+ * Cada pase preserva la propiedad SSA (asignacion unica) salvo cuando
+ * elimina instrucciones completas (esto es seguro porque sus destinos
+ * dejan de ser usados).
+ *
+ * Por que un loop a punto fijo:  los pases no son independientes.  Un
+ * DCE elimina una mul cuyo resultado no se usaba; eso expone un CONST
+ * antes vivo (porque alimentaba la mul) que ahora tambien es dead, y
+ * que solo la siguiente iteracion de DCE captura.  Empiricamente 3-4
+ * iteraciones cubren ~95% de los casos; el limite de 8 evita patologias
+ * en programas degenerados sin sacrificar tiempo de compilacion notable.
  */
 
 #ifndef IR_OPTIMIZER_H
@@ -34,10 +67,12 @@ namespace ir {
  * @brief Nivel de optimizacion de la SSA IR.
  */
 enum class OptLevel : int {
-    O0 = 0, ///< sin optimizacion
-    O1 = 1, ///< DCE + copia
-    O2 = 2, ///< O1 + plegado + inalcanzables
-    O3 = 3, ///< O2 + CSE
+    O0 = 0, ///< sin pases; emite IR tal cual del frontend (depuracion).
+    O1 = 1, ///< pases locales baratos: DCE, copy-prop, simplify, dead-alloc.
+    O2 = 2, ///< O1 + global: const-fold, unreachable, SR, reassoc, tailcall,
+            ///<       LICM, load-narrow, DSE, devirt monomorfico.
+    O3 = 3, ///< O2 + agresivos: CSE local, const-CSE-entry, inline cross-fn,
+            ///<       list scheduling (expone ILP al host CPU / JIT).
 };
 
 /**

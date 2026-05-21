@@ -1,0 +1,54 @@
+// tres mejoras de expresividad coordinadas.
+//
+// (1) Ternario `cond ? a : b` -- operador de seleccion de expresion.
+//     Mismo CFG que un if/else con PHI en merge.
+//
+// (2) `comptime const NAME = expr;` -- constante compile-time evaluada
+//     y inline-ada en cada uso (cero overhead, sin storage runtime).
+//     El init puede usar builtins comptime + operadores + OTRAS
+//     comptime const previas.
+//
+// (3) `static_assert(cond, "msg")` -- verifica invariante en compile-
+//     time.  Si cond es false (o no comptime-evaluable), error de
+//     compilacion con el mensaje.
+
+struct Token { i32 kind; u64 payload; }
+
+// comptime const con introspeccion.
+comptime const u64 TOKEN_SZ      = sizeof<Token>();          // 16 (4+pad+8)
+comptime const u64 TOKEN_K_OFF   = offsetof<Token>("kind");  // 0
+comptime const u64 TOKEN_P_OFF   = offsetof<Token>("payload"); // 8
+
+// comptime const compuestas (usan otras comptime const).
+comptime const u64 BUFFER_CAP    = 256;
+comptime const u64 BUFFER_BYTES  = TOKEN_SZ * BUFFER_CAP;     // 4096
+comptime const i32 MAX_DEPTH     = 32;
+comptime const i32 HALF_DEPTH    = MAX_DEPTH / 2;             // 16
+
+// Static asserts: invariantes verificadas al compilar.  Si alguno
+// fallara, el .velb no se generaria.
+static_assert(TOKEN_SZ == 16,        "Token debe ocupar 16 bytes");
+static_assert(TOKEN_K_OFF == 0,      "Token.kind debe estar en offset 0");
+static_assert(BUFFER_BYTES <= 8192,  "BUFFER_BYTES dentro del limite");
+static_assert(MAX_DEPTH > 0 && MAX_DEPTH <= 64, "MAX_DEPTH en rango valido");
+static_assert(sizeof<i32>() == 4,    "i32 portable");
+
+i32 main() {
+    // Ternario en var-decl.
+    i32 mode_score = (MAX_DEPTH >= 16) ? 14 : 0;
+
+    // Ternario anidado (right-associative).
+    i32 level = 7;
+    i32 tier = (level >= 10) ? 1 : (level >= 5) ? 2 : 3;   // 2
+
+    // Comptime if con comptime const + builtin.
+    i32 r = 0;
+    comptime if (BUFFER_BYTES == 4096 && TOKEN_SZ * 256 == BUFFER_BYTES) {
+        r = 14;
+    }
+
+    // Ternario sobre comptime const + runtime value.
+    i32 step = (tier == 2) ? (HALF_DEPTH - 2) : MAX_DEPTH;  // 14
+
+    return mode_score + r + step;   // 14 + 14 + 14 = 42
+}

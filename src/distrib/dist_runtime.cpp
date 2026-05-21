@@ -628,8 +628,8 @@ bool DistRuntime::msgsend(runtime::ProcessVM *proc,
         Mailbox *mb = get_or_create_mailbox(dest);
         if (!mb->push(proc->pid.local_pid, data.data(), data.size())) return false;
 
-        // A.7.2.5-rev2: SIEMPRE invocar make_ready tras push, sin
-        // condicional sobre dest->state.  El propio make_ready usa CAS y
+        // SIEMPRE invocamos make_ready tras push, sin condicional sobre
+        // @c dest->state.  El propio @c make_ready usa CAS y
         // wake_pending para resolver correctamente:
         //   - dest activo (EXECUTE/RUNNING/etc): no toca state pero deja
         //     wake_pending=true; el scheduler lo respeta al transicionar

@@ -1,0 +1,53 @@
+// Macros estilo Lisp -- MVP via `comptime_compile(string)`.
+//
+// `comptime_compile(s)` toma un string compile-time, lo parsea como
+// una EXPRESION Vex y la evalua recursivamente al compile-time.
+// Permite construir codigo a partir de datos (typename<T>,
+// comptime_to_str, concat) y ejecutarlo sin runtime.
+//
+// Diferencias vs Lisp puro:
+//   - El input es texto, no un AST literal (no hay `'foo` literal).
+//   - El output es un valor comptime, no codigo emitido al AST runtime.
+//     Para code-gen real (emit) se requiere otra fase; aqui solo eval.
+//   - Sin hygenic naming (los identifiers son lookup directo del scope
+//     comptime del modulo).
+//
+// Aun asi, los casos de uso mas comunes de Lisp macros (constantes
+// derivadas + lookups por tipo + factorizacion de expresiones) son
+// expresables.
+
+// (1) Arithmetica trivial.
+comptime const i64 R = comptime_compile("2 + 3 * 7");
+static_assert(R == 23, "macro: 2 + 3*7 = 23");
+
+// (2) Composicion: construir el codigo a partir de datos comptime.
+comptime const i64 N    = 5;
+comptime const string E = comptime_concat("(",
+                            comptime_concat(comptime_to_str(N),
+                                ") * 8"));
+comptime const i64 R2   = comptime_compile(E);
+static_assert(R2 == 40, "macro composicion: 5 * 8 = 40");
+
+// (3) Codigo derivado de un tipo.
+struct Vec3 { f32 x; f32 y; f32 z; }
+comptime const string code_size =
+    comptime_concat("sizeof<",
+        comptime_concat(typename<Vec3>(), ">()"));
+comptime const i64 sz3 = comptime_compile(code_size);
+static_assert(sz3 == 12, "macro typename: sizeof Vec3 = 12");
+
+// (4) Lookup table generada via macro: produce el campo idx-esimo
+// como expresion de offset.
+comptime const string code_off =
+    comptime_concat("offsetof<Vec3>(\"",
+        comptime_concat(field_name<Vec3>(2), "\")"));
+comptime const u64 off_z = comptime_compile(code_off);
+static_assert(off_z == 8, "macro offset: Vec3.z @ 8");
+
+// (5) Macros encadenados (output de un macro como input del siguiente).
+comptime const string e1 = comptime_concat("(", comptime_concat(comptime_to_str(3), " * 4)"));
+comptime const string e2 = comptime_concat(e1, " + 10");
+comptime const i64 r3 = comptime_compile(e2);     // (3 * 4) + 10 = 22
+static_assert(r3 == 22, "macro encadenado: (3*4)+10");
+
+i32 main() { return 42; }

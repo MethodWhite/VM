@@ -1,0 +1,10 @@
+@Macro comptime string Pyramid(i64 n) {
+    return (n <= 0)
+        ? "1"
+        : "(" + Pyramid(n - 1) + "+" + Pyramid(n - 1) + ")";
+}
+i32 main() {
+    i32 r = Pyramid(11);   // 2^11 = 2048 leaves
+    if (r != 2048) return 91;
+    return 42;
+}

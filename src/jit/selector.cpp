@@ -52,6 +52,20 @@ namespace jit {
 
         /* ----- Helpers para el mini-parser de raw_asm (Phase D.3-G) ----- */
 
+        /** @brief Replica de @c EmitCtx::sanitize del ir_emitter: convierte
+         *  cualquier caracter no-alfanumerico/no-underscore en '_'.  Usado
+         *  para resolver nombres de funcion en el symbol_table del .velb,
+         *  que el linker emite ya sanitizados (igual que el .vel emitido). */
+        inline std::string sanitize_label_name(const std::string &s) {
+            std::string r;
+            r.reserve(s.size());
+            for (char c : s) {
+                if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') r += c;
+                else r += '_';
+            }
+            return r;
+        }
+
         /** @brief Slot index del VM register en proc->registers (0..15 = r0..r15,
          *         16 = rsp, 17 = rbp).  -1 si no reconoce. */
         inline int vm_reg_slot_index(const std::string &name) noexcept {
@@ -429,6 +443,24 @@ namespace jit {
                     MOperand::make_reg(PROC_REG)));
         }
 
+        /* Profiler MIPS counter para JIT.  Se emite per-bloque (no
+         * solo prologue): cada bloque ejecutado contribuye N instrs
+         * al counter, donde N = numero de IR instrs del bloque.  Asi
+         * los loops contribuyen N * iter_count, dando MIPS reales.
+         *
+         * Patron emitido al inicio de cada MBlock (1+1 = 2 instrs):
+         *
+         *     mov rax, imm64  ; addr del counter (mismo en todo el metodo)
+         *     add qword [rax], N_block  ; N = ir_block.instrs.size()
+         *
+         * Coste: 2 instr (~3 ns) per block entry, including loop iterations.
+         * El overhead es pequeno comparado con el trabajo del bloque (cada
+         * bloque suele tener >=5 instrs reales).  Para bloques de 1-2 instrs
+         * (raros), el overhead es relativo pero absoluto despreciable. */
+        /* La emision per-block se hace MAS ABAJO, en el inicio del loop
+         * de blocks (linea ~547).  El prologue NO necesita counter porque
+         * no representa work del programa Vex; solo setup. */
+
         /* preservar regs callee-saved usados por regalloc.
          * Conteo PAR garantizado por @c compute_jit_regalloc para que el
          * alignment del frame no cambie (cada push es 8 bytes; 2 o 4
@@ -501,6 +533,26 @@ namespace jit {
         for (size_t bi = 0; bi < ir_fn.blocks.size(); ++bi) {
             const auto &ir_block = ir_fn.blocks[bi];
             MBlockId mb = mf.new_block(block_labels[bi]);
+
+            /* JIT MIPS counter per-block entry.  Cada vez que ejecuta este
+             * bloque (incluyendo loop iterations), suma N al counter.
+             * N = numero de IR instrs del bloque.  El registro counter_addr
+             * se reusa entre bloques pero hay que reemitir el `mov rax` en
+             * cada uno porque RAX puede haber sido clobbeado por las instrs
+             * del bloque anterior.  Coste: 2 instr per block (~3 ns). */
+            if (opts_.jit_instr_counter_addr != 0 && !ir_block.instrs.empty()) {
+                const uint32_t cnt_idx = mf.intern_imm64(opts_.jit_instr_counter_addr);
+                mf.blocks[mb].instrs.push_back(
+                    MInstr::make_unary(MOp::MOV,
+                        MOperand::make_reg(MReg::RAX),
+                        MOperand::make_imm64_idx(cnt_idx)));
+                const int32_t n_instrs = static_cast<int32_t>(
+                    std::min(ir_block.instrs.size(), static_cast<size_t>(INT32_MAX)));
+                mf.blocks[mb].instrs.push_back(
+                    MInstr::make_unary(MOp::ADD,
+                        MOperand::make_mem(MReg::RAX, 0),
+                        MOperand::make_imm32(n_instrs)));
+            }
 
             for (const auto &ins : ir_block.instrs) {
                 using IrOp = ir::IrOp;
@@ -1000,6 +1052,34 @@ namespace jit {
                             if (fn_addr != 0) is_user_call = true;
                         }
 
+                        /* D.4-fix: trampoline JIT->interp.  Si NO se resolvio
+                         * como runtime ni como user-fn JIT-compilable, pero el
+                         * symbol_table del .velb tiene un bytecode entry para
+                         * "code.<sanitized_name>", emitir CALL al runtime
+                         * wrapper @c vrt_call_bc_function que ejecuta el
+                         * bytecode en mini-interp sincronico.  Esto permite
+                         * que main + helpers basicos compilen aunque algunas
+                         * callees (e.g. @c __new_<X> con raw_asm complejo)
+                         * caigan a interp.  Cero overhead para callees ya
+                         * JIT-compiladas (este path solo se toma cuando
+                         * fn_addr==0 tras los dos intentos anteriores). */
+                        bool is_bc_trampoline = false;
+                        uint64_t bc_entry_va = 0;
+                        if (fn_addr == 0
+                         && opts_.runtime != nullptr
+                         && opts_.runtime->call_bc_function != nullptr
+                         && opts_.resolve_symbol
+                         && opts_.mode == SelectorMode::VM_ABI) {
+                            const std::string sym_key =
+                                "code." + sanitize_label_name(ins.func_name);
+                            bc_entry_va = opts_.resolve_symbol(sym_key);
+                            if (bc_entry_va != 0) {
+                                fn_addr = reinterpret_cast<uint64_t>(
+                                    opts_.runtime->call_bc_function);
+                                is_bc_trampoline = true;
+                            }
+                        }
+
                         if (fn_addr == 0) {
                             /* No resolvido - marcar unsupported. */
                             if (jit::g_jit_warn_unsupported) {
@@ -1017,6 +1097,83 @@ namespace jit {
                             }
                             unsupported = true;
                             mf.blocks.back().instrs.push_back({MOp::INT3, 0, 0, 0, {}, {}, {}});
+                            break;
+                        }
+
+                        /* Trampoline JIT->interp: marshalling VM_ABI igual que
+                         * is_user_call (args en proc->regs[1..N], R15=nargs)
+                         * pero la llamada nativa pasa (proc, bc_entry_va) en
+                         * lugar de solo (proc). */
+                        if (is_bc_trampoline) {
+                            const size_t nargs = ins.operands.size();
+                            const int32_t regs_base =
+                                static_cast<int32_t>(VESTA_PROC_REGISTERS_OFFSET);
+
+                            /* Paso 1: stage args en proc->regs[1..N]. */
+                            for (size_t a = 0; a < nargs && a < 12; ++a) {
+                                load_op(mf, ins.operands[a], SCRATCH_A);
+                                const int32_t off = regs_base +
+                                    static_cast<int32_t>((a + 1) * 8);
+                                mf.blocks.back().instrs.push_back(
+                                    MInstr::make_unary(MOp::MOV,
+                                        MOperand::make_mem(MReg::RBX, off),
+                                        MOperand::make_reg(SCRATCH_A)));
+                            }
+                            /* Paso 2: R15 = nargs. */
+                            mf.blocks.back().instrs.push_back(
+                                MInstr::make_unary(MOp::MOV,
+                                    MOperand::make_mem(MReg::RBX, regs_base + 15 * 8),
+                                    MOperand::make_imm32(static_cast<int32_t>(nargs))));
+                            /* Paso 3: Native ABI args:
+                             *   arg0 (rdi/rcx) = rbx (proc)
+                             *   arg1 (rsi/rdx) = bc_entry_va (imm64 pool) */
+#if defined(_WIN32)
+                            const MReg n_arg0 = MReg::RCX;
+                            const MReg n_arg1 = MReg::RDX;
+#else
+                            const MReg n_arg0 = MReg::RDI;
+                            const MReg n_arg1 = MReg::RSI;
+#endif
+                            mf.blocks.back().instrs.push_back(
+                                MInstr::make_unary(MOp::MOV,
+                                    MOperand::make_reg(n_arg0),
+                                    MOperand::make_reg(MReg::RBX)));
+                            const uint32_t bc_pool_idx = mf.intern_imm64(bc_entry_va);
+                            mf.blocks.back().instrs.push_back(
+                                MInstr::make_unary(MOp::MOV,
+                                    MOperand::make_reg(n_arg1),
+                                    MOperand::make_imm64_idx(bc_pool_idx)));
+                            /* Paso 4: mov rax, fn_addr (vrt_call_bc_function);
+                             * call rax + stackmap. */
+                            const uint32_t fn_pool_idx = mf.intern_imm64(fn_addr);
+                            mf.blocks.back().instrs.push_back(
+                                MInstr::make_unary(MOp::MOV,
+                                    MOperand::make_reg(MReg::RAX),
+                                    MOperand::make_imm64_idx(fn_pool_idx)));
+                            MInstr tcall_instr;
+                            tcall_instr.op = MOp::CALL;
+                            tcall_instr.src1 = MOperand::make_reg(MReg::RAX);
+                            emit_stackmap_for_safepoint(tcall_instr);
+                            mf.blocks.back().instrs.push_back(tcall_instr);
+                            /* Paso 5: el wrapper devuelve regs[0] en RAX, pero
+                             * tambien lo ha escrito en proc->registers.regs[0]
+                             * via el mini-interp.  El dst del IR puede leer
+                             * directamente desde RAX -- mas barato que un
+                             * extra load de memoria. */
+                            if (ins.dst != ir::IR_NO_VALUE) {
+                                store_op(mf, ins.dst, MReg::RAX);
+                            }
+                            if (jit::g_jit_warn_unsupported) {
+                                auto key = std::make_pair(
+                                    static_cast<int>(ins.op), ins.source_line);
+                                if (warned_ops.insert(key).second) {
+                                    std::fprintf(stderr,
+                                        "[jit] selector: CALL '%s' via trampoline JIT->interp (callee no JIT-able) en fn '%s' linea %u\n",
+                                        ins.func_name.c_str(),
+                                        ir_fn.name.c_str(),
+                                        ins.source_line);
+                                }
+                            }
                             break;
                         }
 
@@ -2272,10 +2429,33 @@ namespace jit {
                                                 stage_load_ssa(MReg::RAX, ins.operands[ph_src_idx_s]);
                                             }
                                         } else {
-                                            /* src es VMreg o imm. */
+                                            /* src es VMreg, @Absolute(X) o imm. */
                                             int src_slot = vm_reg_slot_index(src);
                                             if (src_slot >= 0) {
                                                 stage_load_slot(MReg::RAX, src_slot);
+                                            } else if (!src.empty() && src[0] == '@'
+                                                    && opts_.resolve_symbol) {
+                                                /* @Absolute("X") / @StringRef("X"):
+                                                 * resolver via symbol_table del linker
+                                                 * y cargar la direccion como imm.  Usado
+                                                 * por `mov {dst}, @Absolute("code.handler")`
+                                                 * que el frontend emite en lower_try para
+                                                 * el handler_pc de un catch block. */
+                                                size_t lp = src.find('(');
+                                                size_t rp = src.rfind(')');
+                                                if (lp == std::string::npos
+                                                 || rp == std::string::npos || rp <= lp + 1) {
+                                                    all_ok = false; break;
+                                                }
+                                                std::string inner = src.substr(lp + 1, rp - lp - 1);
+                                                if (inner.size() >= 2
+                                                 && inner.front() == '"' && inner.back() == '"') {
+                                                    inner = inner.substr(1, inner.size() - 2);
+                                                }
+                                                const uint64_t v = opts_.resolve_symbol(inner);
+                                                if (v == 0) { all_ok = false; break; }
+                                                stage_load_imm(MReg::RAX,
+                                                    static_cast<int64_t>(v));
                                             } else {
                                                 int64_t imm;
                                                 if (!parse_imm_int(src, imm)) { all_ok = false; break; }
@@ -2753,9 +2933,19 @@ namespace jit {
                                     stage_store_slot(16, MReg::RAX);
                                     continue;
                                 }
-                                /* @c gchandle rN, rM -> vrt_gc_handle_for_ptr. */
+                                /* @c gchandle rN, rM -> vrt_gc_handle_for_ptr.
+                                 * SKIP cuando args son placeholders {dst}/{srcN}:
+                                 * el handler con placeholders esta abajo en la
+                                 * nueva seccion (acepta gchandle como parte de
+                                 * un bloque multilinea como synchronized prologue).
+                                 * El check `args[i][0] != '{'` evita que esta
+                                 * variante VMreg-only consuma el opcode y de
+                                 * `all_ok=false` antes de llegar al handler con
+                                 * placeholders. */
                                 if (opcode == "gchandle" && args.size() == 2
-                                 && opts_.runtime->gc_handle_for_ptr) {
+                                 && opts_.runtime->gc_handle_for_ptr
+                                 && !args[0].empty() && args[0][0] != '{'
+                                 && !args[1].empty() && args[1][0] != '{') {
                                     const int dst_slot = vm_reg_slot_index(args[0]);
                                     const int src_slot = vm_reg_slot_index(args[1]);
                                     if (dst_slot < 0 || src_slot < 0) { all_ok = false; break; }
@@ -2856,6 +3046,374 @@ namespace jit {
                                     stage_store_slot(0, MReg::RAX);
                                     continue;
                                 }
+
+                                /* ==================================================
+                                 * Helpers locales para SSA placeholders {dst}/{srcN}.
+                                 * Reusados por tryenter/throw/monenter/monexit + mov.
+                                 * Acepta: VMreg (rN/rsp/rbp), SSA placeholder ({dst},
+                                 * {srcN}), @Absolute("X"), imm decimal/hex/binario.
+                                 * ================================================== */
+                                auto resolve_arg_to_reg =
+                                    [&](const std::string &tok, MReg dst_reg) -> bool {
+                                    /* {dst} placeholder. */
+                                    if (tok == "{dst}") {
+                                        if (ins.dst == ir::IR_NO_VALUE) return false;
+                                        staged.push_back(MInstr::make_unary(MOp::MOV,
+                                            MOperand::make_reg(dst_reg),
+                                            slot_mem(ins.dst)));
+                                        return true;
+                                    }
+                                    /* {srcN} placeholder. */
+                                    if (tok.size() > 5
+                                     && tok[0] == '{' && tok.back() == '}'
+                                     && tok.compare(1, 3, "src") == 0) {
+                                        int n = 0;
+                                        for (size_t k = 4; k + 1 < tok.size(); ++k) {
+                                            if (!std::isdigit(
+                                                    static_cast<unsigned char>(tok[k]))) {
+                                                return false;
+                                            }
+                                            n = n * 10 + (tok[k] - '0');
+                                        }
+                                        if (n < 0
+                                         || static_cast<size_t>(n) >= ins.operands.size()) {
+                                            return false;
+                                        }
+                                        staged.push_back(MInstr::make_unary(MOp::MOV,
+                                            MOperand::make_reg(dst_reg),
+                                            slot_mem(ins.operands[n])));
+                                        return true;
+                                    }
+                                    /* @Absolute("X") / @StringRef("X") via resolve_symbol. */
+                                    if (!tok.empty() && tok[0] == '@'
+                                     && opts_.resolve_symbol) {
+                                        size_t lp = tok.find('(');
+                                        size_t rp = tok.rfind(')');
+                                        if (lp != std::string::npos && rp != std::string::npos
+                                         && rp > lp + 1) {
+                                            std::string inner = tok.substr(lp + 1, rp - lp - 1);
+                                            if (inner.size() >= 2
+                                             && inner.front() == '"' && inner.back() == '"') {
+                                                inner = inner.substr(1, inner.size() - 2);
+                                            }
+                                            const uint64_t v = opts_.resolve_symbol(inner);
+                                            if (v != 0) {
+                                                stage_load_imm(dst_reg,
+                                                    static_cast<int64_t>(v));
+                                                return true;
+                                            }
+                                        }
+                                        return false;
+                                    }
+                                    /* VMreg fallback (rN). */
+                                    const int slot = vm_reg_slot_index(tok);
+                                    if (slot >= 0) {
+                                        stage_load_slot(dst_reg, slot);
+                                        return true;
+                                    }
+                                    /* Imm fallback. */
+                                    int64_t imm;
+                                    if (parse_imm_int(tok, imm)) {
+                                        stage_load_imm(dst_reg, imm);
+                                        return true;
+                                    }
+                                    return false;
+                                };
+
+                                /* Helper para almacenar RAX al destino (VMreg/SSA placeholder). */
+                                auto store_rax_to_dst =
+                                    [&](const std::string &tok) -> bool {
+                                    if (tok == "{dst}") {
+                                        if (ins.dst == ir::IR_NO_VALUE) return false;
+                                        staged.push_back(MInstr::make_unary(MOp::MOV,
+                                            slot_mem(ins.dst),
+                                            MOperand::make_reg(MReg::RAX)));
+                                        return true;
+                                    }
+                                    if (tok.size() > 5
+                                     && tok[0] == '{' && tok.back() == '}'
+                                     && tok.compare(1, 3, "src") == 0) {
+                                        int n = 0;
+                                        for (size_t k = 4; k + 1 < tok.size(); ++k) {
+                                            if (!std::isdigit(
+                                                    static_cast<unsigned char>(tok[k]))) {
+                                                return false;
+                                            }
+                                            n = n * 10 + (tok[k] - '0');
+                                        }
+                                        if (n < 0
+                                         || static_cast<size_t>(n) >= ins.operands.size()) {
+                                            return false;
+                                        }
+                                        staged.push_back(MInstr::make_unary(MOp::MOV,
+                                            slot_mem(ins.operands[n]),
+                                            MOperand::make_reg(MReg::RAX)));
+                                        return true;
+                                    }
+                                    const int slot = vm_reg_slot_index(tok);
+                                    if (slot >= 0) {
+                                        stage_store_slot(slot, MReg::RAX);
+                                        return true;
+                                    }
+                                    return false;
+                                };
+
+                                /* ==================================================
+                                 * mov {dst}, @Absolute("code.X") -- emitido por try
+                                 * para cargar handler_pc en un SSA value.
+                                 * ==================================================
+                                 * Resolve @Absolute via resolve_symbol y store imm
+                                 * al slot SSA del {dst}.  2 instr x86-64 (mov imm64
+                                 * + mov [rbp - off], rax). */
+                                if (opcode == "mov" && args.size() == 2
+                                 && args[0] == "{dst}"
+                                 && !args[1].empty() && args[1][0] == '@'
+                                 && opts_.resolve_symbol) {
+                                    if (!resolve_arg_to_reg(args[1], MReg::RAX)) {
+                                        all_ok = false; break;
+                                    }
+                                    if (!store_rax_to_dst(args[0])) {
+                                        all_ok = false; break;
+                                    }
+                                    continue;
+                                }
+
+                                /* ==================================================
+                                 * gchandle {dst}, {src0} (con placeholders SSA)
+                                 * ==================================================
+                                 * Variante del handler `gchandle rN, rM` ya existente
+                                 * que acepta {dst}/{srcN} en lugar de VMregs.  Usado
+                                 * cuando el frontend Vex emite la version multi-linea
+                                 * (synchronized prologue: comment + gchandle + monenter).
+                                 *
+                                 * vrt_gc_handle_for_ptr(proc, host_ptr) -> handle. */
+                                if (opcode == "gchandle" && args.size() == 2
+                                 && opts_.runtime->gc_handle_for_ptr
+                                 && (args[0].size() > 0 && args[0][0] == '{'
+                                  || args[1].size() > 0 && args[1][0] == '{')) {
+                                    if (!resolve_arg_to_reg(args[1], ABI_ARG1)) {
+                                        all_ok = false; break;
+                                    }
+                                    staged.push_back(MInstr::make_unary(MOp::MOV,
+                                        MOperand::make_reg(ABI_ARG0),
+                                        MOperand::make_reg(MReg::RBX)));
+                                    stage_call(reinterpret_cast<uint64_t>(
+                                        opts_.runtime->gc_handle_for_ptr));
+                                    if (!store_rax_to_dst(args[0])) {
+                                        all_ok = false; break;
+                                    }
+                                    continue;
+                                }
+
+                                /* ==================================================
+                                 * tryleave (sin args) -- INLINE 5 instrucciones
+                                 * ==================================================
+                                 *
+                                 * Inline pop de exc_frame_stack como linked list.
+                                 * El frame popped queda leaked en heap raw (~176 B,
+                                 * aceptable v1; documentado en SelectorOptions).
+                                 *
+                                 *   mov rax, [rbx + EXC_FRAME_OFF]   ; top
+                                 *   test rax, rax
+                                 *   je skip
+                                 *   mov rcx, [rax + 168]              ; prev
+                                 *   mov [rbx + EXC_FRAME_OFF], rcx    ; head = prev
+                                 * skip:
+                                 *
+                                 * 5 instr ~5-8 ciclos vs ~25 ciclos del runtime call.
+                                 * Si exc_frame_stack_offset==0 (no configurado), fallback
+                                 * a vrt_tryleave call (~10 instr). */
+                                if (opcode == "tryleave" && args.empty()) {
+                                    if (opts_.exc_frame_stack_offset != 0) {
+                                        const uint32_t skip_lbl = mf.new_label();
+                                        const int32_t exc_off = opts_.exc_frame_stack_offset;
+                                        const int32_t free_off = opts_.exc_free_list_offset;
+                                        /* mov rax, [rbx + exc_off]    ; top */
+                                        staged.push_back(MInstr::make_unary(MOp::MOV,
+                                            MOperand::make_reg(MReg::RAX),
+                                            MOperand::make_mem(MReg::RBX, exc_off)));
+                                        /* test rax, rax */
+                                        staged.push_back(MInstr::make_unary(MOp::TEST,
+                                            MOperand::make_reg(MReg::RAX),
+                                            MOperand::make_reg(MReg::RAX)));
+                                        /* je skip */
+                                        staged.push_back(MInstr::make_jcc(MCond::E, skip_lbl));
+                                        /* mov rcx, [rax + 168]        ; prev */
+                                        staged.push_back(MInstr::make_unary(MOp::MOV,
+                                            MOperand::make_reg(MReg::RCX),
+                                            MOperand::make_mem(MReg::RAX,
+                                                VESTA_EXC_FRAME_PREV_OFFSET)));
+                                        /* mov [rbx + exc_off], rcx    ; head = prev */
+                                        staged.push_back(MInstr::make_unary(MOp::MOV,
+                                            MOperand::make_mem(MReg::RBX, exc_off),
+                                            MOperand::make_reg(MReg::RCX)));
+                                        /* Si tenemos free_list_offset, push al free
+                                         * list para reciclar el frame (no leak).
+                                         * Coste: 2 instrucciones extra. */
+                                        if (free_off != 0) {
+                                            /* mov rcx, [rbx + free_off]   ; old free head */
+                                            staged.push_back(MInstr::make_unary(MOp::MOV,
+                                                MOperand::make_reg(MReg::RCX),
+                                                MOperand::make_mem(MReg::RBX, free_off)));
+                                            /* mov [rax + 168], rcx        ; popped.prev = old head */
+                                            staged.push_back(MInstr::make_unary(MOp::MOV,
+                                                MOperand::make_mem(MReg::RAX,
+                                                    VESTA_EXC_FRAME_PREV_OFFSET),
+                                                MOperand::make_reg(MReg::RCX)));
+                                            /* mov [rbx + free_off], rax   ; free head = popped */
+                                            staged.push_back(MInstr::make_unary(MOp::MOV,
+                                                MOperand::make_mem(MReg::RBX, free_off),
+                                                MOperand::make_reg(MReg::RAX)));
+                                        }
+                                        /* skip: */
+                                        staged.push_back(MInstr::make_label_def(skip_lbl));
+                                        continue;
+                                    }
+                                    /* Fallback: runtime call. */
+                                    if (!opts_.runtime->tryleave) { all_ok = false; break; }
+                                    staged.push_back(MInstr::make_unary(MOp::MOV,
+                                        MOperand::make_reg(ABI_ARG0),
+                                        MOperand::make_reg(MReg::RBX)));
+                                    stage_call(reinterpret_cast<uint64_t>(
+                                        opts_.runtime->tryleave));
+                                    continue;
+                                }
+
+                                /* ==================================================
+                                 * tryenter {handler_pc}, {type} -> vrt_tryenter
+                                 * ==================================================
+                                 * Calling convention C: (proc, handler_pc, type_class).
+                                 * El frontend emite `tryenter {src0}, {src1}` con
+                                 * src0=handler_pc y src1=ClassInfo* (o 0).
+                                 *
+                                 * El runtime call es OBLIGATORIO aqui: alocar y
+                                 * popular un ExceptionFrame de 176 bytes + snapshot
+                                 * de 16 regs requiere malloc + 22 stores; inlinear
+                                 * eso seria mas de 30 MInstrs cuando un call es ~3. */
+                                if (opcode == "tryenter" && args.size() == 2
+                                 && opts_.runtime->tryenter) {
+                                    if (!resolve_arg_to_reg(args[0], ABI_ARG1)) {
+                                        all_ok = false; break;
+                                    }
+                                    if (!resolve_arg_to_reg(args[1], ABI_ARG2)) {
+                                        all_ok = false; break;
+                                    }
+                                    staged.push_back(MInstr::make_unary(MOp::MOV,
+                                        MOperand::make_reg(ABI_ARG0),
+                                        MOperand::make_reg(MReg::RBX)));
+                                    stage_call(reinterpret_cast<uint64_t>(
+                                        opts_.runtime->tryenter));
+                                    continue;
+                                }
+
+                                /* Helper para emitir el epilogue de la funcion JIT
+                                 * tras throw/rethrow.  Las funciones runtime do_throw
+                                 * actualizan proc->rip al handler_pc pero NO hacen
+                                 * longjmp; retornan normalmente.  Sin el epilogue
+                                 * inline aqui, el codigo JIT continuaria con la
+                                 * siguiente instr en host (basura/fallthrough).
+                                 * Emitiendo el epilogue, el JIT retorna a
+                                 * @c enter_jit -> exec_instr_callvirt -> scheduler,
+                                 * y el scheduler dispatcha el nuevo proc->rip
+                                 * (el catch handler en bytecode interp).
+                                 *
+                                 * Mismo epilogue que IrOp::RET (sin la parte de
+                                 * cargar return value, porque do_throw ya seteo R0
+                                 * con el exc handle).  4-7 instrucciones segun
+                                 * regalloc.callee_saved_used + modo VM_ABI. */
+                                auto stage_function_epilogue = [&]() {
+                                    /* mov rsp, rbp */
+                                    staged.push_back(MInstr::make_unary(MOp::MOV,
+                                        MOperand::make_reg(MReg::RSP),
+                                        MOperand::make_reg(MReg::RBP)));
+                                    /* pop rbp */
+                                    staged.push_back(MInstr::make_unary(MOp::POP,
+                                        MOperand::make_reg(MReg::RBP), {}));
+                                    /* pop regs callee-saved en orden inverso. */
+                                    for (auto it = regalloc.callee_saved_used.rbegin();
+                                         it != regalloc.callee_saved_used.rend(); ++it) {
+                                        staged.push_back(MInstr::make_unary(MOp::POP,
+                                            MOperand::make_reg(*it), {}));
+                                    }
+                                    if (opts_.mode == SelectorMode::VM_ABI) {
+                                        /* pop rbx (proc se preservaba aqui). */
+                                        staged.push_back(MInstr::make_unary(MOp::POP,
+                                            MOperand::make_reg(MReg::RBX), {}));
+                                    }
+                                    /* ret */
+                                    staged.push_back(MInstr::make_ret());
+                                };
+
+                                /* ==================================================
+                                 * throw {src0} -> vrt_throw_user(proc, handle) + epilogue
+                                 * ==================================================
+                                 * 1. Pasa el handle como arg1, proc como arg0.
+                                 * 2. CALL vrt_throw_user (do_throw modifica proc->rip).
+                                 * 3. Emite el epilogue de la funcion JIT para que
+                                 *    retorne a enter_jit/scheduler.  Scheduler ve
+                                 *    proc->rip cambiado y dispatcha el catch handler. */
+                                if (opcode == "throw" && args.size() == 1
+                                 && opts_.runtime->throw_user) {
+                                    if (!resolve_arg_to_reg(args[0], ABI_ARG1)) {
+                                        all_ok = false; break;
+                                    }
+                                    staged.push_back(MInstr::make_unary(MOp::MOV,
+                                        MOperand::make_reg(ABI_ARG0),
+                                        MOperand::make_reg(MReg::RBX)));
+                                    stage_call(reinterpret_cast<uint64_t>(
+                                        opts_.runtime->throw_user));
+                                    stage_function_epilogue();
+                                    continue;
+                                }
+
+                                /* ==================================================
+                                 * rethrow (sin args) -> vrt_rethrow(proc) + epilogue
+                                 * ==================================================
+                                 * Relanza proc->current_exception.  No retorna al JIT;
+                                 * el epilogue garantiza control transferido al scheduler. */
+                                if (opcode == "rethrow" && args.empty()
+                                 && opts_.runtime->rethrow) {
+                                    staged.push_back(MInstr::make_unary(MOp::MOV,
+                                        MOperand::make_reg(ABI_ARG0),
+                                        MOperand::make_reg(MReg::RBX)));
+                                    stage_call(reinterpret_cast<uint64_t>(
+                                        opts_.runtime->rethrow));
+                                    stage_function_epilogue();
+                                    continue;
+                                }
+
+                                /* ==================================================
+                                 * monenter {handle} -> vrt_monitor_enter(proc, handle)
+                                 * monexit  {handle} -> vrt_monitor_exit(proc, handle)
+                                 * ==================================================
+                                 * El frontend emite ambos con un SSA value (a veces
+                                 * {dst} de un gchandle inmediato anterior).  Calling
+                                 * convention C: (proc, handle as u32->u64).
+                                 *
+                                 * Fast path del runtime: CAS sobre ObjectHeader,
+                                 * ~10 ns sin contencion.  Slow path: scheduler
+                                 * coordina blocking.  No inlineable sin exponer
+                                 * GcHeap layout completo (HandleTable + ObjectHeader).
+                                 * Para v1 runtime call es lo correcto. */
+                                if ((opcode == "monenter" || opcode == "monexit")
+                                 && args.size() == 1) {
+                                    const bool is_enter = (opcode == "monenter");
+                                    const uint64_t fn_addr = is_enter
+                                        ? reinterpret_cast<uint64_t>(
+                                              opts_.runtime->monitor_enter)
+                                        : reinterpret_cast<uint64_t>(
+                                              opts_.runtime->monitor_exit);
+                                    if (fn_addr == 0) { all_ok = false; break; }
+                                    if (!resolve_arg_to_reg(args[0], ABI_ARG1)) {
+                                        all_ok = false; break;
+                                    }
+                                    staged.push_back(MInstr::make_unary(MOp::MOV,
+                                        MOperand::make_reg(ABI_ARG0),
+                                        MOperand::make_reg(MReg::RBX)));
+                                    stage_call(fn_addr);
+                                    continue;
+                                }
+
                                 /* Opcode no reconocido por el mini-parser. */
                                 all_ok = false;
                                 break;

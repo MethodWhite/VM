@@ -258,6 +258,26 @@ namespace cli {
         Impl *impl_; ///< Implementacion interna (opaque pointer, definida en cli.cpp)
     };
 
+    /**
+     * @brief Ejecuta una linea del REPL (igual que el prompt `vesta>`) y
+     *        captura todo lo que el comando imprimiria a stdout en un
+     *        string que se devuelve al caller.
+     *
+     * Reemplaza el @c rdbuf de @c std::cout temporalmente por un buffer
+     * en memoria mientras dispacha el comando, asi todas las llamadas a
+     * @c std::cout / @c vesta::scout() / @c printf van al string.  La
+     * funcion es thread-safe via un mutex global porque @c std::cout es
+     * un recurso compartido del proceso.
+     *
+     * @param line Linea cruda igual a la que el operador escribiria en
+     *             el prompt.  Acepta comentarios (#), aliases, etc.
+     * @return Cadena con la salida capturada del comando (puede ser
+     *         vacia para comandos silenciosos).  Si la linea no
+     *         corresponde a ningun comando registrado, devuelve un
+     *         mensaje de error claro.
+     */
+    std::string execute_repl_line(const std::string &line);
+
 } // namespace cli
 
 #endif // CLI_H

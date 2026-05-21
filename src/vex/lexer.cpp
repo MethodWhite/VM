@@ -606,7 +606,10 @@ namespace vex {
     // -----------------------------------------------------------------------
     // Lectura de identificadores y palabras reservadas.
     //
-    // [A-Za-z_][A-Za-z0-9_]* -- ASCII puro, sin Unicode (decision A.1).
+    // [A-Za-z_][A-Za-z0-9_]* -- ASCII puro, sin Unicode en identificadores
+    // (decision de diseno: mantiene el lexer simple y evita ambiguedad
+    // visual entre similares Unicode + permite que el ABI use nombres
+    // identificables sin reglas de normalizacion).
     // -----------------------------------------------------------------------
     Token Lexer::lex_identifier() {
         const SourceLoc start{filename_, line_, column_, (uint32_t)pos_, 0};
@@ -740,9 +743,11 @@ namespace vex {
     // -----------------------------------------------------------------------
     // Lectura de strings "..." o r"...".
     //
-    // En A.1 NO soportamos interpolacion ${...} ni triple-quoted """...""";
-    // si las detectamos, reportamos un diagnostico explicito y emitimos
-    // un STRING_LIT vacio para que el parser pueda seguir reportando errores.
+    // Soporta interpolacion @c ${...} y triple-quoted @c """..."""; el caso
+    // raw @c r"..." desactiva ambos.  Cuando hay interpolacion, el lexer
+    // emite una secuencia ISTR_BEGIN / ISTR_TEXT / ISTR_EXPR_BEGIN / ... /
+    // ISTR_EXPR_END / ISTR_TEXT / ISTR_END que el parser ensambla en un
+    // unico @c StringLitExpr con partes literales + expresiones.
     // -----------------------------------------------------------------------
     Token Lexer::lex_string(bool raw) {
         const SourceLoc start{filename_, line_, column_, (uint32_t)pos_, 0};
@@ -824,13 +829,14 @@ namespace vex {
                 const uint64_t cp = decode_escape(this, source_, pos_, line_, column_,
                                                   diags_, filename_);
                 // Caracter ASCII directo; codepoints >127 se truncan al byte
-                // bajo (suficiente para A.1.5; el soporte UTF-8 completo
-                // llegara con el sistema de strings managed en A.2).
+                // bajo.  Codepoints multi-byte UTF-8 se expresan como
+                // secuencias de bytes literales @c \xHH; el sistema de
+                // strings managed los preserva intactos en el StringObject.
                 value.push_back(static_cast<char>(cp & 0xFF));
                 continue;
             }
             if (!raw && c == '$' && peek_char(1) == '{') {
-                // A.16: detectada interpolacion.  Cambiamos a modo
+                // Detectada interpolacion @c ${...}.  Cambiamos a modo
                 // multi-token y procesamos TODO el string entero en una
                 // pasada, depositando los tokens en string_emit_queue_.
                 // Devolvemos el primer token (ISTR_BEGIN); las siguientes
@@ -899,9 +905,10 @@ namespace vex {
                             // consumimos despues.  Solucion mas simple:
                             // lex_string emite ahora a una cola TEMPORAL.
                             //
-                            // Para A.16 MVP: NO permitir strings anidados
-                            // dentro de ${...}.  El usuario puede assignar
-                            // a una variable y interpolar la variable.
+                            // Limitacion actual: NO permitimos strings con
+                            // su propia interpolacion anidados dentro de
+                            // @c ${...}.  El usuario debe extraer el string
+                            // a una variable y luego interpolar la variable.
                             inner = lex_string(false);
                         } else if (ic == '\'') {
                             inner = lex_char();
@@ -1147,7 +1154,13 @@ namespace vex {
             case ',':  return emit(TokenKind::COMMA,     1);
             case ';':  return emit(TokenKind::SEMICOLON, 1);
             case ':':  return emit(TokenKind::COLON,     1);
-            case '.':  return emit(TokenKind::DOT,       1);
+            case '.':
+                /* A.39: `..` y `..=` para rangos en comptime for. */
+                if (peek_char(1) == '.' && peek_char(2) == '=') {
+                    return emit(TokenKind::DOTDOTEQ, 3);
+                }
+                if (peek_char(1) == '.') return emit(TokenKind::DOTDOT, 2);
+                return emit(TokenKind::DOT, 1);
             case '?':  return emit(TokenKind::QUESTION,  1);
             case '@':  return emit(TokenKind::AT,        1);
             default:
@@ -1175,9 +1188,9 @@ namespace vex {
      * recursividad accidental entre los caches y la lectura cruda.
      */
     Token Lexer::lex_one_raw() {
-        // A.2/A.16 interpolacion: si lex_string emitio una cadena de tokens
-        // ISTR_* en una pasada anterior, drenar el buffer antes de tocar
-        // @c source_.  Cero overhead cuando esta vacio (caso comun).
+        // Interpolacion: si @c lex_string emitio una cadena de tokens
+        // @c ISTR_* en una pasada anterior, drenar el buffer antes de
+        // tocar @c source_.  Cero overhead cuando esta vacio (caso comun).
         if (!string_emit_queue_.empty()) {
             Token t = std::move(string_emit_queue_.front());
             string_emit_queue_.pop_front();

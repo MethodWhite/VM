@@ -1,0 +1,57 @@
+// Macros estilo Lisp con SPLICE/EMIT real al AST runtime.
+//
+// Diferencia con comptime_compile 
+//   comptime_compile("expr") -> evalua y devuelve un VALOR comptime.
+//                                 El codigo desaparece tras eval.
+//   comptime_emit_expr("code") -> parsea el string como AST Vex, lo
+//                                  type-checa en el contexto actual y
+//                                  emite codigo RUNTIME real.  Equivale
+//                                  al `unquote`/`splice` de Lisp/Scheme.
+//
+// Casos cubiertos:
+//   (1) Splice simple de expresion runtime.
+//   (2) Splice referenciando variables del scope actual.
+//   (3) Splice de codigo construido a partir de datos compile-time
+//       (typename, comptime_to_str).
+//   (4) Composicion: macros encadenados.
+
+i32 doblar(i32 x) { return x * 2; }
+i32 mas_uno(i32 x) { return x + 1; }
+
+i32 main() {
+    // (1) Splice simple: el string "10 + 5" -> AST `10 + 5` -> emite
+    // codigo runtime que computa 15.
+    i32 simple = comptime_emit_expr("10 + 5");
+    if (simple != 15) return 91;
+
+    // (2) Splice referenciando variables del scope.  La variable `n`
+    // existe en runtime; el codigo emitido la usa directamente porque
+    // el type checker resuelve los nombres en el scope actual.
+    i32 n = 20;
+    i32 con_var = comptime_emit_expr("doblar(n) + 1");
+    if (con_var != 41) return 92;
+
+    // (3) Construir el codigo a partir de un literal compile-time.
+    // Tan flexible como un macro real: el string puede venir de
+    // typename<T>, comptime_to_str, etc.
+    comptime const string code = comptime_concat("doblar(",
+                                    comptime_concat(comptime_to_str(7), ")"));
+    i32 derivado = comptime_emit_expr(code);   // doblar(7) = 14
+    if (derivado != 14) return 93;
+
+    // (4) Composicion: codigo del macro #1 envuelto en otra llamada.
+    comptime const string inner = "doblar(8)";
+    comptime const string outer = comptime_concat("mas_uno(",
+                                     comptime_concat(inner, ")"));
+    i32 anidado = comptime_emit_expr(outer);   // mas_uno(doblar(8)) = 17
+    if (anidado != 17) return 94;
+
+    // (5) Mix de runtime y compile-time: el codigo usa `n` runtime
+    // PERO incluye una constante derivada por el macro al compile.
+    comptime const string lit_5 = comptime_to_str(5);
+    comptime const string code5 = comptime_concat("n + ", lit_5);
+    i32 mix = comptime_emit_expr(code5);  // n + 5 = 25
+    if (mix != 25) return 95;
+
+    return 42;
+}

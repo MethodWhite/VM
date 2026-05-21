@@ -1,0 +1,109 @@
+// Demo de FFI en tiempo de compilacion: macros que invocan funciones
+// nativas (DLLs del sistema + virtual lib `vesta_comptime` registrada
+// in-process) durante la compilacion y embeben el resultado como literal
+// en el bytecode final.  Cero llamadas FFI en runtime.
+//
+// Componentes demostrados:
+//   1. extern "<lib>" { fn ... }  -- declarar funciones nativas.
+//   2. Llamada a kernel32!GetCurrentProcessId / GetTickCount en compile
+//      time desde un @Macro -> resultado embebido como constante.
+//   3. Mezcla aritmetica sobre los valores obtenidos -> macro genera
+//      una "huella" distinta por cada compilacion sin tocar runtime.
+//   4. Tipos como first-class: el macro M_build_info construye una
+//      cadena de constantes (PID, tick, hash) en compile time y la
+//      retorna como literal de codigo Vex.
+//
+// Pipeline al compilar:
+//   - El AST evaluator de macros detecta `GetCurrentProcessId()` como
+//     extern -> hace LoadLibraryA("kernel32.dll") + GetProcAddress +
+//     invoca la funcion en el proceso del COMPILADOR.
+//   - El valor retornado se trata como ComptimeValue u64.
+//   - El macro hace aritmetica con esos valores + genera un string que
+//     representa codigo Vex valido (literales numericos).
+//   - El compilador re-parsea la salida del macro y la inyecta en el AST.
+//
+// Resultado final: el .velb contiene literales que son funcion del PID
+// + tick count del MOMENTO de la compilacion.
+
+// Funciones de Win32 declaradas como extern.  Estas declaraciones son
+// validas tanto para runtime (lowering a CALLN) como para compile-time
+// (FFI dispatch desde el AST evaluator de macros).
+extern "kernel32.dll" {
+    fn GetCurrentProcessId() -> u32;
+    fn GetTickCount() -> u32;
+}
+
+// Macro 1: huella de build basada en el PID del compilador.
+//   compilar 2 veces -> dos build_id distintos.
+@Macro
+comptime string build_id() {
+    u64 pid = GetCurrentProcessId();
+    u64 tick = GetTickCount();
+    // Mezcla simple: rotacion + xor.  El resultado es deterministico
+    // dado (pid, tick) pero distinto en cada invocacion del compilador.
+    u64 mix = (pid * 31) ^ (tick * 17);
+    return to_str(mix);
+}
+
+// Macro 2: emite el PID literal del compilador.  Util para diagnostico:
+// el binario "sabe" en que proceso fue compilado.
+@Macro
+comptime string compiler_pid() {
+    return to_str(GetCurrentProcessId());
+}
+
+// Macro 3: usa el tick count del compilador como semilla y emite la
+// suma de N pasos de un LCG simple.  Util como check rapido de que la
+// FFI tiene salida no-trivial (un single GetTickCount podria
+// confundirse con un literal pero el LCG con N iteraciones depende
+// del seed inicial de forma no obvia).
+@Macro
+comptime string lcg_sum(i64 count) {
+    u64 seed = GetTickCount();
+    u64 acc = 0;
+    i64 i = 0;
+    while (i < count) {
+        // LCG clasico (glibc): seed = seed * 1103515245 + 12345
+        seed = seed * 1103515245 + 12345;
+        acc = acc + seed;
+        i = i + 1;
+    }
+    return to_str(acc);
+}
+
+// Macro 4: combina FFI + introspeccion via virtual lib `vesta_comptime`.
+// `comptime_type_sizeof` esta registrada in-process como virtual fn
+// (MC.23) -- el AST evaluator la invoca sin necesidad de DLL externa.
+@Macro
+comptime string size_of_u64() {
+    // Llamada implicit a la virtual fn registrada bajo "vesta_comptime"
+    // -- no se requiere `extern "vesta_comptime"` porque MC.20 detecta
+    // automaticamente los nombres registrados.
+    u64 sz = comptime_type_sizeof("u64");
+    return to_str(sz);
+}
+
+i32 main() {
+    // build_id() se evalua en compile time -> literal entero unico.
+    u64 fingerprint = build_id();
+
+    // compiler_pid() = PID del proceso `vm.exe` que compilo este .vex.
+    u64 pid_at_compile = compiler_pid();
+
+    // LCG sum hardcoded en compile time -- valor unico por compilacion.
+    u64 lcg_acc = lcg_sum(4);
+
+    // size_of_u64() = 8, evaluado en compile time via virtual fn.
+    u64 expected_8 = size_of_u64();
+
+    if (expected_8 != 8) return 91;
+
+    // El fingerprint NUNCA es exactamente 0 (probabilidad astronomica).
+    if (fingerprint == 0) return 92;
+    if (pid_at_compile == 0) return 93;
+
+    // El LCG con seed != 0 produce un acumulador no-cero.
+    if (lcg_acc == 0) return 94;
+
+    return 42;
+}

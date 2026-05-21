@@ -77,7 +77,7 @@ static uint64_t next_pow2(uint64_t n) {
     return n + 1;
 }
 
-/* fnv1a_u64 eliminado en A.25: el HashMap usa wyhash64 (1 mul128 + 1 xor)
+/* fnv1a_u64 fue eliminado: el HashMap usa wyhash64 (1 mul128 + 1 xor)
    que es 8x mas rapido que el FNV-1a byte-a-byte (8 muls + 8 xors).  Si
    alguna otra parte futura del plugin necesita FNV-1a, restaurar aqui. */
 
@@ -382,7 +382,7 @@ VESTA_PLUGIN_EXPORT void vcol_alist_sort(uint64_t handle) {
 /* =========================================================================
  * VestaHashMap -- swisstable-style con SSE2 + wyhash64
  *
- * Reescrito en A.25 con design hardware-aware:
+ * Diseno hardware-aware:
  *   - Hash: wyhash64 (1 mul128 + 1 xor) en lugar de FNV-1a (8 muls).
  *   - Layout: grupos de 16 slots con control bytes adyacentes (~4 cache lines
  *     por grupo).  Un control byte por slot encodea: 0x80=empty, 0xFE=deleted,

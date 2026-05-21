@@ -297,6 +297,28 @@ namespace jit {
             mc_opts.register_alloc_addr = reinterpret_cast<uint64_t>(
                 &vrt_register_alloc);
         }
+        /* Offset de exc_frame_stack + exc_free_list para inline tryleave
+         * (7 instr x86-64 vs ~20-30 de vrt_tryleave call) sin leak. */
+        {
+            const int64_t exc_off =
+                reinterpret_cast<int64_t>(&proc_for_read->exc_frame_stack)
+                - reinterpret_cast<int64_t>(proc_for_read);
+            const int64_t free_off =
+                reinterpret_cast<int64_t>(&proc_for_read->exc_free_list)
+                - reinterpret_cast<int64_t>(proc_for_read);
+            if (exc_off >= INT32_MIN && exc_off <= INT32_MAX) {
+                mc_opts.exc_frame_stack_offset = static_cast<int32_t>(exc_off);
+            }
+            if (free_off >= INT32_MIN && free_off <= INT32_MAX) {
+                mc_opts.exc_free_list_offset = static_cast<int32_t>(free_off);
+            }
+        }
+        /* Direccion absoluta del contador MIPS para JIT.  El proc tiene
+         * referencia al scheduler estable durante su vida; su counter
+         * vive en una addr fija.  Embebemos directo como imm64 en el
+         * codigo emitido. */
+        mc_opts.jit_instr_counter_addr =
+            reinterpret_cast<uint64_t>(&proc_for_read->scheduler.profiler_jit_instr_counter);
         /* Resolver user-fns: para evitar recursion arbitraria con cycles,
          * usamos cache global g_eager_cache + resolver simple no-recursive
          * (intenta lookup en cache; si no, intenta eager compile de la
@@ -310,7 +332,10 @@ namespace jit {
             const int32_t nb_off_mc = mc_opts.nursery_bump_offset;
             const int32_t ne_off_mc = mc_opts.nursery_end_offset;
             const uint64_t reg_alloc_mc = mc_opts.register_alloc_addr;
-            mc_opts.resolve_user_fn = [lk_ptr, fn_ptr, st_ptr2, native_resolver, ic_reserver_mc, vmem_reader_mc, nb_off_mc, ne_off_mc, reg_alloc_mc](const std::string &n) -> uint64_t {
+            const int32_t exc_off_mc = mc_opts.exc_frame_stack_offset;
+            const int32_t exc_free_off_mc = mc_opts.exc_free_list_offset;
+            const uint64_t jit_counter_mc = mc_opts.jit_instr_counter_addr;
+            mc_opts.resolve_user_fn = [lk_ptr, fn_ptr, st_ptr2, native_resolver, ic_reserver_mc, vmem_reader_mc, nb_off_mc, ne_off_mc, reg_alloc_mc, exc_off_mc, exc_free_off_mc, jit_counter_mc](const std::string &n) -> uint64_t {
                 auto cit = g_eager_cache.find(n);
                 if (cit != g_eager_cache.end()) {
                     if (cit->second == EAGER_IN_PROGRESS) return 0;
@@ -341,6 +366,9 @@ namespace jit {
                 child_opts.nursery_bump_offset = nb_off_mc;
                 child_opts.nursery_end_offset  = ne_off_mc;
                 child_opts.register_alloc_addr = reg_alloc_mc;
+                child_opts.exc_frame_stack_offset = exc_off_mc;
+                child_opts.exc_free_list_offset = exc_free_off_mc;
+                child_opts.jit_instr_counter_addr = jit_counter_mc;
                 CompileResult cres = g_compiler->compile_with_opts(child_ir, child_opts);
                 const uint64_t addr = cres.fn ? reinterpret_cast<uint64_t>(cres.fn) : 0;
                 g_eager_cache[n] = addr;
@@ -410,7 +438,10 @@ namespace jit {
         const std::vector<ir::IrFunction> *ir_functions,
         const std::unordered_map<std::string, uint64_t> *symbol_table,
         std::function<uint64_t(const std::string &)> resolve_native_fn,
-        std::function<uint64_t(uint64_t)> read_vmem_u64) {
+        std::function<uint64_t(uint64_t)> read_vmem_u64,
+        int32_t exc_frame_stack_offset,
+        int32_t exc_free_list_offset,
+        uint64_t jit_instr_counter_addr) {
         /* Init lazy de threshold desde env (1 vez por proceso). */
         std::call_once(g_env_init_flag, init_threshold_from_env);
 
@@ -476,7 +507,7 @@ namespace jit {
                 if (slot) std::memset(slot, 0, 16);
                 return reinterpret_cast<uint64_t>(slot);
             };
-            *resolver_holder = [lookup_ptr, funcs_ptr, resolver_holder, sym_resolver, resolve_native_fn, ic_reserver, read_vmem_u64]
+            *resolver_holder = [lookup_ptr, funcs_ptr, resolver_holder, sym_resolver, resolve_native_fn, ic_reserver, read_vmem_u64, exc_frame_stack_offset, exc_free_list_offset, jit_instr_counter_addr]
                                (const std::string &name) -> uint64_t {
                 /* Chequear cache primero. */
                 auto cit = g_eager_cache.find(name);
@@ -507,6 +538,9 @@ namespace jit {
                 opts.resolve_native_fn = resolve_native_fn;  /* propagar CALLN resolver */
                 opts.reserve_ic_slot = ic_reserver;          /* IC slots */
                 opts.read_vmem_u64 = read_vmem_u64;          /* Phase D.7.opt inline */
+                opts.exc_frame_stack_offset = exc_frame_stack_offset; /* inline tryleave */
+                opts.exc_free_list_offset = exc_free_list_offset;     /* no leak */
+                opts.jit_instr_counter_addr = jit_instr_counter_addr; /* MIPS counter */
                 CompileResult cres = g_compiler->compile_with_opts(child_ir, opts);
                 const uint64_t addr = cres.fn ? reinterpret_cast<uint64_t>(cres.fn) : 0;
                 g_eager_cache[name] = addr;
@@ -539,6 +573,9 @@ namespace jit {
         top_opts.resolve_symbol  = sym_resolver;
         top_opts.resolve_native_fn = resolve_native_fn;
         top_opts.read_vmem_u64 = read_vmem_u64;
+        top_opts.exc_frame_stack_offset = exc_frame_stack_offset;
+        top_opts.exc_free_list_offset = exc_free_list_offset;
+        top_opts.jit_instr_counter_addr = jit_instr_counter_addr;
         {
             CodeCache *cc_top = g_code_cache;
             top_opts.reserve_ic_slot = [cc_top]() -> uint64_t {

@@ -71,7 +71,7 @@ namespace vm {
         // offset uint32 en bytes 4-7 (byte3 es padding reservado).  FIXED_8.
         {"getstatic", {"getstatic", OpArity::THREE}},
         {"setstatic", {"setstatic", OpArity::THREE}},
-        // A.24 - FFI runtime dinamico:
+        // FFI runtime dinamico (decision en runtime de que DLL y simbolo):
         //   dlopen r_dst, r_path_addr, r_path_len
         //   dlsym  r_dst, r_handle, r_name_addr, r_name_len
         //   callni r_fn        (argc en R15, args en R01..R12)
@@ -287,17 +287,19 @@ namespace vm {
         {"yield",   {"yield",   OpArity::ZERO}},
         {"resume",  {"resume",  OpArity::ONE}},
         {"spawn",   {"spawn",   OpArity::ONE}},
-        // A.7.2.5-rev2 ext: spawnon r_fn, r_hint -- spawn con scheduler hint.
-        // r_hint: -1 (signed) = Here (mismo scheduler que el padre);
-        // 0..N-1 = Pinned al scheduler indicado (modulo num_schedulers).
+        // spawnon r_fn, r_hint -- spawn con scheduler hint.  r_hint: -1
+        // (signed) = Here (mismo scheduler que el padre, ruta cooperativa
+        // sin cruzar threads OS); 0..N-1 = Pinned al scheduler indicado
+        // (modulo num_schedulers, paralelismo real OS-thread).
         {"spawnon", {"spawnon", OpArity::TWO}},
-        // A.9: loadmod r_path_addr, r_path_len -- carga dinamica de un .velb;
-        // r0 = init_pc del modulo cargado (>0) o 0 si failure.
+        // loadmod r_path_addr, r_path_len -- carga dinamica de un .velb
+        // adicional desde el filesystem.  r0 = init_pc del modulo cargado
+        // (>0) o 0 si fallo la carga.  Usado para hot-reload y plugins.
         {"loadmod", {"loadmod", OpArity::TWO}},
-        // A.17.x: panic r_msg_addr, r_msg_len -- lanza FatalError con
+        // panic r_msg_addr, r_msg_len -- lanza FatalError con
         // kind=FATAL_USER_ABORT.  Capturable con try/catch FatalError.
         {"panic",   {"panic",   OpArity::TWO}},
-        // A.17.y: setmethdbg r_method, r_params -- registra debug info
+        // setmethdbg r_method, r_params -- registra debug info
         // (file + start_line) para un MethodInfo en la tabla global.
         {"setmethdbg", {"setmethdbg", OpArity::TWO}},
         {"swapctx", {"swapctx", OpArity::TWO}},

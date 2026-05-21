@@ -1059,7 +1059,11 @@ namespace runtime {
         );
 
         decode_tmp.metadata    = &metadata;       // enlazar metadatos al temporal de descodificacion
-        decode_tmp.exec_cached = metadata.exec;   // A.7.2.5-rev3 perf: cachear exec ptr para hot path
+        // Cachear el puntero a la exec_fn al lado del decoded instr.  El
+        // scheduler en su inner loop usa `d->exec_cached(...)` directo en
+        // vez de `d->metadata->exec(...)` (doble indireccion); ahorra un
+        // potencial cache miss por instruccion VM ejecutada.
+        decode_tmp.exec_cached = metadata.exec;
 
         // llamar al metodo especializado de descodificacion de la instruccion
         metadata.decode(process, decode_tmp);

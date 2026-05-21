@@ -33,6 +33,7 @@
 #include "cli/runtime_api_commands.h"
 #include "util/assembler_multiprocess.h"
 #include "vex/compiler.h"
+#include "vex/comptime_vm.h"   /* Phase MC.4 probe del ComptimeRuntime */
 #include "util/sqlite_singleton.h"
 #include "util/fs_utils.h"
 #include "runtime/manager_runtime.h"
@@ -43,7 +44,14 @@
 #include "distrib/dist_debug.h"
 #include "distrib/node_registry.h"
 #include "debug/debugger.h"
+#include "debug/auth.h"
 #include "install/install.h"
+
+#include <filesystem>
+#include <map>     // Phase MC.16: per-macro manifest map
+#include <set>     // Phase MC.16: manifest diff seen-set
+#include <cctype>  // Phase MC.16: isalnum en find_macro_ranges_with_names
+#include <openssl/rand.h>
 
 #ifdef VESTA_HAS_PREPROCESSOR
     #include "preprocessor/preprocessor.h"
@@ -270,6 +278,18 @@ int main(int argc, char *argv[]) {
             ("gc-debug-buffered","Activar modo BUFFERED del GC debug: ~100x mas rapido (buffer thread-local de 64KB) pero pierde las ultimas trazas en crash. Implica --gc-debug. Alt: env VESTA_GC_DEBUG_BUFFERED=1.")
             ("debug-port",      "Activar el servidor de depuracion TCP en el puerto N (default 9229 si N=0). Soporta multiples clientes simultaneos y JSON via length-prefix framing. El servidor permanece disponible mientras la VM ejecuta; los clientes (e.g. tools/dbg_client.vsh) se conectan via tcp_connect, envian comandos JSON y reciben eventos asincronos (break/exit/exception/spawned). Sin este flag, el debugger NO se instancia y el coste runtime es exactamente cero. Cuando esta presente, el proceso main arranca PAUSADO en su primera instruccion para dar tiempo al cliente a conectarse y poner breakpoints; el cliente debe enviar 'continue 0' para arrancar la ejecucion.",
                 cxxopts::value<uint16_t>()->default_value("0"))
+            ("server-mode",     "Iniciar la VM como un servidor persistente de depuracion. Implica --debug-port (default 9229). No requiere --run: la VM se queda viva esperando comandos del debugger para cargar/ejecutar/matar procesos remotamente. Compatible con --schedulers, --dist-port, etc. Termina con SIGINT (Ctrl+C) o con el comando 'server_shutdown' del cliente. Comandos disponibles: load_velb, load_velb_bytes, kill_proc, server_info, server_shutdown, auth_login/logout/whoami, auth_create_user/delete_user/list_users/change_pass, fs_read/write/list/stat/delete/mkdir/rename.")
+            ("server-port",     "Puerto del servidor persistente (sinonimo de --debug-port en modo --server-mode). Default 9229.",
+                cxxopts::value<uint16_t>()->default_value("0"))
+            ("server-root",     "Directorio raiz del sandbox de filesystem en modo --server-mode. Todas las rutas usadas por fs_* y load_velb se resuelven contra este directorio; cualquier intento de salir (con '..' o rutas absolutas) se rechaza. Sin este flag NO hay sandbox (modo back-compat: cualquier ruta absoluta del servidor es accesible). Recomendado en despliegues compartidos.",
+                cxxopts::value<std::string>()->default_value(""))
+            ("auth-db",         "Ruta al fichero SQLite con la tabla vm_users (usuarios, hashes PBKDF2 y roles) en modo --server-mode. Sin este flag la autenticacion esta desactivada y cualquier cliente puede invocar cualquier comando (modo desarrollo).",
+                cxxopts::value<std::string>()->default_value(""))
+            ("admin-user",      "Nombre del usuario admin a crear automaticamente cuando la base de datos --auth-db esta vacia. Default 'admin'.",
+                cxxopts::value<std::string>()->default_value("admin"))
+            ("admin-password",  "Contrasenya del usuario admin a crear automaticamente. Si se omite y --auth-db apunta a una BD vacia, se genera una contrasenya aleatoria de 24 caracteres y se imprime en stdout UNA UNICA VEZ.",
+                cxxopts::value<std::string>()->default_value(""))
+            ("no-repl",         "Desactivar el REPL interactivo local en modo --server-mode (modo headless). Sin este flag, el operador local mantiene un prompt vesta> que comparte el mismo runtime con los clientes remotos; con el, el proceso solo escucha el socket TCP.")
             ("vex-debug",       "Emitir comentarios `// @line N` en el .vel intermedio del compilador Vex y, cuando se integre la pipeline completa de debug section (Phase 2), embeber la tabla bytecode_offset -> (file, line) en el .velb final.  Sin este flag, el .vel/.velb no contienen info de debug -> el ejecutable es mas pequeno y el frontend NO genera datos extra.  Con el flag, el cliente del debugger puede setear breakpoints por linea Vex (`b file.vex:42`) en lugar de solo por addr.")
             ("port",            "Transpilar el IR a codigo fuente del lenguaje destino y escribir a <output>.<ext> (e.g. .c).  Valores actuales: 'c'.  Futuro: 'java', 'js', 'rust'.  Con --port=c se genera codigo C99 portable listo para compilar con gcc/clang -O3 -std=c11 SIN dependencias de VestaVM (a menos que --port-gc=vesta).  Implica --vex (se aplica al pipeline Vex post-optimizacion).",
                 cxxopts::value<std::string>())
@@ -293,6 +313,7 @@ int main(int argc, char *argv[]) {
             ("preprocess-only", "Solo preprocesar un .vel y mostrar/guardar el resultado (debug)", cxxopts::value<std::string>())
 #endif
             ("keep-labels", "Mantener los nombres de label en el .velb (por defecto se eliminan: el loader no los usa y reducen ~9% el tamano)")
+            ("emit-map", "Generar archivo .velb-map con info de simbolos y secciones (debug). Off por defecto: cuesta ~60% del tiempo del linker")
             ;
 
 
@@ -498,6 +519,246 @@ int main(int argc, char *argv[]) {
         return EXIT_SUCCESS;
     }
 
+    // -----------------------------------------------------------------------
+    // Modo servidor persistente de depuracion (sin ejecutar un .velb inicial).
+    //
+    // vm.exe --server-mode [--server-port N | --debug-port N] [--schedulers M]
+    //        [--dist-port ...] [--vex-debug]
+    //
+    // La VM se queda viva indefinidamente atendiendo comandos del debugger
+    // (load_velb, kill_proc, server_info, server_shutdown, etc.).  Los
+    // clientes (tools/dbg_client.vsh o el IDE Electron) pueden conectarse,
+    // cargar .velb desde el filesystem de la VM, lanzarlos como procesos y
+    // gestionarlos via los comandos normales del protocolo de depuracion.
+    //
+    // Termina con SIGINT (Ctrl+C) o con el comando server_shutdown del cliente.
+    // -----------------------------------------------------------------------
+    if (result.count("server-mode")) {
+        try {
+            size_t num_schedulers = result["schedulers"].as<size_t>();
+            runtime::ManageVM mgr(nullptr, 0);
+            runtime::VM *vm = mgr.loader.create_vm_instance(num_schedulers);
+            if (!vm) {
+                std::cerr << "[server-mode] Error: no se pudo crear la instancia VM\n";
+                return EXIT_FAILURE;
+            }
+
+            // Aplicar configuracion distribuida si el usuario paso flags --dist-*
+            bool has_dist = result.count("dist-port")     > 0 ||
+                            result.count("dist-discover") > 0 ||
+                            result.count("dist-add-node") > 0 ||
+                            result.count("dist-tls")      > 0 ||
+                            result.count("dist-name")     > 0 ||
+                            result.count("dist-token")    > 0 ||
+                            result.count("dist-node-id")  > 0;
+            if (has_dist) apply_dist_config(vm, result);
+
+            // Resolver puerto: --server-port > --debug-port > default 9229
+            uint16_t srv_port = 0;
+            if (result.count("server-port"))
+                srv_port = result["server-port"].as<uint16_t>();
+            if (srv_port == 0 && result.count("debug-port"))
+                srv_port = result["debug-port"].as<uint16_t>();
+            if (srv_port == 0) srv_port = debug::DBG_DEFAULT_PORT;
+
+            // Configuracion del sandbox de filesystem.
+            std::string srv_root = result["server-root"].as<std::string>();
+            if (!srv_root.empty()) {
+                std::error_code rec;
+                std::filesystem::create_directories(srv_root, rec);
+            }
+
+            // Configuracion del AuthManager.
+            std::string auth_db = result["auth-db"].as<std::string>();
+            bool auth_enabled = !auth_db.empty();
+            if (auth_enabled) {
+                if (!debug::AuthManager::instance().init(auth_db)) {
+                    std::cerr << "[server-mode] Error: "
+                              << debug::AuthManager::instance().last_init_error()
+                              << "\n";
+                    std::cerr << "[server-mode] Sugerencia: usa una ruta "
+                                 "absoluta a un directorio escribible, "
+                                 "p.ej. --auth-db \"C:\\Users\\TuUsuario\\"
+                                 "VestaVM\\users.db\".\n";
+                    return EXIT_FAILURE;
+                }
+                // Bootstrap del admin si la BD esta vacia.
+                if (!debug::AuthManager::instance().has_any_user()) {
+                    std::string admin_user = result["admin-user"].as<std::string>();
+                    std::string admin_pass = result["admin-password"].as<std::string>();
+                    if (admin_pass.empty()) {
+                        // Generar contrasenya aleatoria de 24 chars base64.
+                        uint8_t raw[18];
+                        if (RAND_bytes(raw, sizeof(raw)) != 1) {
+                            std::cerr << "[server-mode] Error: RAND_bytes "
+                                         "fallo al generar la contrasenya admin\n";
+                            return EXIT_FAILURE;
+                        }
+                        static const char *alphabet =
+                            "ABCDEFGHJKLMNPQRSTUVWXYZ"
+                            "abcdefghijkmnpqrstuvwxyz"
+                            "23456789";
+                        admin_pass.reserve(24);
+                        for (size_t i = 0; i < 24; ++i)
+                            admin_pass.push_back(alphabet[raw[i % 18] % 62]);
+                    }
+                    std::string e;
+                    if (!debug::AuthManager::instance().create_user(
+                            admin_user, admin_pass, debug::Role::ADMIN, &e)) {
+                        std::cerr << "[server-mode] Error: no se pudo crear "
+                                     "el admin: " << e << "\n";
+                        return EXIT_FAILURE;
+                    }
+                    vesta::scout() << "[server-mode] Usuario admin creado: '"
+                                   << admin_user << "'\n";
+                    vesta::scout() << "[server-mode] Contrasenya admin (SOLO se "
+                                      "muestra una vez): " << admin_pass << "\n";
+                }
+            }
+
+            // Arrancar el servidor de depuracion ANTES de iniciar la VM.
+            auto dbg = std::make_unique<debug::Debugger>(*vm);
+            dbg->set_server_root(srv_root);
+            dbg->set_auth_required(auth_enabled);
+            if (!dbg->start(srv_port)) {
+                std::cerr << "[server-mode] Error: no se pudo iniciar el "
+                             "servidor de depuracion en puerto " << srv_port
+                          << "\n";
+                return EXIT_FAILURE;
+            }
+            vm->debugger = dbg.get();
+            // NO activamos `sched->has_hooks=true` aqui: el debugger lo
+            // hara automaticamente via @c refresh_scheduler_hooks cuando
+            // el primer breakpoint / step / watch llegue.  Si no hay
+            // depuracion activa, los schedulers se quedan en el fast
+            // path threaded computed-goto y el coste runtime es 0%.
+
+            // Modo persistente: el scheduler espera nuevos procesos en
+            // lugar de terminar al quedarse sin trabajo.  Cuando un cliente
+            // hace load_velb, el proceso resultante entra en READY y el
+            // scheduler lo recoge sin necesidad de reiniciar nada.
+            vm->vm_persistent = true;
+            vm->start();
+
+            vesta::scout() << "[server-mode] VM persistente activa.\n";
+            vesta::scout() << "[server-mode] Debugger TCP escuchando en "
+                              "puerto " << srv_port << ".\n";
+            vesta::scout() << "[server-mode] Schedulers: " << num_schedulers
+                           << ".\n";
+            if (!srv_root.empty()) {
+                vesta::scout() << "[server-mode] Sandbox de filesystem: "
+                               << srv_root << "\n";
+            } else {
+                vesta::scout() << "[server-mode] Sin sandbox de filesystem "
+                                  "(use --server-root para restringir).\n";
+            }
+            if (auth_enabled) {
+                vesta::scout() << "[server-mode] Auth: ACTIVO (BD: "
+                               << auth_db << ").  Los clientes deben "
+                                  "invocar auth_login.\n";
+            } else {
+                vesta::scout() << "[server-mode] Auth: DESACTIVADO (modo "
+                                  "desarrollo; use --auth-db <ruta> para "
+                                  "exigir login).\n";
+            }
+            // Conectar el flag global con el debugger para que el comando
+            // server_shutdown remoto lo pueda mover.
+            std::signal(SIGINT, on_dist_sigint);
+            debug::set_server_shutdown_flag(&g_server_running);
+
+            bool no_repl = result.count("no-repl") > 0;
+            if (no_repl) {
+                // -- Modo headless (sin REPL local) --
+                vesta::scout() << "[server-mode] Pulse Ctrl+C o envie "
+                                  "'server_shutdown' para detener.\n";
+                while (g_server_running.load())
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            } else {
+                // -- REPL local compartiendo runtime con clientes remotos --
+                //
+                // El REPL (VestaViewManager) corre en ESTE thread porque
+                // posee stdin (readline necesita TTY).  Un thread watcher
+                // observa g_server_running: si el flag pasa a false desde
+                // fuera (SIGINT o server_shutdown remoto), invoca
+                // VestaViewManager::stop() para cerrar el bucle del REPL
+                // -- pero como readline bloquea en stdin, el operador
+                // debera pulsar Enter UNA vez para liberarlo.  Se imprime
+                // un mensaje para que sepa que hacer.
+                //
+                // Cuando el operador local teclea 'exit' o EOF en el
+                // REPL, vm.run() retorna; pasamos g_server_running a
+                // false aqui mismo para que el watcher salga.
+                vesta::scout() << "[server-mode] REPL local activo "
+                                  "(teclea 'exit' o pulsa Ctrl+D para "
+                                  "salir).  Tambien aceptamos "
+                                  "'server_shutdown' del cliente.\n";
+
+                cli::Config cfg_srv;
+                cfg_srv.history_file  = "my_vm_history.txt";
+                cfg_srv.history_max   = 1000;
+                cfg_srv.prompt        = "vesta(server)> ";
+                cfg_srv.multiline_end = ";;";
+
+                cli::VestaViewManager view_mgr(cfg_srv);
+                view_mgr.set_execute_callback([](const std::string &cmd) {
+                    // mismo comportamiento del REPL normal: ejecucion
+                    // asincrona via run_command_async; cuando el future
+                    // resuelve, se imprime el output.
+                    auto fut = runtime::run_command_async(cmd);
+                    std::thread([f = std::move(fut)]() mutable {
+                        try {
+                            auto out = f.get();
+                            if (!out.empty())
+                                vesta::scout() << out << std::endl;
+                        } catch (const std::exception &e) {
+                            std::cerr << "Runtime error: " << e.what()
+                                      << std::endl;
+                        }
+                    }).detach();
+                });
+
+                std::atomic<bool> watcher_done{false};
+                std::thread watcher([&]() {
+                    while (g_server_running.load() && !watcher_done.load())
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(100));
+                    if (watcher_done.load()) return;
+                    // shutdown remoto / SIGINT: detener el REPL.  El
+                    // readline poll-loop chequea I.running cada ~50 ms,
+                    // asi que view_mgr.stop() liberara el prompt en
+                    // ~50 ms sin requerir entrada del operador.
+                    vesta::scout()
+                        << "\n[server-mode] Apagado recibido; "
+                           "cerrando REPL local.\n";
+                    view_mgr.stop();
+                });
+
+                // Bucle del REPL (bloqueante en stdin).
+                view_mgr.run();
+
+                // El REPL salio (exit/EOF) o fue parado por el watcher;
+                // marcar global y joinar el thread.
+                g_server_running.store(false);
+                watcher_done.store(true);
+                if (watcher.joinable()) watcher.join();
+            }
+
+            vesta::scout() << "[server-mode] Senial de parada recibida; "
+                              "deteniendo VM...\n";
+            if (vm->dist_runtime) vm->dist_runtime->stop();
+            dbg->stop();
+            // Desconectar el hook ANTES de destruir la VM para que un
+            // comando server_shutdown tardio no escriba a memoria liberada.
+            debug::set_server_shutdown_flag(nullptr);
+            vm->stop();
+            vesta::scout() << "[server-mode] Servidor detenido.\n";
+        } catch (const std::exception &e) {
+            std::cerr << "[server-mode] Error: " << e.what() << "\n";
+            return EXIT_FAILURE;
+        }
+        return EXIT_SUCCESS;
+    }
+
     if (result.count("install") ||
         result.count("uninstall") ||
         result.count("repair"))
@@ -527,7 +788,9 @@ int main(int argc, char *argv[]) {
             result["worker"].as<std::string>(),
             out_prefix,
             /*skip_preprocessor=*/false,
-            /*keep_labels=*/(result.count("keep-labels") > 0)
+            /*keep_labels=*/(result.count("keep-labels") > 0),
+            /*ir_section_bytes=*/nullptr,
+            /*emit_map=*/(result.count("emit-map") > 0)
         );
     }
 
@@ -621,7 +884,9 @@ int main(int argc, char *argv[]) {
         return asm_multi_process::run_worker(
             vel_path, out_prefix,
             /*skip_preprocessor=*/false,
-            /*keep_labels=*/(result.count("keep-labels") > 0));
+            /*keep_labels=*/(result.count("keep-labels") > 0),
+            /*ir_section_bytes=*/nullptr,
+            /*emit_map=*/(result.count("emit-map") > 0));
     }
 
     // Compilar un archivo .vex (lenguaje Vex) a .velb.
@@ -820,14 +1085,457 @@ int main(int argc, char *argv[]) {
             copts.port_options.source_path = vex_path;
         }
 
+        /* === Phase MC.12: cache persistente para @Macros ===
+         *
+         * Cache dir: `./.cache/vex/` (cwd-relative).  Key = FNV-1a 64
+         * sobre (cache_format_version + vex_path + vex_source).  File =
+         * `.cache/vex/<hex_key>.velb`.
+         *
+         * Flow:
+         *   1. Compute key.
+         *   2. Si el cache hit existe, setear @c VESTA_MC_PREBUILT antes
+         *      de la primera invocacion de @c compile_vex_source.  Una
+         *      sola compilacion + VM eval directo.
+         *   3. Si miss + el modulo tiene @Macros, ejecutar pase 1 (AST
+         *      eval), persistir el .velb resultante al cache_path, luego
+         *      pase 2 con @c VESTA_MC_PREBUILT seteado.  Dos compiles
+         *      en frio.  Las siguientes corridas son cache-hit -> 1 compile.
+         *
+         * Cache invalidation: implicita.  Cualquier cambio en el byte
+         * stream del fuente (incluso un comentario o whitespace) genera
+         * un key distinto y por tanto miss.  Sin sweeper automatico --
+         * el usuario puede borrar `.cache/vex/` para limpiar manualmente.
+         */
+        const uint8_t cache_format_version = 2;   /* Bump por MC.14 macro-scoped key */
+
+        /* Phase MC.14: macro-scoped cache key.  Hashea SOLO los rangos
+         * source que contienen declaraciones `@Macro` (incluyendo
+         * anotaciones precedentes como @Pure/@Inline).  Cambios en
+         * codigo NO-macro (main, helpers no marcados, comentarios
+         * fuera de macros) NO invalidan el cache.
+         *
+         * Implementacion text-scan: detecta `@Macro`, scanea atras al
+         * inicio de linea + lineas de anotacion previas, scanea adelante
+         * a la llave de cierre balanceada (saltando strings y comentarios
+         * line-style).  Heuristica suficiente para 99% de codigo Vex
+         * estandar.  Edge cases (comentarios de bloque con `@Macro`
+         * dentro, etc.) producen cache miss falso pero no incorrectness.
+         *
+         * Si NO hay @Macros en el fuente, fallback a hash full-source
+         * (el cache no se usa en ese caso de todos modos). */
+        const auto find_macro_ranges =
+            [](const std::string &src) -> std::vector<std::pair<size_t, size_t>> {
+            std::vector<std::pair<size_t, size_t>> ranges;
+            size_t pos = 0;
+            while ((pos = src.find("@Macro", pos)) != std::string::npos) {
+                /* Skip si @Macro aparece dentro de un literal o comentario.
+                 * Heuristica simple: si los 2 chars previos son "//" o "/ *",
+                 * salta.  Mejorable; v1 acepta falsos positivos. */
+                /* Scan back al inicio de linea + lineas de anotacion. */
+                size_t line_start = pos;
+                while (line_start > 0 && src[line_start - 1] != '\n') --line_start;
+                /* Incluir anotaciones precedentes (@Pure, @Inline, etc.) */
+                while (line_start > 0) {
+                    size_t prev_end = line_start - 1;
+                    if (prev_end == 0 || src[prev_end] != '\n') break;
+                    size_t prev_start = prev_end;
+                    while (prev_start > 0 && src[prev_start - 1] != '\n') --prev_start;
+                    size_t k = prev_start;
+                    while (k < prev_end && (src[k] == ' ' || src[k] == '\t')) ++k;
+                    if (k < prev_end && src[k] == '@') {
+                        line_start = prev_start;
+                    } else {
+                        break;
+                    }
+                }
+                /* Avanzar hasta llave de apertura del body. */
+                size_t bs = src.find('{', pos + 6);
+                if (bs == std::string::npos) break;
+                /* Scan balanced close, skipping strings/line-comments. */
+                int depth = 1;
+                size_t i = bs + 1;
+                while (i < src.size() && depth > 0) {
+                    char c = src[i];
+                    if (c == '"') {
+                        ++i;
+                        while (i < src.size() && src[i] != '"') {
+                            if (src[i] == '\\' && i + 1 < src.size()) ++i;
+                            ++i;
+                        }
+                        ++i;
+                        continue;
+                    }
+                    if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+                        while (i < src.size() && src[i] != '\n') ++i;
+                        continue;
+                    }
+                    if (c == '{') ++depth;
+                    else if (c == '}') --depth;
+                    ++i;
+                }
+                ranges.emplace_back(line_start, i);
+                pos = i;
+            }
+            return ranges;
+        };
+
+        /* Phase MC.16: per-macro manifest diagnostico.  Computa hash
+         * por macro y guarda un manifest junto al .velb cacheado.  En
+         * un cache miss, compara con el manifest anterior (si existe)
+         * para reportar QUE macros cambiaron.
+         *
+         * Foundational para true per-macro relink: cuando el linker
+         * soporte compilacion incremental, esta info dira que macros
+         * recompilar.  Por ahora solo diagnostico via VESTA_MC_VERBOSE. */
+        const auto find_macro_ranges_with_names =
+            [&](const std::string &src) ->
+            std::vector<std::tuple<std::string, size_t, size_t>> {
+            std::vector<std::tuple<std::string, size_t, size_t>> ranges;
+            size_t pos = 0;
+            while ((pos = src.find("@Macro", pos)) != std::string::npos) {
+                size_t line_start = pos;
+                while (line_start > 0 && src[line_start - 1] != '\n') --line_start;
+                while (line_start > 0) {
+                    size_t prev_end = line_start - 1;
+                    if (prev_end == 0 || src[prev_end] != '\n') break;
+                    size_t prev_start = prev_end;
+                    while (prev_start > 0 && src[prev_start - 1] != '\n') --prev_start;
+                    size_t k = prev_start;
+                    while (k < prev_end && (src[k] == ' ' || src[k] == '\t')) ++k;
+                    if (k < prev_end && src[k] == '@') {
+                        line_start = prev_start;
+                    } else {
+                        break;
+                    }
+                }
+                size_t bs = src.find('{', pos + 6);
+                if (bs == std::string::npos) break;
+                /* Extraer nombre: tras @Macro hay typically:
+                 *   @Macro\ncomptime string NAME(args) { ... }
+                 * El nombre es el identifier ANTES del '('. */
+                std::string macro_name;
+                {
+                    size_t paren = src.find('(', pos + 6);
+                    if (paren != std::string::npos && paren < bs) {
+                        size_t name_end = paren;
+                        while (name_end > pos + 6 &&
+                               (src[name_end - 1] == ' ' || src[name_end - 1] == '\t' || src[name_end - 1] == '\n')) {
+                            --name_end;
+                        }
+                        size_t name_start = name_end;
+                        while (name_start > pos + 6 &&
+                               (std::isalnum(static_cast<unsigned char>(src[name_start - 1])) ||
+                                src[name_start - 1] == '_')) {
+                            --name_start;
+                        }
+                        if (name_end > name_start) {
+                            macro_name = src.substr(name_start, name_end - name_start);
+                        }
+                    }
+                }
+                if (macro_name.empty()) macro_name = "<anon>";
+
+                int depth = 1;
+                size_t i = bs + 1;
+                while (i < src.size() && depth > 0) {
+                    char c = src[i];
+                    if (c == '"') {
+                        ++i;
+                        while (i < src.size() && src[i] != '"') {
+                            if (src[i] == '\\' && i + 1 < src.size()) ++i;
+                            ++i;
+                        }
+                        ++i;
+                        continue;
+                    }
+                    if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+                        while (i < src.size() && src[i] != '\n') ++i;
+                        continue;
+                    }
+                    if (c == '{') ++depth;
+                    else if (c == '}') --depth;
+                    ++i;
+                }
+                ranges.emplace_back(std::move(macro_name), line_start, i);
+                pos = i;
+            }
+            return ranges;
+        };
+
+        const uint64_t cache_key = [&]() -> uint64_t {
+            constexpr uint64_t FNV_OFFSET = 14695981039346656037ULL;
+            constexpr uint64_t FNV_PRIME  =     1099511628211ULL;
+            uint64_t h = FNV_OFFSET;
+            h ^= cache_format_version;
+            h *= FNV_PRIME;
+            for (char c : vex_path) {
+                h ^= static_cast<uint8_t>(c);
+                h *= FNV_PRIME;
+            }
+            h ^= 0xFFu;
+            h *= FNV_PRIME;
+            const auto ranges = find_macro_ranges(vex_source);
+            if (ranges.empty()) {
+                /* Sin macros: hash full-source.  El cache no se usa
+                 * (has_lowerable_macros=false impedira el populate),
+                 * pero un key estable previene colisiones si el usuario
+                 * compila el mismo path con/sin macros sobre el mismo
+                 * archivo. */
+                for (char c : vex_source) {
+                    h ^= static_cast<uint8_t>(c);
+                    h *= FNV_PRIME;
+                }
+            } else {
+                /* Hash solo los rangos macro + separadores. */
+                for (const auto &r : ranges) {
+                    const size_t end =
+                        (r.second < vex_source.size()) ? r.second : vex_source.size();
+                    for (size_t i = r.first; i < end; ++i) {
+                        h ^= static_cast<uint8_t>(vex_source[i]);
+                        h *= FNV_PRIME;
+                    }
+                    h ^= 0xFEu;   /* separador entre macros distintos. */
+                    h *= FNV_PRIME;
+                }
+            }
+            return h;
+        }();
+        char cache_key_hex[17];
+        std::snprintf(cache_key_hex, sizeof(cache_key_hex), "%016llx",
+                       static_cast<unsigned long long>(cache_key));
+        const std::string cache_dir    = ".cache/vex";
+        const std::string cache_prefix = cache_dir + "/" + cache_key_hex;
+        const std::string cache_path   = cache_prefix + ".velb";
+        const bool cache_hit = std::filesystem::exists(cache_path);
+        const bool user_already_set_prebuilt =
+            (std::getenv("VESTA_MC_PREBUILT") != nullptr);
+        const bool verbose_mc =
+            (std::getenv("VESTA_MC_VERBOSE") != nullptr &&
+             std::getenv("VESTA_MC_VERBOSE")[0] == '1');
+
+        /* CACHE HIT path: setear env var ANTES del primer compile_vex_source.
+         * Solo 1 invocacion de compile, con VM eval activo desde el inicio. */
+        if (cache_hit && !user_already_set_prebuilt) {
+#if defined(_WIN32)
+            _putenv_s("VESTA_MC_PREBUILT", cache_path.c_str());
+#else
+            setenv("VESTA_MC_PREBUILT", cache_path.c_str(), 1);
+#endif
+            if (verbose_mc) {
+                std::cerr << "[mc-cache] hit: " << cache_path << "\n";
+            }
+        }
+
         vex::CompileResult cr =
             vex::compile_vex_source(vex_source, vex_path, copts);
+
+        /* Phase MC.16+: diagnostico de macros que el lowering rechazo
+         * por usar builtins comptime-only no aliasables (comptime_compile,
+         * static_assert, etc.) o comptime globals.  Estos macros caen al
+         * AST evaluator y NO se benefician del cache/VM/memo.  Imprimir
+         * via VESTA_MC_VERBOSE para que el usuario sepa por que. */
+        if (verbose_mc && cr.ok && !cr.macro_skip_reasons.empty()) {
+            for (const auto &sk : cr.macro_skip_reasons) {
+                std::cerr << "[mc-lower] " << sk.first
+                          << ": AST-only (" << sk.second << ")\n";
+            }
+        }
+
+        /* Limpiar env var si lo seteamos arriba (cache hit). */
+        if (cache_hit && !user_already_set_prebuilt) {
+#if defined(_WIN32)
+            _putenv_s("VESTA_MC_PREBUILT", "");
+#else
+            unsetenv("VESTA_MC_PREBUILT");
+#endif
+        }
+
         if (!cr.ok) {
             for (const auto &d : cr.diagnostics.all()) {
                 vex::print_diagnostic(std::cerr, d);
             }
             return EXIT_FAILURE;
         }
+
+        /* CACHE MISS + @Macros presentes: hacer two-phase y persistir
+         * el resultado a `.cache/vex/<key>.velb` para futuras corridas. */
+        if (!cache_hit
+         && cr.has_lowerable_macros
+         && !user_already_set_prebuilt) {
+            std::error_code ec;
+            std::filesystem::create_directories(cache_dir, ec);
+
+            /* Phase MC.16: per-macro manifest diagnostico.  Computamos
+             * hash por macro del fuente actual y comparamos con manifest
+             * anterior (si existe).  Reportamos via VESTA_MC_VERBOSE que
+             * macros cambiaron -- foundation para futuro per-macro relink. */
+            if (verbose_mc) {
+                const auto current_ranges = find_macro_ranges_with_names(vex_source);
+                std::vector<std::pair<std::string, std::string>> current_hashes;
+                current_hashes.reserve(current_ranges.size());
+                for (const auto &r : current_ranges) {
+                    const std::string &mname = std::get<0>(r);
+                    const size_t start = std::get<1>(r);
+                    const size_t end   = std::get<2>(r);
+                    constexpr uint64_t FNV_O = 14695981039346656037ULL;
+                    constexpr uint64_t FNV_P = 1099511628211ULL;
+                    uint64_t h = FNV_O;
+                    for (size_t i = start; i < end && i < vex_source.size(); ++i) {
+                        h ^= static_cast<uint8_t>(vex_source[i]);
+                        h *= FNV_P;
+                    }
+                    char buf[17];
+                    std::snprintf(buf, sizeof(buf), "%016llx",
+                                   static_cast<unsigned long long>(h));
+                    current_hashes.emplace_back(mname, buf);
+                }
+                /* Cargar manifest anterior si existe (key viejo = el del
+                 * cache que acabamos de invalidar; lo buscamos por scan). */
+                std::map<std::string, std::string> previous;
+                bool had_previous = false;
+                {
+                    std::error_code sec;
+                    for (const auto &entry :
+                            std::filesystem::directory_iterator(cache_dir, sec)) {
+                        if (!entry.is_regular_file()) continue;
+                        const std::string p = entry.path().string();
+                        if (p.size() > 9 && p.substr(p.size() - 9) == ".manifest") {
+                            std::ifstream ifs(p);
+                            std::string line;
+                            while (std::getline(ifs, line)) {
+                                const auto tab = line.find('\t');
+                                if (tab != std::string::npos) {
+                                    previous[line.substr(0, tab)] = line.substr(tab + 1);
+                                }
+                            }
+                            had_previous = !previous.empty();
+                            break;  /* solo el primero, suficiente para diag */
+                        }
+                    }
+                }
+                if (had_previous) {
+                    size_t changed = 0, added = 0;
+                    std::set<std::string> seen;
+                    for (const auto &cur : current_hashes) {
+                        seen.insert(cur.first);
+                        auto it = previous.find(cur.first);
+                        if (it == previous.end()) {
+                            std::cerr << "[mc-manifest] anyadido: " << cur.first << "\n";
+                            ++added;
+                        } else if (it->second != cur.second) {
+                            std::cerr << "[mc-manifest] cambio: " << cur.first << "\n";
+                            ++changed;
+                        }
+                    }
+                    for (const auto &prev : previous) {
+                        if (!seen.count(prev.first)) {
+                            std::cerr << "[mc-manifest] eliminado: " << prev.first << "\n";
+                        }
+                    }
+                    std::cerr << "[mc-manifest] total=" << current_hashes.size()
+                              << " cambios=" << changed
+                              << " anyadidos=" << added << "\n";
+                }
+                /* Escribir nuevo manifest. */
+                const std::string manifest_path = cache_prefix + ".manifest";
+                std::ofstream mfs(manifest_path);
+                if (mfs) {
+                    for (const auto &p : current_hashes) {
+                        mfs << p.first << '\t' << p.second << '\n';
+                    }
+                }
+            }
+
+            /* Phase MC.14: cache sweeper TTL-based.  Antes de poblar el
+             * nuevo cache file, escanea @c .cache/vex/ y borra archivos
+             * cuyo mtime sea anterior a @c TTL dias (default 30, override
+             * via env var @c VESTA_MC_CACHE_TTL_DAYS).  Solo corre en el
+             * path de miss para evitar sobrecargar el path comun de hit.
+             * Cost ~50us para directorios con <100 archivos -- despreciable
+             * cuando ya estamos en miss path (que ya cuesta 7-10ms).
+             *
+             * Default agresivo (30 dias) para que el cache no crezca
+             * indefinidamente; el usuario que use el cache regularmente
+             * verá hits constantemente y los archivos no expiran.  Los
+             * archivos de proyectos abandonados se limpian solos. */
+            {
+                uint64_t ttl_days = 30;
+                if (const char *e = std::getenv("VESTA_MC_CACHE_TTL_DAYS")) {
+                    char *end = nullptr;
+                    const unsigned long v = std::strtoul(e, &end, 10);
+                    if (end != e && v <= 3650) ttl_days = v;  /* cap 10 anyos */
+                }
+                if (ttl_days > 0) {
+                    const auto now_tp = std::filesystem::file_time_type::clock::now();
+                    const auto ttl    = std::chrono::hours(24 * ttl_days);
+                    size_t swept = 0;
+                    std::error_code swec;
+                    for (const auto &entry :
+                            std::filesystem::directory_iterator(cache_dir, swec)) {
+                        if (!entry.is_regular_file()) continue;
+                        std::error_code mtec;
+                        const auto mt = entry.last_write_time(mtec);
+                        if (mtec) continue;
+                        if (now_tp - mt > ttl) {
+                            std::error_code rmec;
+                            std::filesystem::remove(entry.path(), rmec);
+                            if (!rmec) ++swept;
+                        }
+                    }
+                    if (verbose_mc && swept > 0) {
+                        std::cerr << "[mc-cache] sweeper: " << swept
+                                  << " archivo(s) expirado(s) eliminado(s) (TTL "
+                                  << ttl_days << " dias)\n";
+                    }
+                }
+            }
+
+            const std::string tmp_vel_path = cache_prefix + ".vel.tmp";
+            {
+                std::ofstream tmp(tmp_vel_path, std::ios::binary);
+                if (tmp) {
+                    if (copts.emit_debug) {
+                        tmp << "// @file " << vex_path << "\n";
+                    }
+                    tmp << cr.vel_text;
+                }
+            }
+            /* Linker -> .velb persistente en .cache/vex/.  Reusa el
+             * mismo @c run_worker que produce el .velb final. */
+            const int tmp_rc = asm_multi_process::run_worker(
+                tmp_vel_path, cache_prefix,
+                /*skip_preprocessor=*/true,
+                /*keep_labels=*/false,
+                /*ir_section_bytes=*/&cr.ir_section_bytes,
+                /*emit_map=*/false);
+            if (tmp_rc == EXIT_SUCCESS) {
+#if defined(_WIN32)
+                _putenv_s("VESTA_MC_PREBUILT", cache_path.c_str());
+#else
+                setenv("VESTA_MC_PREBUILT", cache_path.c_str(), 1);
+#endif
+                vex::CompileResult cr2 =
+                    vex::compile_vex_source(vex_source, vex_path, copts);
+#if defined(_WIN32)
+                _putenv_s("VESTA_MC_PREBUILT", "");
+#else
+                unsetenv("VESTA_MC_PREBUILT");
+#endif
+                if (cr2.ok) {
+                    cr = std::move(cr2);
+                }
+                if (verbose_mc) {
+                    std::cerr << "[mc-cache] miss + populated: "
+                              << cache_path << "\n";
+                }
+                /* Cleanup del .vel temporal y del .velb-map (no de cache_path,
+                 * que es el archivo cacheado y debe persistir). */
+                std::remove(tmp_vel_path.c_str());
+                const std::string cache_velb_map = cache_path + "-map";
+                std::remove(cache_velb_map.c_str());
+            }
+        }
+
         // Mostrar warnings (cr.ok no impide los warnings).
         for (const auto &d : cr.diagnostics.all()) {
             if (d.level != vex::DiagLevel::ERR) vex::print_diagnostic(std::cerr, d);
@@ -998,11 +1706,119 @@ int main(int argc, char *argv[]) {
         // Compilar .vel -> .velb saltando VPP
         // Opcion W: pasar el IR pre-serializado al linker via run_worker
         // para que se embeba en la seccion @c @ir del .velb v3.
-        return asm_multi_process::run_worker(
+        int rc = asm_multi_process::run_worker(
             vel_path, out_prefix,
             /*skip_preprocessor=*/true,
             /*keep_labels=*/(result.count("keep-labels") > 0),
-            /*ir_section_bytes=*/&cr.ir_section_bytes);
+            /*ir_section_bytes=*/&cr.ir_section_bytes,
+            /*emit_map=*/(result.count("emit-map") > 0));
+
+        /* Phase MC.4: probe del ComptimeRuntime (activable via env var
+         * VESTA_COMPTIME_PROBE=1).  Tras producir el .velb, lo carga
+         * en una @c ComptimeRuntime para validar que el pipeline
+         * bytecode-in-memory -> Loader -> symbol_table -> macro_entry_pc
+         * funciona end-to-end.  Imprime stats y los nombres de macros
+         * resueltos.  Cero impacto si el env var no esta seteado. */
+        if (rc == EXIT_SUCCESS) {
+            const char *probe_env = std::getenv("VESTA_COMPTIME_PROBE");
+            if (probe_env && probe_env[0] == '1') {
+                const std::string velb_path = out_prefix + ".velb";
+                std::ifstream f(velb_path, std::ios::binary);
+                if (f) {
+                    std::vector<uint8_t> bytes(
+                        (std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+                    f.close();
+                    vex::ComptimeRuntime ctr;
+                    const bool loaded = ctr.load_macros_from_bytes(std::move(bytes));
+                    std::cerr << "[mc-probe] load_macros_from_bytes -> "
+                              << (loaded ? "OK" : "FAIL") << "\n";
+                    std::cerr << "[mc-probe] is_initialized -> "
+                              << (ctr.is_initialized() ? "true" : "false") << "\n";
+                    std::cerr << "[mc-probe] registered_macro_count -> "
+                              << ctr.registered_macro_count() << "\n";
+                    /* Listar nombres + PCs para demo. */
+                    auto names = ctr.list_registered_macros();
+                    for (const auto &p : names) {
+                        std::cerr << "[mc-probe]   " << p.first
+                                  << " @ 0x" << std::hex << p.second << std::dec << "\n";
+                    }
+                    /* Phase MC.5: intentar invocar el PRIMER macro a
+                     * nivel funcion (filtrar sufijos internos del
+                     * lowering: `_entry_`, `_if_`, `_ret`, `_while_`,
+                     * `_for_`, `_then_`, `_else_`, `_merge_`). */
+                    const std::pair<std::string, uint64_t> *first_fn = nullptr;
+                    auto is_internal_label = [](const std::string &n) {
+                        static const char *suffixes[] = {
+                            "_entry_", "_if_", "_ret", "_while_", "_for_",
+                            "_then_", "_else_", "_merge_", "_loop_"
+                        };
+                        for (const char *suf : suffixes) {
+                            if (n.find(suf) != std::string::npos) return true;
+                        }
+                        return false;
+                    };
+                    for (const auto &p : names) {
+                        if (p.first.find("__macro_") != 0) continue;
+                        if (is_internal_label(p.first))  continue;
+                        if (!first_fn) first_fn = &p;
+                    }
+                    if (!first_fn) {
+                        std::cerr << "[mc-probe] no se encontro macro top-level invocable\n";
+                    } else {
+                        std::cerr << "[mc-probe] invoke target: " << first_fn->first
+                                  << " @ 0x" << std::hex << first_fn->second
+                                  << std::dec << "\n";
+                        /* MC.7: invocar el macro varias veces como
+                         * @c string y mostrar el contenido devuelto. */
+                        for (int iter = 1; iter <= 3; ++iter) {
+                            std::string s_out;
+                            const bool ok = ctr.invoke_string_macro(
+                                first_fn->first, /*args=*/{}, s_out);
+                            std::cerr << "[mc-probe] invoke#" << iter << " -> "
+                                      << (ok ? "OK" : "FAIL")
+                                      << "  string=\"" << s_out << "\"\n";
+                        }
+                        std::cerr << "[mc-probe] call_count -> "
+                                  << ctr.call_count() << "\n";
+                    }
+
+                    /* Phase MC.8: shadow_validate -- replay las
+                     * expectaciones que el TypeChecker capturo durante
+                     * la evaluacion AST de cada @Macro, invocando via
+                     * VM, y comparando los strings.  Cualquier mismatch
+                     * indica un bug en lowering del macro a IR (o en el
+                     * AST evaluator).  Cero coste si no hay expectacioes. */
+                    if (!cr.macro_expectations.empty()) {
+                        for (const auto &e : cr.macro_expectations) {
+                            ctr.record_expectation(
+                                e.macro_name, e.args, e.expected_str, e.src_loc);
+                        }
+                        std::vector<vex::ComptimeRuntime::ShadowMismatch> report;
+                        const size_t mismatches = ctr.shadow_validate(report);
+                        std::cerr << "[mc-shadow] expectations="
+                                  << cr.macro_expectations.size()
+                                  << " validated=" << report.size()
+                                  << " mismatches=" << mismatches << "\n";
+                        for (const auto &m : report) {
+                            std::cerr << "[mc-shadow]   "
+                                      << (m.match ? "OK   " : "FAIL ")
+                                      << m.macro_name << " @ " << m.src_loc
+                                      << "  (" << m.reason << ")";
+                            if (!m.match) {
+                                std::cerr << "  expected=\"" << m.expected
+                                          << "\"  got=\"" << m.got << "\"";
+                            }
+                            std::cerr << "\n";
+                        }
+                    } else {
+                        std::cerr << "[mc-shadow] sin expectaciones (no hay @Macros con args literales)\n";
+                    }
+                }
+            }
+        }
+
+        return rc;
     }
 
     // Compilar un archivo .vel a .velb
@@ -1012,7 +1828,9 @@ int main(int argc, char *argv[]) {
             result["build"].as<std::string>(),
             out_prefix,
             /*skip_preprocessor=*/false,
-            /*keep_labels=*/(result.count("keep-labels") > 0)
+            /*keep_labels=*/(result.count("keep-labels") > 0),
+            /*ir_section_bytes=*/nullptr,
+            /*emit_map=*/(result.count("emit-map") > 0)
         );
     }
 
@@ -1184,11 +2002,21 @@ int main(int argc, char *argv[]) {
                 long long elapsed_us = elapsed_ns / 1'000;
 
                 uint64_t total_instrs   = 0;
+                uint64_t total_jit_instrs = 0;
                 uint64_t active_time_ns = 0;
+                uint64_t jit_time_ns = 0;
                 for (const auto &sched: vm->schedulers) {
                     total_instrs += sched->profiler_instr_counter;
+                    /* JIT instrs: cada metodo JIT-eated incrementa el contador
+                     * con N IR-instrs al entrar (proxy de bytecode instrs).
+                     * Combinarlo con interp counter da MIPS reales. */
+                    total_jit_instrs += sched->profiler_jit_instr_counter;
                     active_time_ns += sched->time_exec + sched->time_decode;
+                    jit_time_ns += sched->time_jit;
                 }
+                /* active_time incluye el JIT time tambien (solo cuenta cuando
+                 * el JIT-method retorna).  Si JIT corre durante interp dispatch,
+                 * el time_jit ya esta incluido en time_exec via el wrapper. */
 
 
                 for (auto &sched: vm->schedulers) {
@@ -1213,10 +2041,16 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
+                /* TOTAL instructions = interp + JIT.  El interp counter
+                 * se incrementa por instr ejecutada (profiler_instr_counter
+                 * sin multiplicar - antes habia un fudge de *256 que ya no
+                 * aplica).  El JIT counter se incrementa por N (IR instrs
+                 * del metodo) al ENTRY de cada invocacion JIT-eated. */
+                const uint64_t total_combined = total_instrs + total_jit_instrs;
                 // sin hooks time_decode/time_exec son 0; usar wall time como base
                 uint64_t mips_base_ns = active_time_ns > 0 ? active_time_ns : (uint64_t) elapsed_ns;
-                double   mips         = total_instrs > 0 && mips_base_ns > 0
-                                  ? (total_instrs * 1000.0) / mips_base_ns
+                double   mips         = total_combined > 0 && mips_base_ns > 0
+                                  ? (total_combined * 1000.0) / mips_base_ns
                                   : 0.0;
 
                 vesta::scout() << "\n=== RUN STATS ===\n";
@@ -1227,7 +2061,18 @@ int main(int argc, char *argv[]) {
                             << active_time_ns / 1000 << " us, "
                             << active_time_ns / 1'000'000 << " ms)\n";
                 }
-                vesta::scout() << "Instrucciones: " << total_instrs << "\n";
+                vesta::scout() << "Instrucciones: " << total_combined
+                               << "  (interp=" << total_instrs
+                               << ", JIT=" << total_jit_instrs << ")\n";
+                if (jit_time_ns > 0) {
+                    vesta::scout() << "JIT time:      " << jit_time_ns << " ns  ("
+                            << jit_time_ns / 1000 << " us, "
+                            << jit_time_ns / 1'000'000 << " ms)\n";
+                    if (total_jit_instrs > 0) {
+                        const double jit_mips = (total_jit_instrs * 1000.0) / jit_time_ns;
+                        vesta::scout() << "JIT MIPS:      " << jit_mips << "\n";
+                    }
+                }
                 vesta::scout() << "MIPS:          " << mips
                         << (active_time_ns > 0 ? "" : "  (wall time)") << "\n";
                 vesta::scout() << "\n=== OVERHEAD BREAKDOWN ===\n";

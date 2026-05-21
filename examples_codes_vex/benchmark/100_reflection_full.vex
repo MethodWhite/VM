@@ -31,21 +31,21 @@ class Calculadora {
 Calculadora pruebas() {
   Calculadora a = new Calculadora();
   /*
-    // Localizar la clase por nombre.
-    i64 cls = forName("Calculadora");
-    if (cls == 0) return 1;
+  // Localizar la clase por nombre.
+  i64 cls = forName("Calculadora");
+  if (cls == 0) return 1;
 
-    // Crear una instancia (sin ctor con args, base queda en 0).
-    i64 obj = newInstance(cls);
-    if (obj == 0) return 2;
+  // Crear una instancia (sin ctor con args, base queda en 0).
+  i64 obj = newInstance(cls);
+  if (obj == 0) return 2;
 
-    // Localizar el metodo "doblar" por nombre.
-    i64 m = getMethod(cls, "doblar");
-    if (m == 0) return 3;
+  // Localizar el metodo "doblar" por nombre.
+  i64 m = getMethod(cls, "doblar");
+  if (m == 0) return 3;
 
-    // Invocar dinamicamente: doblar(21) == 42.
-    i64 result = invoke(m, obj, 21);
-    */
+  // Invocar dinamicamente: doblar(21) == 42.
+  i64 result = invoke(m, obj, 21);
+  */
 
   return a;
 }

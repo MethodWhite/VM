@@ -347,10 +347,22 @@ namespace runtime {
         uint64_t time_decode = 0; ///< Tiempo acumulado en la fase de descodificacion (en ns)
         uint64_t time_event  = 0; ///< Tiempo acumulado en las transiciones de la FSM (en ns)
         uint64_t time_exec   = 0; ///< Tiempo acumulado en la fase de ejecucion (en ns)
+        /// Tiempo acumulado dentro de codigo JIT-eated (en ns).  Incrementado
+        /// por @c exec_instr_callvirt cuando dispatcha a @c enter_jit; mide
+        /// el wall time real del codigo nativo generado para que las metricas
+        /// MIPS/wall-time del programa total reflejen JIT execution.
+        uint64_t time_jit    = 0;
 
         // --- Contadores del profiler por hilo ---
         uint64_t profiler_sample        = 0; ///< Contador de muestras del profiler
         uint64_t profiler_instr_counter = 0; ///< Se incrementa cada 256 instrucciones ejecutadas
+        /// Contador de "instrucciones VM equivalentes" ejecutadas en JIT.
+        /// El JIT-eated code emite @c add qword [&counter], N al inicio de
+        /// cada metodo, donde N es el numero de IR instructions de ese metodo.
+        /// Aproxima cuantas instrucciones bytecode habrian corrido si interp
+        /// hubiera ejecutado el mismo metodo.  Combinado con @c profiler_instr_counter
+        /// da MIPS total: (interp * 256 + jit) / time / 1M.
+        uint64_t profiler_jit_instr_counter = 0;
 
         std::atomic<bool> profiler_running = true; ///< true mientras el profiler deba ejecutarse
 

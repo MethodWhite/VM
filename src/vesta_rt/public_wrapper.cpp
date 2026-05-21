@@ -179,18 +179,99 @@ void vrt_throw_fatal(vrt_proc *proc, uint32_t kind, const char *message) {
     runtime::throw_fatal(as_proc(proc), kind, message);
 }
 
+/* Forward decl: do_throw vive en exec_instruction_oop.cpp con C++ mangling.
+ * NO debe estar en el extern "C" envolvente; usamos un alias que pueda ser
+ * llamado desde las funciones C. */
+void vrt_internal_do_throw(runtime::ProcessVM *vm, uint64_t exc_handle);
+
 void vrt_tryenter(vrt_proc *proc, uint64_t handler_pc, vrt_class *type_class) {
-    /* El bytecode handler exec_instr_tryenter push un ExceptionFrame.
-     * Para JIT-eado en v1 reusamos esa misma logica: el trampoline
-     * jit_to_interp ejecuta el opcode tryenter del bytecode.  Aqui
-     * dejamos stub hasta D.2; el codigo JIT NO debe llamar este
-     * wrapper en v1. */
-    (void)proc; (void)handler_pc; (void)type_class;
+    /* Replica EXACTA de @c exec_instr_tryenter sin la parte de
+     * @c reductions_remaining (irrelevante en frame JIT: el batch ya
+     * lo controla el scheduler enclosing).
+     *
+     * Aloca un ExceptionFrame en heap raw + lo inicializa con:
+     *   - handler_pc: direccion del catch (absoluta VM)
+     *   - type:        ClassInfo* del catch (nullptr = catch-all)
+     *   - saved_rsp/rbp/frame_stack: snapshot para descartar
+     *     pushes del regalloc + frames OOP inacabados durante throw.
+     *   - saved_regs[0..15]: snapshot de R0..R15 para que el catch
+     *     vea el mismo estado que el try entry (igual que C/C++ exc). */
+    if (!proc) return;
+    runtime::ProcessVM *p = as_proc(proc);
+
+    /* Acquire del free list si tiene frames recicladas; sino alloca.
+     * El free list lo popula @c tryleave (bytecode + JIT inline),
+     * eliminando malloc/free pressure y leak por programas con many
+     * try/catch en loops. */
+    runtime::ProcessVM::ExceptionFrame *ef;
+    if (p->exc_free_list != nullptr) {
+        ef = p->exc_free_list;
+        p->exc_free_list = ef->prev;
+    } else {
+        ef = new runtime::ProcessVM::ExceptionFrame();
+    }
+    ef->handler_pc        = handler_pc;
+    ef->type              = reinterpret_cast<loader::ClassInfo *>(type_class);
+    ef->saved_rsp         = p->registers.stack_pointer.qword();
+    ef->saved_rbp         = p->registers.base_pointer.qword();
+    ef->saved_frame_stack = reinterpret_cast<uint64_t>(p->frame_stack);
+    for (int i = 0; i < 16; ++i) {
+        ef->saved_regs[i] = p->registers.regs[i].qword();
+    }
+    ef->prev = p->exc_frame_stack;
+    p->exc_frame_stack = ef;
 }
 
 void vrt_tryleave(vrt_proc *proc) {
-    (void)proc;
-    /* Stub - ver vrt_tryenter. */
+    /* Pop del tope + push al free list para reciclar.  El JIT inlinea
+     * la misma logica en 7 instrucciones x86-64 cuando @c exc_frame_stack_offset
+     * + @c exc_free_list_offset estan configurados (~3x mas rapido que
+     * llegar aqui via call).  Esta version C es fallback para bytecode
+     * interp + JIT en modo testing sin offsets. */
+    if (!proc) return;
+    runtime::ProcessVM *p = as_proc(proc);
+    if (p->exc_frame_stack == nullptr) return;
+    auto *top = p->exc_frame_stack;
+    p->exc_frame_stack = top->prev;
+    /* Push al free list (reusar campo prev). */
+    top->prev = p->exc_free_list;
+    p->exc_free_list = top;
+}
+
+void vrt_throw_user(vrt_proc *proc, uint64_t exc_handle) {
+    /* Delega a do_throw.  Nunca retorna normalmente -- do_throw modifica
+     * RIP/RSP/RBP/regs del proceso y el JIT-eado debe detectar el cambio
+     * via... bueno, no puede.  El throw rompe el flujo normal: tras este
+     * call, el JIT frame queda en estado inconsistente.
+     *
+     * v1: confiamos en que do_throw setea el RIP al handler.  El JIT
+     * NO debe ejecutar nada despues de esta llamada (el lowering del
+     * frontend marca el bloque como terminator post-throw, asi que no
+     * habra mas instrucciones JIT en ese bloque).
+     *
+     * BUG conocido v1: si el handler PC esta en codigo bytecode (no JIT),
+     * el control regresa al interp via el scheduler.  Pero el JIT frame
+     * sigue activo en host stack -> stale frame.  Cuando el handler
+     * eventualmente RET-ea, salta a la direccion de retorno bytecode
+     * (sentinel del trampoline o frame OOP) y todo funciona.  Si el handler
+     * RET-ea a la JIT frame original... unwinding cruzado no soportado.
+     *
+     * Para v1 SOLO soportamos: throw desde JIT cuando el catch esta TAMBIEN
+     * en codigo bytecode (caso comun: el frontend emite catch como bloque
+     * de bytecode, NO como JIT-callable function). */
+    if (!proc) return;
+    vrt_internal_do_throw(as_proc(proc), exc_handle);
+}
+
+void vrt_rethrow(vrt_proc *proc) {
+    /* Relanza la excepcion activa.  El frontend la emite tras hacer monexit
+     * en el handler de un synchronized: el flujo es body -> throw -> catch
+     * (frame del synchronized) -> monexit -> rethrow -> outer catch.
+     *
+     * Mismas limitaciones que vrt_throw_user. */
+    if (!proc) return;
+    runtime::ProcessVM *p = as_proc(proc);
+    vrt_internal_do_throw(p, p->current_exception);
 }
 
 /* ----------------------------------------------------------------------- */
@@ -345,6 +426,56 @@ uint64_t vrt_callvirt_ic(vrt_proc *proc, uint8_t *obj_payload,
  * proceso saldra por EVT_HALT/EVT_ERROR antes. */
 static constexpr uint64_t VRT_BYTECODE_RET_SENTINEL = 0xFEFEFEFE00000000ULL;
 
+/* Helper compartido: ejecuta el bytecode VM en @p p comenzando en
+ * @p bc_va, en un mini run-loop sincronico, hasta que el RET final pop
+ * el sentinel y salte a el.  No pushea frame OOP (uso para funciones
+ * libres / closures; los metodos virtuales usan vrt_run_method_in_interp
+ * que SI pushea el frame OOP).
+ *
+ * Args y resultado pasan por la convencion VM_ABI estandar:
+ *   - args en proc->registers.regs[1..N] (puestos por el caller)
+ *   - argc en proc->registers.regs[15]
+ *   - retorno en proc->registers.regs[0] (devuelto a este helper)
+ *
+ * Restaura rip/rsp/frame_stack/decoded_ptr al estado previo asi que
+ * el JIT caller puede continuar normalmente.
+ */
+static uint64_t vrt_run_bc_at(runtime::ProcessVM *p, uint64_t bc_va) {
+    const uint64_t saved_rip = p->registers.rip.raw();
+    const uint64_t saved_rsp = p->registers.stack_pointer.qword();
+    auto *saved_frame_stack  = p->frame_stack;
+    auto *saved_decoded_ptr  = p->decoded_ptr;
+
+    const uint64_t new_rsp = saved_rsp - 8;
+    p->vm_mem.write_u64_fast(new_rsp, VRT_BYTECODE_RET_SENTINEL);
+    p->registers.stack_pointer.qword(new_rsp);
+    p->registers.rip.qword(bc_va);
+    p->decoded_ptr = &p->icache[0];
+    p->decoded_ptr->pc = UINT64_MAX;
+
+    const uint64_t MAX_ITERS = 100'000'000;
+    uint64_t iters = 0;
+    while (iters++ < MAX_ITERS) {
+        if (p->registers.rip.raw() == VRT_BYTECODE_RET_SENTINEL) break;
+        if (p->state == runtime::HALT || p->state == runtime::DEAD) break;
+        if (p->err_thread != runtime::THREAD_NO_ERROR) break;
+        runtime::decode_instruction(p);
+        runtime::vm_event ev = runtime::execute_instruction(p);
+        if (ev == runtime::EVT_HALT || ev == runtime::EVT_ERROR) break;
+        if (ev == runtime::EVT_IO_WAIT) {
+            runtime::throw_fatal(p, VESTA_FATAL_ILLEGAL_INSTRUCTION,
+                "vrt trampoline JIT->interp: IO_WAIT no soportado en sync interp");
+            break;
+        }
+    }
+
+    p->registers.rip.qword(saved_rip);
+    p->registers.stack_pointer.qword(saved_rsp);
+    p->frame_stack = saved_frame_stack;
+    p->decoded_ptr = saved_decoded_ptr;
+    return p->registers.regs[0].qword();
+}
+
 /* Mini-interp sincronico: ejecuta el bytecode del metodo @p mi en el
  * proceso @p p.  Args ya estan en regs[1..N] (calling convention).
  * Pushea un frame OOP + ret_addr=SENTINEL, salta a mi->code_vaddr, y
@@ -483,43 +614,29 @@ uint64_t vrt_callclosure(vrt_proc *proc, uint64_t fn_addr, uint64_t env_addr) {
         jit::JitFn fn = reinterpret_cast<jit::JitFn>(fn_addr);
         return jit::enter_jit(fn, proc);
     }
-    /* VM bytecode addr: ejecutar via mini-interp.  Pero
-     * vrt_run_method_in_interp toma MethodInfo*, no una vaddr.
-     * Hacemos un mini-loop directo aqui simil a vrt_run_method_in_interp
-     * pero saltando a fn_addr directamente. */
-    const uint64_t saved_rip = p->registers.rip.raw();
-    const uint64_t saved_rsp = p->registers.stack_pointer.qword();
-    auto *saved_frame_stack  = p->frame_stack;
-    auto *saved_decoded_ptr  = p->decoded_ptr;
+    /* VM bytecode addr: ejecutar via mini-interp delegando al helper
+     * compartido vrt_run_bc_at.  El env_addr ya esta en R14 (linea
+     * arriba), por lo que el lambda body lo encontrara como espera la
+     * convencion de closures. */
+    return vrt_run_bc_at(p, fn_addr);
+}
 
-    const uint64_t new_rsp = saved_rsp - 8;
-    p->vm_mem.write_u64_fast(new_rsp, VRT_BYTECODE_RET_SENTINEL);
-    p->registers.stack_pointer.qword(new_rsp);
-    p->registers.rip.qword(fn_addr);
-    p->decoded_ptr = &p->icache[0];
-    p->decoded_ptr->pc = UINT64_MAX;
-
-    const uint64_t MAX_ITERS = 100'000'000;
-    uint64_t iters = 0;
-    while (iters++ < MAX_ITERS) {
-        if (p->registers.rip.raw() == VRT_BYTECODE_RET_SENTINEL) break;
-        if (p->state == runtime::HALT || p->state == runtime::DEAD) break;
-        if (p->err_thread != runtime::THREAD_NO_ERROR) break;
-        runtime::decode_instruction(p);
-        runtime::vm_event ev = runtime::execute_instruction(p);
-        if (ev == runtime::EVT_HALT || ev == runtime::EVT_ERROR) break;
-        if (ev == runtime::EVT_IO_WAIT) {
-            runtime::throw_fatal(p, VESTA_FATAL_ILLEGAL_INSTRUCTION,
-                "vrt_callclosure: IO_WAIT no soportado en sync interp");
-            break;
+uint64_t vrt_call_bc_function(vrt_proc *proc, uint64_t bc_entry_va) {
+    /* Trampoline JIT->interp para CALL/CALLVM cuando la callee no se
+     * pudo JIT-compilar.  El selector emite esta llamada en lugar de
+     * marcar el caller como unsupported, permitiendo que main y otros
+     * metodos JIT-compilen aunque algunas callees caigan a interp.
+     *
+     * Args ya stagedos en proc->registers.regs[1..N] por el caller JIT
+     * (convencion VM_ABI), argc en R15.  Resultado en R0 tras retorno. */
+    if (!proc || bc_entry_va == 0) {
+        if (proc) {
+            runtime::throw_fatal(as_proc(proc), VESTA_FATAL_NULL_POINTER,
+                "vrt_call_bc_function: bc_entry_va nulo");
         }
+        return 0;
     }
-
-    p->registers.rip.qword(saved_rip);
-    p->registers.stack_pointer.qword(saved_rsp);
-    p->frame_stack = saved_frame_stack;
-    p->decoded_ptr = saved_decoded_ptr;
-    return p->registers.regs[0].qword();
+    return vrt_run_bc_at(as_proc(proc), bc_entry_va);
 }
 
 uint64_t vrt_calln(vrt_proc *proc, const char *lib_name, const char *fn_name) {
@@ -899,3 +1016,16 @@ void vrt_setmethdbg(vrt_proc *proc, uint64_t params_vaddr) {
 }
 
 } /* extern "C" */
+
+/* ------------------------------------------------------------------------- */
+/* Alias C++ namespaced para invocar @c runtime::do_throw desde las funciones
+ * C wrapper @c vrt_throw_user / @c vrt_rethrow.  No esta en extern "C" para
+ * preservar el name-mangling de C++.                                        */
+/* ------------------------------------------------------------------------- */
+namespace runtime {
+    void do_throw(ProcessVM *vm, uint64_t exception_ptr);
+}
+
+void vrt_internal_do_throw(runtime::ProcessVM *vm, uint64_t exc_handle) {
+    runtime::do_throw(vm, exc_handle);
+}

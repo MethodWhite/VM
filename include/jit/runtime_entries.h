@@ -78,6 +78,13 @@ namespace jit {
         void       (*throw_fatal)     (vrt_proc *, uint32_t, const char *)   = nullptr;
         void       (*tryenter)        (vrt_proc *, uint64_t, vrt_class *)    = nullptr;
         void       (*tryleave)        (vrt_proc *)                           = nullptr;
+        /* Lanza una excepcion user-defined dado su GcHandle (i64).  Delega
+         * a @c do_throw que recorre @c exc_frame_stack para encontrar el
+         * catch matching y salta al handler.  Nunca retorna normalmente. */
+        void       (*throw_user)      (vrt_proc *, uint64_t)                 = nullptr;
+        /* Relanza la excepcion activa (@c proc->current_exception).  Usado
+         * por el rethrow de los synchronized handlers tras hacer monexit. */
+        void       (*rethrow)         (vrt_proc *)                           = nullptr;
 
         /* ----- FFI ----- */
         uint64_t   (*invoke_native)   (void *, uint64_t, vrt_proc *)         = nullptr;
@@ -93,6 +100,13 @@ namespace jit {
 
         /* ----- CALLN (FFI estatico) ----- */
         uint64_t   (*calln)           (vrt_proc *, const char *, const char *) = nullptr;
+
+        /* ----- Trampoline JIT->interp para CALL/CALLVM unsupported (D.4-fix) ----- */
+        /* Cuando una callee user-defined no se puede JIT-compilar, el
+         * selector emite call a este wrapper que ejecuta el bytecode
+         * en mini-interp sincronico.  Args ya stagedos en
+         * proc->registers.regs[1..N], retorno en R0. */
+        uint64_t   (*call_bc_function)(vrt_proc *, uint64_t)                   = nullptr;
 
         /* ----- VM memory access (Phase D.3-G) ----- */
         uint64_t   (*vm_read_u64)     (vrt_proc *, uint64_t)                 = nullptr;

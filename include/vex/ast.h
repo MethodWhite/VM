@@ -19,15 +19,18 @@
  * por @c std::unique_ptr garantiza ownership claro y zero-cost frente a
  * @c shared_ptr (sin contadores atomicos).
  *
- * Subset cubierto en hito A.1:
- *   - ModuleNode (raiz): lista de FunctionDecl y GlobalVarDecl.
- *   - Statements: Block, VarDecl (local), ExprStmt, If, While, For (C),
- *                 Return, Break, Continue.
- *   - Expressions: literales (int/float/bool/null/char), Ident, Binary,
- *                  Unary, Assign, Call.
- *   - Type AST: solo PrimitiveTypeNode.  Punteros, arrays, generics,
- *               tipos referencia, etc. se anyaden en hitos posteriores
- *               sin tocar la base de la jerarquia (anyadir TypeKind nuevo).
+ * Cobertura actual del AST:
+ *   - ModuleNode (raiz): lista de FunctionDecl, GlobalVarDecl, ClassDecl,
+ *                       StructDecl, EnumDecl, ExternFnDecl.
+ *   - Statements: Block, VarDecl, ExprStmt, If, While, DoWhile, For (C),
+ *                 ForEach (Vex), Return, Break, Continue, Goto, Label,
+ *                 Try/Catch/Finally, Synchronized, Throw, Match.
+ *   - Expressions: literales (int/float/bool/null/char/string con
+ *                  interpolacion), Ident, Binary, Unary, Assign, Call,
+ *                  New, Spawn, RSpawn, Lambda, Match, Cast, FieldAccess,
+ *                  Index, This, InitList.
+ *   - Type AST: PrimitiveTypeNode + PointerTypeNode + ArrayTypeNode +
+ *               NamedTypeNode (con generics) + FunctionTypeNode.
  *
  * Decisiones de hardware:
  *   - NodeKind cabe en 1 byte; el discriminador se inlinea en cada nodo.
@@ -72,8 +75,8 @@ namespace vex::ast {
         TypeAliasDecl,
         StructDecl,
         ClassDecl,
-        EnumDecl,        ///< A.11 ADTs: declaracion de tipo algebraico (enum + variantes).
-        ExternFnDecl,    ///< A.24 - extern "lib.dll" fn name(params) -> ret; (FFI declarativo, 0 overhead).
+        EnumDecl,        ///< Declaracion de tipo algebraico (enum + variantes con/sin payload).
+        ExternFnDecl,    ///< @c extern "lib.dll" fn name(params) -> ret; (FFI declarativo, 0 overhead).
 
         // ----- Statements -----
         BlockStmt,
@@ -91,7 +94,9 @@ namespace vex::ast {
         TryStmt,         ///< try { ... } catch (T e) { ... }
         ThrowStmt,       ///< throw expr;
         ForEachStmt,     ///< for (T x : col) body
-        SynchronizedStmt,///< synchronized (obj) { ... }  (A.7.1: monenter/monexit con finally)
+        SynchronizedStmt,///< synchronized (obj) { ... }  (monenter/monexit con cleanup implicito en cada via de salida)
+        ComptimeBlockStmt, ///< A.39: comptime { ... } scope para comptime const + for + asserts
+        ComptimeForStmt,   ///< A.39: comptime for (i in lo..hi) { body } -- unrolled
 
         // ----- Expressions -----
         IntLitExpr,
@@ -105,6 +110,7 @@ namespace vex::ast {
         BinaryExpr,
         UnaryExpr,
         AssignExpr,
+        TernaryExpr,   ///< cond ? then : else (A.38)
         CallExpr,
         IndexExpr,
         ThisExpr,
@@ -313,7 +319,7 @@ namespace vex::ast {
      * a otro PointerTypeNode envolviendo a T.  El type checker desenvuelve la
      * cadena para producir un @c Type plano (con shared_ptr<Type> como
      * pointee).  Punteros raw NO son rastreados por el GC y NO tienen
-     * verificacion de null en deref hasta que A.6 introduzca @c nonnull.
+     * verificacion de null en deref (solo el tipo @c nonnull T la fuerza).
      */
     struct PointerTypeNode : TypeNode {
         std::unique_ptr<TypeNode> pointee; ///< Tipo apuntado (puede ser otro puntero).
@@ -344,7 +350,7 @@ namespace vex::ast {
 
     /**
      * @struct FunctionTypeNode
-     * @brief Tipo de funcion: @c fn(T1, T2, ...) -> R (Phase A.10).
+     * @brief Tipo de funcion / closure: @c fn(T1, T2, ...) -> R.
      *
      * Permite declarar variables, parametros y campos cuyo tipo es una
      * funcion / closure.  El parser lo construye al ver el keyword @c fn
@@ -404,6 +410,16 @@ namespace vex::ast {
         /// Flag asociado: true si la fuente era borrow_mut (necesita
         /// restore al drop).  False si era borrow shared o owner directo.
         bool        borrow_reborrow_source_is_mut = false;
+
+        /// si esta Expr es un IdentExpr que resuelve a un comptime
+        /// const (global de A.38 o local de A.39), el type checker
+        /// graba aqui el valor para que el lowering lo inline como CONST
+        /// directo.  Sin esto, los comptime const LOCALES se perderian
+        /// al pop_comptime_scope() del type checker antes del lowering.
+        bool        comptime_const_resolved = false;
+        bool        comptime_const_is_str = false;
+        int64_t     comptime_const_int = 0;
+        std::string comptime_const_str;
 
         explicit Expr(NodeKind k) : Node(k) {}
     };
@@ -492,7 +508,7 @@ namespace vex::ast {
     struct FieldAccessExpr : Expr {
         std::unique_ptr<Expr> base;
         std::string           field_name;
-        /// @brief A.4.3: si !=0, el acceso resuelve a un accesor de
+        /// @brief Si !=0, el acceso resuelve a un accesor de
         /// propiedad y el lowering emite la llamada en vez de un
         /// getfield directo.  1 = getter (`obj.prop`), 2 = setter (lhs
         /// de un AssignExpr; @ref AssignExpr::is_property_set se marca
@@ -515,9 +531,31 @@ namespace vex::ast {
         UnaryExpr() : Expr(NodeKind::UnaryExpr) {}
     };
 
+    /**
+     * @struct TernaryExpr
+     * @brief Operador ternario `cond ? then : else` (A.38).
+     *
+     * Equivalente semantico a `if (cond) then_value else else_value` pero
+     * como expresion.  El type checker deduce el tipo resultado como el
+     * "common type" entre @c then_expr y @c else_expr (mismo
+     * @c types_assignable que usa AssignExpr).  El lowering emite el patron
+     * `cond -> br_cond %c, then_bb, else_bb; bb_then -> ...; bb_else -> ...;
+     * merge -> phi.t [then_val, then_bb] [else_val, else_bb]`.
+     *
+     * Asociativo por la derecha: `a ? b : c ? d : e` == `a ? b : (c ? d : e)`.
+     * Cortocircuita: solo se evalua la rama elegida (importante si las
+     * sub-expresiones tienen efectos secundarios como calls).
+     */
+    struct TernaryExpr : Expr {
+        std::unique_ptr<Expr> cond;
+        std::unique_ptr<Expr> then_expr;
+        std::unique_ptr<Expr> else_expr;
+        TernaryExpr() : Expr(NodeKind::TernaryExpr) {}
+    };
+
     struct AssignExpr : Expr {
         AssignOp              op;
-        std::unique_ptr<Expr> target;  // lvalue (IdentExpr en A.1; con punteros sera mas amplio)
+        std::unique_ptr<Expr> target;  // lvalue: IdentExpr, FieldAccess, IndexExpr o UnaryExpr Deref
         std::unique_ptr<Expr> value;
         AssignExpr() : Expr(NodeKind::AssignExpr) {}
     };
@@ -525,6 +563,21 @@ namespace vex::ast {
     struct CallExpr : Expr {
         std::unique_ptr<Expr>              callee;
         std::vector<std::unique_ptr<Expr>> args;
+        /// Argumentos de tipo @c <T,U,...> para builtins comptime
+        /// (@c sizeof<T>, @c offsetof<T>, etc.).  Vacio para llamadas
+        /// normales.  Solo poblado por el parser cuando el callee es un
+        /// IdentExpr cuyo nombre matchea un builtin comptime conocido y
+        /// va seguido de @c <...>.  El type checker valida que el numero
+        /// de type args coincida con la aridad esperada del builtin.
+        std::vector<std::unique_ptr<TypeNode>> type_args;
+        /// A.43.10: macros Lisp con quote/emit/splicing.  Cuando el type
+        /// checker detecta @c comptime_emit_expr("texto"), parsea el
+        /// texto como una expresion Vex, lo type-checa en el contexto
+        /// actual y guarda el AST resultante aqui.  El lowering, al ver
+        /// este campo no-null, baja la expresion sustituida en lugar de
+        /// emitir una llamada.  Equivalente al `splice` de Lisp/Scheme
+        /// para emitir codigo al AST runtime (no solo eval comptime).
+        std::unique_ptr<Expr>              macro_expanded;
         CallExpr() : Expr(NodeKind::CallExpr) {}
     };
 
@@ -553,7 +606,7 @@ namespace vex::ast {
     struct NewExpr : Expr {
         std::string                        class_name;
         std::vector<std::unique_ptr<Expr>> args;
-        /// Argumentos de tipo para `new Box<i32>(42)` (A.8 generics).
+        /// Argumentos de tipo para @c new Box<i32>(42).
         /// Vacio para clases no genericas.  El type checker monomorphiza
         /// la clase plantilla y reemplaza class_name con el nombre del
         /// tipo concreto generado (ej. "Box_i32").
@@ -626,8 +679,9 @@ namespace vex::ast {
         ///                @c sched_idx (modulo num_schedulers para evitar
         ///                fuera de rango).  Sintaxis: `spawn on(expr) { body }`.
         ///
-        /// Cuando llegue @c rspawn (A.7.4) este enum se extendera con
-        /// @c Remote para distribucion cross-node.
+        /// Spawn distribuido cross-node se modela via @c RSpawnExpr en
+        /// lugar de extender este enum, porque cambia la semantica del
+        /// valor de retorno (Future<T> vs PID).
         enum class Policy : uint8_t {
             Auto   = 0,
             Here   = 1,
@@ -668,7 +722,7 @@ namespace vex::ast {
 
     /**
      * @struct LambdaExpr
-     * @brief Expresion lambda / closure inline (Phase A.10).
+     * @brief Expresion lambda / closure inline con captura lexica.
      *
      * Sintaxis aceptada por el parser:
      * @code
@@ -702,7 +756,7 @@ namespace vex::ast {
      */
     /**
      * @struct MatchArm
-     * @brief Una rama de un @c match: pattern + body (Phase A.11 ADTs).
+     * @brief Una rama de un @c match: pattern + body (destructuring de ADT).
      *
      * El patron puede ser:
      *   - Variant simple: @c Color.Red    (variant_name="Red", bindings vacio)
@@ -828,7 +882,7 @@ namespace vex::ast {
         /// Nombre del helper sintetico generado (@c __lambda_<N>).  El call
         /// site lo usa para emitir @c mov r_fn, @c \@Absolute("code." + name).
         std::string              synthetic_name;
-        /// A.15 (gap O): true si el env block se aloca en HEAP RAW
+        /// true si el env block se aloca en HEAP RAW
         /// (RAW_ALLOC) en lugar de en STACK (ALLOCA).  Lo activa el
         /// lowering cuando la funcion contenedora retorna FUNCTION; el
         /// helper sintetico marca @c env_ptr.is_host_ptr=true para que
@@ -848,6 +902,16 @@ namespace vex::ast {
         std::string               name;
         std::unique_ptr<Expr>     init;       ///< null si no hay inicializador.
         bool                      is_const = false;
+        /// marca `comptime const NAME = expr;` local.  El type
+        /// checker evalua el init y registra en
+        /// @c TypeChecker::comptime_const_locals_; el lowering omite la
+        /// emision (no genera ALLOCA ni STORE).
+        bool                      is_comptime = false;
+        /// A.43.7: marca `auto NAME = expr;` o `var NAME = expr;` con
+        /// inferencia local de tipo.  El parser deja @c type=nullptr y
+        /// setea @c infer_type=true; el type checker computa el tipo del
+        /// @c init y lo aplica al binding sin requerir TypeNode en el AST.
+        bool                      infer_type = false;
         VarDeclStmt() : Stmt(NodeKind::VarDeclStmt) {}
     };
 
@@ -856,10 +920,57 @@ namespace vex::ast {
         ExprStmt() : Stmt(NodeKind::ExprStmt) {}
     };
 
+    /**
+     * @struct ComptimeBlockStmt
+     * @brief bloque `comptime { ... }` -- scope para comptime const,
+     *        comptime for y static_assert.
+     *
+     * Todo lo declarado dentro vive en un scope comptime nuevo (push_/
+     * pop_comptime_scope en el type checker).  El bloque NO emite
+     * codigo runtime; el lowering lo trata como no-op.  Runtime stmts
+     * dentro son error (no se permite).
+     */
+    struct ComptimeBlockStmt : Stmt {
+        std::vector<std::unique_ptr<Stmt>> stmts;
+        ComptimeBlockStmt() : Stmt(NodeKind::ComptimeBlockStmt) {}
+    };
+
+    /**
+     * @struct ComptimeForStmt
+     * @brief `comptime for (i in lo..hi) { body }` unrolled.
+     *
+     * El type checker evalua @c lo y @c hi en compile-time.  Para cada
+     * valor de @c var_name en [lo, hi) (o [lo, hi] si @c inclusive), el
+     * lowering CLONA el body con @c var_name bindeado al valor concreto
+     * (registrado en @c comptime_const_locals_).  Result: N copias del
+     * body emitidas en secuencia, sin loop runtime.  Cuerpo emite
+     * codigo runtime normalmente.
+     */
+    struct ComptimeForStmt : Stmt {
+        std::string           var_name;     ///< nombre del index
+        std::unique_ptr<Expr> lo_expr;
+        std::unique_ptr<Expr> hi_expr;
+        bool                  inclusive = false;  ///< true para `..=`
+        std::unique_ptr<Stmt> body;        ///< BlockStmt usualmente
+        ComptimeForStmt() : Stmt(NodeKind::ComptimeForStmt) {}
+    };
+
     struct IfStmt : Stmt {
         std::unique_ptr<Expr> cond;
         std::unique_ptr<Stmt> then_branch;
         std::unique_ptr<Stmt> else_branch;    ///< null si no hay else.
+        /**
+         * @brief marca `comptime if (cond) { ... }`.
+         *
+         * El type checker exige que `cond` se evalue 100% en compile-time
+         * (literales + builtins comptime + operadores logicos/aritmeticos
+         * sobre constantes).  El lowering descarta la rama no tomada
+         * COMPLETAMENTE -- no se baja a IR, no se emite bytecode --
+         * eliminando branches y phi nodes.  Util para generic code que
+         * elige implementaciones por tipo (sizeof<T>() <= 8 -> by-value
+         * vs by-pointer) sin coste runtime.
+         */
+        bool is_comptime = false;
         IfStmt() : Stmt(NodeKind::IfStmt) {}
     };
 
@@ -910,11 +1021,11 @@ namespace vex::ast {
      * @struct ForEachStmt
      * @brief @c for (T name : collection) body.
      *
-     * En A.6 MVP soportamos colecciones que sean arrays nativos con
-     * tamano conocido en compile time (T[N]) o decay-to-pointer (T[]).
-     * El lowering desazucara a un counted loop usando un indice oculto.
-     * Para T[N] usamos N como cota; para T[] el caller debe pasar un
-     * tamano (pendiente, MVP solo soporta T[N] inline).
+     * Soportamos colecciones que sean arrays nativos con tamano conocido
+     * en compile time (T[N]) o decay-to-pointer (T[]).  El lowering
+     * desazucara a un counted loop usando un indice oculto.  Para T[N]
+     * usamos N como cota; para T[] el caller debe pasar un tamano
+     * (limitacion actual: solo @c T[N] inline esta verificado).
      */
     struct ForEachStmt : Stmt {
         std::unique_ptr<TypeNode> iter_type;
@@ -1020,6 +1131,11 @@ namespace vex::ast {
     struct ParamDecl : Node {
         std::unique_ptr<TypeNode> type;
         std::string               name;
+        /** @c true si el tipo declarado fue `expr` (solo valido en @Macro):
+         * el parser captura el texto raw del call site como string en lugar
+         * de parsear la expresion. El @c type queda materializado como
+         * primitivo STRING para el body del macro. */
+        bool                      is_expr_capture = false;
         ParamDecl() : Node(NodeKind::ParamDecl) {}
     };
 
@@ -1028,7 +1144,8 @@ namespace vex::ast {
      * @brief Declaracion (o definicion) de una funcion top-level.
      *
      * Si @c body es null, se trata de una declaracion sin definicion
-     * (extern, futura FFI).  En A.1 todas las funciones son @c body != null.
+     * (typicamente FFI extern; las funciones extern reales se modelan
+     * via @c ExternFnDecl, este caso queda como fallback general).
      */
     struct FunctionDecl : Node {
         std::unique_ptr<TypeNode>               return_type;
@@ -1036,6 +1153,33 @@ namespace vex::ast {
         std::vector<std::unique_ptr<ParamDecl>>  params;
         std::unique_ptr<BlockStmt>               body;
         bool                                     is_async = false; ///< @Async: el cuerpo se ejecuta en un proceso hijo, devuelve handle de Future
+        /// marca `comptime fn` -- la funcion se interpreta en
+        /// compile-time, no genera codigo runtime.  Solo puede llamarse
+        /// desde contextos comptime (init de comptime const, condicion
+        /// de comptime if, args de comptime for, otros comptime fn).
+        bool                                     is_comptime = false;
+        /// parametros de tipo para comptime fns genericos.
+        /// Sintaxis: `comptime <T, U> R name(params) { ... }`.  Permite
+        /// type-level metaprogramming -- el body puede usar T como un
+        /// tipo (sizeof<T>, kind<T>, etc.) y el call site provee T:
+        /// `my_fn<Vec3>(...)`.  Solo aplica a comptime fns.
+        std::vector<std::string>                 type_params;
+        /// marca `@Macro` -- comptime fn cuyo string de retorno
+        /// se INYECTA como codigo Vex en el call site (parse + lower).
+        /// Equivalente a invocar `comptime_emit_expr(my_fn(args))`
+        /// transparentemente.  Solo aplica a comptime fns que retornan
+        /// string.  Permite la sintaxis `i32 r = mi_macro(args);` con
+        /// inyeccion automatica del codigo generado.
+        bool                                     is_macro = false;
+        /// marca `@Pure` -- el cuerpo NO depende ni modifica
+        /// state externo (globales mutables, gensym, etc.) -- solo de
+        /// los args.  El evaluador comptime puede MEMOIZAR la salida
+        /// por (nombre, args).  Llamadas repetidas con mismos args
+        /// devuelven el resultado cacheado sin reejecutar el body.
+        /// Coste runtime cero (todo compile-time).  Si el usuario
+        /// marca @Pure una fn impura, el resultado es indefinido --
+        /// la memoizacion no detecta el cheating.
+        bool                                     is_pure  = false;
         FunctionDecl() : Node(NodeKind::FunctionDecl) {}
     };
 
@@ -1082,6 +1226,12 @@ namespace vex::ast {
         std::string               name;
         std::unique_ptr<Expr>     init;
         bool                      is_const = false;
+        ///  marca `comptime const`.  El init debe ser comptime-
+        /// evaluable; el type checker guarda el valor en
+        /// @c TypeChecker::comptime_const_values_ y los usos posteriores
+        /// se baja como @c IrOp::CONST inline (cero overhead).  No genera
+        /// global runtime storage.
+        bool                      is_comptime = false;
         GlobalVarDecl() : Node(NodeKind::GlobalVarDecl) {}
     };
 
@@ -1119,7 +1269,7 @@ namespace vex::ast {
         std::unique_ptr<TypeNode> type;
         std::string               name;
         SourceLoc                 loc;
-        /// A.18 fase C - Bit field width.  0 = campo normal (byte-aligned).
+        /// Bit field width.  0 = campo normal (byte-aligned).
         /// >0 = bit field con esta cantidad de bits.  El type checker
         /// calcula bit_offset y los empaqueta en storage words del tipo
         /// declarado (i32 -> 32 bits por word, etc.).  Estilo C/C++.
@@ -1138,6 +1288,12 @@ namespace vex::ast {
     struct StructDecl : Node {
         std::string                  name;
         std::vector<StructFieldDecl> fields;
+        /// marca `@Introspect` -- el compilador
+        /// emite IntrospectInfo POD en static_data y registra el tipo en
+        /// el global `__introspect_registry` para que `find_type("Name")`
+        /// runtime lo encuentre.  Sin esta marca, el tipo solo es
+        /// introspectable via builtins comptime (sin overhead).
+        bool                         is_introspect = false;
         StructDecl() : Node(NodeKind::StructDecl) {}
     };
 
@@ -1191,6 +1347,8 @@ namespace vex::ast {
     struct EnumDecl : Node {
         std::string                  name;
         std::vector<EnumVariantDecl> variants;
+        /// marca `@Introspect`.  Ver `StructDecl`.
+        bool                         is_introspect = false;
         EnumDecl() : Node(NodeKind::EnumDecl) {}
     };
 
@@ -1308,6 +1466,8 @@ namespace vex::ast {
         /// ClassRegistry como ClassInfo* (sin instanciar) para que la
         /// reflexion (findclass) y el typeswitch las puedan localizar.
         bool                                              is_interface = false;
+        /// marca `@Introspect`.  Ver `StructDecl`.
+        bool                                              is_introspect = false;
         ClassDecl() : Node(NodeKind::ClassDecl) {}
     };
 

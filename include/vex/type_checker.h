@@ -43,9 +43,35 @@
 #include <unordered_map>
 #include <vector>
 
+#include <memory>
 #include "vex/ast.h"
 #include "vex/borrow_checker.h"
+#include "vex/comptime_vm.h"
 #include "vex/diagnostic.h"
+
+namespace vex {
+    /**
+     * @brief ComptimeValue recursivo via shared_ptr.
+     *
+     * Necesario shared_ptr para break el cycle de "containers de self".
+     * `std::unordered_map<K, ComptimeValue>` con T incompleto es UB en
+     * C++17 (no soportado por libstdc++).  Con shared_ptr el container
+     * almacena punteros + las copias son O(1) hasta que se necesita
+     * deep copy (que se hace explicitamente cuando se necesita modificar
+     * sin afectar al original).
+     */
+    struct ComptimeValue {
+        bool        is_str    = false;
+        bool        is_array  = false;
+        bool        is_struct = false;
+        bool        is_type   = false;
+        int64_t     value     = 0;
+        std::string str;
+        std::vector<std::shared_ptr<ComptimeValue>> array_vals;
+        std::unordered_map<std::string, std::shared_ptr<ComptimeValue>> struct_fields;
+        Type        type_val;
+    };
+}
 
 namespace vex {
 
@@ -119,11 +145,15 @@ namespace vex {
         std::vector<StructFieldInfo> fields;
         uint32_t                     size_bytes  = 0;
         uint32_t                     align_bytes = 1;
+        /// marca `@Introspect` -- el lowering emite
+        /// IntrospectInfo POD en static_data para que `find_type("Name")`
+        /// runtime lo encuentre.
+        bool                         is_introspect = false;
     };
 
     /**
      * @struct EnumVariantInfo
-     * @brief Resumen de una variante de enum (Phase A.11 ADTs).
+     * @brief Resumen de una variante de enum (ADT, tagged union).
      *
      * @c tag es el indice asignado por el orden de declaracion (0..N-1).
      * @c field_types lista los tipos de los payload fields en orden.
@@ -153,6 +183,8 @@ namespace vex {
         std::vector<EnumVariantInfo> variants;
         uint32_t                     size_bytes        = 8;  ///< Minimum: solo el tag.
         uint32_t                     max_payload_fields = 0; ///< 0 si todas son sin payload.
+        /// marca `@Introspect`.
+        bool                         is_introspect = false;
     };
 
     /**
@@ -237,6 +269,10 @@ namespace vex {
         /// resolver estaticamente en este modulo (los advice chains corren
         /// al despachar dinamicamente; un CALL directo los saltaria).
         bool                         is_aspect = false;
+        /// marca `@Introspect` -- el lowering emite
+        /// IntrospectInfo POD en static_data para que `find_type("Name")`
+        /// runtime lo encuentre.
+        bool                         is_introspect = false;
         /// true si la clase declara `~ClassName()`.  Computado tras
         /// agregar todos los metodos.  El type checker usa este flag para
         /// rechazar escapes ilegales: una instancia con destructor NO puede
@@ -307,6 +343,7 @@ namespace vex {
          * @param diags Sumidero de diagnosticos.
          */
         TypeChecker(ast::ModuleNode &mod, Diagnostics &diags);
+        ~TypeChecker();  //limpia g_active_typechecker thread_local
 
         /**
          * @brief Ejecuta el checker.
@@ -553,6 +590,185 @@ namespace vex {
          * a @c types_assignable.
          */
         bool class_is_assignable(const Type &target, const Type &value) const noexcept;
+
+    public:
+        /**
+         * @brief tabla de constantes comptime declaradas con
+         * `comptime const T NAME = expr;` a nivel modulo.
+         *
+         * Cada entrada `{name -> {type, value_bits}}` es poblada por el
+         * type checker tras evaluar el init con @c comptime_eval_expr.
+         * El lowering consulta esta tabla en @c lower_ident para
+         * inlinear el valor como @c IrOp::CONST en cada uso (cero
+         * overhead, sin storage runtime).  El evaluador comptime
+         * (`comptime_eval_expr`) tambien la consulta para resolver
+         * identifiers a su valor cacheado, permitiendo `comptime const`
+         * en cualquier expresion comptime (incluida `comptime if`).
+         */
+        struct ComptimeConst {
+            Type        type;
+            bool        is_str    = false;
+            bool        is_array  = false;
+            bool        is_struct = false;
+            bool        is_type   = false;    ///< contiene un Type
+            bool        is_mutable = false;
+            int64_t     value     = 0;
+            std::string str_value;
+            std::vector<std::shared_ptr<ComptimeValue>> array_vals;
+            std::unordered_map<std::string, std::shared_ptr<ComptimeValue>> struct_fields;
+            Type        type_val;
+        };
+        const std::unordered_map<std::string, ComptimeConst> &
+        comptime_const_values() const noexcept { return comptime_const_values_; }
+        std::unordered_map<std::string, ComptimeConst> &
+        comptime_const_values() noexcept { return comptime_const_values_; }
+
+        /**
+         * @brief stack de scopes locales de comptime const.
+         *
+         * Se push al entrar a una funcion, un bloque @c comptime { ... },
+         * un body de @c comptime for o un cuerpo de @c comptime fn; se
+         * pop al salir.  Los identifiers se resuelven buscando desde el
+         * top (mas reciente) hacia abajo; finalmente caen en la tabla
+         * global @c comptime_const_values_ .
+         */
+        const std::vector<std::unordered_map<std::string, ComptimeConst>> &
+        comptime_const_locals() const noexcept { return comptime_const_locals_; }
+        std::vector<std::unordered_map<std::string, ComptimeConst>> &
+        comptime_const_locals() noexcept { return comptime_const_locals_; }
+        void push_comptime_scope() {
+            comptime_const_locals_.emplace_back();
+        }
+        void pop_comptime_scope() {
+            if (!comptime_const_locals_.empty()) {
+                comptime_const_locals_.pop_back();
+            }
+        }
+        void register_comptime_local(const std::string &name,
+                                      ComptimeConst v) {
+            if (comptime_const_locals_.empty()) push_comptime_scope();
+            comptime_const_locals_.back()[name] = std::move(v);
+        }
+
+        /**
+         * @brief registro de funciones declaradas como `comptime fn`.
+         *
+         * Cuando una llamada se resuelve a un nombre presente aqui, el
+         * evaluador @c comptime_eval_expr la interpreta en compile-time
+         * en lugar de generar codigo runtime.  Soporta recursion con un
+         * limite de profundidad (defensivo contra loops infinitos).
+         */
+        const std::unordered_map<std::string, const ast::FunctionDecl *> &
+        comptime_fns() const noexcept { return comptime_fns_; }
+        void register_comptime_fn(const std::string &name,
+                                   const ast::FunctionDecl *fn) {
+            comptime_fns_[name] = fn;
+        }
+        /// Contador de recursion para detectar loops infinitos en
+        /// comptime fn (limite 256 niveles).
+        int &comptime_recursion_depth() noexcept {
+            return comptime_recursion_depth_;
+        }
+
+        /// stack de scopes de type-params bindeados para
+        /// comptime fn genericos.  Cuando se llama `my_fn<T1, T2>(...)`,
+        /// push scope con {"T1" -> resolved_t1, "T2" -> resolved_t2},
+        /// eval body, pop.  @c resolve_type_node consulta este stack
+        /// para sustituir IdentExpr de tipo (e.g. `T` en `sizeof<T>()`)
+        /// por el tipo bindeado.
+        std::vector<std::unordered_map<std::string, Type>> &
+        comptime_type_locals() noexcept { return comptime_type_locals_; }
+        const std::vector<std::unordered_map<std::string, Type>> &
+        comptime_type_locals() const noexcept { return comptime_type_locals_; }
+        void push_comptime_type_scope() {
+            comptime_type_locals_.emplace_back();
+        }
+        void pop_comptime_type_scope() {
+            if (!comptime_type_locals_.empty()) {
+                comptime_type_locals_.pop_back();
+            }
+        }
+        void register_comptime_type(const std::string &name, Type t) {
+            if (comptime_type_locals_.empty()) push_comptime_type_scope();
+            comptime_type_locals_.back()[name] = std::move(t);
+        }
+        /// Lookup en el stack de type-params.  Devuelve true + setea
+        /// @c out_t si encontro el nombre.
+        /// accesor publico a diagnostics, requerido por
+        /// @c comptime_compile para reportar errores de parsing de los
+        /// fragmentos de fuente que recibe como input.  Mutable porque
+        /// el evaluador comptime (`comptime_eval_expr`) recibe @c const
+        /// @c TypeChecker& pero necesita anyadir errores cuando un
+        /// fragmento es invalido.
+        Diagnostics &diagnostics() const noexcept { return diags_; }
+        bool lookup_comptime_type(const std::string &name, Type &out_t) const {
+            for (auto it = comptime_type_locals_.rbegin();
+                 it != comptime_type_locals_.rend(); ++it) {
+                auto hit = it->find(name);
+                if (hit != it->end()) {
+                    out_t = hit->second;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+    private:
+        std::unordered_map<std::string, ComptimeConst> comptime_const_values_;
+        std::vector<std::unordered_map<std::string, ComptimeConst>>
+            comptime_const_locals_;
+        std::unordered_map<std::string, const ast::FunctionDecl *>
+            comptime_fns_;
+        int comptime_recursion_depth_ = 0;
+        std::vector<std::unordered_map<std::string, Type>>
+            comptime_type_locals_;
+        /// profundidad de scopes `synchronized` activos en el
+        /// path actual.  Incrementa al entrar a un SynchronizedStmt y
+        /// decrementa al salir.  Los builtins @c wait / @c notify /
+        /// @c notifyAll lo consultan: si es 0 se emite error claro
+        /// "debe llamarse dentro de un synchronized".
+        int synchronized_depth_ = 0;
+        /// contador para @c gensym -- emite identificadores
+        /// frescos unicos por llamada, util para macros hygenic que
+        /// quieren introducir nombres sin colision con el scope del
+        /// caller.  El contador es per-TypeChecker (no global) asi
+        /// cada compilacion empieza desde 0.
+        uint64_t gensym_counter_ = 0;
+        /// cache de memoizacion para fns @Pure.  Key =
+        /// nombre+args serializados; value = ComptimeEvalResult cacheado
+        /// via shared_ptr para evitar tener que conocer el size del tipo
+        /// en este header (ComptimeEvalResult vive en comptime_introspect.h
+        /// y depende de ComptimeValue de este header, asi que evitamos el
+        /// ciclo via puntero).  Llamadas repetidas con mismos args
+        /// retornan el resultado sin reejecutar el body.
+        std::unordered_map<std::string, std::shared_ptr<struct ComptimeEvalResult>>
+            pure_macro_cache_;
+        /// runtime dedicado a ejecutar @Macros lowered al IR.
+        /// Lazy: construido vacio aqui, la VM interna se inicializa al
+        /// primer @c try_invoke.  Vida util = vida util del TypeChecker.
+        /// Reusado cross-macro durante toda la compilacion.
+        ComptimeRuntime comptime_runtime_;
+
+        /// contadores de hits/misses del path VM-only en
+        /// el call site del @Macro.  hits = invocacion VM exitosa
+        /// (resultado usado, AST eval saltado); misses = VM no aplico
+        /// (flag off, sin bytecode, args no codificables, o invoke
+        /// fallo) y caimos al AST evaluator.  Reset al start de run().
+        uint32_t macro_vmonly_hits_   = 0;
+        uint32_t macro_vmonly_misses_ = 0;
+
+    public:
+        uint64_t next_gensym_id() noexcept { return gensym_counter_++; }
+        std::unordered_map<std::string, std::shared_ptr<struct ComptimeEvalResult>> &
+        pure_macro_cache() noexcept { return pure_macro_cache_; }
+        ComptimeRuntime       &comptime_runtime()       noexcept { return comptime_runtime_; }
+        const ComptimeRuntime &comptime_runtime() const noexcept { return comptime_runtime_; }
+
+        /// Phase MC.9: snapshot publico de los contadores VM-only para
+        /// diagnostico desde main.cpp (cuando VESTA_MC_VERBOSE esta on).
+        uint32_t macro_vmonly_hits()   const noexcept { return macro_vmonly_hits_; }
+        uint32_t macro_vmonly_misses() const noexcept { return macro_vmonly_misses_; }
+    private:
 
         // -----------------------------------------------------------------
         // Datos.

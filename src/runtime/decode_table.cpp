@@ -2489,8 +2489,9 @@ namespace runtime {
             exec_instr_loadmod, decode_instr_two_op_reg
         },
 
-        /* 0x5A  panic r_msg_addr, r_msg_len - A.17.x: lanza FatalError con
-                  kind = FATAL_USER_ABORT y message = bytes[vm_addr,len]. */
+        /* 0x5A  panic r_msg_addr, r_msg_len - lanza FatalError con
+                  kind = FATAL_USER_ABORT y message = bytes[vm_addr,len].
+                  Capturable desde Vex via try/catch (FatalError e). */
         {
             "panic", Assembly::Bytecode::AddressingMode::REG,
             Assembly::Bytecode::InstrSizeMode::FIXED_4,

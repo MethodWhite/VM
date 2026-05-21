@@ -1,0 +1,86 @@
+// azucar sintactico exhaustivo para metaprogramacion.
+//
+// (1) ALIASES GLOBALES sin prefijo `comptime_`:
+//        concat, streq, strlen, chr, ord, substr, repeat, to_str,
+//        replace, contains, emit_expr, compile, ct_print.
+//     Reducen verbosidad ~50%.  Disponibles en cualquier contexto.
+//
+// (2) OPERADORES sobre strings comptime:
+//        s1 + s2   ->  concat (string + int auto-stringifia)
+//        s1 == s2  ->  streq
+//        s1 != s2  ->  !streq
+//
+// (3) BLOQUE comptime {} con sugar `name = expr;`:
+//        Cada decl dentro del bloque equivale a
+//        `comptime const auto name = expr;` (inferencia + const implicito).
+//        Reduce ruido en cadenas largas de templates.
+
+i32 doblar(i32 x) { return x * 2; }
+i32 sumar(i32 a, i32 b) { return a + b; }
+i32 mas_uno(i32 x) { return x + 1; }
+
+i32 main() {
+    // ============================================
+    // (1) Bloque comptime con sintaxis super-concisa.
+    //     Comparar este codigo con la version verbose pre-A.43.13:
+    //
+    //     // ANTES (verbose):
+    //     comptime const string t = "doblar({x})";
+    //     comptime const string r = comptime_replace(t, "{x}", "10");
+    //     comptime const string o = comptime_concat("mas_uno(",
+    //                                  comptime_concat(r, ")"));
+    //     static_assert(comptime_streq(o, "mas_uno(doblar(10))"), "...");
+    //
+    //     // AHORA (sugar):
+    //     comptime {
+    //         t = "doblar({x})";
+    //         r = replace(t, "{x}", "10");
+    //         o = "mas_uno(" + r + ")";
+    //         static_assert(o == "mas_uno(doblar(10))", "...");
+    //     }
+    // ============================================
+    comptime {
+        t = "doblar({x})";
+        r = replace(t, "{x}", "10");
+        o = "mas_uno(" + r + ")";
+        static_assert(o == "mas_uno(doblar(10))",  "composicion via aliases + ops");
+        static_assert(contains(o, "doblar"),        "contains alias");
+        static_assert(strlen(r) == 10,              "strlen alias");
+    }
+
+    // ============================================
+    // (2) Auto-stringify de int en concat con +.
+    //     `"prefix" + n` automaticamente stringifica n.
+    // ============================================
+    comptime {
+        n = 7;
+        msg = "n=" + n + " ok";
+        static_assert(msg == "n=7 ok", "auto-stringify int+string");
+    }
+
+    // ============================================
+    // (3) Aliases NUMERICOS y string-build complejo.
+    // ============================================
+    comptime {
+        a = to_str(5);                 // "5"
+        b = repeat("|", 3);            // "|||"
+        sep = chr(45);                 // "-"  (codepoint 45)
+        line = a + sep + b;            // "5-|||"
+        static_assert(line == "5-|||",  "chr+repeat+to_str combinados");
+    }
+
+    // ============================================
+    // (4) Macros completos usando todo el azucar.
+    //     Template + replace + emit.
+    // ============================================
+    comptime sq_tpl = "{x} * {x}";
+    comptime sq_at_8 = replace(sq_tpl, "{x}", to_str(8));
+    i32 r_sq = emit_expr(sq_at_8);  // 64
+    if (r_sq != 64) return 91;
+
+    comptime macro_arg = "doblar(21)";
+    i32 r_42 = emit_expr(macro_arg);  // 42
+    if (r_42 != 42) return 92;
+
+    return 42;
+}

@@ -1,0 +1,87 @@
+// @Macro avanzado -- composicion, recursion, globales mutables.
+//
+// Tres caracteristicas que cierran el modelo de macros maximalistas:
+//
+//   (1) COMPOSICION: una @Macro puede invocar OTRA @Macro desde su body.
+//       En contexto comptime (body de la macro padre), la llamada interna
+//       retorna el string generado (no inyecta).  El padre lo combina y
+//       devuelve el resultado final que SI se inyecta al call site.
+//
+//   (2) RECURSION: una @Macro puede llamarse a si misma.  El evaluador
+//       comptime tiene cota dura de 256 niveles (defensa anti-loop).
+//
+//   (3) GLOBALES MUTABLES: `comptime var X = ...` a nivel modulo.  Las
+//       @Macros pueden leer + escribir.  Util para id counters, tablas
+//       de simbolos acumuladas, cache de codigo, etc.
+
+i32 doblar(i32 x) { return x * 2; }
+i32 mas_uno(i32 x) { return x + 1; }
+i32 sumar(i32 a, i32 b) { return a + b; }
+
+// ============================================
+// (1) COMPOSICION
+// ============================================
+@Macro
+comptime string M_inc(i64 n) {
+    return "mas_uno(" + to_str(n) + ")";
+}
+
+@Macro
+comptime string M_inc_double(i64 n) {
+    // Llamada interna a OTRA @Macro: devuelve string.
+    string inner = M_inc(n);
+    return "doblar(" + inner + ")";
+}
+
+// ============================================
+// (2) RECURSION
+// ============================================
+@Macro
+comptime string M_chain(i64 n) {
+    string body = (n <= 0)
+        ? "x"
+        : "mas_uno(" + M_chain(n - 1) + ")";
+    return body;
+}
+
+// ============================================
+// (3) GLOBALES MUTABLES + UNIQUE-ID GENERATOR
+// ============================================
+comptime auto g_counter = 0;
+
+@Macro
+comptime string M_next_double() {
+    g_counter = g_counter + 1;
+    return "doblar(" + to_str(g_counter) + ")";
+}
+
+// Otra macro que tambien usa el global.
+@Macro
+comptime string M_label() {
+    g_counter = g_counter + 100;
+    return to_str(g_counter);
+}
+
+i32 main() {
+    // (1) Composicion: M_inc_double(7) -> "doblar(mas_uno(7))" = doblar(8) = 16.
+    i32 r1 = M_inc_double(7);
+    if (r1 != 16) return 91;
+
+    // (2) Recursion: M_chain(3) -> "mas_uno(mas_uno(mas_uno(x)))" con x=5 -> 8.
+    i32 x = 5;
+    i32 r2 = M_chain(3);
+    if (r2 != 8) return 92;
+
+    // (3a) Globales mutables: cada call al macro incrementa el contador.
+    i32 a = M_next_double();   // doblar(1) = 2
+    i32 b = M_next_double();   // doblar(2) = 4
+    i32 c = M_next_double();   // doblar(3) = 6
+    if (a + b + c != 12) return 93;
+
+    // (3b) Otra macro modifica el MISMO global -- estado compartido.
+    i32 e = M_label();          // g_counter += 100 -> 103
+    static_assert(g_counter == 103, "globales compartidos entre macros");
+    if (e != 103) return 94;
+
+    return 42;
+}

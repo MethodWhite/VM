@@ -33,6 +33,18 @@
 #include "jit/interp_jit_bridge.h"
 #include "vesta_rt/public.h"
 
+#include <time.h>
+
+/* Helper local de timing para el JIT path.  Duplicado de @c now_ns en
+ * decode_instruction.cpp (no expuesto en header); medir con CLOCK_MONOTONIC
+ * para que cuente wall time real del JIT execution.  Solo se invoca cuando
+ * @c has_hooks esta activo (modo --stats), zero overhead sin profiler. */
+static inline uint64_t jit_now_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
 namespace runtime {
 
     // =========================================================================
@@ -110,14 +122,17 @@ namespace runtime {
                 uint64_t saved_regs[16];
                 for (int i = 0; i < 16; ++i) saved_regs[i] = ef->saved_regs[i];
 
-                // desapilar todos los frames TRYENTER hasta el handler encontrado
+                // desapilar todos los frames TRYENTER hasta el handler encontrado.
+                // Reciclar a free list en lugar de delete (mismo patron que tryleave).
                 while (vm->exc_frame_stack != nullptr && vm->exc_frame_stack != ef) {
                     ProcessVM::ExceptionFrame *tmp = vm->exc_frame_stack;
                     vm->exc_frame_stack = tmp->prev;
-                    delete tmp; // liberar frame apilado por TRYENTER
+                    tmp->prev = vm->exc_free_list;
+                    vm->exc_free_list = tmp;
                 }
                 vm->exc_frame_stack = ef->prev; // el handler se consume al saltar
-                delete ef;
+                ef->prev = vm->exc_free_list;
+                vm->exc_free_list = ef;
 
                 // Unwind del CPU stack y de frame_stack al estado
                 // del tryenter.  Esto descarta:
@@ -324,7 +339,7 @@ namespace runtime {
         // Helper local para empujar (frame + return_pc) atomicamente.  Se
         // invoca varias veces consecutivas para construir la cadena AOP.
         // El parametro opcional @c around_target marca el frame como un
-        // advice AROUND con un target a invocar via @c proceed (A.5.4 ext).
+        // advice AROUND con un target original a invocar via @c proceed.
         //
         // NOTA: NO escribimos ret_to al stack VM.  El slot reservado por
         // `rsp -= 8` queda sin inicializar, lo cual es seguro porque:
@@ -360,8 +375,27 @@ namespace runtime {
             // jit_code != null, asi que skip es seguro.
             if (__builtin_expect(method->jit_code != nullptr, 1)) {
                 jit::JitFn fn = reinterpret_cast<jit::JitFn>(method->jit_code);
+                // Salvar rip antes de entrar al JIT para detectar throw
+                // cross-boundary: si do_throw modifico proc->rip (a catch
+                // handler), NO debemos sobreescribirlo a ret_addr (eso
+                // saltaria el catch).  El JIT body normal NO modifica rip
+                // del proceso (la convencion VM_ABI usa solo regs[]), asi
+                // que cualquier cambio post-enter_jit indica redirect via
+                // throw.
+                const uint64_t pre_rip = vm->registers.rip.raw();
+                // Timing del JIT execution para --stats.  El CALL_TO_JIT
+                // overhead (clock_gettime ~20 ns) se justifica porque la
+                // unica forma de saber CUANTO tarda el JIT es medirlo
+                // aqui (el interp dispatch loop nunca entra a JIT code).
+                // Sin este timing, los stats de wall-time son incorrectos.
+                const bool measuring = vm->scheduler.has_hooks;
+                const uint64_t t0 = measuring ? jit_now_ns() : 0;
                 (void)jit::enter_jit(fn, reinterpret_cast<vrt_proc *>(vm));
-                vm->registers.rip.qword(ret_addr);
+                if (measuring) vm->scheduler.time_jit += jit_now_ns() - t0;
+                if (vm->registers.rip.raw() == pre_rip) {
+                    // Sin redirect: avanzar normalmente a ret_addr.
+                    vm->registers.rip.qword(ret_addr);
+                } /* else: throw redirigio rip a handler_pc; respetar. */
                 vm->decoded_ptr->flags_info.did_jump = true;
                 return;
             }
@@ -374,8 +408,14 @@ namespace runtime {
             }
             if (method->jit_code != nullptr) {
                 jit::JitFn fn = reinterpret_cast<jit::JitFn>(method->jit_code);
+                const uint64_t pre_rip = vm->registers.rip.raw();
+                const bool measuring = vm->scheduler.has_hooks;
+                const uint64_t t0 = measuring ? jit_now_ns() : 0;
                 (void)jit::enter_jit(fn, reinterpret_cast<vrt_proc *>(vm));
-                vm->registers.rip.qword(ret_addr);
+                if (measuring) vm->scheduler.time_jit += jit_now_ns() - t0;
+                if (vm->registers.rip.raw() == pre_rip) {
+                    vm->registers.rip.qword(ret_addr);
+                }
                 vm->decoded_ptr->flags_info.did_jump = true;
                 return;
             }
@@ -470,7 +510,8 @@ namespace runtime {
         // Push frame para target (sin nuevo proceed_target: el target
         // no es AROUND de si mismo).  La calling convention preserva
         // r1=this y args ya en su sitio.
-        auto *frame            = vm->frame_pool.acquire(); // A.34.fix13
+        // Pool intrusivo en lugar de new/delete: O(1) acquire/release.
+        auto *frame            = vm->frame_pool.acquire();
         frame->prev            = vm->frame_stack;
         frame->method          = target;
         frame->return_pc       = ret_addr;
@@ -533,7 +574,8 @@ namespace runtime {
         // frame_base).  Ver explicacion extendida en CALLVIRT::push_step.
         auto push_step = [&](loader::MethodInfo *m, uint64_t ret_to) {
             const uint64_t cur_rsp = vm->registers.stack_pointer.qword();
-            auto *frame       = vm->frame_pool.acquire(); // A.34.fix13
+            // Pool intrusivo en lugar de new/delete: O(1) acquire/release.
+            auto *frame       = vm->frame_pool.acquire();
             frame->prev       = vm->frame_stack;
             frame->method     = m;
             frame->return_pc  = ret_to;
@@ -618,7 +660,8 @@ namespace runtime {
 
         // crear FrameHeader para soporte de excepciones
         const uint64_t cur_rsp = vm->registers.stack_pointer.qword();
-        auto *frame       = vm->frame_pool.acquire(); // A.34.fix13
+        // Pool intrusivo en lugar de new/delete: O(1) acquire/release.
+        auto *frame       = vm->frame_pool.acquire();
         frame->prev       = vm->frame_stack;
         frame->method     = method;
         frame->return_pc  = ret_addr;

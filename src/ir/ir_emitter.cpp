@@ -64,7 +64,9 @@ struct EmitCtx {
     bool                   comments; // emitir comentarios de origen
     bool                   emit_debug; // emitir comentarios @line N por instruccion
     uint32_t               label_seq; // secuencia para etiquetas unicas de condicion
-    // A.34.fix14: true si se emitio enter (spill_count > 0); false = metodo hoja sin frame.
+    // true si se emitio enter (spill_count > 0); false = metodo hoja sin frame.
+    // Permite skipear leave en epilogos cuando no hay frame, ahorrando 2 bytes
+    // por ret en metodos hoja (tipicos: getters, setters, ops aritmeticas pequenas).
     bool                   has_frame;
 
     // Cache de constantes en scratches para evitar `mov r14, K; mov r14, K`
@@ -1874,9 +1876,10 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
                 // antes de un TAILCALL: en SSA clasico un tailcall implica que su
                 // resultado es el ultimo uso de la funcion, asi que no hay valores
                 // vivos despues.  Si live_regs_through_call devolvio algo, es bug
-                // upstream; aun asi, en TAILCALL los pushes ya emitidos seran
-                // popeados nunca, lo que es incorrecto.  Para A.1 los tailcalls
-                // los emite explicitamente el optimizador IR y mantienen el invariante.
+                // upstream; aun asi, en TAILCALL los pushes ya emitidos serian
+                // popeados nunca, lo que romperia el stack discipline.  El
+                // optimizador IR (@c ir_pass_tailcall) solo promociona CALL+RET
+                // a TAILCALL cuando esta condicion se cumple por construccion.
             } else {
                 ctx.out << "    callvm @Absolute(\""
                         << EmitCtx::abs_lbl(EmitCtx::sanitize(ins.func_name)) << "\")\n";
@@ -1888,7 +1891,11 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
                     emit_mov_if_needed(ctx, rd, "r0");
                     ctx.store_spilled(ins.dst);
                 }
-                // 6. Restore en orden inverso.  A.32.fix: refresh GC ptrs.
+                // 6. Restore en orden inverso.  Para slots que llevaban un host_ptr
+                // a un objeto GC-managed, el helper hace gcderef sobre el GcHandle
+                // salvado en lugar de un pop crudo: el GC pudo haber evacuado el
+                // objeto durante la llamada, asi que el host_ptr previo es obsoleto
+                // pero el handle es estable.
                 emit_restore_all_gc_aware(ctx, call_pos, regs_to_save);
             }
             break;
@@ -1971,10 +1978,11 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             //
             // Igualmente critico: si fn_addr quedo en r1..r12 (un slot
             // de argumento), el parallel-move de abajo lo destruira al
-            // colocar el arg correspondiente.  Detectado en A.15 al
-            // ejecutar `add5(10)` donde el `mov r1, [r2]` cargaba
-            // fn_addr en r1 y luego `mov r1, r7` (parallel move del
-            // arg=10) lo sobrescribia.  Mismo fix: evacuar a r13.
+            // colocar el arg correspondiente.  Caso reproducible: una
+            // closure invocada con `add5(10)` donde el `mov r1, [r2]`
+            // carga fn_addr en r1 y luego el parallel-move `mov r1, r7`
+            // (que coloca el arg=10) lo sobrescribe.  Mismo fix: evacuar
+            // a r13.
             // r13 nunca es target de la calling convention (r1..r12
             // args, r14 env, r15 nargs, r0 retorno) asi que es seguro.
             const size_t nargs_check = ins.operands.size() > 0
@@ -2114,8 +2122,14 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
         }
 
         case IrOp::CALLM: {
-            // Dispatch dinamico via MethodInfo* directo (A.5.2.b: interfaces,
-            // y reflexion runtime).  Layout de operands en el IR:
+            // Dispatch dinamico via MethodInfo* directo.  Necesario cuando la
+            // vtable_idx no se conoce en compile time, p.ej. invocacion
+            // polimorfica sobre un tipo interfaz (donde cada implementador
+            // tiene su propia vtable y el slot puede diferir) o reflexion
+            // runtime via @c getMethod(cls, name) + invoke.  El frontend
+            // resuelve el MethodInfo* en runtime y lo pasa como operando.
+            //
+            // Layout de operands en el IR:
             //   operands[0] = obj (host_ptr a ObjectHeader)
             //   operands[1] = method (MethodInfo* obtenido via findmethod)
             //   operands[2..] = args declarados (van a r2..r_{N+1})

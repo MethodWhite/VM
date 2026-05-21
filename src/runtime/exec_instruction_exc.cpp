@@ -51,7 +51,17 @@ namespace runtime {
         auto *class_ptr = reinterpret_cast<loader::ClassInfo *>(
             vm->registers.regs[r_type].qword());                        // tipo capturado (puede ser nullptr)
 
-        auto *ef       = new ProcessVM::ExceptionFrame();               // alocar nuevo frame
+        // Acquire del free list (reciclado por previas tryleave) si tiene
+        // frames; sino alocar nuevo via new.  Elimina malloc/free pressure
+        // en programas con try/catch en loops (e.g. 1M iter de try -> 0 mallocs
+        // tras el primer ciclo, vs 1M antes).
+        ProcessVM::ExceptionFrame *ef;
+        if (vm->exc_free_list != nullptr) {
+            ef = vm->exc_free_list;
+            vm->exc_free_list = ef->prev;
+        } else {
+            ef = new ProcessVM::ExceptionFrame();
+        }
         ef->handler_pc = handler_pc;                                    // guardar PC del handler
         ef->type       = class_ptr;                                     // guardar tipo capturado
         // snapshot RSP/RBP/frame_stack al momento del tryenter.
@@ -76,17 +86,8 @@ namespace runtime {
         ef->prev       = vm->exc_frame_stack;                           // encadenar con el frame anterior
         vm->exc_frame_stack = ef;                                       // empujar al tope de la pila
 
-        // Optimizacion AV recovery (fix19 ext): forzar fin de
-        // batch para que el scheduler arme @c setjmp en el siguiente.
-        // El scheduler solo arma recovery cuando @c exc_frame_stack es
-        // no-null al INICIO del batch, lo que ahorra ~10-15 ns por
-        // batch en programas sin try.  Sin este forzado, un AV
-        // ocurrido entre la ejecucion de @c tryenter y el final del
-        // batch actual se escaparia del recovery (la ventana podria
-        // ser de cientos de instrucciones).  Coste: 1 store + alguna
-        // perdida por terminar batch antes; tryenter es raro asi que
-        // es despreciable.  Si reductions_remaining ya es <= 1, no
-        // hacer nada (el batch ya esta a punto de terminar).
+        // Optimizacion AV recovery (fix19 ext): forzar fin de batch
+        // para que el scheduler arme @c setjmp en el siguiente.
         if (vm->reductions_remaining > 1) {
             vm->reductions_remaining = 1;
         }
@@ -106,7 +107,10 @@ namespace runtime {
 
         ProcessVM::ExceptionFrame *top = vm->exc_frame_stack; // frame del tope
         vm->exc_frame_stack = top->prev;                      // desapilar
-        delete top;                                           // liberar la memoria
+        // Reciclar via free list en lugar de delete (elimina malloc/free
+        // pressure y leak por programas con many try/catch en loops).
+        top->prev = vm->exc_free_list;
+        vm->exc_free_list = top;
     }
 
 } // namespace runtime

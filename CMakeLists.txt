@@ -410,6 +410,7 @@ set(VESTA_RT_SOURCES
 
         # FFI - puente plugins nativos
         ${CMAKE_CURRENT_SOURCE_DIR}/src/ffi/native_ffi.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ffi/virtual_lib_registry.cpp
 
         # Class registry (POO dinamica + reflexion + AOP)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/loader/class_registry.cpp

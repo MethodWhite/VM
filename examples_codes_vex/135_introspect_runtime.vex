@@ -1,0 +1,67 @@
+// introspeccion: 
+//
+// Cuando un tipo se marca con @Introspect, el compilador emite una
+// estructura IntrospectInfo POD en static_data + registra el nombre del
+// tipo en una tabla global.  En runtime, `find_type("Name")` devuelve un
+// puntero al IntrospectInfo (i64) o 0 si no existe.  Los builtins
+// `type_info_*` consultan la informacion mediante ese puntero.
+//
+// MVP: find_type acepta literales compile-time (resueltos a un
+// `mov @Absolute(...)` directo).  Runtime string lookup queda pendiente
+// para Sprint 5.
+
+@Introspect
+struct Vec3 {
+    f64 x;
+    f64 y;
+    f64 z;
+}
+
+@Introspect
+class Persona {
+    i32 edad;
+    string nombre;
+}
+
+struct NoMarcada {
+    i32 a;
+}
+
+i32 main() {
+    // Buscar Vec3 (registrado con @Introspect).
+    i64 vinfo = find_type("Vec3");
+    i32 ok = 0;
+    if (vinfo != 0)                            ok = ok + 4;
+
+    // Metadata basica.
+    i32 kind  = type_info_kind(vinfo);        // 2 = Struct
+    u32 size  = type_info_size(vinfo);        // 24 (3 f64)
+    u32 align = type_info_align(vinfo);       // 8
+    u32 nf    = type_info_field_count(vinfo); // 3
+
+    if (kind == 2)  ok = ok + 4;
+    if (size == 24) ok = ok + 4;
+    if (align == 8) ok = ok + 4;
+    if (nf == 3)    ok = ok + 4;
+
+    // Offsets de fields individuales.
+    u32 off0 = type_info_field_offset(vinfo, 0);  // 0
+    u32 off2 = type_info_field_offset(vinfo, 2);  // 16
+    if (off0 == 0)  ok = ok + 4;
+    if (off2 == 16) ok = ok + 4;
+
+    // Nombre del tipo y del primer field.
+    string tname = type_info_name(vinfo);
+    string fn0   = type_info_field_name(vinfo, 0);
+    if (tname.length() == 4) ok = ok + 4;  // "Vec3"
+    if (fn0.length() == 1)   ok = ok + 4;  // "x"
+
+    // Class introspect.
+    i64 pinfo = find_type("Persona");
+    if (type_info_kind(pinfo) == 1)         ok = ok + 1;  // 1 = Class
+    if (type_info_field_count(pinfo) == 2)  ok = ok + 1;
+
+    // Tipo sin @Introspect -> 0.
+    if (find_type("NoMarcada") == 0)        ok = ok + 4;
+    return ok;  // esperado: 42 (4*9 + 1*2 + 4 = 42)
+}

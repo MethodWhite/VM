@@ -21,6 +21,7 @@ general; para detalles de cada feature consulta los docs especificos en
    - [Async y concurrencia](#async-y-concurrencia)
    - [Strings con interpolacion](#strings-con-interpolacion)
    - [FFI a APIs nativas](#ffi-a-apis-nativas)
+   - [Metaprogramacion](#metaprogramacion)
 4. [El pipeline de compilacion](#4-el-pipeline-de-compilacion)
 5. [Referencia detallada por tema](#5-referencia-detallada-por-tema)
 
@@ -453,6 +454,55 @@ i32 dynamic() {
 
 Detalles: [doc/VMdoc/Vex/FFI.md](./VMdoc/Vex/FFI.md).
 
+### Metaprogramacion
+
+Vex tiene un sistema de macros compile-time potente: `@Macro` ejecuta
+codigo arbitrario en tiempo de compilacion y emite codigo Vex que se
+inyecta en el call site. Combinable con introspeccion de tipos, FFI
+compile-time y captura de DSLs arbitrarios.
+
+```vex
+// Macro simple: tabla de Fibonacci embebida como literal.
+@Macro
+comptime string fib_at(i64 idx) {
+    i64 fibs[16] = {0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610};
+    if (idx < 0 || idx >= 16) return "0";
+    return to_str(fibs[idx]);
+}
+
+// DSL via captura raw con `expr`: el call site escribe sintaxis
+// arbitraria y el macro la parsea.
+@Macro
+comptime string walk(expr code) {
+    // `code` es la string verbatim del call site, p.ej. "root -> 0x10 -> 0x20"
+    return parse_and_emit(code);
+}
+
+// Introspeccion zero-overhead.
+i32 main() {
+    i64 f10 = fib_at(10);                // se compila como `i64 f10 = 55;`
+    u64 v = walk(root -> 0x100 -> 0);    // pointer chase generado
+    u64 sz = sizeof<i64>();              // literal 8 embebido
+    static_assert(sz == 8, "u64 size");
+    return 42;
+}
+```
+
+**Features**:
+
+- `@Macro` + `comptime string` -- funcion compile-time que retorna codigo.
+- `expr` param -- captura raw del call site para construir DSLs.
+- Builtins cortos: `strlen`, `substr`, `concat` (via `+`), `to_str`,
+  `chr`, `ord`, `repeat`, `replace`, `contains`, `gensym`.
+- Introspeccion: `sizeof<T>`, `typename<T>`, `kind<T>`, `field_count<T>`,
+  `has_field<T>`, `is_subtype<A,B>`, `for_each_field<T>`, etc.
+- FFI compile-time: invoca `kernel32.dll` u otras DLLs durante la
+  compilacion; el resultado se "fosiliza" como literal en el `.velb`.
+- `static_assert(cond, "msg")` -- verifica invariantes en compile-time.
+- Arrays + structs nativos usables dentro del body del macro.
+
+Detalles completos: [doc/VMdoc/Vex/Metaprogramacion.md](./VMdoc/Vex/Metaprogramacion.md).
+
 ---
 
 ## 4. El pipeline de compilacion
@@ -495,6 +545,18 @@ Flags utiles para inspeccionar:
   `.ir.post.mmd`, `.vel.mmd`).
 - `--vex-debug`: incluye debug info (file:line) en el `.velb` para el debugger.
 - `--jit-warn`: warnings sobre que IR ops el selector no soporta.
+- `--emit-map`: genera archivo `.velb-map` con info de simbolos y secciones
+  (debug). Off por defecto: cuesta ~60% del tiempo del linker para programas
+  reales.
+
+Variables de entorno utiles para profiling/diagnostico:
+
+- `VESTA_LINKER_PROFILE=1`: traza fase a fase del linker (`build_executable`,
+  `apply_relocations`, `write_to_file`, etc.) con timing en microsegundos.
+- `VESTA_MC_VERBOSE=1`: traza el pipeline de macros (lowering, cache hits/
+  misses, AST-only fallbacks, manifest diffs).
+- `VESTA_MC_JIT=1`: activa eager-compile JIT de macros (~5-6x speedup para
+  macros con loops pesados; ~10ms cold-start por macro).
 
 ---
 
@@ -514,6 +576,7 @@ Flags utiles para inspeccionar:
 - [OOP](./VMdoc/Vex/OOP.md) - clases, herencia, interfaces, properties, modificadores
 - [Generics](./VMdoc/Vex/Generics.md) - class T, monomorphizacion
 - [ReflexionAOP](./VMdoc/Vex/ReflexionAOP.md) - forName, getClass, @Aspect, advice
+- [Metaprogramacion](./VMdoc/Vex/Metaprogramacion.md) - @Macro, expr capture, introspeccion, FFI compile-time
 - [Colecciones](./VMdoc/Vex/Colecciones.md) - ArrayList, HashMap, Queue, etc.
 - [Excepciones](./VMdoc/Vex/Excepciones.md) - try/catch/finally, FatalError, panic
 

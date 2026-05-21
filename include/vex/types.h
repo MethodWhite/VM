@@ -101,7 +101,7 @@ namespace vex {
         /// 24 bytes: 8 tag (0=err, 1=ok) + 8 V + 8 E.  V en @c pointee y
         /// E en @c pointee2.
         RESULT,
-        /// Tipo @c fn(T1, T2, ...) -> R: closure / function pointer (Phase A.10).
+        /// Tipo @c fn(T1, T2, ...) -> R: closure / function pointer.
         /// Layout en memoria: 16 bytes = `[+0 i64 fn_addr][+8 i64 env_addr]`.
         /// Cuando la lambda no captura nada, env_addr = 0 (sentinela "sin
         /// env") y la calling convention degenera a un callvmr puro sin
@@ -231,6 +231,13 @@ namespace vex {
         ///
         /// @c pointee = tipo T del payload.
         SHARED_PTR,
+        /// Type-as-first-class-value.  Sentinela usado SOLO en
+        /// declaraciones de @c comptime const Type T = comptime_type<X>().
+        /// No tiene representacion runtime (cero bytes); el ComptimeConst
+        /// asociado lleva el @c Type real en su campo @c type_val.  Al
+        /// usar `T` en posicion de tipo, `type_from_node` lo resuelve via
+        /// @c comptime_const_values_.
+        TYPE_META,
         // Sentinela para construir tablas planas.
         COUNT
     };
@@ -239,9 +246,11 @@ namespace vex {
      * @struct Type
      * @brief Representacion del tipo de una expresion o declaracion.
      *
-     * En A.1 solo se usan tipos primitivos.  El miembro @c kind es el
-     * discriminador; futuros campos (e.g. @c element_type para arrays,
-     * @c pointee para punteros) se anyadiran como union etiquetada.
+     * El miembro @c kind es el discriminador principal; campos adicionales
+     * (@c pointee para punteros, @c fn_params/fn_return para funciones,
+     * @c element_type para arrays, @c struct_name para structs/clases/
+     * enums, @c is_virtual para distinguir punteros VM vs host, etc.)
+     * estan declarados pero solo son relevantes para el @c kind apropiado.
      *
      * Layout: 1 byte util + padding -> queda en 1 cache line incluso
      * cuando se almacenan miles de tipos juntos.
@@ -504,7 +513,7 @@ namespace vex {
             case TokenKind::KW_FLOAT:  return PrimitiveKind::F32;
             case TokenKind::KW_DOUBLE: return PrimitiveKind::F64;
 
-            // A.18 - tipo string dedicado (StringObject GC-managed).
+            // Tipo string dedicado (referencia a StringObject GC-managed).
             case TokenKind::KW_STRING: return PrimitiveKind::STRING;
 
             // tipos primitivos de coleccion (handles del plugin
@@ -599,10 +608,13 @@ namespace vex {
             case PrimitiveKind::OPTIONAL: return 16;
             case PrimitiveKind::RESULT:   return 24;
             case PrimitiveKind::FUNCTION: return 16;
-            // A.18: string es un GcHandle (i64) opaco al frontend.
+            // string es un GcHandle (i64) opaco al frontend; el StringObject
+            // real vive en el heap del GC y se accede via instrucciones
+            // dedicadas (STRRAW, STRGETBYTES, etc.).
             case PrimitiveKind::STRING:   return 8;
-            // A.26: tipos primitivos de coleccion son handles host pointers
-            // (i64).  El backing real vive en la heap del plugin nativo.
+            // Tipos primitivos de coleccion: cada uno es un handle (i64) que
+            // el plugin nativo de colecciones traduce a la estructura real
+            // en su propia heap.  El frontend solo conoce el handle opaco.
             case PrimitiveKind::ARRAYLIST: return 8;
             case PrimitiveKind::HASHMAP:   return 8;
             case PrimitiveKind::HASHSET:   return 8;
@@ -624,6 +636,8 @@ namespace vex {
             // via campo extra del Type).
             case PrimitiveKind::UNIQUE_PTR: return 8;
             case PrimitiveKind::SHARED_PTR: return 8;
+            // TYPE_META: marcador comptime sin storage runtime.
+            case PrimitiveKind::TYPE_META: return 0;
             case PrimitiveKind::COUNT:  return 0;
         }
         return 0;
@@ -776,6 +790,7 @@ namespace vex {
             case PrimitiveKind::BORROW_MUT: return "borrow_mut";
             case PrimitiveKind::UNIQUE_PTR: return "unique";
             case PrimitiveKind::SHARED_PTR: return "shared";
+            case PrimitiveKind::TYPE_META: return "Type";
             case PrimitiveKind::COUNT:  return "<count>";
         }
         return "<unknown>";
@@ -816,9 +831,10 @@ namespace vex {
         if (target == value) return true;
         if (is_numeric(target.kind) && is_numeric(value.kind)) return true;
         if (target.kind == PrimitiveKind::PTR && value.kind == PrimitiveKind::PTR) {
-            // Tratamos un PTR sin pointee como `void*` (caso de builtins
-            // pre-A.3.4 que se declararon con Type{PTR} a secas).  Esto
-            // permite que free(p) acepte cualquier T* sin diagnosticar.
+            // Tratamos un PTR sin pointee como @c void* (caso de builtins
+            // historicamente declarados con @c Type{PTR} a secas).  Esto
+            // permite que free(p) acepte cualquier T* sin diagnosticar
+            // type mismatch contra el tipo concreto del puntero.
             const bool t_void = !target.pointee
                               || target.pointee->kind == PrimitiveKind::VOID;
             const bool v_void = !value.pointee

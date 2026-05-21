@@ -1,0 +1,38 @@
+// inferencia local de tipo con `auto` / `var`.
+// Ambos son sinonimos contextuales (no keywords reservados); solo se
+// interpretan como tipo-decl cuando van seguidos inmediatamente por un
+// identifier en posicion de var-decl.  Asi codigo existente con
+// variables llamadas `auto`/`var` sigue funcionando salvo en posicion
+// de var-decl con un IDENT siguiente.
+
+i32 suma(i32 a, i32 b) { return a + b; }
+i64 large(i64 x) { return x * 100; }
+f64 half(f64 x) { return x / 2.0; }
+
+i32 main() {
+    // Primitivos inferidos.
+    auto a = 7;                    // i32 (literal entero)
+    var  b = 35;                   // i32
+    auto c = suma(a, b);      // i32 (return type de suma)
+    auto big = large(420);       // i64 (return type de large)
+
+    // Cadenas aritmeticas.
+    auto sum2 = a + b;             // i32
+    var   doubled = c * 2;         // i32
+
+    // Inferencia con literal float.
+    auto pi = 3.14;                // f64
+    auto h  = half(pi);            // f64
+
+    // Validar valores.
+    if (a != 7)         return 91;
+    if (b != 35)        return 92;
+    if (c != 42)        return 93;
+    if (big != 42000)   return 94;
+    if (sum2 != 42)     return 95;
+    if (doubled != 84)  return 96;
+    if (h <= 0.0)       return 97;
+
+    auto result = c * 1;            // i32 = 42
+    return result;
+}

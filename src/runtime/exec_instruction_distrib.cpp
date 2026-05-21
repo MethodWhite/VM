@@ -149,9 +149,10 @@ void exec_instr_loadmod(ProcessVM *vm, const DecodedInstr &instr) {
     // No usamos 0 como sentinela de error: el sentinela es file-not-found
     // (manejado arriba) o parse-failure (load_module_dynamic devolveria 0
     // pero tampoco anadiria al pool, asi que distinguimos por el comportamiento
-    // del callvm posterior).  Para A.9 MVP: si load_module_dynamic devuelve 0
-    // asumimos failure ya que el caso "init_pc legitimo == 0" se solapa con
-    // el code section del caller (limitacion documentada de VA fija).
+    // del callvm posterior).  Por simplicidad de la API: si
+    // @c load_module_dynamic devuelve 0 asumimos failure, ya que el caso
+    // "init_pc legitimo == 0" se solapa con el code section del caller
+    // (limitacion documentada de la asignacion de VA fija).
     if (init_pc == 0) {
         vm->registers.regs[0].qword(0); // failure
         return;

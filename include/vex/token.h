@@ -14,11 +14,11 @@
  * @file token.h
  * @brief Tipos de token y estructura Token para el frontend Vex.
  *
- * El conjunto de TokenKind aqui declarado cubre TODA la sintaxis cerrada
- * de Vex (no solo el subset de A.1) para que el lexer en hitos posteriores
- * solo tenga que activar las ramas correspondientes; esto evita renombres
- * y reordenamientos del enum (que invalidarian tablas planas indexadas
- * por ordinal en el parser).
+ * El conjunto de TokenKind declarado aqui cubre TODA la sintaxis cerrada
+ * de Vex.  Esto evita renombres y reordenamientos del enum (que
+ * invalidarian tablas planas indexadas por ordinal en el parser) cuando
+ * se anyaden caracteristicas nuevas: cualquier futuro feature reusa
+ * tokens existentes o anyade nuevos al final.
  *
  * Reglas de diseno:
  *  - El enum se mantiene compacto (uint16_t suficiente).
@@ -195,8 +195,8 @@ namespace vex {
         KW_RSPAWN,          ///< rspawn(node) { body } -> Future remoto
         KW_ASM,
         KW_OVERRIDE,        ///< Tambien aceptado como anotacion @Override.
-        KW_MATCH,           ///< A.11 ADTs: `match expr { case Variant => ... }`
-        KW_CASE,            ///< A.11 ADTs: rama de un `match`.  Reusable a futuro como switch-case.
+        KW_MATCH,           ///< match expr { case Variant(payload) => ... } (destructuring de ADT).
+        KW_CASE,            ///< Rama de un @c match.  Tambien reservado para futuras extensiones tipo switch.
 
         // ---------------------------------------------------------------
         // Categoria 8: operadores y simbolos.
@@ -233,7 +233,7 @@ namespace vex {
         AND_AND,            ///< &&
         OR_OR,              ///< ||
         BANG,               ///< !
-        BANG_BANG,          ///< !! (operador prefijo de unwrap; A.6 Optional)
+        BANG_BANG,          ///< !! operador prefijo de unwrap sobre @c Optional<T>.
 
         // Bitwise
         AMP,                ///< &
@@ -258,6 +258,8 @@ namespace vex {
         SEMICOLON,          ///< ;
         COLON,              ///< :
         DOT,                ///< .
+        DOTDOT,             ///< ..  (rango exclusivo en comptime for)
+        DOTDOTEQ,           ///< ..= (rango inclusivo en comptime for)
         ARROW,              ///< ->
         FAT_ARROW,          ///< =>
         QUESTION,           ///< ?

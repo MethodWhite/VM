@@ -451,7 +451,7 @@ namespace runtime {
     void decode_instr_dlopen_dlsym(ProcessVM *vm, DecodedInstr &instr);
 
     /**
-     * @brief A.24 - Descodificador de @c callni (FIXED_4, 1 reg).
+     * @brief Descodificador de @c callni (FIXED_4, 1 reg) para FFI runtime.
      *
      * Layout: @c [0x00][0x64][b2][b3] donde @c b2 = (r_fn<<4) | 0.
      * Almacena @c r_fn en @c data_instruction.reg_data.reg1.  El argc se

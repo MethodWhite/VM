@@ -2,3 +2,4 @@
 *.velb*
 *.ir
 out
+*.log

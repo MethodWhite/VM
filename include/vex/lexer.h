@@ -22,9 +22,9 @@
  *  - Reporta errores via vex::Diagnostics (no lanza excepciones).
  *  - Lookahead de 1 token con un buffer interno (mas barato que clonar
  *    todo el estado como hace el lexer .vel original).
- *  - Reconoce TODOS los tokens cerrados de Vex; las features no soportadas
- *    en A.1 (interpolacion ${...} y strings triple-quoted """...""") se
- *    detectan y emiten un diagnostico explicito hasta que llegue A.2.
+ *  - Reconoce TODOS los tokens cerrados de Vex, incluyendo interpolacion
+ *    @c ${...} (emite secuencia ISTR_BEGIN/TEXT/EXPR_BEGIN/.../END), strings
+ *    triple-quoted @c """...""" y raw @c r"...".
  *  - Comentarios //... y bloque slash-asterisco se descartan (no se emiten
  *    como tokens), salvo que en el futuro queramos reaprovecharlos para
  *    documentacion (en cuyo caso habra que cambiar la politica).
@@ -121,6 +121,14 @@ namespace vex {
          */
         [[nodiscard]] const std::string &filename() const noexcept { return filename_; }
 
+        /**
+         * @brief Acceso de solo lectura al codigo fuente completo.
+         *
+         * Usado por @c Parser para realizar @c expr-capture en macros:
+         * extrae texto raw entre dos offsets de @c SourceLoc.
+         */
+        [[nodiscard]] const std::string &source_buffer() const noexcept { return source_; }
+
     private:
         /**
          * @brief Avanza un caracter y actualiza linea/columna.
@@ -164,9 +172,15 @@ namespace vex {
         /**
          * @brief Lee un string literal "..." (estandar) o r"..." (raw).
          *
-         * Detecta y rechaza con diagnostico explicito triple-quoted
-         * """...""" e interpolacion ${...}; el soporte completo llegara
-         * en el hito A.2.
+         * Soporta tres variantes:
+         *   - @c "..."     string normal con escapes y posibles @c ${expr}.
+         *   - @c r"..."    raw: sin escapes, sin interpolacion.
+         *   - @c """..."""  triple-quoted: multilinea con escapes y @c ${expr}.
+         *
+         * Cuando detecta interpolacion, deposita en @c string_emit_queue_
+         * una secuencia ISTR_BEGIN, ISTR_TEXT*, ISTR_EXPR_BEGIN/END pairs,
+         * e ISTR_END.  Las siguientes llamadas a @c lex_one_raw drenan
+         * la cola antes de tocar @c source_ otra vez.
          *
          * @param raw Si es true, no procesa escapes ni interpolacion.
          */

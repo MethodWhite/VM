@@ -227,15 +227,20 @@ namespace ir {
         TAILCALL = 0x82, ///< tailcall @fn(%a, %b, ...)                (tail-call intra)
         CALLVIRT = 0x83, ///< %dst = callvirt.T %obj, vtbl_idx(%a, ...) (virtual via vtable)
         CALLN    = 0x84, ///< %dst = calln.T   @lib:func(%a, ...)      (nativa FFI calln)
-        CALLM    = 0x85, ///< %dst = callm.T   %obj, %method(%a, ...)  (dispatch via MethodInfo*; A.5.2.b interfaces, reflexion)
-        CALLCLOSURE = 0x86, ///< %dst = callclosure.T %fn_ptr, %env(%a, ...)  (Phase A.10:
-                            ///< llamada a closure inline.  Identico a CALLIND pero ademas
+        CALLM    = 0x85, ///< %dst = callm.T   %obj, %method(%a, ...)  (dispatch via puntero
+                         ///< MethodInfo* directo; usado para invocacion polimorfica sobre
+                         ///< tipo interfaz y para reflexion runtime donde la vtable_idx no
+                         ///< es conocida en compile time)
+        CALLCLOSURE = 0x86, ///< %dst = callclosure.T %fn_ptr, %env(%a, ...)
+                            ///< Llamada a closure inline.  Identico a CALLIND pero ademas
                             ///< coloca @c env en R14 antes del @c callvm fn_ptr.  Si la
                             ///< lambda no captura nada, env = 0 (sentinela).  El campo
                             ///< @c func_ptr lleva el SSA del fn_addr; el primer operando
                             ///< es el env_ptr; los restantes son los args declarados.
-                            ///< Lowering en exec: @c lower_lambda_expr emite el helper
-                            ///< sintetico __lambda_<N> y el call site usa este opcode.)
+                            ///< Lowering: el frontend Vex emite un helper sintetico
+                            ///< @c __lambda_<N> con el cuerpo del lambda y el call site
+                            ///< usa este opcode pasando fn_addr + env_addr en el slot
+                            ///< stack del function value (16 bytes inline, cero heap).
 
         MAKE_VARIANT = 0x88, ///< make_variant @"Enum.Variant", tag=imm, payload=[%p0, %p1, ...]
                             ///<Marker semantico para construccion de un valor
@@ -437,11 +442,13 @@ namespace ir {
         /// @c i32** pp = &p; **pp = v.  Solo cubre 1 nivel de indireccion;
         /// patrones con mas niveles (e.g. @c &pp) caen al modelo legacy.
         bool        pointee_is_host_ptr = false;
-        /// A.32.fix - true si el valor es un host_ptr a un objeto GESTIONADO
-        /// por el GC (instancia de clase Vex tipicamente).  El emisor IR
-        /// usa este flag para que cualquier @c push/@c pop alrededor de un
-        /// CALL que pueda disparar GC se haga sobre el GcHandle (estable),
-        /// no sobre el host_ptr (movido por evacuacion en GC generacional).
+        /// true si el valor es un host_ptr a un objeto GESTIONADO por el GC
+        /// (instancia de clase Vex tipicamente).  El emisor IR usa este flag
+        /// para que cualquier @c push/@c pop alrededor de un CALL que pueda
+        /// disparar GC se haga sobre el GcHandle (estable a traves de la
+        /// evacuacion), no sobre el host_ptr crudo (que el collector
+        /// generacional puede mover durante un minor o major GC, dejando
+        /// el reg salvado apuntando a memoria liberada).
         ///
         /// Patron emitido al spillar:
         /// @code
@@ -665,6 +672,21 @@ namespace ir {
          */
         std::string              generic_template_name; ///< vacio si no es monomorphizacion
         std::vector<std::string> generic_type_args;     ///< concretos sustituidos (paralelo a type_params)
+
+        /**
+         * @brief Phase MC.1: marca esta IrFunction como derivada del
+         * body de un `@Macro`.  El nombre suele ser `__macro_<original>`.
+         * El TypeChecker mantiene un mapa name -> IrFunction* para
+         * recuperarla al ejecutar el macro via la ComptimeVM (Phase MC.2+).
+         *
+         * NO afecta el codegen ni la ejecucion runtime: estas funciones
+         * NO son linkeadas desde call sites de codigo runtime; solo
+         * existen como bytecode invocable desde el TypeChecker durante
+         * compile-time evaluation.
+         *
+         * @c false para todas las IrFunctions regulares.
+         */
+        bool                     is_macro_compiled = false;
 
         /**
          * @brief Crea un nuevo valor SSA en el pool.

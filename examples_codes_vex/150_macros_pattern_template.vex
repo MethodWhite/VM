@@ -1,0 +1,88 @@
+// pattern matching declarativo para macros via templates.
+//
+// `comptime_replace(s, needle, replacement)` substituye TODAS las
+// ocurrencias de `needle` en `s` por `replacement`.  Combinado con
+// `comptime_emit_expr`, permite escribir macros tipo `syntax-rules`
+// de Scheme: el template tiene placeholders `{x}`, `{y}`, etc., y el
+// macro los reemplaza por valores reales antes de emit.
+//
+// `comptime_contains(s, needle) -> bool` valida que el template tenga
+// los placeholders esperados antes de aplicar replace.
+
+i32 doblar(i32 x) { return x * 2; }
+i32 sumar(i32 a, i32 b) { return a + b; }
+i32 mas_uno(i32 x) { return x + 1; }
+
+i32 main() {
+    // ============================================
+    // (1) Template con UN placeholder.
+    // ============================================
+    comptime tpl1 = "doblar({x})";
+    comptime t1   = comptime_replace(tpl1, "{x}", "21");   // -> "doblar(21)"
+    static_assert(comptime_streq(t1, "doblar(21)"), "template 1-placeholder");
+
+    i32 r1 = comptime_emit_expr(t1);   // runtime: doblar(21) = 42
+    if (r1 != 42) return 91;
+
+    // ============================================
+    // (2) Template con MULTIPLES placeholders.
+    // ============================================
+    comptime tpl2 = "sumar({a}, {b})";
+    comptime t2a  = comptime_replace(tpl2,  "{a}", "10");
+    comptime t2   = comptime_replace(t2a,   "{b}", "32");   // -> "sumar(10, 32)"
+    static_assert(comptime_streq(t2, "sumar(10, 32)"), "template 2-placeholder");
+
+    i32 r2 = comptime_emit_expr(t2);  // sumar(10, 32) = 42
+    if (r2 != 42) return 92;
+
+    // ============================================
+    // (3) Validacion del template antes de replace.
+    // ============================================
+    comptime tpl3 = "doblar({val})";
+    static_assert(comptime_contains(tpl3, "{val}"), "template tiene {val}");
+    static_assert(!comptime_contains(tpl3, "{noexiste}"), "template no tiene {noexiste}");
+
+    // ============================================
+    // (4) Macro de incremento: aplicar mas_uno a un valor parametrico.
+    //     Imitacion declarativa de un macro Scheme:
+    //       (define-syntax inc-call (syntax-rules () ((_ x) (mas_uno x))))
+    // ============================================
+    comptime tpl_inc = "mas_uno({x})";
+    comptime inc20   = comptime_replace(tpl_inc, "{x}", "20");
+    i32 r3 = comptime_emit_expr(inc20);   // mas_uno(20) = 21
+    if (r3 != 21) return 93;
+
+    // ============================================
+    // (5) Template con OCURRENCIAS REPETIDAS del mismo placeholder.
+    //     Calcula x*x via "{x} * {x}".  Replace substituye TODAS.
+    // ============================================
+    comptime tpl_sq = "{x} * {x}";
+    comptime sq7    = comptime_replace(tpl_sq, "{x}", "7");
+    static_assert(comptime_streq(sq7, "7 * 7"), "replace all occurrences");
+    i32 r4 = comptime_emit_expr(sq7);  // 49
+    if (r4 != 49) return 94;
+
+    // ============================================
+    // (6) gensym + template = hygenic macro real.
+    //     El placeholder {tmp} se substituye por un identifier fresco
+    //     en cada uso del macro, evitando colisiones.
+    // ============================================
+    comptime tpl_h    = "doblar({arg})";
+    comptime fresh_id = gensym("expr");  // "expr_N" unico
+    comptime hg       = comptime_replace(tpl_h, "{arg}", "21");
+    i32 r5 = comptime_emit_expr(hg);   // doblar(21) = 42
+    if (r5 != 42) return 95;
+
+    // ============================================
+    // (7) Composicion: macro que aplica DOS templates.
+    // ============================================
+    comptime t_outer  = "mas_uno({inner})";
+    comptime t_inner  = "doblar({x})";
+    comptime inner    = comptime_replace(t_inner, "{x}", "10");  // "doblar(10)"
+    comptime combined = comptime_replace(t_outer, "{inner}", inner); // "mas_uno(doblar(10))"
+    static_assert(comptime_streq(combined, "mas_uno(doblar(10))"), "composed template");
+    i32 r6 = comptime_emit_expr(combined);  // mas_uno(doblar(10)) = 21
+    if (r6 != 21) return 96;
+
+    return 42;
+}

@@ -133,7 +133,11 @@ namespace runtime {
             0x10000000ULL + (new_pid.local_pid % 0x1000ULL) * 0x100000ULL;
         child->registers.stack_pointer.qword(stack_base);
         child->registers.base_pointer.qword(stack_base);
-        // A.34.fix8 - GC stack scanning: setear limite superior del stack.
+        // Limites para el GC stack scanner conservativo del proceso hijo:
+        // el sweep solo escanea el rango [stack_low_water, stack_high] en
+        // busca de roots vivas, ahorrando tiempo cuando la pila no esta
+        // llena.  Inicializamos ambos al base; @c subsp actualiza
+        // @c stack_low_water con cada empuje real.
         child->stack_high      = stack_base;
         child->stack_low_water = stack_base;
 
@@ -148,7 +152,7 @@ namespace runtime {
         // cada una de sus secciones, copiando bytecode al rango de VAs
         // original.  Asi copiamos EXACTAMENTE lo que el loader cargo (sin
         // depender de un tamano fijo arbitrario), y soportamos modulos
-        // adicionales cargados con loadmodule (A.9 futuro).
+        // adicionales cargados dinamicamente con @c loadmodule.
         vm_ref.loader_public.copy_executables_to(*child);
 
         // activar el proceso: pasa de NEW a READY y se inserta en la cola
@@ -220,7 +224,11 @@ namespace runtime {
             0x10000000ULL + (new_pid.local_pid % 0x1000ULL) * 0x100000ULL;
         child->registers.stack_pointer.qword(stack_base);
         child->registers.base_pointer.qword(stack_base);
-        // A.34.fix8 - GC stack scanning: setear limite superior del stack.
+        // Limites para el GC stack scanner conservativo del proceso hijo:
+        // el sweep solo escanea el rango [stack_low_water, stack_high] en
+        // busca de roots vivas, ahorrando tiempo cuando la pila no esta
+        // llena.  Inicializamos ambos al base; @c subsp actualiza
+        // @c stack_low_water con cada empuje real.
         child->stack_high      = stack_base;
         child->stack_low_water = stack_base;
 

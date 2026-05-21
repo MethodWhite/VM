@@ -504,6 +504,26 @@ namespace jit {
             emit_modrm_mem(dst, src.reg & 7, out);
             return;
         }
+        /* ALU mem/imm32: REX.W + 0x81 /subop + ModR/M + imm32.
+         * Forma optimizada con imm8 sign-ext: REX.W + 0x83 /subop + ModR/M + imm8.
+         * Usado por @c add qword [&counter], N en el JIT MIPS profiler. */
+        if (dst.kind == MOperandKind::MEM && src.kind == MOperandKind::IMM32) {
+            const uint8_t base  = dst.reg;
+            const uint8_t index = static_cast<uint8_t>(dst.mem_index());
+            const bool has_index = (index != static_cast<uint8_t>(MReg::NONE));
+            const uint8_t rex = rex_byte(true, 0, base, has_index ? index : 0);
+            if (rex) put8(out, rex);
+            if (src.value >= -128 && src.value <= 127) {
+                put8(out, 0x83);
+                emit_modrm_mem(dst, alu_subop, out);
+                put8(out, static_cast<uint8_t>(src.value & 0xFF));
+            } else {
+                put8(out, 0x81);
+                emit_modrm_mem(dst, alu_subop, out);
+                put32(out, static_cast<uint32_t>(src.value));
+            }
+            return;
+        }
         put8(out, 0xCC);
     }
 

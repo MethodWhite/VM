@@ -22,7 +22,9 @@ i64 factorial(i64 n) {
     if (n <= 1) {
         return 1;
     }
-    return n * factorial(n - 1);
+    return n * factorial(
+        n - 1
+    );
 }
 
 i32 main() {

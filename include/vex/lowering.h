@@ -130,9 +130,42 @@ namespace vex {
 
         /**
          * @brief Emite GETPROC y devuelve el SSA value (PTR al ProcessVM).
-         *        Usado por las variantes GC-aware de las colecciones (A.30).
+         *        Usado por las variantes GC-aware de las colecciones (cada
+         *        variante @c *_gc del plugin recibe @c proc como primer arg
+         *        para poder invocar @c gc_addref / @c gc_release sobre los
+         *        slots que contienen GcHandles).
          */
         ir::IrValueId emit_getproc(uint32_t source_line);
+
+        /**
+         * @brief emite la secuencia ALLOCA + GETPROC +
+         * CALLN(native_fn) + STRMAKE para convertir un valor primitivo
+         * a string (StringObject GcHandle).
+         *
+         * Usado por interpolacion `${val}` y por los builtins `to_str`,
+         * `chr`, `ord` que se aliasan al runtime path.  El @c native_fn
+         * (e.g. "vio_int_to_vmbuf", "vstr_chr_to_vmbuf") debe respetar
+         * la firma `(proc_ptr, vm_addr, value) -> length`.
+         *
+         * @param v_val      SSA value del valor primitivo a stringificar.
+         * @param native_fn  Nombre de la funcion native en vesta_io.
+         * @param source_line Linea para diagnostico.
+         * @return GcHandle del StringObject resultante.
+         */
+        ir::IrValueId stringify_primitive_via_native(
+            ir::IrValueId v_val,
+            const char   *native_fn,
+            uint32_t      source_line);
+
+        /**
+         * @brief Phase MC.17.2 -- obtiene (o aloca) el slot @c static_data
+         * que materializa un comptime global como memoria runtime para
+         * macros lowereados.  Ver @c comptime_global_slots_.
+         *
+         * @return idx valido o @c UINT64_MAX si el global no es int
+         *         (strings/structs no soportados en v1).
+         */
+        uint64_t get_or_create_comptime_global_slot(const std::string &name);
 
         /**
          * @brief Inserta una conversion de tipo si difiere; identidad si igual.
@@ -196,6 +229,7 @@ namespace vex {
         ir::IrValueId  lower_ident(ast::IdentExpr *e);
         ir::IrValueId  lower_string_lit(ast::StringLitExpr *e);
         ir::IrValueId  lower_assign(ast::AssignExpr *e);
+        ir::IrValueId  lower_ternary(ast::TernaryExpr *e);  ///< A.38: cond ? then : else
         ir::IrValueId  lower_field_access(ast::FieldAccessExpr *e);
         ir::IrValueId  lower_index(ast::IndexExpr *e);
 
@@ -623,7 +657,7 @@ namespace vex {
         void           write_local(const std::string &name, ir::IrValueId v,
                                    ir::IrType ir_ty, uint32_t source_line);
 
-        // Helper para reportar features no soportadas en A.1.
+        // Helper para reportar features no soportadas por el lowering.
         void           unsupported(SourceLoc loc, const char *feature);
 
         void           error_at(SourceLoc loc, std::string msg);
@@ -635,6 +669,28 @@ namespace vex {
         ast::ModuleNode    &mod_;
         const TypeChecker  &tc_;
         Diagnostics        &diags_;
+
+        // contadores de @Macros lowered al IR.  Diagnostico
+        // para que el desarrollador sepa cuantos @Macros se beneficiaron
+        // del lowering y cuantos cayeron al evaluator AST por features
+        // todavia no soportadas (introspect, comptime var, etc.).
+        uint32_t macro_lowered_count_ = 0;
+        uint32_t macro_skipped_count_ = 0;
+
+        /// por cada @Macro que el lowering rechazo (usa
+        /// builtins comptime-only no aliasables, comptime globals, etc.),
+        /// guarda @c (macro_name, reason).  El compiler los propaga al
+        /// @c CompileResult y main.cpp los imprime via
+        /// @c VESTA_MC_VERBOSE para que el usuario entienda por que
+        /// ciertos macros no se benefician del path VM.
+        std::vector<std::pair<std::string, std::string>> macro_skip_reasons_;
+
+    public:
+        uint32_t macro_lowered_count() const noexcept { return macro_lowered_count_; }
+        uint32_t macro_skipped_count() const noexcept { return macro_skipped_count_; }
+        const std::vector<std::pair<std::string, std::string>> &
+        macro_skip_reasons() const noexcept { return macro_skip_reasons_; }
+    private:
 
         // Nombre del fichero fuente actual (para warnings que solo
         // tienen un source_line).  Se infiere del primer AST node con
@@ -738,6 +794,24 @@ namespace vex {
         /// del codigo no tiene overhead.
         bool current_fn_has_loops_ = false;
 
+        /// @c true cuando estamos lowereando el body de
+        /// un @Macro.  Se usa para forzar que las VarDecl marcadas
+        /// @c is_comptime se bajen como vars runtime regulares (el
+        /// macro corre en VM; los locales se computan en cada
+        /// invocacion).  Reset al entrar/salir de cada funcion.
+        bool current_fn_is_macro_ = false;
+
+        /// cache `name -> static_data_idx` para comptime
+        /// globals referenciados por @Macros lowereados.  Cada global
+        /// se materializa como un slot de 8 bytes en static_data del
+        /// .velb, inicializado con el valor compile-time.  Los macros
+        /// leen/escriben via @c STR_LIT_ADDR + LOAD/STORE i64.  El AST
+        /// evaluator mantiene su propia copia en
+        /// @c TypeChecker::comptime_const_values_ -- son dos espacios
+        /// de memoria distintos pero cada pase del two-phase compile
+        /// se mantiene consistente internamente.
+        std::unordered_map<std::string, uint64_t> comptime_global_slots_;
+
         /// sret en call sites: cache nombre-de-funcion -> PrimitiveKind
         /// del tipo de retorno semantico (antes de la transformacion sret).
         /// Solo nos interesa distinguir OPTIONAL / RESULT del resto, porque
@@ -759,7 +833,7 @@ namespace vex {
         /// @c *p = id) o a un slot de array (@c arr[i] = id).  Para esos
         /// locales NO registramos auto-free al exit del scope porque el
         /// caller (o el padre) toma posesion del handle y debera liberarlo
-        /// (o el GC lo gestionara cuando integremos GC roots en A.27.3+).
+        /// (o el GC lo gestionara via stack scanning conservativo).
         ///
         /// Conservador: si algun uso del local podria escapar segun los
         /// patrones detectados por @c scan_escaping_locals, se marca como
@@ -885,7 +959,8 @@ namespace vex {
             ///               coleccion primitiva.  Usa @c func_name para el
             ///               nombre del simbolo nativo y @c needs_proc para
             ///               decidir si emite GETPROC + lo prepende como
-            ///               primer argumento (variantes @c *_free_gc de A.30).
+            ///               primer argumento (variantes @c *_free_gc del
+            ///               plugin de colecciones GC-aware).
             ///               El regalloc trata el CALLN como cualquier call,
             ///               preservando regs caller-saved automaticamente.
             ///   SMARTPTR_FREE: libera un @c unique<T> al exit del scope.
@@ -996,12 +1071,64 @@ namespace vex {
         /// helpers; el flush a @c out_mod_ pasa al final de @c run().
         size_t lambda_counter_ = 0;
 
+        /// contador per-funcion para nombres unicos de bloques del
+        /// operador ternario (@c ter_then_<N> / @c ter_else_<N> /
+        /// @c ter_merge_<N>).  Se incrementa por cada @c lower_ternary.
+        size_t ternary_counter_ = 0;
+
+        /// stack dinamico de comptime const en lowering.  Usado por
+        /// @c lower_comptime_for para bindear el index a su valor const
+        /// en cada iteracion del unroll.  @c lower_ident consulta este
+        /// stack ANTES de las anotaciones AST -- permite override per-
+        /// iteracion del unroll sin re-correr el type checker.
+        struct ComptimeLocalEntry {
+            bool        is_str = false;
+            int64_t     value  = 0;
+            std::string str_value;
+            ir::IrType  ir_t   = ir::IrType::I64;
+        };
+        std::vector<std::unordered_map<std::string, ComptimeLocalEntry>>
+            lowering_comptime_scopes_;
+
+        /**
+         * @brief emite el cuerpo de un `comptime for` desenrollado.
+         *
+         * Evalua @c lo y @c hi en compile-time.  Por cada valor de i en
+         * [lo, hi) (o [lo, hi] si inclusive), push scope con i->valor,
+         * baja el body como stmt normal, pop scope.  Resultado: N copias
+         * del body emitidas en secuencia, con i siendo una constante
+         * conocida en cada uno (los IdentExpr de i se resuelven via
+         * @c lowering_comptime_scopes_).
+         */
+        void lower_comptime_for(ast::ComptimeForStmt *s);
+
         /// helpers de spawn pendientes de anyadir al modulo.  Las
         /// funciones se acumulan aqui durante el lowering del padre y se
         /// vuelcan a @c out_mod_ al final de @c run() para preservar el
         /// orden de funciones (main primero -> emisor IR la marca como
         /// entry point con @c hlt; spawn helpers despues -> @c ret).
         std::vector<ir::IrFunction> pending_spawn_helpers_;
+
+        /// mapa de nombre de tipo @c @Introspect ->
+        /// indice del chunk IntrospectInfo en @c static_data.  Poblado por
+        /// @c emit_introspect_info_chunks() al final de @c run(); consultado
+        /// por @c lower_call para resolver @c find_type("Name") a un
+        /// @c @Absolute("code.s_<idx>") directo (cero overhead cuando el
+        /// nombre es literal compile-time).
+        std::unordered_map<std::string, uint64_t> introspect_idx_by_name_;
+
+        /**
+         * @brief emite chunks IntrospectInfo POD en
+         * @c static_data para cada tipo marcado @c @Introspect.
+         *
+         * Invocado al final de @c run() tras lower_class_methods (que
+         * rellena fields/methods).  Itera @c tc_.struct_layouts(),
+         * @c class_layouts() y @c enum_layouts(); por cada layout con
+         * @c is_introspect=true genera el chunk binario con header (24
+         * bytes) + FieldInfo[] + nombres inline.  Indices guardados en
+         * @c introspect_idx_by_name_ para resolver @c find_type literal.
+         */
+        void emit_introspect_info_chunks();
 
         /// si !=IR_NO_VALUE estamos bajando el body de una
         /// funcion @Async como spawn helper.  El SSA value contiene el

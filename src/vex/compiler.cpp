@@ -74,6 +74,27 @@ namespace vex {
             return res;
         }
 
+        // : copiar las "expectaciones" de @Macro capturadas
+        // por el TypeChecker (al evaluar via AST) hacia la CompileResult.
+        // El caller (main.cpp probe / shadow-eval mode) las reaplica
+        // sobre una nueva ComptimeRuntime tras cargar el bytecode y
+        // ejecuta shadow_validate.  Cero coste si no hay @Macros.
+        const auto &ctr_ro = tc.comptime_runtime();
+        const size_t n_exp = ctr_ro.expectation_count();
+        res.macro_expectations.reserve(n_exp);
+        for (size_t i = 0; i < n_exp; ++i) {
+            auto v = ctr_ro.expectation_at(i);
+            if (!v.macro_name || !v.args || !v.expected_str || !v.src_loc) {
+                continue;
+            }
+            CompileResult::MacroExpectation e;
+            e.macro_name   = *v.macro_name;
+            e.args         = *v.args;
+            e.expected_str = *v.expected_str;
+            e.src_loc      = *v.src_loc;
+            res.macro_expectations.push_back(std::move(e));
+        }
+
         // 2.5. (opcional) Diagrama Mermaid del AST post type-check.  Lo
         // generamos AHORA porque ya tenemos los result_type rellenos pero
         // antes de que el lowering altere el AST.  Util para ver la
@@ -104,6 +125,23 @@ namespace vex {
             res.ok = false;
             return res;
         }
+
+        /* : set @c has_lowerable_macros si el lowering emitio
+         * al menos una IrFunction marcada @c is_macro_compiled.  Esto
+         * es un gate mas robusto que @c macro_expectations.empty() para
+         * disparar el two-phase compile, porque incluye casos con args
+         * no codificables (string, struct, array) que no aparecerian
+         * como expectations pero si pueden beneficiarse del VM path. */
+        for (const auto &fn : irmod.functions) {
+            if (fn.is_macro_compiled) {
+                res.has_lowerable_macros = true;
+                break;
+            }
+        }
+
+        /* +: copiar las razones de skip del lowering a la
+         * CompileResult para que main.cpp las imprima via VESTA_VERBOSE. */
+        res.macro_skip_reasons = lo.macro_skip_reasons();
 
         // 3.5. (opcional) Volcar el IR pre-optimizacion al campo
         // @c res.ir_text para que el caller pueda inspeccionarlo con la
@@ -215,7 +253,7 @@ namespace vex {
          * version post-optimizacion (incluyendo dead-alloc elim, DCE,
          * etc.) en lugar de la version frontend cruda.
          *
-         * Phase D.7.opt: corregido bug donde el .velb llevaba IR
+         * D.7.opt: corregido bug donde el .velb llevaba IR
          * UNOPTIMIZED.  El JIT auto-trigger compilaba @c pruebas con la
          * call a @c __new_Calculadora aunque el optimizer ya la habia
          * eliminado a nivel .vel.

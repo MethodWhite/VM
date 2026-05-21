@@ -1,0 +1,95 @@
+// Stress test: macros profundamente anidados, recursivos, y multiples
+// call sites.  Mide:
+//   - Compile time: cuanto tarda el front end en expandir todo.
+//   - Runtime: si los emit-eds tienen overhead vs codigo hand-written.
+
+i32 doblar(i32 x) { return x * 2; }
+i32 mas_uno(i32 x) { return x + 1; }
+
+// Contador global compartido entre N macros.
+comptime var i64 g_n = 0;
+
+// Macro recursivo profundo: genera mas_uno(mas_uno(...x...)) con N niveles.
+@Macro
+comptime string M_chain(i64 n) {
+    return (n <= 0)
+        ? "x"
+        : "mas_uno(" + M_chain(n - 1) + ")";
+}
+
+// Macro de tabla: genera una expresion con N llamadas a doblar(i).
+@Macro
+comptime string M_sum_doubles(i64 n) {
+    comptime var string code = "0";
+    comptime var i64 i = 1;
+    while (i <= n) {
+        code = code + " + doblar(" + to_str(i) + ")";
+        i = i + 1;
+    }
+    return code;
+}
+
+// Macro que combina otros macros (composicion).
+@Macro
+comptime string M_combo(i64 depth, i64 width) {
+    return M_chain(depth) + " + (" + M_sum_doubles(width) + ")";
+}
+
+i32 main() {
+    i32 x = 0;
+
+    // ============================================
+    // STRESS 1: macro recursivo profundo.  100 niveles
+    // de mas_uno anidados.
+    // ============================================
+    i32 r1 = M_chain(100);   // mas_uno aplicado 100 veces a x=0 -> 100
+
+    // ============================================
+    // STRESS 2: tabla de 100 sumas (loop comptime).
+    // 0 + doblar(1) + doblar(2) + ... + doblar(100)
+    // = 2 * (1 + 2 + ... + 100) = 10100
+    // ============================================
+    i32 r2 = M_sum_doubles(100);
+
+    // ============================================
+    // STRESS 3: composicion de macros.
+    // M_combo(50, 50) = chain50 + sum_doubles50
+    // chain50 = 50, sum_doubles50 = 2 * (1+...+50) = 2550
+    // total = 2600
+    // ============================================
+    i32 r3 = M_combo(50, 50);
+
+    // ============================================
+    // STRESS 4: 20 sitios de llamada distintos al mismo macro.
+    // Cada uno se expande independientemente.
+    // ============================================
+    i32 acc = 0;
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    acc = acc + M_chain(10);
+    // 20 * 10 = 200
+
+    if (r1 != 100)  return 91;
+    if (r2 != 10100) return 92;
+    if (r3 != 2600) return 93;
+    if (acc != 200) return 94;
+
+    return 42;
+}

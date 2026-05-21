@@ -32,18 +32,201 @@
 
 #include "vex/type_checker.h"
 #include "vex/collection_intrinsics.h"  // tabla de tipos coleccion
+#include "vex/comptime_introspect.h"    // comptime_field_type
+#include "vex/lexer.h"                  // parse de fragments en comptime_emit_expr
+#include "vex/parser.h"                 // parse_one_expr para macros con splice
 #include "loader/oop_types.h"  // para sizeof(loader::ObjectHeader) en el layout de clases
 
 #include <algorithm>
 #include <utility>
+#include <cstdlib>      // getenv para VESTA_MC_VMONLY/PREBUILT
+#include <cstring>      // memcpy para bitcast f64 -> u64
+#include <fstream>      // cargar prebuilt .velb desde disco
+#include <iostream>     // log VESTA_MC_VERBOSE
+#include <mutex>        // std::call_once para registro one-shot
+
+#include "ffi/virtual_lib_registry.h"  // registrar vex_static_assert
 
 namespace vex {
+
+    /* TypeChecker activo (thread_local) para los virtual
+     * fns expuestos a macros via `extern "vesta_comptime"`.  Cuando un
+     * macro llama @c static_assert (o futuros @c comptime_compile, etc.),
+     * el virtual fn accede al TypeChecker del compile en curso via este
+     * puntero.  Single-thread compile -> sin contencion. */
+    thread_local TypeChecker *g_active_typechecker = nullptr;
+
+    /**
+     * @brief implementacion del virtual fn `static_assert`
+     * exportado bajo `extern "vesta_comptime"`.  Cuando un macro lo
+     * invoca via la FFI dispatch (camino A), esta funcion recibe el
+     * @c cond evaluado y un @c msg como C-string (host_ptr a bytes).
+     *
+     * Si @c cond es 0/falso, emite un diagnostic error en el TypeChecker
+     * activo (g_active_typechecker) y returns 1 (status fail).  El AST
+     * eval del macro recibe el u64 returned y puede propagar; pero el
+     * mecanismo standar es: el diagnostic emite el error -> el macro
+     * sigue ejecutando pero el compile final fallara con ese error.
+     *
+     * @c msg puede ser @c nullptr; en ese caso se usa un mensaje generic.
+     *
+     * @note Marcada @c extern "C" para que su nombre no sea mangled
+     *       (asi @c register_virtual_fn la registra con simbolo limpio
+     *       y la FFI dispatch la encuentra via fn_ptr).
+     */
+    /**
+     * @brief virtual fn `comptime_compile(src) -> string`.
+     *
+     * Toma source Vex como C-string, lo trata como una EXPRESION Vex y
+     * la devuelve TAL CUAL como string.  Sirve para componer codigo
+     * desde macros sin que el AST evaluator se queje de "no es comptime
+     * evaluable".  El AST resultante se parsea en el call site de la
+     * macro como cualquier otro string de retorno @Macro.
+     *
+     * En v1 es esencialmente identity (devuelve src tal cual).  La
+     * utilidad real esta en que el usuario puede pasar AST construido
+     * via macros recursivos y obtener un string concreto sin
+     * preocuparse de comptime_eval_expr.
+     *
+     * @c msg buffer compartido estatico para mantener el c_str() valido
+     * mientras el caller lo necesite.  Limpio al destruir el
+     * TypeChecker (cleanup via clear).
+     */
+    static std::string g_comptime_compile_buf;
+    extern "C" const char *vex_comptime_compile(const char *src) {
+        if (!src) return "";
+        g_comptime_compile_buf = src;
+        return g_comptime_compile_buf.c_str();
+    }
+
+    /**
+     * @brief Phase MC.23: helpers virtual fn para queries de tipos por
+     * NOMBRE (string).  Mucho mas simple que la version con hash: el
+     * macro pasa "i32"/"u64"/"f32"/"<class_name>" y obtiene la metadata.
+     *
+     * Coverage: primitivos + clases + structs + enums.  Devuelve 0
+     * si el nombre no se reconoce.
+     */
+    static Type type_from_name_str(const char *name) {
+        if (!name) return Type{};
+        const std::string nm{name};
+        /* Primitivos. */
+        if (nm == "i8")     return Type{PrimitiveKind::I8};
+        if (nm == "i16")    return Type{PrimitiveKind::I16};
+        if (nm == "i32")    return Type{PrimitiveKind::I32};
+        if (nm == "i64")    return Type{PrimitiveKind::I64};
+        if (nm == "u8")     return Type{PrimitiveKind::U8};
+        if (nm == "u16")    return Type{PrimitiveKind::U16};
+        if (nm == "u32")    return Type{PrimitiveKind::U32};
+        if (nm == "u64")    return Type{PrimitiveKind::U64};
+        if (nm == "f32")    return Type{PrimitiveKind::F32};
+        if (nm == "f64")    return Type{PrimitiveKind::F64};
+        if (nm == "bool")   return Type{PrimitiveKind::BOOL};
+        if (nm == "char")   return Type{PrimitiveKind::CHAR};
+        if (nm == "string") return Type{PrimitiveKind::STRING};
+        if (nm == "ptr")    return Type{PrimitiveKind::PTR};
+        /* Clase/struct/enum por nombre.  Buscamos en los layouts del
+         * TypeChecker activo. */
+        if (!g_active_typechecker) return Type{};
+        const auto &cls = g_active_typechecker->class_layouts();
+        if (cls.find(nm) != cls.end()) {
+            Type t{PrimitiveKind::CLASS};
+            t.struct_name = nm;
+            return t;
+        }
+        const auto &str = g_active_typechecker->struct_layouts();
+        if (str.find(nm) != str.end()) {
+            Type t{PrimitiveKind::STRUCT};
+            t.struct_name = nm;
+            return t;
+        }
+        const auto &enm = g_active_typechecker->enum_layouts();
+        if (enm.find(nm) != enm.end()) {
+            Type t{PrimitiveKind::STRUCT};   // enum representado como STRUCT en Type
+            t.struct_name = nm;
+            return t;
+        }
+        return Type{};
+    }
+
+    extern "C" uint64_t vex_comptime_type_sizeof(const char *name) {
+        if (!g_active_typechecker) return 0;
+        const Type t = type_from_name_str(name);
+        if (t.kind == PrimitiveKind::VOID) return 0;
+        return comptime_type_size(*g_active_typechecker, t);
+    }
+
+    extern "C" uint64_t vex_comptime_type_alignof(const char *name) {
+        if (!g_active_typechecker) return 0;
+        const Type t = type_from_name_str(name);
+        if (t.kind == PrimitiveKind::VOID) return 0;
+        return comptime_type_align(*g_active_typechecker, t);
+    }
+
+    extern "C" uint64_t vex_comptime_type_kind(const char *name) {
+        if (!g_active_typechecker) return 0;
+        const Type t = type_from_name_str(name);
+        return static_cast<uint64_t>(comptime_type_kind(t));
+    }
+
+    extern "C" uint64_t vex_static_assert(int64_t cond, const char *msg) {
+        if (cond) return 0;   /* OK -- no-op. */
+        const std::string text = msg ? std::string("static_assert: ") + msg
+                                      : std::string("static_assert fallo");
+        if (g_active_typechecker) {
+            SourceLoc loc;
+            loc.file = "<comptime>";
+            g_active_typechecker->diagnostics().error(loc, text);
+        } else {
+            std::fprintf(stderr, "[vex] %s (sin TypeChecker activo)\n",
+                          text.c_str());
+        }
+        return 1;             /* status fail (para el caller si lo lee). */
+    }
 
     TypeChecker::TypeChecker(ast::ModuleNode &mod, Diagnostics &diags)
         : mod_(mod), diags_(diags) {
         // Reservar espacio razonable para evitar realocaciones en programas tipicos.
         scopes_.reserve(8);
         function_sigs_.reserve(16);
+        /* marcar este TypeChecker como el activo + registrar
+         * los virtual fns una vez por proceso (registration idempotent).
+         * NOTA: g_active_typechecker se mantiene apuntando aqui hasta el
+         * destructor.  Multi-instancia en paralelo no soportado todavia
+         * (single-thread compile por diseno). */
+        g_active_typechecker = this;
+        static std::once_flag once_reg;
+        std::call_once(once_reg, []() {
+            ffi::register_virtual_fn(
+                "vesta_comptime", "static_assert",
+                reinterpret_cast<void *>(&vex_static_assert));
+            /* type queries via virtual fns.  Macros invocan
+             * `comptime_type_sizeof("i32")` etc. y obtienen metadata. */
+            ffi::register_virtual_fn(
+                "vesta_comptime", "comptime_type_sizeof",
+                reinterpret_cast<void *>(&vex_comptime_type_sizeof));
+            ffi::register_virtual_fn(
+                "vesta_comptime", "comptime_type_alignof",
+                reinterpret_cast<void *>(&vex_comptime_type_alignof));
+            ffi::register_virtual_fn(
+                "vesta_comptime", "comptime_type_kind",
+                reinterpret_cast<void *>(&vex_comptime_type_kind));
+            /* comptime_compile: identity en v1 (devuelve src tal cual).
+             * Util para que el AST evaluator no rechace el call cuando
+             * el macro hace `return comptime_compile(complicated_str)`. */
+            ffi::register_virtual_fn(
+                "vesta_comptime", "comptime_compile",
+                reinterpret_cast<void *>(&vex_comptime_compile));
+        });
+    }
+
+    TypeChecker::~TypeChecker() {
+        /* Phase MC.20: limpiar el pointer thread_local SOLO si es esta
+         * instancia (defensive: otro TypeChecker pudo haberse construido
+         * y sobreescrito el slot). */
+        if (g_active_typechecker == this) {
+            g_active_typechecker = nullptr;
+        }
     }
 
     // =====================================================================
@@ -415,6 +598,7 @@ namespace vex {
         cloned->is_final       = tmpl->is_final;
         cloned->is_aspect      = tmpl->is_aspect;
         cloned->is_interface   = tmpl->is_interface;
+        cloned->is_introspect  = tmpl->is_introspect;
         // type_params vacio: ya es concreto.
 
         // Clonar fields.
@@ -728,6 +912,35 @@ namespace vex {
         initial_errors_ = diags_.error_count();
         push_scope(); // global
 
+        /* si la flag de prebuilt esta seteada, intentamos
+         * cargar el `.velb` cacheado en el @c comptime_runtime_ ANTES de
+         * type-checar.  Esto permite que la rama @Macro VM-only (mas
+         * abajo) tenga bytecode disponible al encontrar el primer call
+         * site.  Cero impacto si la flag no esta o el archivo no existe
+         * (la rama VM cae a AST eval). */
+        if (const char *pre = std::getenv("VESTA_MC_PREBUILT")) {
+            if (pre[0]) {
+                std::ifstream f(pre, std::ios::binary);
+                if (f) {
+                    std::vector<uint8_t> bytes(
+                        (std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+                    if (!bytes.empty()) {
+                        const bool ok =
+                            comptime_runtime_.load_macros_from_bytes(std::move(bytes));
+                        if (ok) {
+                            const char *verbose = std::getenv("VESTA_MC_VERBOSE");
+                            if (verbose && verbose[0] == '1') {
+                                std::cerr << "[mc-prebuilt] cargado: " << pre
+                                          << " (" << comptime_runtime_.registered_macro_count()
+                                          << " macros registrados)\n";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // -------- registrar templates + monomorphizar.
         // Primero localizamos todas las clases con type_params y las
         // marcamos como templates (no se procesaran como concretas).
@@ -799,6 +1012,22 @@ namespace vex {
         collect_globals();
         check_functions();
         pop_scope();
+
+        /* log resumen de hits/misses del path VM-only si el
+         * usuario activo verbose.  Util para verificar que el opt-in
+         * @c VESTA_MC_VMONLY=1 + @c VESTA_MC_PREBUILT=... efectivamente
+         * desvio las invocaciones @Macro al VM. */
+        if (macro_vmonly_hits_ > 0 || macro_vmonly_misses_ > 0) {
+            if (const char *v = std::getenv("VESTA_MC_VERBOSE")) {
+                if (v[0] == '1') {
+                    std::cerr << "[mc-vmonly] hits=" << macro_vmonly_hits_
+                              << " misses=" << macro_vmonly_misses_
+                              << "  memo_hits=" << comptime_runtime_.memo_hit_count()
+                              << " memo_misses=" << comptime_runtime_.memo_miss_count()
+                              << "\n";
+                }
+            }
+        }
         return diags_.error_count() == initial_errors_;
     }
 
@@ -909,6 +1138,35 @@ namespace vex {
         }
         if (tn->kind == ast::NodeKind::NamedTypeNode) {
             const auto *nt = static_cast<const ast::NamedTypeNode *>(tn);
+            /* si el nombre esta bindeado como comptime type-param
+             * (estamos dentro de un call a comptime fn generica), lo
+             * sustituimos por el tipo concreto.  Esto permite que
+             * `sizeof<T>()` dentro del body resuelva al tipo proveido en
+             * el call site. */
+            {
+                Type bound;
+                if (lookup_comptime_type(nt->name, bound)) {
+                    return bound;
+                }
+            }
+            /* Type-as-first-class-value.  Si el nombre matchea un
+             * `comptime const Type X = comptime_type<...>()` global, el
+             * `type_val` cacheado contiene el Type real -> sustituir.
+             * Permite usar `X` en cualquier posicion de tipo. */
+            {
+                auto it_ct = comptime_const_values_.find(nt->name);
+                if (it_ct != comptime_const_values_.end()
+                 && it_ct->second.is_type
+                 && it_ct->second.type_val.kind != PrimitiveKind::TYPE_META) {
+                    return it_ct->second.type_val;
+                }
+            }
+            /* identifier `Type` actua como sentinela TYPE_META.  El
+             * caller (check_var_decl + lower_var_decl) se encarga del
+             * binding real (sin storage runtime). */
+            if (nt->name == "Type" && nt->type_args.empty()) {
+                return Type{PrimitiveKind::TYPE_META};
+            }
             // -1) Builtins genericos del compilador: Optional<T> y
             //     Result<V, E> NO se monomorphizan; el type checker los
             //     recoge como tipos especiales con layout fijo, y el
@@ -1325,7 +1583,8 @@ namespace vex {
                 auto *s = static_cast<ast::StructDecl *>(decl.get());
                 if (!struct_layouts_.count(s->name)) {
                     StructLayout empty;
-                    empty.name = s->name;
+                    empty.name          = s->name;
+                    empty.is_introspect = s->is_introspect;
                     struct_layouts_.emplace(s->name, std::move(empty));
                 }
             } else if (decl->kind == ast::NodeKind::ClassDecl) {
@@ -1334,16 +1593,18 @@ namespace vex {
                 if (!c->type_params.empty()) continue;
                 if (!class_layouts_.count(c->name)) {
                     ClassLayout empty;
-                    empty.name         = c->name;
-                    empty.is_interface = c->is_interface;
-                    empty.is_aspect    = c->is_aspect;
+                    empty.name          = c->name;
+                    empty.is_interface  = c->is_interface;
+                    empty.is_aspect     = c->is_aspect;
+                    empty.is_introspect = c->is_introspect;
                     class_layouts_.emplace(c->name, std::move(empty));
                 }
             } else if (decl->kind == ast::NodeKind::EnumDecl) {
                 auto *en = static_cast<ast::EnumDecl *>(decl.get());
                 if (!enum_layouts_.count(en->name)) {
                     EnumLayout empty;
-                    empty.name = en->name;
+                    empty.name          = en->name;
+                    empty.is_introspect = en->is_introspect;
                     enum_layouts_.emplace(en->name, std::move(empty));
                 }
             }
@@ -1514,14 +1775,20 @@ namespace vex {
                 if (max_align > 1 && offset % max_align != 0) {
                     offset += max_align - (offset % max_align);
                 }
-                layout.size_bytes  = offset;
-                layout.align_bytes = max_align;
+                layout.size_bytes   = offset;
+                layout.align_bytes  = max_align;
+                /* preservar la marca @Introspect que
+                 * la pre-pasada copio del AST.  Como aqui sobrescribimos
+                 * la entrada con un layout local fresco, hay que re-copiar
+                 * el flag desde el StructDecl. */
+                layout.is_introspect = s->is_introspect;
 
                 // Sobrescribir la entrada vacia pre-registrada con el layout
                 // ya completo.  Usar operator[] = porque la entrada existe.
                 struct_layouts_[s->name] = std::move(layout);
             } else if (decl->kind == ast::NodeKind::EnumDecl) {
-                // A.11 ADTs: registrar el enum con su layout (max_payload).
+                // Registrar el enum (ADT) con su layout: max_payload determina
+                // el tamano del slot (8 + 8*N_payload_fields_max) y los tags.
                 auto *en = static_cast<ast::EnumDecl *>(decl.get());
                 // Pre-pasada creo entradas vacias en enum_layouts_; un
                 // enum es "ya registrado" si tiene variantes.  Para
@@ -1572,6 +1839,8 @@ namespace vex {
                 // se padea a 8 bytes para uniformidad del offset acceso
                 // (i*8 a partir de offset 8) sin tablas por variante.
                 elay.size_bytes = 8 + 8 * max_pl;
+                /* preservar marca @Introspect del AST. */
+                elay.is_introspect = en->is_introspect;
                 // Sobrescribir entrada vacia pre-registrada.
                 enum_layouts_[en->name] = std::move(elay);
             } else if (decl->kind == ast::NodeKind::ClassDecl) {
@@ -1601,6 +1870,9 @@ namespace vex {
                 layout.super_name      = c->super_name;
                 layout.interface_names = c->interface_names;
                 layout.is_interface    = c->is_interface;
+                /* preservar la marca @Introspect del AST. */
+                layout.is_introspect   = c->is_introspect;
+                layout.is_aspect       = c->is_aspect;
 
                 // Herencia: si hay super_name resuelto, copiamos sus fields
                 // y metodos al inicio del layout actual.  Los offsets
@@ -1990,6 +2262,35 @@ namespace vex {
             if (!decl) continue;
             if (decl->kind == ast::NodeKind::FunctionDecl) {
                 auto *fn = static_cast<ast::FunctionDecl *>(decl.get());
+                /* comptime fn -- registrar para que las llamadas
+                 * desde contextos comptime puedan interpretar el body.
+                 * NO se registra como Symbol::Function regular porque
+                 * NO debe llamarse desde codigo runtime.  Pero sigue
+                 * declarando el nombre en el scope global para que el
+                 * type checker resuelva el ident en el callee de las
+                 * llamadas (comptime_eval_expr discrimina luego). */
+                if (fn->is_comptime) {
+                    register_comptime_fn(fn->name, fn);
+                    /* Tambien registramos un Symbol::Function dummy para
+                     * que `lookup(fn->name)` lo resuelva.  El sig real
+                     * importa poco porque la llamada nunca sale a IR. */
+                    FunctionSig sig_ct;
+                    sig_ct.return_type = type_from_node(fn->return_type.get());
+                    sig_ct.param_types.reserve(fn->params.size());
+                    for (auto &p : fn->params) {
+                        sig_ct.param_types.push_back(type_from_node(p->type.get()));
+                    }
+                    Symbol s;
+                    s.kind      = SymbolKind::Function;
+                    s.sig_index = (uint32_t)function_sigs_.size();
+                    sig_by_name_[fn->name] = s.sig_index;
+                    function_sigs_.push_back(std::move(sig_ct));
+                    if (!declare(fn->name, s)) {
+                        diags_.error(fn->loc,
+                            "comptime fn: redefinicion de '" + fn->name + "'");
+                    }
+                    continue;
+                }
 
                 FunctionSig sig;
                 Type ret_t = type_from_node(fn->return_type.get());
@@ -2064,6 +2365,14 @@ namespace vex {
                     if (gv->init) {
                         Type t = check_expr(gv->init.get());
                         const Type want = type_from_node(gv->type.get());
+                        /* A.39: para comptime const NO aplicamos el check
+                         * estricto -- el "tipo" del literal es flexible
+                         * (string literal tiene type PTR pero comptime
+                         * lo evalua como STRING).  La validez se chequea
+                         * via comptime_eval_expr abajo. */
+                        if (gv->is_comptime) {
+                            /* skip */
+                        } else
                         if (t.kind != PrimitiveKind::COUNT
                          && want.kind != PrimitiveKind::COUNT
                          && !is_numeric(t.kind) == !is_numeric(want.kind)
@@ -2080,11 +2389,67 @@ namespace vex {
                             }
                         }
                     }
+                    /* comptime const NAME = expr; evaluar init en
+                     * compile-time y cachear el valor.  Errors si no es
+                     * comptime-evaluable. */
+                    if (gv->is_comptime) {
+                        if (!gv->init) {
+                            diags_.error(gv->loc,
+                                "'comptime const " + gv->name +
+                                "' requiere un inicializador");
+                        } else {
+                            const ComptimeEvalResult r =
+                                comptime_eval_expr(*this, gv->init.get());
+                            if (!r.ok) {
+                                diags_.error(gv->init->loc,
+                                    "el init de 'comptime const " + gv->name +
+                                    "' no es comptime-evaluable");
+                            } else {
+                                ComptimeConst c;
+                                /* sugar: si gv->type es nullptr
+                                 * (sugar `comptime X = ...` sin tipo
+                                 * explicito), inferimos el tipo desde el
+                                 * ComptimeEvalResult: is_str->STRING,
+                                 * is_type->TYPE_META, else->I64. */
+                                if (gv->type) {
+                                    c.type = type_from_node(gv->type.get());
+                                } else if (r.is_str) {
+                                    c.type = Type{PrimitiveKind::STRING};
+                                } else if (r.is_type) {
+                                    c.type = Type{PrimitiveKind::TYPE_META};
+                                } else {
+                                    c.type = Type{PrimitiveKind::I64};
+                                }
+                                c.is_str    = r.is_str;
+                                c.is_array  = r.is_array;
+                                c.is_struct = r.is_struct;
+                                c.is_type   = r.is_type;
+                                /* A.43.17: globales `comptime var` son mutables.
+                                 * Los `comptime const` mantienen is_mutable=false.
+                                 * Las @Macro y comptime fn pueden modificar
+                                 * globals mutables via apply_comptime_assign. */
+                                c.is_mutable = !gv->is_const;
+                                if (r.is_str)         c.str_value     = r.str;
+                                else if (r.is_array)  c.array_vals    = r.array_vals;
+                                else if (r.is_struct) c.struct_fields = r.struct_fields;
+                                else if (r.is_type)   c.type_val      = r.type_val;
+                                else                  c.value         = r.value;
+                                comptime_const_values_[gv->name] = c;
+                            }
+                        }
+                    }
                 }
                 continue;
             }
             auto *fn = static_cast<ast::FunctionDecl *>(decl.get());
             if (!fn->body) continue;
+            /* comptime fn -- el body solo se interpreta al
+             * call site via comptime_eval_stmt.  No type-check estatico
+             * aqui (los IdentExpr no necesitan annotation; el eval los
+             * busca en tc.comptime_const_locals_).  Si hay errores de
+             * sintaxis o expresiones invalidas, el eval fallara con
+             * `ok=false` en el call y emitiremos error alli. */
+            if (fn->is_comptime) continue;
 
             // Mejora II: validacion @Async extendida.  Antes solo permitia
             // funciones sin parametros y return type i64.  Ahora:
@@ -2517,7 +2882,128 @@ namespace vex {
                             type_to_string(tv));
                     }
                 }
+                /* incrementa el depth para que wait/notify/notifyAll
+                 * dentro del body se acepten.  Decrementa al salir aun si
+                 * el body tuvo errores (no bloquea diagnosticos sucesivos). */
+                ++synchronized_depth_;
                 if (ss->body) check_stmt(ss->body.get(), fn_return_type);
+                --synchronized_depth_;
+                return;
+            }
+            case ast::NodeKind::ComptimeBlockStmt: {
+                /* bloque comptime { ... } -- scope con vars
+                 * mutables + control de flujo completo.  Se procesa con
+                 * UN solo pase interleaved: para cada stmt, primero
+                 * validamos via check_stmt (annota IdentExprs y registra
+                 * vars en comptime_const_locals_), luego ejecutamos via
+                 * comptime_eval_stmt (aplica asignaciones, evalua while
+                 * con counter mutable, etc).  Esto garantiza que un
+                 * static_assert posterior vea el estado actualizado por
+                 * las asignaciones anteriores. */
+                auto *cb = static_cast<ast::ComptimeBlockStmt *>(s);
+                push_comptime_scope();
+                ComptimeControl ctrl;
+                for (auto &inner : cb->stmts) {
+                    if (!inner) continue;
+                    /* Validar permisos del stmt.  Otros stmts emiten
+                     * error explicito. */
+                    bool valid = false;
+                    if (inner->kind == ast::NodeKind::VarDeclStmt) {
+                        auto *v = static_cast<ast::VarDeclStmt *>(inner.get());
+                        if (v->is_comptime) valid = true;
+                    } else if (inner->kind == ast::NodeKind::ExprStmt
+                            || inner->kind == ast::NodeKind::IfStmt
+                            || inner->kind == ast::NodeKind::WhileStmt
+                            || inner->kind == ast::NodeKind::DoWhileStmt
+                            || inner->kind == ast::NodeKind::ForStmt
+                            || inner->kind == ast::NodeKind::BlockStmt
+                            || inner->kind == ast::NodeKind::ComptimeBlockStmt
+                            || inner->kind == ast::NodeKind::ComptimeForStmt
+                            || inner->kind == ast::NodeKind::BreakStmt
+                            || inner->kind == ast::NodeKind::ContinueStmt) {
+                        valid = true;
+                    }
+                    if (!valid) {
+                        diags_.error(inner->loc,
+                            "comptime block: stmt no soportado en contexto comptime");
+                        continue;
+                    }
+                    /* PASS A: annotation pass.  Para VarDeclStmt
+                     * comptime, registramos el binding via check_var_decl
+                     * (eso lo agrega a comptime_const_locals_).  Para
+                     * todo lo demas NO llamamos check_stmt (porque
+                     * dispararia static_assert con estado obsoleto u
+                     * otras evaluaciones tempranas).  En su lugar
+                     * confiamos en que comptime_eval_stmt anota lo que
+                     * necesite via check_ident interno (comptime_eval_expr
+                     * busca directo en comptime_const_locals_, no necesita
+                     * annotation). */
+                    if (inner->kind == ast::NodeKind::VarDeclStmt) {
+                        auto *v = static_cast<ast::VarDeclStmt *>(inner.get());
+                        check_var_decl(v);
+                        continue; /* check_var_decl ya evaluo el init */
+                    }
+                    /* PASS B: execute comptime.  Para ExprStmt con
+                     * static_assert (o cualquier CallExpr con efecto
+                     * compile-time), llamamos check_expr DENTRO de la
+                     * llamada que invoca eval.  Para AssignExpr,
+                     * comptime_eval_stmt actualiza el binding.  Para
+                     * if/while/for, ejecuta el cuerpo iterativamente. */
+                    if (inner->kind == ast::NodeKind::ExprStmt) {
+                        auto *es = static_cast<ast::ExprStmt *>(inner.get());
+                        if (es->expr) {
+                            /* Pre-annotate identifiers via check_expr.
+                             * Esto tambien dispara static_assert si lo
+                             * hay -- y como se hace AHORA (tras las
+                             * asignaciones previas), ve el estado
+                             * actualizado. */
+                            (void)check_expr(es->expr.get());
+                        }
+                    }
+                    /* Ejecutar el stmt en compile-time. */
+                    if (!comptime_eval_stmt(*this, inner.get(), ctrl)) {
+                        diags_.error(inner->loc,
+                            "comptime block: stmt no evaluable en compile-time");
+                        break;
+                    }
+                    if (ctrl.returned || ctrl.break_seen || ctrl.continue_seen) {
+                        ctrl.returned = ctrl.break_seen = ctrl.continue_seen = false;
+                        break;
+                    }
+                }
+                pop_comptime_scope();
+                return;
+            }
+            case ast::NodeKind::ComptimeForStmt: {
+                /* A.39: comptime for (i in lo..hi) { body } -- evaluamos
+                 * lo y hi en compile-time.  El body se chequea UNA vez
+                 * con i bindeado al valor de lo (suficiente para validar
+                 * tipos en la primera iteracion; el lowering hace el
+                 * unroll real clonando el body N veces). */
+                auto *cf = static_cast<ast::ComptimeForStmt *>(s);
+                if (!cf->lo_expr || !cf->hi_expr) {
+                    diags_.error(cf->loc,
+                        "comptime for: rango incompleto");
+                    return;
+                }
+                const ComptimeEvalResult lo = comptime_eval_expr(
+                    *this, cf->lo_expr.get());
+                const ComptimeEvalResult hi = comptime_eval_expr(
+                    *this, cf->hi_expr.get());
+                if (!lo.ok || !hi.ok || lo.is_str || hi.is_str) {
+                    diags_.error(cf->loc,
+                        "comptime for: lo y hi deben ser enteros "
+                        "comptime-evaluables");
+                    return;
+                }
+                /* Chequear el body con i bindeado a lo (representativo). */
+                push_comptime_scope();
+                ComptimeConst c;
+                c.type  = Type{PrimitiveKind::I64};
+                c.value = lo.value;
+                register_comptime_local(cf->var_name, std::move(c));
+                if (cf->body) check_stmt(cf->body.get(), fn_return_type);
+                pop_comptime_scope();
                 return;
             }
             default:
@@ -2526,9 +3012,73 @@ namespace vex {
     }
 
     void TypeChecker::check_var_decl(ast::VarDeclStmt *vd) {
+        /* `comptime const NAME = expr;` local.  Evalua el init en
+         * compile-time y registra en el scope local de comptime const.
+         * El lowering lo trata como no-op (no genera ALLOCA ni STORE);
+         * cualquier ident posterior queda anotado por check_ident. */
+        if (vd->is_comptime) {
+            if (!vd->init) {
+                diags_.error(vd->loc,
+                    std::string("'comptime ") + (vd->is_const ? "const " : "")
+                    + vd->name + "' requiere un inicializador");
+                return;
+            }
+            const ComptimeEvalResult r =
+                comptime_eval_expr(*this, vd->init.get());
+            if (!r.ok) {
+                diags_.error(vd->init->loc,
+                    std::string("el init de 'comptime ")
+                    + (vd->is_const ? "const " : "")
+                    + vd->name + "' no es comptime-evaluable");
+                return;
+            }
+            ComptimeConst c;
+            /* sugar: si vd->type es nullptr (sugar `comptime X = ...`
+             * local sin tipo explicito), inferimos el tipo desde el
+             * ComptimeEvalResult.  Misma logica que en el handler global. */
+            if (vd->type) {
+                c.type = type_from_node(vd->type.get());
+            } else if (r.is_str) {
+                c.type = Type{PrimitiveKind::STRING};
+            } else if (r.is_type) {
+                c.type = Type{PrimitiveKind::TYPE_META};
+            } else {
+                c.type = Type{PrimitiveKind::I64};
+            }
+            c.is_str     = r.is_str;
+            c.is_array   = r.is_array;
+            c.is_struct  = r.is_struct;
+            c.is_type    = r.is_type;
+            c.is_mutable = !vd->is_const;
+            if (r.is_str)         c.str_value     = r.str;
+            else if (r.is_array)  c.array_vals    = r.array_vals;
+            else if (r.is_struct) c.struct_fields = r.struct_fields;
+            else if (r.is_type)   c.type_val      = r.type_val;
+            else                  c.value         = r.value;
+            register_comptime_local(vd->name, std::move(c));
+            return;
+        }
         Symbol s;
         s.kind     = SymbolKind::Variable;
-        s.type     = type_from_node(vd->type.get());
+        /* `auto NAME = init;` o `var NAME = init;` -- inferencia
+         * local.  El parser dejo @c vd->type=nullptr y marco infer_type.
+         * Computamos el tipo del init aqui y lo aplicamos al binding sin
+         * reconstruir el AST.  Falla con error si no hay init. */
+        if (vd->infer_type) {
+            if (!vd->init) {
+                diags_.error(vd->loc,
+                    "'auto " + vd->name + "' requiere un inicializador (no se puede inferir sin valor)");
+                return;
+            }
+            s.type = check_expr(vd->init.get());
+            if (s.type.kind == PrimitiveKind::VOID) {
+                diags_.error(vd->loc,
+                    "no se pudo inferir el tipo de '" + vd->name + "' (init devuelve void)");
+                return;
+            }
+        } else {
+            s.type = type_from_node(vd->type.get());
+        }
         s.is_const = vd->is_const;
         // Captura del alias de reflexion (Class/Method/Field/Object) para
         // habilitar dispatch ergonomico `cls.getMethod(...)` etc.  El TypeNode
@@ -2730,6 +3280,33 @@ namespace vex {
                 diags_.error(s->cond->loc, "condicion de 'if' debe ser numerica o bool");
             }
         }
+        /* `comptime if (cond)` exige que cond sea evaluable
+         * 100% en compile-time.  Si no lo es, error claro aqui (no se
+         * espera al lowering).  Tambien valida solo la rama elegida --
+         * la otra se descarta sin chequear (permite codigo que no compila
+         * en la rama no tomada, p.ej. usando features no soportadas para
+         * el tipo concreto). */
+        if (s->is_comptime) {
+            const ComptimeEvalResult r = comptime_eval_expr(*this, s->cond.get());
+            if (!r.ok) {
+                diags_.error(s->cond->loc,
+                    "comptime if: la condicion debe ser evaluable en "
+                    "compile-time (literales + builtins comptime + "
+                    "operadores logicos/aritmeticos)");
+                /* Como fallback, chequear ambas ramas para no perder
+                 * diagnosticos posteriores. */
+                if (s->then_branch) check_stmt(s->then_branch.get(), fn_return_type);
+                if (s->else_branch) check_stmt(s->else_branch.get(), fn_return_type);
+                return;
+            }
+            /* Solo chequeamos la rama tomada.  La otra se descarta. */
+            if (r.value != 0) {
+                if (s->then_branch) check_stmt(s->then_branch.get(), fn_return_type);
+            } else {
+                if (s->else_branch) check_stmt(s->else_branch.get(), fn_return_type);
+            }
+            return;
+        }
         if (s->then_branch) check_stmt(s->then_branch.get(), fn_return_type);
         if (s->else_branch) check_stmt(s->else_branch.get(), fn_return_type);
     }
@@ -2897,6 +3474,36 @@ namespace vex {
             case ast::NodeKind::AssignExpr:
                 t = check_assign(static_cast<ast::AssignExpr *>(e));
                 break;
+            case ast::NodeKind::TernaryExpr: {
+                /*ternario cond ? then : else.  Tipo resultado =
+                 * tipo en comun entre then y else (preferimos el de then;
+                 * si else no es asignable a then se reporta error). */
+                auto *te = static_cast<ast::TernaryExpr *>(e);
+                if (te->cond) {
+                    Type ct = check_expr(te->cond.get());
+                    if (ct.kind != PrimitiveKind::BOOL && !is_numeric(ct.kind)
+                     && ct.kind != PrimitiveKind::COUNT) {
+                        diags_.error(te->cond->loc,
+                            "condicion ternaria debe ser numerica o bool, no '"
+                            + type_to_string(ct) + "'");
+                    }
+                }
+                Type tt = te->then_expr ? check_expr(te->then_expr.get()) : Type{};
+                Type et = te->else_expr ? check_expr(te->else_expr.get()) : Type{};
+                /* Si los dos son numericos, promovemos al mas ancho.
+                 * Si son tipos compatibles, usamos tt como resultado.
+                 * Si no, error. */
+                if (tt.kind == PrimitiveKind::COUNT) tt = et;
+                if (et.kind == PrimitiveKind::COUNT) et = tt;
+                if (!types_assignable(tt, et) && !types_assignable(et, tt)) {
+                    diags_.error(te->loc,
+                        "ternario: ramas con tipos incompatibles '"
+                        + type_to_string(tt) + "' y '"
+                        + type_to_string(et) + "'");
+                }
+                t = tt;
+                break;
+            }
             case ast::NodeKind::CallExpr:
                 t = check_call(static_cast<ast::CallExpr *>(e));
                 break;
@@ -3325,6 +3932,43 @@ namespace vex {
     }
 
     Type TypeChecker::check_ident(ast::IdentExpr *e) {
+        /* A.39: si el ident resuelve a un comptime const (local o
+         * global), anotamos el valor en el AST.  El lowering lee la
+         * marca y emite CONST directo sin volver a consultar la tabla
+         * (que puede haber sido pop()-ada por scope locals).  Esto
+         * preserva los comptime const locales a traves del boundary
+         * type-check -> lowering. */
+        {
+            /* Buscar en stack de scopes locales primero. */
+            for (auto sc = comptime_const_locals_.rbegin();
+                 sc != comptime_const_locals_.rend(); ++sc) {
+                auto it = sc->find(e->name);
+                if (it != sc->end()) {
+                    e->comptime_const_resolved = true;
+                    if (it->second.is_str) {
+                        e->comptime_const_is_str = true;
+                        e->comptime_const_str    = it->second.str_value;
+                    } else {
+                        e->comptime_const_int = it->second.value;
+                    }
+                    e->result_type = it->second.type;
+                    return e->result_type;
+                }
+            }
+            /* Tabla global. */
+            auto it = comptime_const_values_.find(e->name);
+            if (it != comptime_const_values_.end()) {
+                e->comptime_const_resolved = true;
+                if (it->second.is_str) {
+                    e->comptime_const_is_str = true;
+                    e->comptime_const_str    = it->second.str_value;
+                } else {
+                    e->comptime_const_int = it->second.value;
+                }
+                e->result_type = it->second.type;
+                return e->result_type;
+            }
+        }
         size_t depth = 0;
         const Symbol *s = lookup_with_depth(e->name, &depth);
         if (!s) {
@@ -3377,9 +4021,12 @@ namespace vex {
             }
         }
         if (s->kind == SymbolKind::Function) {
-            // Tratamos las funciones como un tipo VOID a efectos de inferencia
-            // sin call; la llamada (CallExpr) lo manejara.  En A.1 no
-            // soportamos funciones de primer nivel (function pointers).
+            // Tratamos las funciones como un tipo VOID a efectos de
+            // inferencia cuando aparecen sin call directo; el caso CALL
+            // (CallExpr) lo manejara especificamente.  Pasar una funcion
+            // libre como argumento a un parametro @c fn(T) -> R esta
+            // soportado y se promociona explicitamente a function value
+            // en @c check_call (cubre el caso first-class).
             return Type{};
         }
         return s->type;
@@ -3508,7 +4155,7 @@ namespace vex {
             for (const auto &f : lay.static_fields) {
                 if (f.name == e->field_name) return f.type;
             }
-            // A.4.3: si no hay campo, buscar getter de propiedad
+            // Si no hay campo con ese nombre, buscar getter de propiedad
             // `get_<field_name>`.  Si existe, marcar como acceso de
             // propiedad y devolver su tipo de retorno.  El lowering ve
             // @c property_kind=1 y emite la llamada al accesor.
@@ -4143,6 +4790,28 @@ namespace vex {
             return Type{};
         }
         const auto *id = static_cast<const ast::IdentExpr *>(e->target.get());
+        /* asignacion a comptime var (mutable).  Si el nombre esta
+         * en el stack de comptime const locales y is_mutable=true,
+         * permitimos la asignacion: el comptime_eval_stmt (en bloques
+         * comptime / fn bodies) la procesa.  No emitimos error aqui. */
+        {
+            const auto &stack = comptime_const_locals_;
+            for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
+                auto hit = it->find(id->name);
+                if (hit != it->end()) {
+                    if (!hit->second.is_mutable) {
+                        diags_.error(e->loc,
+                            "asignacion a 'comptime const' inmutable: '"
+                            + id->name + "'");
+                        return Type{};
+                    }
+                    /* Chequear tipo del valor (compatible). */
+                    Type vt = check_expr(e->value.get());
+                    (void)vt;
+                    return hit->second.type;
+                }
+            }
+        }
         size_t id_depth = 0;
         const Symbol *s = lookup_with_depth(id->name, &id_depth);
         if (!s) {
@@ -4448,8 +5117,11 @@ namespace vex {
         }
 
         // Caso A: obj.method(args) - callee es FieldAccessExpr.  El base
-        // puede ser de tipo CLASS (instancia) o STRUCT (no soportado en
-        // A.4.1, llegan en A.5+).
+        // debe ser de tipo CLASS (instancia con vtable).  Los structs son
+        // value types y sus metodos se desugaran a funciones libres
+        // tomando @c Struct* como primer argumento, asi que el dispatch
+        // de @c struct_instance.method() pasa por la ruta de free function
+        // call, no por aqui.
         if (e->callee->kind == ast::NodeKind::FieldAccessExpr) {
             auto *fa = static_cast<ast::FieldAccessExpr *>(e->callee.get());
             const Type bt = check_expr(fa->base.get());
@@ -4532,7 +5204,687 @@ namespace vex {
             for (auto &a : e->args) (void)check_expr(a.get());
             return Type{};
         }
+        /* A.43.13: aliases globales para builtins comptime.  Reduce
+         * verbosidad permitiendo escribir `concat(a, b)` en vez de
+         * `comptime_concat(a, b)`, `replace(s, n, v)` en vez de
+         * `comptime_replace(...)`, etc.  Los aliases mutan el AST
+         * in-place (renombran el IdentExpr a su nombre canonico) asi
+         * todas las branches downstream que comparan @c id->name siguen
+         * funcionando sin cambios.  Solo se aplica a CallExpr; no
+         * afecta a IdentExpr en otras posiciones.
+         *
+         * Nota: NO aliasamos `print` (colisiona con runtime print) ni
+         * nombres ya usados por la stdlib.  El usuario que quiera ser
+         * explicito puede seguir escribiendo `comptime_*`. */
+        {
+            auto *id_mut = static_cast<ast::IdentExpr *>(e->callee.get());
+            static const std::pair<const char *, const char *> ALIASES[] = {
+                {"concat",      "comptime_concat"},
+                {"streq",       "comptime_streq"},
+                {"strlen",      "comptime_strlen"},
+                {"chr",         "comptime_chr"},
+                {"ord",         "comptime_ord"},
+                {"substr",      "comptime_substr"},
+                {"repeat",      "comptime_repeat"},
+                {"to_str",      "comptime_to_str"},
+                {"replace",     "comptime_replace"},
+                {"contains",    "comptime_contains"},
+                {"emit_expr",   "comptime_emit_expr"},
+                {"compile",     "comptime_compile"},
+                {"ct_print",    "comptime_print"},
+            };
+            for (const auto &a : ALIASES) {
+                if (id_mut->name == a.first) {
+                    id_mut->name = a.second;
+                    break;
+                }
+            }
+        }
         const auto *id = static_cast<const ast::IdentExpr *>(e->callee.get());
+
+        // -----------------------------------------------------------------
+        // Builtins comptime de introspection (Sprint 1).
+        // Toman <T> en e->type_args.  Resolvidos a CONSTANTES literales
+        // por el lowering.  Cero overhead runtime.  Validamos:
+        //   1. e->type_args.size() == aridad esperada.
+        //   2. e->args.size() == 0 (los del sprint 1 son nullary).
+        //   3. T es resoluble (type_from_node devuelve algo distinto a VOID).
+        // El RETURN type lo fijamos aqui; el VALOR concreto lo computa
+        // lowering invocando los helpers en comptime_introspect.h.
+        // -----------------------------------------------------------------
+        if (e->type_args.size() >= 1
+         && (id->name == "sizeof"   || id->name == "alignof"
+          || id->name == "typename" || id->name == "type_id"
+          || id->name == "kind"     || id->name == "comptime_type"
+          || id->name == "parent_class" || id->name == "element_type"
+          || id->name == "error_type")) {
+            if (e->type_args.size() != 1) {
+                diags_.error(e->loc,
+                    id->name + ": se esperaba 1 type arg <T>, recibidos "
+                    + std::to_string(e->type_args.size()));
+            }
+            if (!e->args.empty()) {
+                diags_.error(e->loc,
+                    id->name + ": no acepta argumentos runtime (solo <T>)");
+            }
+            /* Validar que T sea resoluble.  type_from_node devuelve un
+             * Type con kind=VOID si no logro resolver. */
+            Type resolved = e->type_args.empty()
+                ? Type{}
+                : type_from_node(e->type_args[0].get());
+            if (resolved.kind == PrimitiveKind::VOID
+             && e->type_args.size() == 1) {
+                /* Si el usuario escribio sizeof<void>() o similar,
+                 * permitirlo (sizeof(void)=0).  Pero si fue por fallo de
+                 * resolucion, type_from_node ya emitio diagnostico. */
+            }
+            /* Tipo de retorno segun el builtin. */
+            Type rt{};
+            if (id->name == "sizeof" || id->name == "alignof") {
+                rt = Type{PrimitiveKind::U64};
+            } else if (id->name == "typename") {
+                rt = Type{PrimitiveKind::STRING};
+            } else if (id->name == "type_id") {
+                rt = Type{PrimitiveKind::U32};
+            } else if (id->name == "kind") {
+                rt = Type{PrimitiveKind::I32};
+            } else if (id->name == "comptime_type"
+                    || id->name == "parent_class"
+                    || id->name == "element_type"
+                    || id->name == "error_type") {
+                /* devuelven un Type como first-class value.  Solo
+                 * usable como init de `comptime const Type X = ...`. */
+                rt = Type{PrimitiveKind::TYPE_META};
+            }
+            e->result_type = rt;
+            return rt;
+        }
+
+        // -----------------------------------------------------------------
+        // introspection: acceso directo a campos via offset
+        // compile-time.  Bypass de getfield/setfield -- el offset se
+        // resuelve via comptime_field_offset y el LOAD/STORE va directo.
+        //
+        //   field_get<T>(obj: T, "f")        -> typeof(T.f)
+        //   field_set<T>(obj: T, "f", value) -> void
+        //
+        // Ventajas vs `obj.f` plano:
+        //   - bypass del CALLVIRT a getter de propiedad
+        //   - bypass del RMW de bit fields (acceso al storage word directo)
+        //   - acceso "raw" util para serializadores / hashers genericos
+        // -----------------------------------------------------------------
+        if (!e->type_args.empty()
+         && (id->name == "field_get" || id->name == "field_set")) {
+            const bool is_get = (id->name == "field_get");
+            if (e->type_args.size() != 1) {
+                diags_.error(e->loc,
+                    id->name + ": se esperaba 1 type arg <T>, recibidos "
+                    + std::to_string(e->type_args.size()));
+            }
+            const size_t expected_args = is_get ? 2 : 3;
+            if (e->args.size() != expected_args) {
+                diags_.error(e->loc,
+                    id->name + ": se esperaban " + std::to_string(expected_args)
+                    + " argumentos (obj, \"field\""
+                    + (is_get ? "" : ", value") + "), recibidos "
+                    + std::to_string(e->args.size()));
+            }
+            const Type t = e->type_args.empty()
+                ? Type{} : type_from_node(e->type_args[0].get());
+            /* obj: debe ser STRUCT/CLASS compatible con T. */
+            if (!e->args.empty()) {
+                const Type ot = check_expr(e->args[0].get());
+                if (ot.kind != PrimitiveKind::CLASS
+                 && ot.kind != PrimitiveKind::STRUCT
+                 && ot.kind != PrimitiveKind::COUNT) {
+                    diags_.error(e->args[0]->loc,
+                        id->name + ": el primer argumento debe ser una "
+                        "instancia de tipo " + type_to_string(t)
+                        + ", recibido '" + type_to_string(ot) + "'");
+                }
+            }
+            /* segundo arg: string literal compile-time con el nombre. */
+            std::string fname;
+            if (e->args.size() >= 2) {
+                auto *slit = dynamic_cast<ast::StringLitExpr *>(
+                    e->args[1].get());
+                if (!slit || slit->is_interpolated()) {
+                    diags_.error(e->args[1]->loc,
+                        id->name + ": el segundo argumento debe ser un "
+                        "literal string compile-time (no interpolado)");
+                } else {
+                    fname = slit->value;
+                }
+                (void)check_expr(e->args[1].get());
+            }
+            /* Resolver el tipo del campo en T. */
+            Type ftype = comptime_field_type(*this, t, fname);
+            if (ftype.kind == PrimitiveKind::COUNT && !fname.empty()) {
+                diags_.error(e->loc,
+                    id->name + ": el tipo '" + type_to_string(t)
+                    + "' no tiene campo '" + fname + "'");
+            }
+            /* field_set: tercer arg debe ser asignable al tipo del campo. */
+            if (!is_get && e->args.size() >= 3) {
+                const Type vt = check_expr(e->args[2].get());
+                if (ftype.kind != PrimitiveKind::COUNT
+                 && !types_assignable(ftype, vt)) {
+                    diags_.error(e->args[2]->loc,
+                        "field_set: el valor de tipo '" + type_to_string(vt)
+                        + "' no es asignable al campo '" + fname
+                        + "' de tipo '" + type_to_string(ftype) + "'");
+                }
+            }
+            /* Tipo de retorno. */
+            const Type rt = is_get
+                ? (ftype.kind == PrimitiveKind::COUNT ? Type{} : ftype)
+                : Type{PrimitiveKind::VOID};
+            e->result_type = rt;
+            return rt;
+        }
+
+        // -----------------------------------------------------------------
+        // Sprint 3-C introspection: for_each_field<T>(cb) / for_each_method.
+        // El callback se invoca UNA vez por cada field/method de T en
+        // compile-time (loop completamente unrolled).  La firma del
+        // callback debe ser `fn(string) -> void` (o `fn(string) -> T`
+        // ignorando el retorno).
+        // -----------------------------------------------------------------
+        if (!e->type_args.empty()
+         && (id->name == "for_each_field" || id->name == "for_each_method")) {
+            if (e->type_args.size() != 1) {
+                diags_.error(e->loc,
+                    id->name + ": se esperaba 1 type arg <T>, recibidos "
+                    + std::to_string(e->type_args.size()));
+            }
+            if (e->args.size() != 1) {
+                diags_.error(e->loc,
+                    id->name + ": se esperaba 1 argumento (callback), recibidos "
+                    + std::to_string(e->args.size()));
+            }
+            (void)type_from_node(e->type_args[0].get());
+            if (!e->args.empty()) {
+                const Type cbt = check_expr(e->args[0].get());
+                /* El callback debe ser FUNCTION tomando 1 string. */
+                if (cbt.kind != PrimitiveKind::FUNCTION
+                 || cbt.fn_params.size() != 1
+                 || cbt.fn_params[0].kind != PrimitiveKind::STRING) {
+                    diags_.error(e->args[0]->loc,
+                        id->name + ": el callback debe tener firma "
+                        "fn(string) -> _ (recibe el nombre del field/method)");
+                }
+            }
+            const Type rt{PrimitiveKind::VOID};
+            e->result_type = rt;
+            return rt;
+        }
+
+        // -----------------------------------------------------------------
+        // Sprint 2 introspection: queries de fields/methods + queries de tipos.
+        // Aridades:
+        //   1 type_arg, 0 runtime args:  field_count, method_count,
+        //                                 is_class, is_struct, is_primitive
+        //   1 type_arg, 1 runtime arg:   offsetof, has_field, has_method,
+        //                                 field_type (arg debe ser string lit)
+        //                                 field_name (arg debe ser int lit)
+        //   2 type_args, 0 runtime args: is_subtype, is_same
+        // -----------------------------------------------------------------
+        {
+            const std::string &nm = id->name;
+            const bool one_targ_no_args =
+                nm == "field_count"  || nm == "method_count"
+             || nm == "is_class"     || nm == "is_struct"
+             || nm == "is_primitive";
+            const bool one_targ_str_arg =
+                nm == "offsetof"     || nm == "has_field"
+             || nm == "has_method"   || nm == "field_type";
+            const bool one_targ_int_arg = (nm == "field_name"
+                                         || nm == "field_type_at"
+                                         || nm == "method_name"
+                                         || nm == "method_return_type");
+            const bool two_targ_no_args =
+                nm == "is_subtype"   || nm == "is_same";
+
+            if ((one_targ_no_args || one_targ_str_arg
+              || one_targ_int_arg || two_targ_no_args)
+             && !e->type_args.empty()) {
+                /* Aridad de type_args. */
+                const size_t expected_targs = two_targ_no_args ? 2 : 1;
+                if (e->type_args.size() != expected_targs) {
+                    diags_.error(e->loc,
+                        nm + ": se esperaban " + std::to_string(expected_targs)
+                        + " type args, recibidos "
+                        + std::to_string(e->type_args.size()));
+                }
+                /* Aridad de runtime args. */
+                const size_t expected_args =
+                    (one_targ_str_arg || one_targ_int_arg) ? 1 : 0;
+                if (e->args.size() != expected_args) {
+                    diags_.error(e->loc,
+                        nm + ": se esperaban " + std::to_string(expected_args)
+                        + " argumentos runtime, recibidos "
+                        + std::to_string(e->args.size()));
+                }
+                /* Validar que los type_args resuelvan. */
+                for (auto &ta : e->type_args) (void)type_from_node(ta.get());
+                /* Arg literal compile-time (string lit no interpolado, o
+                 * int lit).  El lowering lo asume garantizado. */
+                if (one_targ_str_arg && !e->args.empty()) {
+                    auto *slit = dynamic_cast<ast::StringLitExpr *>(
+                        e->args[0].get());
+                    if (!slit || slit->is_interpolated()) {
+                        diags_.error(e->args[0]->loc,
+                            nm + ": el argumento debe ser un literal string "
+                            "compile-time (no interpolado, no variable)");
+                    }
+                    (void)check_expr(e->args[0].get());
+                }
+                if (one_targ_int_arg && !e->args.empty()) {
+                    auto *ilit = dynamic_cast<ast::IntLitExpr *>(
+                        e->args[0].get());
+                    if (!ilit) {
+                        diags_.error(e->args[0]->loc,
+                            nm + ": el argumento debe ser un literal entero "
+                            "compile-time (no variable, no expresion)");
+                    }
+                    (void)check_expr(e->args[0].get());
+                }
+                /* Tipo de retorno segun el builtin. */
+                Type rt{};
+                if (nm == "offsetof") {
+                    rt = Type{PrimitiveKind::U64};
+                } else if (nm == "field_count" || nm == "method_count") {
+                    rt = Type{PrimitiveKind::U32};
+                } else if (nm == "field_name" || nm == "field_type") {
+                    rt = Type{PrimitiveKind::STRING};
+                } else if (nm == "field_type_at") {
+                    /* A.43: field_type_at<T>(idx) -> Type as first-class value. */
+                    rt = Type{PrimitiveKind::TYPE_META};
+                } else if (nm == "method_name") {
+                    /* A.43: method_name<T>(idx) -> string. */
+                    rt = Type{PrimitiveKind::STRING};
+                } else if (nm == "method_return_type") {
+                    /* A.43: method_return_type<T>(idx) -> Type. */
+                    rt = Type{PrimitiveKind::TYPE_META};
+                } else {
+                    /* has_field/has_method/is_subtype/is_same/is_class/
+                     * is_struct/is_primitive -> BOOL. */
+                    rt = Type{PrimitiveKind::BOOL};
+                }
+                e->result_type = rt;
+                return rt;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // A.39: builtins comptime sobre strings.
+        //   comptime_concat(a, b) -> string  (concat de 2 strings comptime)
+        //   comptime_streq(a, b)  -> bool    (igualdad de strings comptime)
+        //   comptime_strlen(s)    -> u64     (longitud en bytes)
+        //
+        // Estos son SIEMPRE compile-time -- args deben ser comptime-
+        // evaluables a string.  El lowering los inlinea como literal
+        // (string -> STR_LIT_ADDR+STRMAKE; int -> CONST) sin runtime call.
+        // -----------------------------------------------------------------
+        /* A.43.12: comptime_replace(s, needle, replacement) y
+         * comptime_contains(s, needle) -- patron declarativo de templates
+         * para macros.  Combinados con `comptime_emit_expr` permiten
+         * generar codigo a partir de templates con placeholders. */
+        if (id->name == "comptime_replace") {
+            if (e->args.size() != 3) {
+                diags_.error(e->loc,
+                    "comptime_replace: se esperaban 3 args (str, needle, replacement), recibidos "
+                    + std::to_string(e->args.size()));
+            } else {
+                for (auto &a : e->args) (void)check_expr(a.get());
+            }
+            Type rt{PrimitiveKind::STRING};
+            e->result_type = rt;
+            return rt;
+        }
+        if (id->name == "comptime_contains") {
+            if (e->args.size() != 2) {
+                diags_.error(e->loc,
+                    "comptime_contains: se esperaban 2 args (str, needle), recibidos "
+                    + std::to_string(e->args.size()));
+            } else {
+                for (auto &a : e->args) (void)check_expr(a.get());
+            }
+            Type rt{PrimitiveKind::BOOL};
+            e->result_type = rt;
+            return rt;
+        }
+        /* A.43.11: gensym(prefix) -> string.  Devuelve un identifier
+         * fresco unico, util para macros hygenic (prevenir capture en
+         * el scope del caller).  Validacion minima: 1 arg string. */
+        if (id->name == "gensym") {
+            if (e->args.size() != 1) {
+                diags_.error(e->loc,
+                    "gensym: se esperaba 1 argumento (string prefix), recibidos "
+                    + std::to_string(e->args.size()));
+            } else {
+                (void)check_expr(e->args[0].get());
+            }
+            Type rt{PrimitiveKind::STRING};
+            e->result_type = rt;
+            return rt;
+        }
+        /* comptime_emit_expr(str) -- macros Lisp con splice/emit.
+         * El string se parsea como una EXPRESION Vex, se type-checa en el
+         * contexto actual y se SUSTITUYE en el AST runtime (no solo
+         * comptime eval).  El lowering ve el AST sustituido y emite
+         * codigo runtime real.  Equivalente al unquote/splice de Lisp.
+         * Diferencia con comptime_compile: este SI emite codigo runtime;
+         * comptime_compile solo evalua al compile-time y descarta el AST. */
+        if (id->name == "comptime_emit_expr") {
+            if (e->args.size() != 1) {
+                diags_.error(e->loc,
+                    "comptime_emit_expr: se esperaba 1 argumento (string), recibidos "
+                    + std::to_string(e->args.size()));
+                return Type{};
+            }
+            (void)check_expr(e->args[0].get());
+            const ComptimeEvalResult sarg = comptime_eval_expr(*this, e->args[0].get());
+            if (!sarg.ok || !sarg.is_str) {
+                diags_.error(e->args[0]->loc,
+                    "comptime_emit_expr: el argumento debe ser un string comptime-evaluable");
+                return Type{};
+            }
+            /* Parsear el fragmento como expresion Vex. */
+            Lexer fragment_lex(sarg.str, "<comptime_emit_expr>", diags_);
+            Parser fragment_par(fragment_lex, diags_);
+            std::unique_ptr<ast::Expr> parsed = fragment_par.parse_one_expr();
+            if (!parsed) {
+                diags_.error(e->loc,
+                    "comptime_emit_expr: el fragmento no se pudo parsear como expresion");
+                return Type{};
+            }
+            parsed->loc = e->loc;
+            /* Type-checar la expresion sustituida en el contexto actual. */
+            const Type rt = check_expr(parsed.get());
+            /* Guardar el AST sustituido para que el lowering lo recoja. */
+            e->macro_expanded = std::move(parsed);
+            e->result_type    = rt;
+            return rt;
+        }
+        /* comptime_compile(str) -> result.  MVP de macros estilo
+         * Lisp: el string se parsea como una EXPRESION Vex y se evalua
+         * en compile-time.  Permite construir codigo a partir de datos
+         * (typename<T>, comptime_concat, comptime_to_str, etc.) y
+         * ejecutarlo sin runtime.  Limitaciones:
+         *  - Solo expresion (no statements).
+         *  - El tipo de retorno depende del contenido y se inferira
+         *    desde el comptime const que reciba el valor; aqui en check
+         *    devolvemos el tipo declarado del binding o un sentinela u64. */
+        if (id->name == "comptime_compile") {
+            if (e->args.size() != 1) {
+                diags_.error(e->loc,
+                    "comptime_compile: se esperaba 1 argumento (string), recibidos "
+                    + std::to_string(e->args.size()));
+            }
+            if (!e->args.empty()) {
+                (void)check_expr(e->args[0].get());
+                /* Eval temprano para reportar errores de parsing aqui. */
+                const ComptimeEvalResult r = comptime_eval_expr(*this, e);
+                if (!r.ok) {
+                    diags_.error(e->loc,
+                        "comptime_compile: el fragmento no es comptime-evaluable");
+                }
+                /* Devolver el tipo segun el contenido inferido. */
+                Type rt{};
+                if (r.is_str)        rt = Type{PrimitiveKind::STRING};
+                else if (r.is_type)  rt = Type{PrimitiveKind::TYPE_META};
+                else                 rt = Type{PrimitiveKind::I64};
+                e->result_type = rt;
+                return rt;
+            }
+            Type rt{PrimitiveKind::I64};
+            e->result_type = rt;
+            return rt;
+        }
+        /* comptime_print(value) -> u64 (=0).  Emite a stderr en
+         * compile-time.  Acepta string/int/Type.  Validacion minima: 1 arg
+         * comptime-evaluable.  Retorna u64=0 para componer en static_assert. */
+        if (id->name == "comptime_print") {
+            if (e->args.size() != 1) {
+                diags_.error(e->loc,
+                    "comptime_print: se esperaba 1 argumento, recibidos "
+                    + std::to_string(e->args.size()));
+            }
+            if (!e->args.empty()) {
+                (void)check_expr(e->args[0].get());
+                const ComptimeEvalResult r = comptime_eval_expr(*this, e->args[0].get());
+                if (!r.ok) {
+                    diags_.error(e->args[0]->loc,
+                        "comptime_print: el argumento no es comptime-evaluable");
+                }
+            }
+            Type rt{PrimitiveKind::U64};
+            e->result_type = rt;
+            return rt;
+        }
+
+        if (id->name == "comptime_concat"
+         || id->name == "comptime_streq"
+         || id->name == "comptime_strlen"
+         || id->name == "comptime_chr"
+         || id->name == "comptime_ord"
+         || id->name == "comptime_substr"
+         || id->name == "comptime_repeat"
+         || id->name == "comptime_to_str") {
+            const std::string &nm  = id->name;
+            size_t expected;
+            if (nm == "comptime_strlen" || nm == "comptime_chr"
+             || nm == "comptime_ord"    || nm == "comptime_to_str") {
+                expected = 1;
+            } else if (nm == "comptime_substr") {
+                expected = 3;
+            } else {
+                expected = 2;
+            }
+            if (e->args.size() != expected) {
+                diags_.error(e->loc,
+                    nm + ": se esperaban " + std::to_string(expected)
+                    + " argumentos, recibidos "
+                    + std::to_string(e->args.size()));
+            }
+            /* Chequear que los args sean comptime-evaluables.
+             * El tipo (string vs int) depende del builtin:
+             *   chr/repeat: arg int (codepoint o count)
+             *   to_str: arg int
+             *   ord: arg string
+             *   substr: arg0 string, arg1/arg2 ints
+             *   concat/streq/strlen: arg(s) string */
+            for (auto &a : e->args) (void)check_expr(a.get());
+            for (size_t i = 0; i < e->args.size(); ++i) {
+                const ComptimeEvalResult r = comptime_eval_expr(*this, e->args[i].get());
+                bool need_str = false;
+                if (nm == "comptime_concat" || nm == "comptime_streq"
+                 || nm == "comptime_strlen" || nm == "comptime_ord") {
+                    need_str = true;
+                } else if ((nm == "comptime_substr" || nm == "comptime_repeat")
+                        && i == 0) {
+                    need_str = true;
+                }
+                if (!r.ok) {
+                    /* si el arg es un IdentExpr que resuelve
+                     * a un `comptime var` (mutable) o `comptime const`
+                     * en cualquier scope, NO emitimos error.  Esto
+                     * cubre el caso de comptime_strlen(s) dentro de un
+                     * @Macro body donde `s` esta declarada como
+                     * `comptime var string s = "";` -- en type-check
+                     * time s tiene valor "" (inicial) pero el call
+                     * SITE del macro la evaluara con el valor mutado
+                     * tras el loop.  El AST evaluator en
+                     * comptime_introspect.cpp ya resuelve correctamente
+                     * al call site.  Aqui solo el chequeo estatico es
+                     * demasiado estricto. */
+                    bool deferrable = false;
+                    if (e->args[i]->kind == ast::NodeKind::IdentExpr) {
+                        const auto *id = static_cast<const ast::IdentExpr *>(
+                            e->args[i].get());
+                        /* Buscar en local stack del lowering (comptime
+                         * for index / comptime var locales). */
+                        for (auto it = comptime_const_locals_.rbegin();
+                             it != comptime_const_locals_.rend(); ++it) {
+                            if (it->find(id->name) != it->end()) {
+                                deferrable = true;
+                                break;
+                            }
+                        }
+                        /* Buscar en globales comptime const. */
+                        if (!deferrable && comptime_const_values_.count(id->name)) {
+                            deferrable = true;
+                        }
+                    }
+                    if (!deferrable) {
+                        diags_.error(e->args[i]->loc,
+                            nm + ": argumento " + std::to_string(i)
+                            + " no es comptime-evaluable");
+                    }
+                } else if (need_str && !r.is_str) {
+                    diags_.error(e->args[i]->loc,
+                        nm + ": argumento " + std::to_string(i)
+                        + " debe ser string comptime");
+                } else if (!need_str && r.is_str) {
+                    diags_.error(e->args[i]->loc,
+                        nm + ": argumento " + std::to_string(i)
+                        + " debe ser int comptime");
+                }
+            }
+            Type rt{};
+            if (nm == "comptime_concat" || nm == "comptime_chr"
+             || nm == "comptime_substr" || nm == "comptime_repeat"
+             || nm == "comptime_to_str") {
+                rt = Type{PrimitiveKind::STRING};
+            } else if (nm == "comptime_streq") {
+                rt = Type{PrimitiveKind::BOOL};
+            } else {
+                rt = Type{PrimitiveKind::U64};
+            }
+            e->result_type = rt;
+            return rt;
+        }
+
+        // -----------------------------------------------------------------
+        // static_assert(cond, "msg")
+        // Verifica una condicion comptime-evaluable.  Si la cond es false
+        // (o no evaluable), emite error de compile-time con el msg.  No
+        // genera codigo runtime: el lowering devuelve IR_NO_VALUE (void).
+        // -----------------------------------------------------------------
+        if (id->name == "static_assert") {
+            if (e->args.size() != 2) {
+                diags_.error(e->loc,
+                    "static_assert: se esperaban 2 argumentos "
+                    "(cond, \"msg\"), recibidos "
+                    + std::to_string(e->args.size()));
+                return Type{PrimitiveKind::VOID};
+            }
+            /* Validar tipo de la cond y del msg.  No es bloqueante --
+             * intentamos evaluar de todas formas. */
+            for (auto &a : e->args) (void)check_expr(a.get());
+            /* Extraer msg literal. */
+            std::string msg;
+            auto *slit = dynamic_cast<ast::StringLitExpr *>(
+                e->args[1].get());
+            if (!slit || slit->is_interpolated()) {
+                diags_.error(e->args[1]->loc,
+                    "static_assert: el segundo argumento debe ser un "
+                    "literal string compile-time (no interpolado)");
+            } else {
+                msg = slit->value;
+            }
+            /* try comptime eval first.  Si la cond ES
+             * comptime-evaluable: fire diagnostic si false (same as
+             * before).  Si NO ES (e.g. depende de macro param), NO
+             * emitimos error -- el lowering bajara a CALLN
+             * "vesta_comptime:static_assert" que evalua en runtime VM
+             * (que sigue siendo compile time porque la macro corre en
+             * ComptimeRuntime). */
+            const ComptimeEvalResult r = comptime_eval_expr(
+                *this, e->args[0].get());
+            if (r.ok && r.value == 0) {
+                diags_.error(e->loc,
+                    std::string("static_assert FAILED: ")
+                    + (msg.empty() ? std::string("condicion falsa") : msg));
+            }
+            /* Si !r.ok, no emitimos error -- el lowering despachara
+             * via FFI al virtual fn que hace el check en runtime VM. */
+
+            /* el tipo de retorno cambia segun el contexto.
+             * Si la cond es comptime-evaluable (caso comun a nivel
+             * modulo), devolvemos VOID -- el call site no usa el
+             * resultado.  Si NO es (macros con runtime cond), devolvemos
+             * I64 porque el lowering emitira CALLN a un fn que devuelve
+             * i64 status (0=ok, 1=fail) y algunos sitios podrian leer
+             * el valor. */
+            const Type rt = r.ok
+                ? Type{PrimitiveKind::VOID}
+                : Type{PrimitiveKind::I64};
+            e->result_type = rt;
+            return rt;
+        }
+
+        // -----------------------------------------------------------------
+        // Sprint 4 (A.37.s4): builtins runtime de introspection.
+        //   find_type(name: string)              -> i64 (ptr a IntrospectInfo
+        //                                            o 0 si no existe)
+        //   type_info_kind(p)                    -> i32
+        //   type_info_size(p)                    -> u32
+        //   type_info_align(p)                   -> u32
+        //   type_info_field_count(p)             -> u32
+        //   type_info_name(p)                    -> string
+        //   type_info_field_name(p, idx)         -> string
+        //   type_info_field_offset(p, idx)       -> u32
+        //   type_info_field_size(p, idx)         -> u32
+        // -----------------------------------------------------------------
+        {
+            const std::string &nm = id->name;
+            const bool is_find    = (nm == "find_type");
+            const bool is_simple  =
+                nm == "type_info_kind"  || nm == "type_info_size"
+             || nm == "type_info_align" || nm == "type_info_field_count";
+            const bool is_str_q   = (nm == "type_info_name");
+            const bool is_field_idx_str =
+                (nm == "type_info_field_name");
+            const bool is_field_idx_num =
+                nm == "type_info_field_offset"
+             || nm == "type_info_field_size";
+            if (is_find || is_simple || is_str_q
+             || is_field_idx_str || is_field_idx_num) {
+                const size_t expected = is_find ? 1
+                                       : is_simple ? 1
+                                       : is_str_q  ? 1
+                                       : 2;
+                if (e->args.size() != expected) {
+                    diags_.error(e->loc,
+                        nm + ": se esperaban " + std::to_string(expected)
+                        + " argumentos, recibidos "
+                        + std::to_string(e->args.size()));
+                }
+                /* Validar tipo del primer arg (string para find_type / _name;
+                 * i64/ptr para type_info_*).  No imponemos restriccion
+                 * estricta: aceptamos COUNT (inferido) y dejamos al lowering
+                 * confiar en que el handle es un i64. */
+                for (auto &a : e->args) (void)check_expr(a.get());
+                if (is_find && !e->args.empty()) {
+                    const Type ta = e->args[0]->result_type;
+                    if (ta.kind != PrimitiveKind::STRING
+                     && ta.kind != PrimitiveKind::PTR
+                     && ta.kind != PrimitiveKind::COUNT) {
+                        diags_.error(e->args[0]->loc,
+                            "find_type: el argumento debe ser un string");
+                    }
+                }
+                Type rt{};
+                if (is_find) rt = Type{PrimitiveKind::I64};
+                else if (nm == "type_info_kind")  rt = Type{PrimitiveKind::I32};
+                else if (nm == "type_info_name" || nm == "type_info_field_name") rt = Type{PrimitiveKind::STRING};
+                else rt = Type{PrimitiveKind::U32};
+                e->result_type = rt;
+                return rt;
+            }
+        }
 
         // -----------------------------------------------------------------
         // Builtins de reflexion.  No se declaran como funciones
@@ -4833,6 +6185,17 @@ namespace vex {
             return rt;
         }
         if (id->name == "wait" || id->name == "notify" || id->name == "notifyAll") {
+            /* validacion estatica.  wait/notify/notifyAll requieren
+             * mantener el monitor del target -- semanticamente solo tienen
+             * sentido dentro de un bloque `synchronized (obj) { ... }`.
+             * Llamarlas fuera produce IllegalMonitorState en runtime; el
+             * check estatico evita el bug antes del primer arranque. */
+            if (synchronized_depth_ == 0) {
+                diags_.error(e->loc,
+                    id->name + ": solo puede invocarse dentro de un bloque "
+                    "'synchronized (obj) { ... }' (de lo contrario el proceso "
+                    "no posee el monitor y se produce IllegalMonitorState en runtime)");
+            }
             if (e->args.size() != 1) {
                 diags_.error(e->loc,
                     id->name + ": se esperaba 1 argumento (target del monitor), recibidos " +
@@ -5361,6 +6724,248 @@ namespace vex {
             return rt;
         }
 
+        /* A.43.16: @Macro -- comptime fn cuyo string de retorno se
+         * INYECTA como codigo Vex en el call site (auto-emit).  El
+         * call site evalua la fn al compile-time, parsea el resultado
+         * como expresion y type-checa la expresion en el contexto
+         * actual.  El tipo retornado por el call es el de la expresion
+         * generada, NO `string` (el tipo declarado de la fn). */
+        {
+            auto fn_it = comptime_fns_.find(id->name);
+            if (fn_it != comptime_fns_.end()
+             && fn_it->second && fn_it->second->is_macro) {
+                /* Phase MC.9/MC.10: VM eval es el camino DEFAULT cuando
+                 * el bytecode esta disponible.  Sin flags ni opt-in: si
+                 * @c comptime_runtime_ tiene el macro registrado y los
+                 * args son codificables como uint64, invocamos via VM.
+                 * Fallback transparente al AST evaluator si la VM falla
+                 * o si los args no son encodables.  El bytecode se
+                 * popula automaticamente via two-phase compile (main.cpp
+                 * orquestador) sin intervencion del usuario. */
+                ComptimeEvalResult r;
+                bool used_vm = false;
+                if ((comptime_runtime_.registered_macro_count() > 0)
+                 && e->args.size() <= 12) {
+                    std::vector<uint64_t> arg_words;
+                    arg_words.reserve(e->args.size());
+                    bool can_encode = true;
+                    for (const auto &a : e->args) {
+                        if (!a) { can_encode = false; break; }
+                        switch (a->kind) {
+                            case ast::NodeKind::IntLitExpr: {
+                                const auto *lit = static_cast<const ast::IntLitExpr *>(a.get());
+                                arg_words.push_back(lit->value);
+                                break;
+                            }
+                            case ast::NodeKind::BoolLitExpr: {
+                                const auto *lit = static_cast<const ast::BoolLitExpr *>(a.get());
+                                arg_words.push_back(lit->value ? 1u : 0u);
+                                break;
+                            }
+                            case ast::NodeKind::CharLitExpr: {
+                                const auto *lit = static_cast<const ast::CharLitExpr *>(a.get());
+                                arg_words.push_back(lit->codepoint);
+                                break;
+                            }
+                            case ast::NodeKind::NullLitExpr:
+                                arg_words.push_back(0u);
+                                break;
+                            case ast::NodeKind::FloatLitExpr: {
+                                /* f64 literal -> bits IEEE 754 en u64
+                                 * (bitcast).  El body del macro lee el reg
+                                 * como bits y reconstruye el f64 via FCVT/
+                                 * BITCAST IR si es necesario. */
+                                const auto *lit = static_cast<const ast::FloatLitExpr *>(a.get());
+                                uint64_t bits = 0;
+                                std::memcpy(&bits, &lit->value, sizeof(bits));
+                                arg_words.push_back(bits);
+                                break;
+                            }
+                            case ast::NodeKind::StringLitExpr: {
+                                /* string literal -> GcHandle a un
+                                 * StringObject construido via
+                                 * @c runtime::make_string_flat (misma maquinaria
+                                 * que STRMAKE).  Solo soportamos literales
+                                 * NO interpolados; los interpolados requieren
+                                 * runtime evaluation que no podemos pre-computar. */
+                                const auto *lit = static_cast<const ast::StringLitExpr *>(a.get());
+                                if (lit->is_interpolated()) {
+                                    can_encode = false;
+                                    break;
+                                }
+                                uint64_t handle = 0;
+                                if (!comptime_runtime_.marshal_string(lit->value, handle)) {
+                                    can_encode = false;
+                                    break;
+                                }
+                                arg_words.push_back(handle);
+                                break;
+                            }
+                            case ast::NodeKind::UnaryExpr: {
+                                /* -literal -> negacion compile-time.
+                                 * Cubre patrones comunes como `M(-42)` que
+                                 * el parser representa como UnaryExpr(Neg,
+                                 * IntLit(42)). */
+                                const auto *u = static_cast<const ast::UnaryExpr *>(a.get());
+                                if (u->op == ast::UnOp::Neg && u->operand) {
+                                    if (u->operand->kind == ast::NodeKind::IntLitExpr) {
+                                        const auto *lit = static_cast<const ast::IntLitExpr *>(u->operand.get());
+                                        const int64_t signed_val =
+                                            -static_cast<int64_t>(lit->value);
+                                        arg_words.push_back(static_cast<uint64_t>(signed_val));
+                                    } else if (u->operand->kind == ast::NodeKind::FloatLitExpr) {
+                                        const auto *lit = static_cast<const ast::FloatLitExpr *>(u->operand.get());
+                                        const double neg = -lit->value;
+                                        uint64_t bits = 0;
+                                        std::memcpy(&bits, &neg, sizeof(bits));
+                                        arg_words.push_back(bits);
+                                    } else {
+                                        can_encode = false;
+                                    }
+                                } else {
+                                    can_encode = false;
+                                }
+                                break;
+                            }
+                            default:
+                                can_encode = false;
+                                break;
+                        }
+                        if (!can_encode) break;
+                    }
+                    if (can_encode) {
+                        std::string vm_out;
+                        /* si el macro es @Pure, usar la
+                         * variante memoized (cache HOST-side @c
+                         * (macro,args) -> result).  Hits del cache no
+                         * tocan la VM.  Si el macro no es @Pure, no
+                         * cache; cada call site invoca el VM fresco. */
+                        const bool is_pure = fn_it->second->is_pure;
+                        const bool vm_ok = comptime_runtime_
+                            .invoke_string_macro_memoized(
+                                "__macro_" + id->name,
+                                arg_words, vm_out, is_pure);
+                        if (vm_ok) {
+                            r.ok      = true;
+                            r.is_str  = true;
+                            r.str     = std::move(vm_out);
+                            used_vm   = true;
+                            ++macro_vmonly_hits_;
+                        } else {
+                            ++macro_vmonly_misses_;
+                        }
+                    }
+                }
+                /* Fallback AST: corre solo si VM-only no aplico o fallo. */
+                if (!used_vm) {
+                    r = comptime_eval_expr(*this, e);
+                }
+                if (!r.ok || !r.is_str) {
+                    diags_.error(e->loc,
+                        "@Macro '" + id->name + "' debe ser comptime-evaluable a string");
+                    return Type{};
+                }
+                /* Parsear el string como expresion Vex. */
+                Lexer fragment_lex(r.str, "<macro:" + id->name + ">", diags_);
+                Parser fragment_par(fragment_lex, diags_);
+                std::unique_ptr<ast::Expr> parsed = fragment_par.parse_one_expr();
+                if (!parsed) {
+                    diags_.error(e->loc,
+                        "@Macro '" + id->name + "' devolvio codigo no-parseable: " + r.str);
+                    return Type{};
+                }
+                parsed->loc = e->loc;
+                /* Type-checar y guardar el AST para que el lowering lo recoja. */
+                const Type rt = check_expr(parsed.get());
+                e->macro_expanded = std::move(parsed);
+                e->result_type    = rt;
+
+                /* record SHADOW EXPECTATION para validacion
+                 * cruzada AST vs VM.  Solo registramos si:
+                 *   (a) Todos los args son literales codificables como
+                 *       uint64 (Int, Bool, Char, Null) -- el VM espera
+                 *       valores raw en R1..R12.  Otros tipos requeririan
+                 *       marshalling adicional que cae fuera del scope MC.8.
+                 *   (b) Hay <= 12 args (CALLVM convention).
+                 *
+                 * Si no encaja, simplemente no registramos -- la expansion
+                 * AST sigue siendo correcta y el shadow_validate solo
+                 * cubrira un subset de call sites en MC.8.  MC.9 ampliara
+                 * el marshalling para string args, structs, etc. */
+                if (e->args.size() <= 12) {
+                    std::vector<uint64_t> arg_words;
+                    arg_words.reserve(e->args.size());
+                    bool can_record = true;
+                    for (const auto &a : e->args) {
+                        if (!a) { can_record = false; break; }
+                        switch (a->kind) {
+                            case ast::NodeKind::IntLitExpr: {
+                                const auto *lit = static_cast<const ast::IntLitExpr *>(a.get());
+                                arg_words.push_back(lit->value);
+                                break;
+                            }
+                            case ast::NodeKind::BoolLitExpr: {
+                                const auto *lit = static_cast<const ast::BoolLitExpr *>(a.get());
+                                arg_words.push_back(lit->value ? 1u : 0u);
+                                break;
+                            }
+                            case ast::NodeKind::CharLitExpr: {
+                                const auto *lit = static_cast<const ast::CharLitExpr *>(a.get());
+                                arg_words.push_back(lit->codepoint);
+                                break;
+                            }
+                            case ast::NodeKind::NullLitExpr:
+                                arg_words.push_back(0u);
+                                break;
+                            case ast::NodeKind::FloatLitExpr: {
+                                /* bitcast double -> u64. */
+                                const auto *lit = static_cast<const ast::FloatLitExpr *>(a.get());
+                                uint64_t bits = 0;
+                                std::memcpy(&bits, &lit->value, sizeof(bits));
+                                arg_words.push_back(bits);
+                                break;
+                            }
+                            case ast::NodeKind::UnaryExpr: {
+                                /* -literal -> negacion comptime. */
+                                const auto *u = static_cast<const ast::UnaryExpr *>(a.get());
+                                if (u->op == ast::UnOp::Neg && u->operand) {
+                                    if (u->operand->kind == ast::NodeKind::IntLitExpr) {
+                                        const auto *lit = static_cast<const ast::IntLitExpr *>(u->operand.get());
+                                        const int64_t sv = -static_cast<int64_t>(lit->value);
+                                        arg_words.push_back(static_cast<uint64_t>(sv));
+                                    } else if (u->operand->kind == ast::NodeKind::FloatLitExpr) {
+                                        const auto *lit = static_cast<const ast::FloatLitExpr *>(u->operand.get());
+                                        const double neg = -lit->value;
+                                        uint64_t bits = 0;
+                                        std::memcpy(&bits, &neg, sizeof(bits));
+                                        arg_words.push_back(bits);
+                                    } else {
+                                        can_record = false;
+                                    }
+                                } else {
+                                    can_record = false;
+                                }
+                                break;
+                            }
+                            default:
+                                can_record = false;
+                                break;
+                        }
+                        if (!can_record) break;
+                    }
+                    if (can_record) {
+                        const std::string src_loc =
+                            e->loc.file + ":" +
+                            std::to_string(e->loc.line) + ":" +
+                            std::to_string(e->loc.column);
+                        comptime_runtime_.record_expectation(
+                            id->name, std::move(arg_words), r.str, src_loc);
+                    }
+                }
+                return rt;
+            }
+        }
+
         size_t id_depth = 0;
         const Symbol *s = lookup_with_depth(id->name, &id_depth);
         if (!s) {
@@ -5405,11 +7010,13 @@ namespace vex {
             for (size_t i = 0; i < n; ++i) {
                 Type ta = check_expr(e->args[i].get());
                 const Type &tp = fn_type.fn_params[i];
-                // Coercion gap N (A.14): si el parametro espera FUNCTION
-                // y el argumento es un identifier que resuelve a una
-                // funcion top-level con firma compatible, sintetizar un
-                // function value (fn_addr, env_addr=0).  Patcheamos
-                // result_type del IdentExpr para que el lowering lo
+                // Promocion automatica de funcion top-level a function
+                // value cuando se pasa por nombre como argumento:  si el
+                // parametro espera FUNCTION y el argumento es un identifier
+                // que resuelve a una funcion declarada en el modulo con
+                // firma compatible, sintetizar un function value
+                // (fn_addr, env_addr=0).  Patcheamos result_type del
+                // IdentExpr para que el lowering lo
                 // reconozca y emita el slot de 16 bytes con env=0.
                 if (tp.kind == PrimitiveKind::FUNCTION
                  && ta.kind == PrimitiveKind::VOID

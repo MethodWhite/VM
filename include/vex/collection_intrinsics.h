@@ -48,8 +48,11 @@ namespace vex {
         const char    *vex_ctor_name;   ///< Nombre del constructor Vex (ej. "arraylist").
         const char    *native_new_fn;   ///< Funcion native (ej. "vcol_alist_new").
         const char    *native_free_fn;  ///< Funcion native de free (ej. "vcol_alist_free").
-        /// A.30.next: variante GC-aware del free (toma proc + handle).
-        /// nullptr si la coleccion no admite elementos GC (e.g. solo i64).
+        /// Variante GC-aware del free.  Toma (proc, handle) en lugar de
+        /// solo (handle): el plugin la usa para invocar @c gc_release
+        /// sobre los slots que contienen GcHandles antes de liberar el
+        /// almacenamiento.  nullptr si la coleccion no admite elementos
+        /// GC (p.ej. ArrayList<i64> donde los elementos son escalares).
         const char    *native_free_fn_gc;
         int            default_cap;     ///< Capacidad por defecto (0 = ctor sin args).
     };

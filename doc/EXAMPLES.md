@@ -37,7 +37,8 @@ separados en `examples_codes_vex/benchmark/`.
   - [17. Colecciones](#17-colecciones)
   - [18. Strings](#18-strings)
   - [19. Distribuido](#19-distribuido)
-  - [20. Comparativas side-by-side con otros lenguajes](#20-comparativas-side-by-side-con-otros-lenguajes)
+  - [20. Metaprogramacion](#20-metaprogramacion)
+  - [21. Comparativas side-by-side con otros lenguajes](#21-comparativas-side-by-side-con-otros-lenguajes)
     - [Hello World](#hello-world)
     - [Fibonacci recursivo](#fibonacci-recursivo)
     - [Patron Optional (vs nullable)](#patron-optional-vs-nullable)
@@ -720,7 +721,152 @@ Compilar y ejecutar entre 2 procesos:
 
 ---
 
-## 20. Comparativas side-by-side con otros lenguajes
+## 20. Metaprogramacion
+
+Macros compile-time que generan codigo, capturan DSLs y consultan tipos
+sin overhead runtime. Detalles completos: [Metaprogramacion.md](./VMdoc/Vex/Metaprogramacion.md).
+
+**[`159_macro_expr_capture.vex`](../examples_codes_vex/159_macro_expr_capture.vex)** -
+captura raw de codigo arbitrario con `expr`:
+
+```vex
+@Macro
+comptime string M_identity(expr code) {
+    // `code` recibe el texto verbatim del call site.
+    return "\"" + code + "\"";
+}
+
+i32 main() {
+    // El parser captura "ptr -> 0x90 -> 0x10 -> 0x20" sin parsearlo
+    // como expresion -- el macro decide como interpretarlo.
+    string captured = M_identity(ptr -> 0x90 -> 0x10 -> 0x20);
+    return 42;
+}
+```
+
+**[`160_macro_walk_pchase.vex`](../examples_codes_vex/160_macro_walk_pchase.vex)** -
+DSL real: pointer chase anidado generado en compile-time:
+
+```vex
+@Macro
+comptime string walk(expr code) {
+    // Parser interno: split por "->", emitir derefs anidados.
+    // ...usa strlen, substr, operadores + y == sobre strings...
+}
+
+i32 main() {
+    u64* root = (u64*)malloc(256);
+    // ... poblar punteros ...
+
+    // El compilador transforma esto:
+    u64 v = walk(root -> 0x100 -> 0 -> 0);
+    // en esto:
+    // u64 v = *(u64*)((u64)( *(u64*)((u64)( *(u64*)((u64)( root ) + 0x100) ) + 0) ) + 0);
+    return 42;
+}
+```
+
+El `.vel` emitido contiene exactamente 3 instrucciones `movh` consecutivas,
+una por hop. Sin overhead vs escribir el chase manualmente.
+
+**[`161_macro_ffi_compile_time.vex`](../examples_codes_vex/161_macro_ffi_compile_time.vex)** -
+FFI a DLLs del sistema en tiempo de compilacion:
+
+```vex
+extern "kernel32.dll" {
+    fn GetCurrentProcessId() -> u32;
+    fn GetTickCount() -> u32;
+}
+
+@Macro
+comptime string build_id() {
+    u64 pid  = GetCurrentProcessId();   // FFI en compile-time
+    u64 tick = GetTickCount();          // FFI en compile-time
+    u64 mix  = (pid * 31) ^ (tick * 17);
+    return to_str(mix);  // embebido como literal en el .velb
+}
+
+@Macro
+comptime string size_of_u64() {
+    // Virtual lib `vesta_comptime` registrada in-process; sin extern explicito.
+    return to_str(comptime_type_sizeof("u64"));  // siempre 8
+}
+
+i32 main() {
+    u64 fingerprint = build_id();  // valor unico por compilacion
+    u64 sz = size_of_u64();         // = 8
+    return 42;
+}
+```
+
+Cada compilacion produce un binario distinto (depende del PID + tick del
+compilador). El `.velb` final NO referencia kernel32 -- solo contiene
+`mov rN, <literal>` con el valor calculado al compilar.
+
+**[`162_macro_comptime_data.vex`](../examples_codes_vex/162_macro_comptime_data.vex)** -
+arrays y "diccionario" via arrays paralelos en compile-time:
+
+```vex
+@Macro
+comptime string fib_at(i64 idx) {
+    i64 fibs[16] = {0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610};
+    if (idx < 0 || idx >= 16) return "0";
+    return to_str(fibs[idx]);
+}
+
+// Diccionario via arrays paralelos (no hay HashMap comptime).
+@Macro
+comptime string lookup(i64 key) {
+    i64 keys[5] = {1, 2, 5, 10, 42};
+    i64 vals[5] = {100, 200, 555, 1000, 9999};
+    i64 i = 0;
+    while (i < 5) {
+        if (keys[i] == key) return to_str(vals[i]);
+        i = i + 1;
+    }
+    return "-1";
+}
+
+// Switch-via-ternario generado en compile-time.
+@Macro
+comptime string switch_gen() {
+    i64 cases[3] = {1, 2, 3};
+    i64 results[3] = {10, 20, 30};
+    string code = "0";
+    i64 i = 2;
+    while (i >= 0) {
+        code = "((x == " + to_str(cases[i]) + ") ? " + to_str(results[i]) + " : " + code + ")";
+        i = i - 1;
+    }
+    return code;
+}
+
+i32 main() {
+    i64 f10 = fib_at(10);     // se compila como `i64 f10 = 55;`
+    i64 v   = lookup(5);       // se compila como `i64 v = 555;`
+    i64 x   = 2;
+    i64 sw  = switch_gen();    // ternario anidado generado
+    return 42;
+}
+```
+
+**Patron clave: azucar sintactico**. Dentro del cuerpo de un macro, los
+operadores nativos sobre strings (`+` concat, `==`/`!=` equals) y los
+builtins cortos (`strlen`, `substr`, `to_str`, `chr`, `ord`, `repeat`,
+`replace`, `contains`, `gensym`) son siempre preferidos a las versiones
+`comptime_*` verbose. Mismo bytecode emitido, codigo ~3x mas corto.
+
+```vex
+// Verbose (legacy):
+return comptime_concat("(", comptime_concat(comptime_to_str(n), ")"));
+
+// Preferido:
+return "(" + to_str(n) + ")";
+```
+
+---
+
+## 21. Comparativas side-by-side con otros lenguajes
 
 ### Hello World
 

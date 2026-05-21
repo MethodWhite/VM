@@ -21,6 +21,7 @@
  * (resolve_native_symbol, resolve_all).
  */
 #include "ffi/native_ffi.h"
+#include "ffi/virtual_lib_registry.h"  // Phase MC.20: lookup_virtual_fn
 
 #ifdef _WIN32
 #include "windows.h"
@@ -172,9 +173,17 @@ namespace ffi {
             const std::string &mod_name  = modules[key.module_idx];
             const std::string &func_name = functions[key.function_idx];
 
-            /* cargar modulo y resolver la funcion nativa */
-            void *mod          = load_native_module(mod_name);
-            void *fn           = resolve_native_symbol(mod, func_name);
+            /* virtual lib registry FIRST.  Si el par
+             * @c (mod_name, func_name) esta registrado in-process,
+             * usamos ese fn_ptr y skipeamos LoadLibrary.  Esto permite
+             * que macros invoquen `extern "vesta_comptime" fn ...`
+             * desde codigo lowered al VM. */
+            void *fn = ffi::lookup_virtual_fn(mod_name, func_name);
+            if (!fn) {
+                /* cargar modulo y resolver la funcion nativa */
+                void *mod = load_native_module(mod_name);
+                fn        = resolve_native_symbol(mod, func_name);
+            }
             entry.resolved_ptr = fn;
 
             /* parchear cada instruccion CALLN que referencia este simbolo */

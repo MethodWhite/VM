@@ -1,0 +1,26 @@
+extern "kernel32.dll" {
+    fn GetCurrentProcessId() -> u32;
+    fn GetTickCount() -> u32;
+    fn Sleep(u32 ms) -> void;
+    fn Beep(u32 freq, u32 dur ) -> i32;
+}
+ 
+i32 main() {
+    u32 pid = GetCurrentProcessId();
+    u32 t0 = GetTickCount();
+    
+    println("PID: ${pid}");
+    println("Iniciando trabajo...");
+    
+    for (u64 i = 0; i < 10; i++) {
+        Beep(440 + 20 * i, 100);   // A4 durante 100ms
+        Sleep(50);
+        Beep(523 + 20 * i, 100);   // C5
+        Sleep(50);
+        Beep(659 + 20 * i, 200);   // E5
+    }
+    
+    u32 t1 = GetTickCount();
+    println("Transcurrieron ${t1-t0} ms");
+    return 0;
+}

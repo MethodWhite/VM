@@ -1,0 +1,52 @@
+// introspeccion comptime: builtins atomicos que se
+// resuelven 100% en tiempo de compilacion.  Cada llamada baja a
+// UN solo IrOp::CONST (o STRMAKE para typename) -- cero overhead
+// runtime, cero acceso a tablas de metadata.
+//
+// Builtins disponibles:
+//   sizeof<T>()    -> u64   tamano en bytes
+//   alignof<T>()   -> u64   alineamiento en bytes
+//   typename<T>()  -> string nombre canonico (StringObject)
+//   type_id<T>()   -> u32   FNV-1a 32-bit estable
+//   kind<T>()      -> i32   categoria (Primitive=0, Class=1, Struct=2, ...)
+
+i32 main() {
+    // Tamanos de primitivos: el compilador conoce el ABI exactamente.
+    u64 sz_i32  = sizeof<i32>();      // 4
+    u64 sz_i64  = sizeof<i64>();      // 8
+    u64 sz_ptr  = sizeof<i32*>();     // 8 (puntero)
+
+    // Alineamientos siguen la regla "size para escalar, 8 para wrapper".
+    u64 al_i8   = alignof<i8>();      // 1
+    u64 al_f64  = alignof<f64>();     // 8
+
+    // Categorias: los enteros, floats, bool, char son Primitive.
+    i32 k_i32   = kind<i32>();        // 0 = Primitive
+    i32 k_ptr   = kind<i32*>();       // 7 = Ptr
+
+    // type_id<T>(): FNV-1a 32-bit del nombre canonico ("i32", "i64", ...).
+    // Estable cross-build: dos ejecuciones del programa dan el mismo ID.
+    // Util para fast-path "es de tipo X?" via 1 cmp + 1 jcc.
+    u32 id_a    = type_id<i32>();
+    u32 id_b    = type_id<i32>();     // mismo tipo -> mismo ID
+    u32 id_c    = type_id<i64>();     // tipo distinto -> ID distinto
+
+    // typename<T>(): construye un StringObject inline con el nombre
+    // canonico.  Util para reflexion + logging + debug.
+    string name = typename<i32>();
+    i32 name_len = name.length();     // 3
+
+    // Sumamos puntos por cada chequeo OK -> esperado 42.
+    i32 ok = 0;
+    if (sz_i32 == 4)     ok = ok + 4;
+    if (sz_i64 == 8)     ok = ok + 4;
+    if (sz_ptr == 8)     ok = ok + 4;
+    if (al_i8 == 1)      ok = ok + 4;
+    if (al_f64 == 8)     ok = ok + 4;
+    if (k_i32 == 0)      ok = ok + 4;
+    if (k_ptr == 7)      ok = ok + 4;
+    if (id_a == id_b)    ok = ok + 4;
+    if (id_a != id_c)    ok = ok + 4;
+    if (name_len == 3)   ok = ok + 6;
+    return ok;
+}

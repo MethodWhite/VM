@@ -1,0 +1,161 @@
+// Demo: estructuras de datos en COMPILE-TIME via @Macro.
+//
+// Vex soporta arrays nativos `T[N]`, structs, strings y aritmetica
+// dentro del AST evaluator de macros (A.41 + A.42).  Esto permite:
+//   - Construir tablas en compile time y emitir su contenido como
+//     literales en el .velb final.
+//   - "Diccionarios" compile-time via arrays paralelos (keys[], vals[])
+//     con busqueda lineal -- O(N) durante compile, cero coste runtime.
+//   - Iteracion sobre las estructuras para generar expresiones Vex.
+//
+// Limitacion: las colecciones runtime del plugin (ArrayList, HashMap,
+// HashSet, Queue, Deque, TreeMap, TreeSet) NO funcionan en compile-time
+// porque dependen de CALLN a stdlib/native/collections, y el AST
+// evaluator no despacha CALLN runtime durante la evaluacion del macro.
+//
+// Nota: structs con init list `{.x = 1, .y = 2}` Y arrays de structs
+// no son lowereables en el body del macro hoy (el lowering trata de
+// emitirlos como vars runtime y falla).  La via portable es usar
+// arrays planos de i64 que SI se lowerean bien.
+
+// Macro 1: tabla de Fibonacci precomputada en compile-time.
+// El call site recibe el N-esimo fib como literal.
+@Macro
+comptime string fib_at(i64 idx) {
+    i64 fibs[16] = {0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610};
+    if (idx < 0) return "0";
+    if (idx >= 16) return "0";
+    return to_str(fibs[idx]);
+}
+
+// Macro 2: area de un rectangulo "modelado" via arrays paralelos.
+// width/height/etc. viven en compile time; el resultado es un literal.
+@Macro
+comptime string rect_area() {
+    // dims[0] = width, dims[1] = height.  Patron de struct-via-array.
+    i64 dims[2] = {80, 24};
+    i64 area = dims[0] * dims[1];
+    return to_str(area);
+}
+
+// Macro 3: "diccionario" en compile-time via arrays paralelos.
+// keys[] y vals[] son arrays alineados.  Busqueda lineal.
+@Macro
+comptime string lookup(i64 key) {
+    i64 keys[5] = {1, 2, 5, 10, 42};
+    i64 vals[5] = {100, 200, 555, 1000, 9999};
+    i64 i = 0;
+    while (i < 5) {
+        if (keys[i] == key) {
+            return to_str(vals[i]);
+        }
+        i = i + 1;
+    }
+    return "-1";  // not found
+}
+
+// Macro 4: genera una expresion suma de cuadrados como literal Vex.
+// El call site recibe "0 + 1 + 4 + 9 + 16" -- el constant folder
+// del IR optimizer lo pliega a 30.
+@Macro
+comptime string sum_squares(i64 n) {
+    string result = "0";
+    i64 i = 1;
+    while (i <= n) {
+        result = result + " + " + to_str(i * i);
+        i = i + 1;
+    }
+    return result;
+}
+
+// Macro 5: traza de una matriz 3x3 (suma de la diagonal).
+// Demuestra acceso a array 1D como matriz [row*N+col].
+@Macro
+comptime string trace_3x3() {
+    i64 mat[9] = {
+        1, 2, 3,
+        4, 5, 6,
+        7, 8, 9
+    };
+    // Diagonal: indices 0, 4, 8 -> 1 + 5 + 9 = 15
+    i64 trace_val = mat[0] + mat[4] + mat[8];
+    return to_str(trace_val);
+}
+
+// Macro 6: tabla string-> int.  Devuelve un literal segun key.
+// Notar el match implicito via if-else chain (la AST evaluator NO
+// soporta `match` sobre strings; if-else con `==` SI).
+@Macro
+comptime string http_status(string code) {
+    if (code == "OK")        return "200";
+    if (code == "NOT_FOUND") return "404";
+    if (code == "ERROR")     return "500";
+    return "0";
+}
+
+// Macro 7: itera un array comptime para generar el codigo de un switch
+// case por case.  Demuestra meta-programacion: la estructura comptime
+// produce codigo Vex en tiempo de compilacion.
+//
+// Resultado emitido (texto literal Vex que se re-parsea):
+//   ((x == 1) ? 10 : ((x == 2) ? 20 : ((x == 3) ? 30 : 0)))
+@Macro
+comptime string switch_gen(i64 x_unused) {
+    // Tablas que se "compilan" en una cadena de ternarios.
+    i64 cases[3] = {1, 2, 3};
+    i64 results[3] = {10, 20, 30};
+    string code = "0";
+    i64 i = 2;  // iterar inverso para anidar correctamente
+    while (i >= 0) {
+        code = "((x == " + to_str(cases[i]) + ") ? " + to_str(results[i]) + " : " + code + ")";
+        i = i - 1;
+    }
+    return code;
+}
+
+i32 main() {
+    // fib_at(10) = 55, embebido como literal.
+    i64 f10 = fib_at(10);
+    if (f10 != 55) return 91;
+
+    i64 f0 = fib_at(0);
+    i64 f15 = fib_at(15);
+    if (f0 != 0) return 92;
+    if (f15 != 610) return 93;
+
+    // rect_area() = 80 * 24 = 1920.
+    i64 area = rect_area();
+    if (area != 1920) return 94;
+
+    // Lookup en "diccionario" comptime.
+    i64 v1 = lookup(5);     // 555
+    i64 v2 = lookup(42);    // 9999
+    i64 vmissing = lookup(99);  // -1
+    if (v1 != 555) return 95;
+    if (v2 != 9999) return 96;
+    if (vmissing != -1) return 97;
+
+    // sum_squares(4) = 0 + 1 + 4 + 9 + 16 = 30.
+    i64 s = sum_squares(4);
+    if (s != 30) return 98;
+
+    // trace_3x3() = 1 + 5 + 9 = 15.
+    i64 tr = trace_3x3();
+    if (tr != 15) return 99;
+
+    // String -> int lookup.
+    i64 status_ok = http_status("OK");
+    i64 status_nf = http_status("NOT_FOUND");
+    if (status_ok != 200) return 80;
+    if (status_nf != 404) return 81;
+
+    // El switch_gen emite un ternario anidado en compile time.
+    // En el call site se parsea como expresion Vex y se evalua a runtime
+    // sobre la variable `x`.  El optimizer puede plegar segun el valor.
+    i64 x = 2;
+    i64 sw = switch_gen(0);  // arg unused -- la estructura interna decide
+    // sw vale: ((x==1)?10 : ((x==2)?20 : ((x==3)?30 : 0)))  con x=2 -> 20
+    if (sw != 20) return 82;
+
+    return 42;
+}

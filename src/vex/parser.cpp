@@ -28,9 +28,50 @@
 
 #include "vex/parser.h"
 
+#include <string>
+#include <unordered_set>
 #include <utility>
 
 namespace vex {
+
+    /**
+     * @brief Reconoce nombres de builtins comptime de introspection.
+     *
+     * Solo cuando el parser ve un IdentExpr cuyo nombre esta en este set
+     * y va seguido de @c <, consume los type args como parte de un
+     * CallExpr generico.  Sin esta restriccion, @c LT en posicion postfix
+     * seria ambiguo con operadores de comparacion (@c foo < bar).
+     *
+     * Para anyadir nuevos builtins comptime: insertar el nombre aqui y en
+     * el dispatcher del type checker.  El parser solo necesita el set
+     * (un name no listado se trata como llamada normal sin type args, lo
+     * cual no rompe codigo existente -- LT pasa al binary expr parser).
+     */
+    static bool is_comptime_builtin_name(const std::string &name) {
+        static const std::unordered_set<std::string> set = {
+            /* queries atomicas */
+            "sizeof", "alignof", "typename", "type_id", "kind",
+            /* queries de fields/methods */
+            "offsetof", "has_field", "has_method",
+            "field_count", "method_count",
+            "field_name", "field_type",
+            "is_subtype", "is_same",
+            "is_class", "is_struct", "is_primitive",
+            /* iteracion + acceso directo */
+            "field_get", "field_set",
+            "for_each_field", "for_each_method",
+            /* Type-as-first-class-value + builtins composables */
+            "comptime_type", "parent_class", "element_type",
+            "error_type", "field_type_at",
+            "method_name", "method_return_type",
+            /* string ops comptime (sin <T>) */
+            /* Estos NO toman type_args, pero los meto aqui solo para
+             * documentar que son builtins reconocidos.  El parser no los
+             * usa para nada especial (no consume LT). */
+        };
+        return set.count(name) > 0;
+    }
+
 
     // ---------------------------------------------------------------------
     // Constructor.
@@ -310,16 +351,23 @@ namespace vex {
             return parse_using_decl();
         }
         // Anotaciones top-level que preceden a una clase o funcion:
-        //   @Aspect: clase de aspectos
-        //   @Async:  funcion async, transformada a wrapper future + spawn 
+        //   @Aspect:     clase de aspectos
+        //   @Async:      funcion async, transformada a wrapper future + spawn
+        //   @Introspect: clase/struct/enum runtime-introspectable (Sprint 4 A.37.s4)
         //   Otras se aceptan y se ignoran silenciosamente.
-        bool top_is_aspect = false;
-        bool top_is_async  = false;
+        bool top_is_aspect     = false;
+        bool top_is_async      = false;
+        bool top_is_introspect = false;
+        bool top_is_macro      = false;  /* A.43.16: @Macro */
+        bool top_is_pure       = false;  /* A.43.20: @Pure -- memoizable */
         while (current_.kind == TokenKind::AT) {
             (void)consume();
             if (current_.kind == TokenKind::IDENTIFIER) {
                 if (current_.lexeme == "Aspect") top_is_aspect = true;
                 else if (current_.lexeme == "Async") top_is_async = true;
+                else if (current_.lexeme == "Introspect") top_is_introspect = true;
+                else if (current_.lexeme == "Macro") top_is_macro = true;
+                else if (current_.lexeme == "Pure")  top_is_pure  = true;
                 (void)consume();
                 if (current_.kind == TokenKind::LPAREN) {
                     int depth = 0;
@@ -337,12 +385,15 @@ namespace vex {
         }
         // struct <nombre> { ... }
         if (current_.kind == TokenKind::KW_STRUCT) {
-            return parse_struct_decl();
+            auto sd = parse_struct_decl();
+            if (sd && top_is_introspect) sd->is_introspect = true;
+            return sd;
         }
         // class <nombre> { ... }
         if (current_.kind == TokenKind::KW_CLASS) {
             auto cd = parse_class_decl();
-            if (cd && top_is_aspect) cd->is_aspect = true;
+            if (cd && top_is_aspect)     cd->is_aspect     = true;
+            if (cd && top_is_introspect) cd->is_introspect = true;
             return cd;
         }
         // interface <nombre> { metodos abstractos }
@@ -350,16 +401,152 @@ namespace vex {
         // metodos acepta `;` en lugar de body para metodos abstractos.
         if (current_.kind == TokenKind::KW_INTERFACE) {
             auto cd = parse_interface_decl();
+            if (cd && top_is_introspect) cd->is_introspect = true;
             return cd;
         }
         // ADTs: enum <nombre> { Variante1, Variante2(T1, T2), ... }
         if (current_.kind == TokenKind::KW_ENUM) {
-            return parse_enum_decl();
+            auto ed = parse_enum_decl();
+            if (ed && top_is_introspect) ed->is_introspect = true;
+            return ed;
+        }
+
+        // 'comptime const T NAME = expr;' a nivel modulo.  Marca
+        // la const como evaluable en compile-time; los usos se inlinean
+        // como CONST IR.  El parser detecta IDENT(comptime) + KW_CONST
+        // contextualmente.
+        // 'comptime <TYPE> <NAME>(params) { body }' a nivel modulo
+        // declara una funcion comptime que se interpreta al compilar.
+        // No emite codigo runtime.
+        bool is_comptime_const = false;
+        bool is_comptime_var   = false;
+        bool is_comptime_fn    = false;
+        std::vector<std::string> comptime_type_params;
+        if (current_.kind == TokenKind::IDENTIFIER
+         && current_.lexeme == "comptime") {
+            Lexer &mut_lex = const_cast<Lexer &>(lex_);
+            if (mut_lex.peek_at(0).kind == TokenKind::KW_CONST) {
+                (void)consume();   /* 'comptime' */
+                is_comptime_const = true;
+            } else if (mut_lex.peek_at(0).kind == TokenKind::IDENTIFIER
+                    && (mut_lex.peek_at(0).lexeme == "var"
+                     || mut_lex.peek_at(0).lexeme == "auto")) {
+                /* `comptime auto X` y `comptime var X` aceptados
+                 * como alias.  Soportan DOS modos:
+                 *   (a) `comptime var T NAME = init;` -- tipo explicito.
+                 *   (b) `comptime var NAME = init;`   -- inferencia.
+                 *   (c) `comptime auto NAME = init;`  -- idem (b).
+                 */
+                const SourceLoc sugar_loc = current_.loc;
+                (void)consume();   /* 'comptime' */
+                (void)consume();   /* 'var' o 'auto' */
+                /* Detectar modo (b)/(c): siguiente token es IDENT seguido
+                 * de `=`.  Si si, build GlobalVarDecl con type=nullptr +
+                 * is_const=false + is_comptime=true + infer. */
+                if (current_.kind == TokenKind::IDENTIFIER
+                 && mut_lex.peek_at(0).kind == TokenKind::ASSIGN) {
+                    auto gv = std::make_unique<ast::GlobalVarDecl>();
+                    gv->loc         = sugar_loc;
+                    gv->name        = consume().lexeme;
+                    gv->is_const    = false;       /* mutable */
+                    gv->is_comptime = true;
+                    gv->type        = nullptr;     /* infer */
+                    (void)expect(TokenKind::ASSIGN,
+                                 "se esperaba '=' tras 'comptime var/auto' + nombre");
+                    gv->init = parse_expr();
+                    (void)expect(TokenKind::SEMICOLON,
+                                 "se esperaba ';' al final de la decl comptime var");
+                    return gv;
+                }
+                is_comptime_var = true;
+            } else if (mut_lex.peek_at(0).kind == TokenKind::IDENTIFIER
+                    && mut_lex.peek_at(1).kind == TokenKind::ASSIGN) {
+                /* sugar: `comptime NAME = expr;` -> equivale a
+                 * `comptime const auto NAME = expr;` con inferencia.
+                 * Reduce el ruido al construir cadenas de macros + types
+                 * en compile-time (que repetian `comptime const ...` por
+                 * todas partes).  Solo aplica cuando el siguiente al
+                 * IDENT es `=` (sin tipo entre medias). */
+                const SourceLoc sugar_loc = current_.loc;
+                (void)consume();   /* 'comptime' */
+                std::string nm = consume().lexeme;        /* NAME */
+                (void)expect(TokenKind::ASSIGN,
+                             "se esperaba '=' tras 'comptime' + nombre");
+                auto gv = std::make_unique<ast::GlobalVarDecl>();
+                gv->loc         = sugar_loc;
+                gv->name        = std::move(nm);
+                gv->is_const    = true;
+                gv->is_comptime = true;
+                gv->type        = nullptr;   /* infer desde init */
+                gv->init        = parse_expr();
+                (void)expect(TokenKind::SEMICOLON,
+                             "se esperaba ';' al final de la decl comptime");
+                return gv;
+            } else {
+                /* `comptime` seguido de un tipo => funcion comptime.
+                 * Heuristica: tras `comptime`, el siguiente token comienza
+                 * un tipo (primitivo, identifier de struct/class, etc.)
+                 * y la decl es por lo tanto una funcion (ya que vars usan
+                 * `comptime const`).  Si lo que sigue NO es un tipo
+                 * (e.g. otro ident generico), dejamos `comptime` sin
+                 * consumir y el flujo regular emitira error. */
+                /* Aseguramos que tras `comptime` venga algo parseable
+                 * como tipo Y luego un `(` -- senal de funcion. */
+                /* Sin consumir, just chequeamos.  Por simplicidad:
+                 * consumimos `comptime`, marcamos el flag, y si luego no
+                 * encontramos un tipo + `(`, el error sera lanzado por
+                 * el parser regular abajo. */
+                (void)consume();   /* 'comptime' */
+                is_comptime_fn = true;
+                /* A.41: type params opcionales `<T, U, ...>` para
+                 * comptime fn genericos.  El parser los captura aqui y
+                 * los asignara al FunctionDecl despues de parsearlo. */
+                if (current_.kind == TokenKind::LT) {
+                    (void)consume();   /* '<' */
+                    while (current_.kind == TokenKind::IDENTIFIER) {
+                        comptime_type_params.push_back(consume().lexeme);
+                        if (current_.kind == TokenKind::COMMA) {
+                            (void)consume();
+                            continue;
+                        }
+                        break;
+                    }
+                    (void)expect_close_angle("se esperaba '>' al cerrar type params");
+                }
+            }
         }
 
         // Manejar 'const' opcional al principio.
         bool is_const = false;
         if (match(TokenKind::KW_CONST)) is_const = true;
+        if (is_comptime_const && !is_const) {
+            error_here("'comptime' debe ir seguido de 'const'");
+        }
+
+        // `static_assert(cond, "msg");` a nivel modulo.  Lo
+        // parseamos como una ExprStmt envuelto en un GlobalVarDecl
+        // dummy con type=void + init=ese CallExpr.  El type checker lo
+        // procesa en la pasada de globales y emite error si la cond es
+        // false; el lowering lo trata como void global (no genera codigo).
+        if (current_.kind == TokenKind::IDENTIFIER
+         && current_.lexeme == "static_assert") {
+            Lexer &mut_lex = const_cast<Lexer &>(lex_);
+            if (mut_lex.peek_at(0).kind == TokenKind::LPAREN) {
+                const SourceLoc sa_loc = current_.loc;
+                auto call_expr = parse_expr();              /* static_assert(...) */
+                (void)expect(TokenKind::SEMICOLON,
+                             "se esperaba ';' tras static_assert(...)");
+                auto gv = std::make_unique<ast::GlobalVarDecl>();
+                gv->loc  = sa_loc;
+                gv->name = std::string("__static_assert_")
+                         + std::to_string(static_assert_counter_++);
+                auto tn = std::make_unique<ast::PrimitiveTypeNode>();
+                tn->prim = PrimitiveKind::VOID;
+                gv->type = std::move(tn);
+                gv->init = std::move(call_expr);
+                return gv;
+            }
+        }
 
         if (!starts_type()) {
             error_here("se esperaba un tipo al inicio de la declaracion top-level");
@@ -387,11 +574,37 @@ namespace vex {
             // El lowering trata estas funciones distinto: las envuelve en
             // future_alloc + spawn { msgrecv handle + body + fulfill } y
             // devuelve el handle del future al caller.
-            if (fd && top_is_async) fd->is_async = true;
+            if (fd && top_is_async)     fd->is_async = true;
+            if (fd && is_comptime_fn)   fd->is_comptime = true;
+            if (fd && top_is_macro)     fd->is_macro = true;
+            if (fd && top_is_pure)      fd->is_pure  = true;
+            if (fd && is_comptime_fn)   fd->type_params = std::move(comptime_type_params);
+            // Registrar posiciones de params @c expr para que el parser sepa
+            // hacer raw-text capture en los call sites de este @Macro.  Solo
+            // se honra el flag cuando la funcion es @Macro: en otro contexto
+            // produciria un mensaje de error en el type checker.
+            if (fd && top_is_macro && !fd->params.empty()) {
+                std::vector<int> positions;
+                for (size_t i = 0; i < fd->params.size(); ++i) {
+                    if (fd->params[i] && fd->params[i]->is_expr_capture) {
+                        positions.push_back(static_cast<int>(i));
+                    }
+                }
+                if (!positions.empty()) {
+                    macro_expr_params_[fd->name] = std::move(positions);
+                }
+            }
             return fd;
         }
+        // `comptime T NAME = expr;` sin `(` -- comptime var
+        // mutable (NO error como antes; cae al global var path arriba).
         // Es una variable global.
-        return parse_global_var_decl(std::move(type_node), std::move(name), loc, is_const);
+        // `comptime var T NAME = expr;` -> comptime var mutable
+        // a nivel modulo.  `comptime const ...` mantiene semantica
+        // inmutable
+        auto gv = parse_global_var_decl(std::move(type_node), std::move(name), loc, is_const);
+        if (gv && (is_comptime_const || is_comptime_var)) gv->is_comptime = true;
+        return gv;
     }
 
     // ---------------------------------------------------------------------
@@ -433,7 +646,8 @@ namespace vex {
         }
         (void)expect(TokenKind::RPAREN, "se esperaba ')' al cerrar la lista de parametros");
 
-        // Cuerpo: bloque obligatorio en A.1 (no hay extern aun).
+        // Cuerpo: bloque obligatorio para funciones Vex; las funciones
+        // sin cuerpo (FFI extern) se modelan via @c ExternFnDecl aparte.
         if (current_.kind != TokenKind::LBRACE) {
             error_here("se esperaba '{' para abrir el cuerpo de la funcion");
             return fn;
@@ -443,6 +657,27 @@ namespace vex {
     }
 
     std::unique_ptr<ast::ParamDecl> Parser::parse_param() {
+        // Caso especial `expr name`: tipo contextual valido SOLO en params
+        // de @Macro.  Lo materializamos como STRING para el body del macro;
+        // la captura raw se hace en el call site (parse_postfix con
+        // raw-text slicing).  Marcamos @c is_expr_capture para que el
+        // registro posterior (en parse_function_decl) lo recolecte.
+        if (current_.kind == TokenKind::IDENTIFIER && current_.lexeme == "expr") {
+            auto p = std::make_unique<ast::ParamDecl>();
+            p->loc = current_.loc;
+            (void)consume();  // consume 'expr'
+            auto tn = std::make_unique<ast::PrimitiveTypeNode>();
+            tn->loc = p->loc;
+            tn->prim = PrimitiveKind::STRING;
+            p->type = std::move(tn);
+            p->is_expr_capture = true;
+            if (current_.kind != TokenKind::IDENTIFIER) {
+                error_here("se esperaba un nombre tras el tipo 'expr' del parametro");
+                return p;
+            }
+            p->name = consume().lexeme;
+            return p;
+        }
         if (!starts_type()) {
             error_here("se esperaba un tipo en parametro");
             return nullptr;
@@ -491,8 +726,10 @@ namespace vex {
     // ---------------------------------------------------------------------
     // Tipos.
     //
-    // En A.1 solo primitivos.  Punteros, arrays, generics se anyaden en
-    // hitos posteriores (esto se quedara como caso por defecto del switch).
+    // Cobertura actual: primitivos, punteros @c T*, arrays @c T[N] y
+    // @c T[], @c VirtualPtr<T>, generics @c Cls<T1, T2>, tipos de
+    // funcion @c fn(T) -> R, y @c nonnull T.  La rama del switch que
+    // no matche cae al case por defecto, que reporta error claro.
     // ---------------------------------------------------------------------
 
     bool Parser::looks_like_cast() const noexcept {
@@ -610,6 +847,19 @@ namespace vex {
         // es el keyword reservado.
         if (current_.kind == TokenKind::KW_FN) return true;
         if (current_.kind != TokenKind::IDENTIFIER) return false;
+        /* `auto NAME = init;` y `var NAME = init;` cuentan como
+         * inicio de var-decl (con inferencia local de tipo).  `auto`/`var`
+         * NO son keywords reservadas; solo se interpretan asi cuando van
+         * seguidas inmediatamente por otro IDENTIFIER (el nombre). */
+        if ((current_.lexeme == "auto" || current_.lexeme == "var")) {
+            Lexer &mut_lex = const_cast<Lexer &>(lex_);
+            // peek_at(0) es el SIGUIENTE token, no el actual.  El check es
+            // "el token despues de `auto`/`var` debe ser IDENT (el nombre)".
+            const Token &nx = mut_lex.peek_at(0);
+            if (nx.kind == TokenKind::IDENTIFIER) {
+                return true;
+            }
+        }
 
         Lexer &mut_lex = const_cast<Lexer &>(lex_);
         size_t off = 0;
@@ -634,6 +884,25 @@ namespace vex {
         }
         // Saltar `*`s.
         while (mut_lex.peek_at(off).kind == TokenKind::STAR) ++off;
+        /* saltar `[N]` o `[]` -- postfix de arrays nativos.
+         * Permite que `Point[3] arr = ...` y `Cls<T>[5] v = ...` se
+         * reconozcan como type-decl. */
+        const size_t MAX_LOOKAHEAD = 64;
+        while (mut_lex.peek_at(off).kind == TokenKind::LBRACKET) {
+            ++off;
+            int b_depth = 1;
+            size_t guard = 0;
+            while (b_depth > 0 && off < MAX_LOOKAHEAD && guard++ < MAX_LOOKAHEAD) {
+                TokenKind k = mut_lex.peek_at(off).kind;
+                if (k == TokenKind::END_OF_FILE) return false;
+                if (k == TokenKind::LBRACKET) ++b_depth;
+                else if (k == TokenKind::RBRACKET) --b_depth;
+                ++off;
+            }
+            if (b_depth != 0) return false;
+            /* Permitir tambien `*` o mas `[]` tras el array. */
+            while (mut_lex.peek_at(off).kind == TokenKind::STAR) ++off;
+        }
         // aceptar `T !!name` (BANG_BANG entre tipo y nombre).
         if (mut_lex.peek_at(off).kind == TokenKind::BANG_BANG) ++off;
         return mut_lex.peek_at(off).kind == TokenKind::IDENTIFIER;
@@ -1222,7 +1491,7 @@ namespace vex {
         }
         c->name = consume().lexeme;
 
-        // Generics A.8: parametros de tipo opcionales `<T>`, `<K, V>`.
+        // Generics: parametros de tipo opcionales `<T>`, `<K, V>`.
         // Cada parametro es un identificador simple; la clase se trata
         // como plantilla y no se procesa como clase concreta hasta que
         // se instancie via `Box<i32>`.
@@ -1243,8 +1512,9 @@ namespace vex {
                 return nullptr;
             }
             c->super_name = consume().lexeme;
-            // Soporte de interfaces multiples llega en A.5: aqui ignoramos
-            // tokens adicionales ',' <ident> y los reportamos como no soportados.
+            // Despues de la superclase, una lista opcional de interfaces
+            // separadas por coma: @c class X : Base, IFoo, IBar.  El type
+            // checker valida que sean efectivamente interfaces.
             while (current_.kind == TokenKind::COMMA) {
                 (void)consume();
                 if (current_.kind == TokenKind::IDENTIFIER) {
@@ -1762,6 +2032,184 @@ namespace vex {
                 (void)consume();                   // ':'
                 return lab;
             }
+            // `comptime if (cond) { ... }` -- el if se evalua
+            // 100% en compile-time y solo la rama tomada se baja a IR.
+            // Detectamos contextualmente para no reservar `comptime` como
+            // keyword global (puede usarse como nombre de variable).
+            if (current_.lexeme == "comptime"
+             && mut_lex.peek_at(0).kind == TokenKind::KW_IF) {
+                (void)consume();                   // 'comptime' (IDENT)
+                auto s = parse_if_stmt();           // parsea como if normal
+                if (s && s->kind == ast::NodeKind::IfStmt) {
+                    static_cast<ast::IfStmt *>(s.get())->is_comptime = true;
+                }
+                return s;
+            }
+            // A.39: `comptime const T NAME = expr;` local.
+            if (current_.lexeme == "comptime"
+             && mut_lex.peek_at(0).kind == TokenKind::KW_CONST) {
+                (void)consume();                   // 'comptime'
+                (void)consume();                   // 'const'
+                auto vd = parse_var_decl_stmt(true);
+                if (vd && vd->kind == ast::NodeKind::VarDeclStmt) {
+                    auto *v = static_cast<ast::VarDeclStmt *>(vd.get());
+                    v->is_comptime = true;
+                }
+                return vd;
+            }
+            /* sugar local: `comptime NAME = expr;` ->
+             * equivale a `comptime const auto NAME = expr;` con
+             * inferencia.  Reduce el ruido en cadenas largas de
+             * macros + concat de strings comptime. */
+            if (current_.lexeme == "comptime"
+             && mut_lex.peek_at(0).kind == TokenKind::IDENTIFIER
+             && mut_lex.peek_at(0).lexeme != "var"
+             && mut_lex.peek_at(1).kind == TokenKind::ASSIGN) {
+                const SourceLoc sugar_loc = current_.loc;
+                (void)consume();                   /* 'comptime' */
+                auto vd = std::make_unique<ast::VarDeclStmt>();
+                vd->loc         = sugar_loc;
+                vd->name        = consume().lexeme;  /* NAME */
+                vd->is_const    = true;
+                vd->is_comptime = true;
+                vd->infer_type  = true;
+                vd->type        = nullptr;
+                (void)expect(TokenKind::ASSIGN,
+                             "se esperaba '=' tras 'comptime' + nombre");
+                vd->init = parse_expr();
+                (void)expect(TokenKind::SEMICOLON,
+                             "se esperaba ';' al final de la decl comptime");
+                return vd;
+            }
+            // `comptime var T NAME = expr;` local mutable.
+            // Convencion: el modificador `var` (IDENT contextual) hace
+            // explicito que la variable es comptime-mutable, paralelo a
+            // `comptime const` para inmutable.
+            // : `comptime auto X` aceptado como alias.  Tambien
+            // soporta `comptime var/auto NAME = init;` (sin tipo) con
+            // inferencia local.
+            if (current_.lexeme == "comptime"
+             && mut_lex.peek_at(0).kind == TokenKind::IDENTIFIER
+             && (mut_lex.peek_at(0).lexeme == "var"
+              || mut_lex.peek_at(0).lexeme == "auto")) {
+                const SourceLoc sugar_loc = current_.loc;
+                (void)consume();                   // 'comptime'
+                (void)consume();                   // 'var' o 'auto'
+                /* Modo inferencia: `comptime var NAME = init;` sin tipo. */
+                if (current_.kind == TokenKind::IDENTIFIER
+                 && mut_lex.peek_at(0).kind == TokenKind::ASSIGN) {
+                    auto vd = std::make_unique<ast::VarDeclStmt>();
+                    vd->loc         = sugar_loc;
+                    vd->name        = consume().lexeme;
+                    vd->is_const    = false;   /* mutable */
+                    vd->is_comptime = true;
+                    vd->infer_type  = true;
+                    vd->type        = nullptr;
+                    (void)expect(TokenKind::ASSIGN,
+                                 "se esperaba '=' tras 'comptime var/auto' + nombre");
+                    vd->init = parse_expr();
+                    (void)expect(TokenKind::SEMICOLON,
+                                 "se esperaba ';' al final de la decl comptime var");
+                    return vd;
+                }
+                auto vd = parse_var_decl_stmt(false);
+                if (vd && vd->kind == ast::NodeKind::VarDeclStmt) {
+                    auto *v = static_cast<ast::VarDeclStmt *>(vd.get());
+                    v->is_comptime = true;
+                }
+                return vd;
+            }
+            // `comptime { stmts }` bloque scope para comptime const +
+            // comptime for + static_assert.  El bloque NO emite codigo
+            // runtime.
+            // sugar: dentro del bloque, `NAME = expr;` (sin
+            // 'comptime const' explicito) cuenta como nueva decl
+            // `comptime const NAME = expr;` con inferencia.  Reduce
+            // ruido en macros donde cada decl repetia `comptime const`.
+            if (current_.lexeme == "comptime"
+             && mut_lex.peek_at(0).kind == TokenKind::LBRACE) {
+                const SourceLoc loc = current_.loc;
+                (void)consume();                   // 'comptime'
+                (void)expect(TokenKind::LBRACE,
+                             "se esperaba '{' tras 'comptime'");
+                auto cb = std::make_unique<ast::ComptimeBlockStmt>();
+                cb->loc = loc;
+                while (current_.kind != TokenKind::RBRACE
+                    && current_.kind != TokenKind::END_OF_FILE) {
+                    /* sugar: detectar `NAME = expr;` directo
+                     * antes del parse_statement normal.  Solo aplica
+                     * cuando el siguiente al IDENT es ASSIGN -- otros
+                     * IdentExpr (e.g., expr-stmt funcional) caen al
+                     * parser normal. */
+                    if (current_.kind == TokenKind::IDENTIFIER
+                     && mut_lex.peek_at(0).kind == TokenKind::ASSIGN) {
+                        const SourceLoc decl_loc = current_.loc;
+                        auto vd = std::make_unique<ast::VarDeclStmt>();
+                        vd->loc         = decl_loc;
+                        vd->name        = consume().lexeme;
+                        vd->is_const    = true;
+                        vd->is_comptime = true;
+                        vd->infer_type  = true;
+                        vd->type        = nullptr;
+                        (void)expect(TokenKind::ASSIGN,
+                                     "se esperaba '=' tras nombre en comptime block");
+                        vd->init = parse_expr();
+                        (void)expect(TokenKind::SEMICOLON,
+                                     "se esperaba ';' al final de la decl comptime");
+                        cb->stmts.push_back(std::move(vd));
+                        continue;
+                    }
+                    auto inner = parse_statement();
+                    if (inner) cb->stmts.push_back(std::move(inner));
+                    else synchronize();
+                }
+                (void)expect(TokenKind::RBRACE,
+                             "se esperaba '}' al cerrar comptime block");
+                return cb;
+            }
+            // `comptime for (i in lo..hi) { body }` unrolled.
+            // Sintaxis: `comptime for (IDENT in EXPR `..` EXPR) { body }`
+            // o `..=` para rango inclusivo.
+            if (current_.lexeme == "comptime"
+             && mut_lex.peek_at(0).kind == TokenKind::KW_FOR) {
+                const SourceLoc loc = current_.loc;
+                (void)consume();                   // 'comptime'
+                (void)consume();                   // 'for'
+                (void)expect(TokenKind::LPAREN,
+                             "se esperaba '(' tras 'comptime for'");
+                if (current_.kind != TokenKind::IDENTIFIER) {
+                    error_here(
+                        "se esperaba nombre del index tras 'comptime for ('");
+                    synchronize();
+                    return nullptr;
+                }
+                auto cf = std::make_unique<ast::ComptimeForStmt>();
+                cf->loc      = loc;
+                cf->var_name = consume().lexeme;
+                if (current_.kind != TokenKind::KW_IN) {
+                    error_here(
+                        "se esperaba 'in' tras el nombre del index");
+                } else {
+                    (void)consume();
+                }
+                cf->lo_expr = parse_expr();
+                /* `..` o `..=` para rango. */
+                if (current_.kind == TokenKind::DOTDOT) {
+                    (void)consume();
+                    cf->inclusive = false;
+                } else if (current_.kind == TokenKind::DOTDOTEQ) {
+                    (void)consume();
+                    cf->inclusive = true;
+                } else {
+                    error_here(
+                        "se esperaba '..' o '..=' en el rango de comptime for");
+                }
+                cf->hi_expr = parse_expr();
+                (void)expect(TokenKind::RPAREN,
+                             "se esperaba ')' tras el rango de comptime for");
+                cf->body = parse_statement();
+                return cf;
+            }
         }
         switch (current_.kind) {
             case TokenKind::LBRACE:        return parse_block();
@@ -1804,7 +2252,8 @@ namespace vex {
             case TokenKind::KW_THROW:      return parse_throw_stmt();
             case TokenKind::KW_SYNCHRONIZED: return parse_synchronized_stmt();
             case TokenKind::KW_MATCH: {
-                // A.11 ADTs: match como statement.  El parser de
+                // Match como statement (destructuring de ADT como
+                // sentencia de control de flujo).  El parser de
                 // expresion ya sabe parsear MatchExpr (rama en
                 // parse_primary), pero como statement queremos que NO
                 // exija un `;` final (igual que if/while/for).
@@ -1827,7 +2276,21 @@ namespace vex {
         auto vd = std::make_unique<ast::VarDeclStmt>();
         vd->loc      = current_.loc;
         vd->is_const = is_const;
-        vd->type     = parse_type_node();
+        /* `auto NAME = init;` o `var NAME = init;` -- inferencia
+         * local de tipo desde el init.  `auto`/`var` se reconocen como
+         * IDENTIFIER contextual seguido de OTRO IDENTIFIER (el nombre);
+         * asi NO los reservamos como keywords y codigo existente con
+         * variables llamadas `auto`/`var` sigue funcionando salvo en
+         * posicion de tipo en var-decl. */
+        if (current_.kind == TokenKind::IDENTIFIER
+         && (current_.lexeme == "auto" || current_.lexeme == "var")
+         && lex_.peek_at(0).kind == TokenKind::IDENTIFIER) {
+            (void)consume();          /* descartar 'auto' o 'var' */
+            vd->type        = nullptr;
+            vd->infer_type  = true;
+        } else {
+            vd->type     = parse_type_node();
+        }
         // azucar: `T !!name = init;` equivale a
         // `nonnull T name = !!init;`.  El `!!` entre tipo y nombre
         // marca el tipo como no-null y envuelve el inicializador con
@@ -1925,6 +2388,30 @@ namespace vex {
         (void)consume(); // 'for'
         (void)expect(TokenKind::LPAREN, "se esperaba '(' tras 'for'");
 
+        // aceptar `comptime const/var T NAME = expr` como init del for.
+        // Esto permite usar el counter como comptime value dentro del body
+        // si el resto del for esta en contexto comptime (e.g. dentro de
+        // comptime fn body).  Sintaxis: `for (comptime var i64 i = 0; ...)`.
+        // El parser detecta `comptime` aqui y construye un VarDeclStmt con
+        // is_comptime=true; el resto del for se procesa normalmente.
+        bool init_is_comptime = false;
+        bool init_is_comptime_const = false;
+        if (current_.kind == TokenKind::IDENTIFIER
+         && current_.lexeme == "comptime") {
+            Lexer &mut_lex = const_cast<Lexer &>(lex_);
+            if (mut_lex.peek_at(0).kind == TokenKind::KW_CONST) {
+                (void)consume(); /* comptime */
+                (void)consume(); /* const */
+                init_is_comptime = true;
+                init_is_comptime_const = true;
+            } else if (mut_lex.peek_at(0).kind == TokenKind::IDENTIFIER
+                    && mut_lex.peek_at(0).lexeme == "var") {
+                (void)consume(); /* comptime */
+                (void)consume(); /* var */
+                init_is_comptime = true;
+            }
+        }
+
         // Disambiguacion entre foreach y counted-for.
         //   foreach: `for (T NAME : EXPR) body`
         //   counted: `for (init? ; cond? ; step?) body`
@@ -1963,6 +2450,9 @@ namespace vex {
                 vd->loc  = for_loc;
                 vd->type = std::move(type_node);
                 vd->name = std::move(name);
+                /* `for (comptime var/const T NAME = expr; ...)` */
+                vd->is_comptime = init_is_comptime;
+                vd->is_const    = init_is_comptime_const;
                 if (match(TokenKind::ASSIGN)) {
                     vd->init = parse_expr();
                 }
@@ -2103,9 +2593,9 @@ namespace vex {
 
     std::unique_ptr<ast::Expr> Parser::parse_assignment() {
         // Asociatividad por la derecha.  Parseamos el lado izquierdo
-        // como una expresion or-logico y, si vemos un operador de
+        // como una expresion ternaria y, si vemos un operador de
         // asignacion, recursamos para el lado derecho.
-        auto lhs = parse_logical_or();
+        auto lhs = parse_ternary();
         ast::AssignOp op;
         if (ast::assignop_from_token(current_.kind, op)) {
             const SourceLoc loc = current_.loc;
@@ -2119,6 +2609,36 @@ namespace vex {
             return a;
         }
         return lhs;
+    }
+
+    /**
+     * @brief operador ternario `cond ? then : else`.
+     *
+     * Precedencia: entre assignment (mas baja) y logical_or (mas alta).
+     * Asociatividad por la derecha (igual que C/C++/Java).  El COLON
+     * separa las dos ramas; ambas se parsean como `parse_assignment`
+     * para que se acepten asignaciones en las ramas:
+     *   `flag ? x = 1 : x = 2`  -- legal aunque inusual
+     *
+     * Cuidado con `match`: el COLON tambien aparece en arms de match
+     * y en labels.  Pero parse_ternary solo consume `?` -> cualquier
+     * COLON sin `?` previo no afecta a este path.
+     */
+    std::unique_ptr<ast::Expr> Parser::parse_ternary() {
+        auto cond = parse_logical_or();
+        if (current_.kind != TokenKind::QUESTION) return cond;
+        const SourceLoc loc = current_.loc;
+        (void)consume();                                /* '?' */
+        auto then_expr = parse_assignment();
+        (void)expect(TokenKind::COLON,
+                     "se esperaba ':' en la expresion ternaria");
+        auto else_expr = parse_assignment();
+        auto t = std::make_unique<ast::TernaryExpr>();
+        t->loc       = loc;
+        t->cond      = std::move(cond);
+        t->then_expr = std::move(then_expr);
+        t->else_expr = std::move(else_expr);
+        return t;
     }
 
     // Helper: macro-like factory para los niveles binarios izquierda-asociativos.
@@ -2340,7 +2860,8 @@ namespace vex {
     }
 
     std::unique_ptr<ast::Expr> Parser::parse_postfix() {
-        // Postfix: x++, x--, x(args).  En A.1 solo estos tres.
+        // Operadores postfix soportados: x++, x--, x(args), x[i],
+        // x.field, x?.field, x?.[i], x?
         auto expr = parse_primary();
         while (true) {
             switch (current_.kind) {
@@ -2357,16 +2878,188 @@ namespace vex {
                     expr = std::move(u);
                     break;
                 }
+                case TokenKind::LT: {
+                    /* Soporte para builtins comptime con type args:
+                     * @c sizeof<T>(), @c offsetof<T>("field"), etc.
+                     * Solo se activa cuando @c expr es un IdentExpr cuyo
+                     * nombre matchea un builtin comptime conocido.  Sin
+                     * esta restriccion, @c LT en posicion postfix seria
+                     * ambiguo con operadores de comparacion (@c foo < bar).
+                     * Si el nombre no es builtin comptime, salimos del
+                     * switch para que el LT lo procese binary_expr. */
+                    if (expr->kind != ast::NodeKind::IdentExpr) {
+                        return expr;
+                    }
+                    const auto *id_chk = static_cast<const ast::IdentExpr *>(expr.get());
+                    /* para nombres no-builtin, hacemos un lookahead
+                     * permisivo: si el patron es `name<TYPE_STUFF>(` lo
+                     * tratamos como type-args (probable comptime fn
+                     * generica).  Esto evita reservar nombres conocidos
+                     * y permite que usuarios definan sus propias
+                     * generic comptime fns sin tocar la whitelist. */
+                    if (!is_comptime_builtin_name(id_chk->name)) {
+                        /* Lookahead: tras `<` esperamos un token que
+                         * arranque un tipo y eventualmente `>` + `(`.
+                         * Si no encontramos `(` tras el `>` (o `>>`) en
+                         * un rango razonable, fallback a binary `<`. */
+                        Lexer &mut_lex = const_cast<Lexer &>(lex_);
+                        bool looks_like_type_args = false;
+                        int depth = 0;
+                        for (size_t k = 0; k < 32; ++k) {
+                            const auto &tk = mut_lex.peek_at(k);
+                            if (tk.kind == TokenKind::LT) { depth++; continue; }
+                            if (tk.kind == TokenKind::GT) {
+                                if (depth == 0) {
+                                    const auto &after = mut_lex.peek_at(k + 1);
+                                    looks_like_type_args =
+                                        (after.kind == TokenKind::LPAREN);
+                                    break;
+                                }
+                                depth--; continue;
+                            }
+                            if (tk.kind == TokenKind::SHR) {
+                                if (depth <= 1) {
+                                    const auto &after = mut_lex.peek_at(k + 1);
+                                    looks_like_type_args =
+                                        (after.kind == TokenKind::LPAREN);
+                                    break;
+                                }
+                                depth -= 2; continue;
+                            }
+                            if (tk.kind == TokenKind::SEMICOLON
+                             || tk.kind == TokenKind::LBRACE
+                             || tk.kind == TokenKind::RBRACE
+                             || tk.kind == TokenKind::END_OF_FILE) break;
+                        }
+                        if (!looks_like_type_args) {
+                            return expr;
+                        }
+                    }
+                    const SourceLoc loc = current_.loc;
+                    (void)consume();  /* '<' */
+                    std::vector<std::unique_ptr<ast::TypeNode>> tas;
+                    while (current_.kind != TokenKind::GT
+                        && current_.kind != TokenKind::SHR
+                        && current_.kind != TokenKind::END_OF_FILE) {
+                        auto ta = parse_type_node();
+                        if (!ta) break;
+                        tas.push_back(std::move(ta));
+                        if (!match(TokenKind::COMMA)) break;
+                    }
+                    (void)expect_close_angle(
+                        "se esperaba '>' al cerrar type args de builtin comptime");
+                    /* Tras los type args DEBE venir '(' para los args runtime
+                     * del builtin (incluso si es ()). */
+                    if (current_.kind != TokenKind::LPAREN) {
+                        error_here("se esperaba '(' tras type args de builtin comptime");
+                        break;
+                    }
+                    (void)consume();  /* '(' */
+                    auto call = std::make_unique<ast::CallExpr>();
+                    call->loc    = loc;
+                    call->callee = std::move(expr);
+                    call->type_args = std::move(tas);
+                    if (current_.kind != TokenKind::RPAREN) {
+                        while (true) {
+                            auto arg = parse_expr();
+                            if (arg) call->args.push_back(std::move(arg));
+                            if (!match(TokenKind::COMMA)) break;
+                        }
+                    }
+                    (void)expect(TokenKind::RPAREN, "se esperaba ')' al cerrar la llamada");
+                    expr = std::move(call);
+                    break;
+                }
                 case TokenKind::LPAREN: {
                     const SourceLoc loc = current_.loc;
                     (void)consume();
                     auto call = std::make_unique<ast::CallExpr>();
                     call->loc    = loc;
+                    /* Detectar @Macro con params @c expr: si el callee es un
+                     * IdentExpr cuyo nombre esta en @c macro_expr_params_,
+                     * para cada arg en posicion marcada hacemos raw-text
+                     * capture en lugar de parsear como expresion.  Las demas
+                     * posiciones siguen el flujo normal. */
+                    const std::vector<int> *expr_positions = nullptr;
+                    if (expr && expr->kind == ast::NodeKind::IdentExpr) {
+                        const auto *id = static_cast<const ast::IdentExpr *>(expr.get());
+                        auto it = macro_expr_params_.find(id->name);
+                        if (it != macro_expr_params_.end()) {
+                            expr_positions = &it->second;
+                        }
+                    }
                     call->callee = std::move(expr);
                     if (current_.kind != TokenKind::RPAREN) {
+                        int arg_idx = 0;
                         while (true) {
-                            auto arg = parse_expr();
-                            if (arg) call->args.push_back(std::move(arg));
+                            bool is_raw = false;
+                            if (expr_positions) {
+                                for (int pos : *expr_positions) {
+                                    if (pos == arg_idx) { is_raw = true; break; }
+                                }
+                            }
+                            if (is_raw) {
+                                /* Raw-text capture: leer source desde el
+                                 * offset del token actual hasta el siguiente
+                                 * COMMA o RPAREN a depth 0.  El lexer ya tiene
+                                 * el offset absoluto en current_.loc.offset. */
+                                const std::string &src = lex_.source_buffer();
+                                const uint32_t start_off = current_.loc.offset;
+                                int paren_depth = 0;
+                                int brack_depth = 0;
+                                int brace_depth = 0;
+                                uint32_t end_off = start_off;
+                                /* Consumir tokens hasta el siguiente COMMA
+                                 * o RPAREN a depth 0.  Tracking paren/bracket/
+                                 * brace para no cortar dentro de subexprs. */
+                                while (current_.kind != TokenKind::END_OF_FILE) {
+                                    if (paren_depth == 0 && brack_depth == 0
+                                        && brace_depth == 0) {
+                                        if (current_.kind == TokenKind::COMMA
+                                            || current_.kind == TokenKind::RPAREN) {
+                                            end_off = current_.loc.offset;
+                                            break;
+                                        }
+                                    }
+                                    switch (current_.kind) {
+                                        case TokenKind::LPAREN:   ++paren_depth; break;
+                                        case TokenKind::RPAREN:   --paren_depth; break;
+                                        case TokenKind::LBRACKET: ++brack_depth; break;
+                                        case TokenKind::RBRACKET: --brack_depth; break;
+                                        case TokenKind::LBRACE:   ++brace_depth; break;
+                                        case TokenKind::RBRACE:   --brace_depth; break;
+                                        default: break;
+                                    }
+                                    (void)consume();
+                                }
+                                if (end_off == start_off) {
+                                    /* No avanzamos: arg vacio.  Construimos
+                                     * un StringLit vacio. */
+                                    end_off = start_off;
+                                }
+                                /* Trim trailing whitespace del span. */
+                                while (end_off > start_off
+                                    && end_off <= src.size()
+                                    && (src[end_off - 1] == ' '
+                                     || src[end_off - 1] == '\t'
+                                     || src[end_off - 1] == '\n'
+                                     || src[end_off - 1] == '\r')) {
+                                    --end_off;
+                                }
+                                std::string captured;
+                                if (start_off < src.size() && end_off >= start_off
+                                    && end_off <= src.size()) {
+                                    captured = src.substr(start_off, end_off - start_off);
+                                }
+                                auto slit = std::make_unique<ast::StringLitExpr>();
+                                slit->loc = loc;
+                                slit->value = std::move(captured);
+                                call->args.push_back(std::move(slit));
+                            } else {
+                                auto arg = parse_expr();
+                                if (arg) call->args.push_back(std::move(arg));
+                            }
+                            ++arg_idx;
                             if (!match(TokenKind::COMMA)) break;
                         }
                     }
@@ -2396,8 +3089,8 @@ namespace vex {
                     break;
                 }
                 case TokenKind::LBRACKET: {
-                    // Subscript: base[index].  En A.3.4.b se restringe a
-                    // base de tipo puntero; el type checker valida.
+                    // Subscript: base[index].  El type checker restringe la
+                    // base a tipo puntero o array (operacion de indexacion).
                     const SourceLoc loc = current_.loc;
                     (void)consume(); // '['
                     auto idx = std::make_unique<ast::IndexExpr>();
@@ -2617,8 +3310,8 @@ namespace vex {
                 auto e = std::make_unique<ast::NewExpr>();
                 e->loc        = loc;
                 e->class_name = consume().lexeme;
-                // Generics A.8: argumentos de tipo opcionales `<T>` para
-                // `new Box<i32>(42)`.
+                // Argumentos de tipo opcionales `<T1, T2, ...>` para
+                // instanciaciones genericas: @c new Box<i32>(42).
                 if (current_.kind == TokenKind::LT) {
                     (void)consume(); // '<'
                     while (current_.kind != TokenKind::GT

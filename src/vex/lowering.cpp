@@ -1,4 +1,4 @@
-/*
+\s[0-3].\/*
  * VestaVM - Maquina Virtual Distribuida
  *
  * Copyright (C) 2026 David Lopez.T (DesmonHak) (Castilla y Leon, ES)
@@ -17,6 +17,9 @@
 
 #include "vex/lowering.h"
 #include "vex/collection_intrinsics.h"  // tabla de tipos coleccion
+#include "vex/comptime_introspect.h"   // helpers compartidos rama A
+#include "vex/lexer.h"                  // parse de fragments para @Macro
+#include "vex/parser.h"                 // parse_one_expr para @Macro
 
 #include <functional>
 #include <set>
@@ -145,6 +148,47 @@ namespace vex {
                 collect_assigned_vars(r->value.get(), out);
                 return;
             }
+            case ast::NodeKind::TryStmt: {
+                auto *t = static_cast<const ast::TryStmt *>(n);
+                collect_assigned_vars(t->body.get(), out);
+                for (auto &cc: t->catches) {
+                    collect_assigned_vars(cc.body.get(), out);
+                }
+                collect_assigned_vars(t->finally_body.get(), out);
+                return;
+            }
+            case ast::NodeKind::SynchronizedStmt: {
+                auto *ss = static_cast<const ast::SynchronizedStmt *>(n);
+                collect_assigned_vars(ss->target.get(), out);
+                collect_assigned_vars(ss->body.get(), out);
+                return;
+            }
+            case ast::NodeKind::ThrowStmt: {
+                auto *ts = static_cast<const ast::ThrowStmt *>(n);
+                collect_assigned_vars(ts->value.get(), out);
+                return;
+            }
+            case ast::NodeKind::MatchExpr: {
+                auto *me = static_cast<const ast::MatchExpr *>(n);
+                collect_assigned_vars(me->scrutinee.get(), out);
+                for (auto &arm: me->arms) {
+                    collect_assigned_vars(arm.body.get(), out);
+                }
+                return;
+            }
+            case ast::NodeKind::SpawnExpr: {
+                auto *se = static_cast<const ast::SpawnExpr *>(n);
+                collect_assigned_vars(se->body.get(), out);
+                return;
+            }
+            case ast::NodeKind::RSpawnExpr: {
+                auto *re = static_cast<const ast::RSpawnExpr *>(n);
+                collect_assigned_vars(re->node_idx.get(), out);
+                collect_assigned_vars(re->body.get(), out);
+                return;
+            }
+            /* LabelStmt es solo un marker; el stmt siguiente vive en el
+             * BlockStmt enclosing y se procesa por iteracion normal. */
             case ast::NodeKind::VarDeclStmt: {
                 auto *v = static_cast<const ast::VarDeclStmt *>(n);
                 // VarDeclStmt introduce una variable nueva: NO entra en el
@@ -182,8 +226,8 @@ namespace vex {
             case PrimitiveKind::VOID: return ir::IrType::VOID;
             case PrimitiveKind::BOOL: return ir::IrType::BOOL;
             // CHAR no tiene contraparte directa en ir::IrType; mapeamos a U8
-            // (mismo ancho, semanticamente equivalente para A.1 que solo lo
-            // usa como entero pequenyo).
+            // (mismo ancho, semanticamente equivalente porque el frontend
+            // solo lo usa como entero pequenyo sin codepoint awareness).
             case PrimitiveKind::CHAR: return ir::IrType::U8;
             case PrimitiveKind::I8: return ir::IrType::I8;
             case PrimitiveKind::I16: return ir::IrType::I16;
@@ -262,6 +306,13 @@ namespace vex {
                 break;
             }
         }
+
+        // EMITIR PRIMERO los IntrospectInfo chunks
+        // y poblar @c introspect_idx_by_name_ ANTES de bajar funciones,
+        // para que @c find_type("Literal") pueda resolver el indice del
+        // chunk en compile-time durante el lowering de main / otras
+        // funciones.  Los layouts ya estan calculados por el type checker.
+        emit_introspect_info_chunks();
 
         // Pase 1: registrar el tipo de retorno de cada funcion para validar
         // las llamadas.  Esto en un programa real ya esta en el type checker,
@@ -403,11 +454,12 @@ namespace vex {
                     lower_function(fd, out_module);
                 }
             } else if (decl->kind == ast::NodeKind::GlobalVarDecl) {
-                // Las variables globales no se bajan en A.1, pero
-                // `const T NAME = lit;` SI funciona (lower_ident las
-                // inlinea como CONST en cada uso).  Solo avisamos para
-                // las globales NO-const o las que tienen inicializador
-                // no-literal (que efectivamente se ignoran).
+                // Las variables globales con storage real no estan soportadas
+                // en el frontend Vex actual.  Pero `const T NAME = lit;` SI
+                // funciona porque @c lower_ident las inlinea como CONST en
+                // cada uso (no necesitan storage).  Solo avisamos para las
+                // globales NO-const o las que tienen inicializador no-literal
+                // (que efectivamente se ignoran).
                 auto *gv            = static_cast<ast::GlobalVarDecl *>(decl.get());
                 bool  literal_const = gv->is_const && gv->init && (
                     gv->init->kind == ast::NodeKind::IntLitExpr
@@ -415,9 +467,18 @@ namespace vex {
                         && static_cast<ast::UnaryExpr *>(gv->init.get())->op == ast::UnOp::Neg
                         && static_cast<ast::UnaryExpr *>(gv->init.get())->operand
                         && static_cast<ast::UnaryExpr *>(gv->init.get())->operand->kind == ast::NodeKind::IntLitExpr));
-                if (!literal_const) {
+                /* A.38/A.39: `comptime const` y `static_assert` (que se
+                 * envuelve como GlobalVarDecl dummy con type=void) no
+                 * tienen storage runtime y NO necesitan warning. */
+                bool  is_comptime_silent =
+                    gv->is_comptime
+                 || (gv->type
+                  && gv->type->kind == ast::NodeKind::PrimitiveTypeNode
+                  && static_cast<ast::PrimitiveTypeNode *>(gv->type.get())->prim
+                       == PrimitiveKind::VOID);
+                if (!literal_const && !is_comptime_silent) {
                     diags_.warning(decl->loc,
-                                   "variable global no-const ignorada (sin storage en A.1)");
+                                   "variable global no-const ignorada (sin storage real en este frontend)");
                 }
             }
         }
@@ -464,12 +525,630 @@ namespace vex {
     }
 
     // ---------------------------------------------------------------------
+    // Sprint 4 (A.37.s4): IntrospectInfo POD chunks.
+    //
+    // Para cada layout marcado @Introspect emitimos UN chunk en
+    // static_data con este layout self-contained (todas las direcciones
+    // son offsets relativos al inicio del chunk, asi no hace falta
+    // relocation cross-chunk):
+    //
+    // HEADER (24 bytes):
+    //   +0   u32 kind         (0=Prim, 1=Class, 2=Struct, 3=Enum)
+    //   +4   u32 size_bytes
+    //   +8   u32 align_bytes
+    //   +12  u32 field_count
+    //   +16  u32 name_off     -- offset interno a los bytes del nombre
+    //   +20  u32 name_len
+    //
+    // FIELDS array (16 bytes cada uno):  ofset 24 + i*16
+    //   +0   u32 offset       -- offset del field DENTRO de la instancia
+    //   +4   u32 size_bytes
+    //   +8   u32 name_off     -- offset interno
+    //   +12  u32 name_len
+    //
+    // NAMES area: empieza tras los FIELDS.  Bytes raw, sin NUL
+    // terminator (la longitud va en name_len; el accesor type_info_name
+    // construye un StringObject via STRMAKE con name_addr + name_len).
+    // ---------------------------------------------------------------------
+    void Lowering::emit_introspect_info_chunks() {
+        auto build_chunk = [this](const std::string &name,
+                                   uint32_t           kind,
+                                   uint32_t           size_bytes,
+                                   uint32_t           align_bytes,
+                                   const std::vector<std::pair<std::string,
+                                                                std::pair<uint32_t,
+                                                                           uint32_t>>>
+                                       &fields) -> std::vector<uint8_t> {
+            const uint32_t field_count = static_cast<uint32_t>(fields.size());
+            const size_t   header_sz   = 24;
+            const size_t   fields_sz   = field_count * 16;
+            /* Calculamos los offsets de los nombres tras la tabla de fields. */
+            uint32_t name_off = static_cast<uint32_t>(header_sz + fields_sz);
+            uint32_t name_len = static_cast<uint32_t>(name.size());
+            std::vector<std::pair<uint32_t, uint32_t>> field_name_ranges;
+            field_name_ranges.reserve(fields.size());
+            uint32_t cur = name_off + name_len;
+            for (auto &f : fields) {
+                const uint32_t flen = static_cast<uint32_t>(f.first.size());
+                field_name_ranges.push_back({cur, flen});
+                cur += flen;
+            }
+            /* Reservamos el buffer con tamano exacto y rellenamos. */
+            std::vector<uint8_t> buf;
+            buf.resize(cur, 0);
+            auto put_u32 = [&buf](size_t at, uint32_t v) {
+                buf[at + 0] = static_cast<uint8_t>(v & 0xFF);
+                buf[at + 1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+                buf[at + 2] = static_cast<uint8_t>((v >> 16) & 0xFF);
+                buf[at + 3] = static_cast<uint8_t>((v >> 24) & 0xFF);
+            };
+            put_u32(0,  kind);
+            put_u32(4,  size_bytes);
+            put_u32(8,  align_bytes);
+            put_u32(12, field_count);
+            put_u32(16, name_off);
+            put_u32(20, name_len);
+            for (size_t i = 0; i < fields.size(); ++i) {
+                const size_t base = header_sz + i * 16;
+                put_u32(base + 0,  fields[i].second.first);   /* offset */
+                put_u32(base + 4,  fields[i].second.second);  /* size */
+                put_u32(base + 8,  field_name_ranges[i].first);  /* name_off */
+                put_u32(base + 12, field_name_ranges[i].second); /* name_len */
+            }
+            /* Copiar bytes del nombre del tipo. */
+            for (size_t i = 0; i < name.size(); ++i) buf[name_off + i] = static_cast<uint8_t>(name[i]);
+            /* Copiar bytes de los nombres de fields. */
+            for (size_t i = 0; i < fields.size(); ++i) {
+                const auto &nm = fields[i].first;
+                const uint32_t pos = field_name_ranges[i].first;
+                for (size_t j = 0; j < nm.size(); ++j) {
+                    buf[pos + j] = static_cast<uint8_t>(nm[j]);
+                }
+            }
+            return buf;
+        };
+
+        /* Structs marcados @Introspect. */
+        for (const auto &kv : tc_.struct_layouts()) {
+            const auto &lay = kv.second;
+            if (!lay.is_introspect) continue;
+            std::vector<std::pair<std::string, std::pair<uint32_t, uint32_t>>> fs;
+            fs.reserve(lay.fields.size());
+            for (const auto &f : lay.fields) {
+                fs.push_back({f.name, {f.offset, f.size}});
+            }
+            std::vector<uint8_t> chunk = build_chunk(
+                lay.name, /*Struct=*/2, lay.size_bytes, lay.align_bytes, fs);
+            const uint64_t idx = out_mod_->intern_static_data(std::move(chunk));
+            introspect_idx_by_name_[lay.name] = idx;
+        }
+        /* Clases marcadas @Introspect.  No emitimos metodos por ahora
+         * (Sprint 4 MVP cubre solo fields; Sprint 5 anyade methods). */
+        for (const auto &kv : tc_.class_layouts()) {
+            const auto &lay = kv.second;
+            if (!lay.is_introspect) continue;
+            std::vector<std::pair<std::string, std::pair<uint32_t, uint32_t>>> fs;
+            fs.reserve(lay.fields.size());
+            for (const auto &f : lay.fields) {
+                fs.push_back({f.name, {f.offset, f.size}});
+            }
+            std::vector<uint8_t> chunk = build_chunk(
+                lay.name, /*Class=*/1, lay.size_bytes, /*align=*/8, fs);
+            const uint64_t idx = out_mod_->intern_static_data(std::move(chunk));
+            introspect_idx_by_name_[lay.name] = idx;
+        }
+        /* Enums marcados @Introspect.  Listamos variantes como "fields"
+         * sinteticos con offset=tag, size=0 -- conveccion para el MVP;
+         * el usuario sabe que el campo offset en realidad es el tag. */
+        for (const auto &kv : tc_.enum_layouts()) {
+            const auto &lay = kv.second;
+            if (!lay.is_introspect) continue;
+            std::vector<std::pair<std::string, std::pair<uint32_t, uint32_t>>> fs;
+            fs.reserve(lay.variants.size());
+            for (const auto &v : lay.variants) {
+                fs.push_back({v.name, {v.tag, 0}});
+            }
+            std::vector<uint8_t> chunk = build_chunk(
+                lay.name, /*Enum=*/3, lay.size_bytes, /*align=*/8, fs);
+            const uint64_t idx = out_mod_->intern_static_data(std::move(chunk));
+            introspect_idx_by_name_[lay.name] = idx;
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // Lowering de una funcion.
     // ---------------------------------------------------------------------
 
+    /**
+     * @brief Phase MC.1 -- detecta si el body de un @Macro contiene
+     * caracteristicas que el IR runtime NO soporta todavia.
+     *
+     * Devuelve la primera razon encontrada (string descriptivo) o cadena
+     * vacia si el body es lowerable.  Used by @c lower_function para
+     * decidir si lowear o saltar el body al IR.
+     *
+     * Patrones detectados como NO soportados (todavia):
+     *   - Calls a builtins comptime-only (`comptime_concat`, `to_str`,
+     *     `gensym`, `comptime_compile`, etc.).
+     *   - Calls con type_args (introspect: `sizeof<T>`, `field_name<T>`,
+     *     `comptime_type<T>`, etc.).
+     *   - VarDeclStmt con `is_comptime=true` (comptime var/const) --
+     *     requiere puente de memoria compartida (MC.5).
+     *   - ExprStmt con AssignExpr a IdentExpr global comptime --
+     *     mismo motivo que arriba.
+     *
+     * En sprints posteriores (MC.4, MC.5) cada categoria se vuelve
+     * "soportada" anadiendo un FFI runtime + bridge de memoria.
+     */
+    static std::string macro_body_unsupported_reason(const TypeChecker &tc,
+                                                       const ast::Stmt *s);
+    static std::string macro_body_unsupported_reason_expr(const TypeChecker &tc,
+                                                            const ast::Expr *e);
+
+    static std::string macro_body_unsupported_reason_expr(const TypeChecker &tc,
+                                                            const ast::Expr *e) {
+        if (!e) return "";
+        switch (e->kind) {
+            case ast::NodeKind::IdentExpr: {
+                /* Phase MC.17.2: refs a `comptime const` (INMUTABLES)
+                 * globales de tipo int SE ACEPTAN -- se materializan
+                 * como slot @c static_data de 8 bytes, leidos via
+                 * LOAD i64.  El valor es fijo, no hay divergencia
+                 * posible con el AST evaluator.
+                 *
+                 * `comptime var` (MUTABLES) siguen rechazados porque
+                 * la VM y el AST evaluator mantendrian copias separadas
+                 * que se desincronizarian con @Pure memoization
+                 * (test 156).  Soportarlos requiere shared memory
+                 * cross-AST/VM (deferred). */
+                const auto *id = static_cast<const ast::IdentExpr *>(e);
+                auto cit = tc.comptime_const_values().find(id->name);
+                if (cit != tc.comptime_const_values().end()) {
+                    if (cit->second.is_str) {
+                        return "ref a comptime global string '" + id->name + "'";
+                    }
+                    if (cit->second.is_mutable) {
+                        return "ref a comptime var (mutable) global '" + id->name + "'";
+                    }
+                    /* comptime const int OK. */
+                    return "";
+                }
+                return "";
+            }
+            case ast::NodeKind::CallExpr: {
+                const auto *ce = static_cast<const ast::CallExpr *>(e);
+                /* Calls con type-args -> introspect: NO soportado v1. */
+                if (!ce->type_args.empty()) {
+                    return "introspect builtin con type_args (sizeof<T>, etc.)";
+                }
+                /* Calls a builtins comptime-only por nombre. */
+                if (ce->callee && ce->callee->kind == ast::NodeKind::IdentExpr) {
+                    const auto *id = static_cast<const ast::IdentExpr *>(ce->callee.get());
+                    /* Phase MC.15B+C: los builtins que YA estan aliasados a
+                     * sus equivalentes runtime str_* en @c lower_call NO
+                     * deben rechazarse aqui -- el lowering los soporta.
+                     * Los demas siguen siendo comptime-only.
+                     *
+                     * Lowereables (MC.15B: concat/streq/strlen; MC.15C:
+                     * to_str/chr/ord/substr/gensym):
+                     *   comptime_concat  -> STRCAT
+                     *   comptime_streq   -> STRCMP + cmp
+                     *   comptime_strlen  -> STRLEN
+                     *   comptime_to_str  -> CALLN(vio_int_to_vmbuf) + STRMAKE
+                     *   comptime_chr     -> CALLN(vio_char_to_vmbuf) + STRMAKE
+                     *   comptime_ord     -> STRRAW + LOAD u8
+                     *   comptime_substr  -> STRSLICE
+                     *   gensym           -> CALLN(vio_gensym)
+                     *
+                     * Restantes (MC.15D futuro): repeat, replace, contains,
+                     * compile, emit_expr, type, print/ct_print.
+                     */
+                    /* Restantes comptime-only tras MC.18+MC.20:
+                     *   comptime_compile / compile      -- generacion de codigo dinamica
+                     *   comptime_emit_expr / emit_expr  -- splice de AST en compile-time
+                     *   comptime_type                   -- type-as-value
+                     *
+                     * `comptime_print`, `ct_print` -> `println` (MC.18).
+                     * `static_assert` -> virtual lib `vesta_comptime`
+                     * via FFI bridge (MC.20).  El lowering emite CALLN
+                     * a "vesta_comptime:static_assert" que el Loader
+                     * resuelve via @c lookup_virtual_fn al cargar el
+                     * .velb. */
+                    static const std::unordered_set<std::string> COMPTIME_ONLY = {
+                        "comptime_compile", "comptime_emit_expr",
+                        "comptime_type",
+                        "compile", "emit_expr",
+                    };
+                    if (COMPTIME_ONLY.count(id->name)) {
+                        return "builtin comptime-only '" + id->name + "'";
+                    }
+                    /* Phase MC.17.3: calls a @Macros user-defined SE ACEPTAN
+                     * (la callee tambien se baja a IR con nombre
+                     * `__macro_<callee>`, asi que emitimos CALLVM regular
+                     * a esa label).  Calls a comptime fns NO-@Macro
+                     * siguen rechazados (necesitarian inline o lower
+                     * propio que no esta hecho). */
+                    auto fn_it = tc.comptime_fns().find(id->name);
+                    if (fn_it != tc.comptime_fns().end()) {
+                        if (fn_it->second && fn_it->second->is_macro) {
+                            /* Aceptamos.  El callee macro tambien sera
+                             * lowereado por el linker (al final del
+                             * pase).  Si su body resulta no-lowereable,
+                             * el __macro_<callee> no existira y la
+                             * CALLVM fallara en runtime -- ese caso
+                             * cae al fallback AST por inconsistencia. */
+                            return "";
+                        }
+                        return "call a comptime fn user-defined '" + id->name + "'";
+                    }
+                }
+                /* Recurse en args. */
+                for (const auto &a : ce->args) {
+                    auto r = macro_body_unsupported_reason_expr(tc, a.get());
+                    if (!r.empty()) return r;
+                }
+                auto r = macro_body_unsupported_reason_expr(tc, ce->callee.get());
+                if (!r.empty()) return r;
+                return "";
+            }
+            case ast::NodeKind::BinaryExpr: {
+                const auto *bn = static_cast<const ast::BinaryExpr *>(e);
+                auto r = macro_body_unsupported_reason_expr(tc, bn->lhs.get());
+                if (!r.empty()) return r;
+                return macro_body_unsupported_reason_expr(tc, bn->rhs.get());
+            }
+            case ast::NodeKind::InitListExpr: {
+                /* Init list `{a, b, c}` o `{.x=1, .y=2}` requiere ALLOCA
+                 * tipado del destino (array o struct) en runtime.  El
+                 * path del macro lowering no lo soporta; cae al AST
+                 * evaluator que SI maneja arrays/structs (A.42). */
+                return "init list `{...}` en macro body (usa AST eval)";
+            }
+            case ast::NodeKind::IndexExpr: {
+                /* Array indexing `arr[i]` requiere conocer el tipo de
+                 * `arr` y el sizeof del elemento para emitir ADD + LOAD
+                 * correctos.  En el body de un macro las vars locales
+                 * pueden ser arrays comptime que NO existen en runtime;
+                 * fallback al AST evaluator. */
+                return "array indexing `arr[i]` en macro body (usa AST eval)";
+            }
+            case ast::NodeKind::UnaryExpr: {
+                const auto *un = static_cast<const ast::UnaryExpr *>(e);
+                return macro_body_unsupported_reason_expr(tc, un->operand.get());
+            }
+            case ast::NodeKind::TernaryExpr: {
+                const auto *te = static_cast<const ast::TernaryExpr *>(e);
+                auto r = macro_body_unsupported_reason_expr(tc, te->cond.get());
+                if (!r.empty()) return r;
+                r = macro_body_unsupported_reason_expr(tc, te->then_expr.get());
+                if (!r.empty()) return r;
+                return macro_body_unsupported_reason_expr(tc, te->else_expr.get());
+            }
+            case ast::NodeKind::AssignExpr: {
+                const auto *ae = static_cast<const ast::AssignExpr *>(e);
+                auto r = macro_body_unsupported_reason_expr(tc, ae->target.get());
+                if (!r.empty()) return r;
+                return macro_body_unsupported_reason_expr(tc, ae->value.get());
+            }
+            default:
+                return "";
+        }
+    }
+
+    static std::string macro_body_unsupported_reason(const TypeChecker &tc,
+                                                       const ast::Stmt *s) {
+        if (!s) return "";
+        switch (s->kind) {
+            case ast::NodeKind::BlockStmt: {
+                const auto *bs = static_cast<const ast::BlockStmt *>(s);
+                for (const auto &st : bs->body) {
+                    auto r = macro_body_unsupported_reason(tc, st.get());
+                    if (!r.empty()) return r;
+                }
+                return "";
+            }
+            case ast::NodeKind::VarDeclStmt: {
+                const auto *vd = static_cast<const ast::VarDeclStmt *>(s);
+                /*   (1/3): `comptime var/const` LOCALES dentro
+                 * de un macro body ya no se rechazan.  El lowering los
+                 * trata como vars runtime regulares (en `lower_var_decl`
+                 * detectamos el flag y descartamos la rama comptime
+                 * cuando current_fn_is_macro_=true).  El VM computa el
+                 * init en cada invocacion -- mismo resultado semantico
+                 * que la evaluacion AST que ocurria one-time.
+                 *
+                 * Validamos solo el init si esta presente. */
+                /* Vars locales de tipo array nativo `T[N]` o struct
+                 * nominal NO son lowereables en este path (requeriria
+                 * ALLOCA + sizeof del elemento + path completo de
+                 * struct layout).  Fallback al AST evaluator que SI
+                 * maneja arrays/structs comptime (A.41+A.42). */
+                if (vd->type) {
+                    const auto *t = vd->type.get();
+                    if (t->kind == ast::NodeKind::ArrayTypeNode) {
+                        return "var local de tipo array en macro body (usa AST eval)";
+                    }
+                    if (t->kind == ast::NodeKind::NamedTypeNode) {
+                        /* Si el nombre matchea un struct declarado, es
+                         * un struct value-type que no lowereamos en el
+                         * body del macro. */
+                        const auto *nt = static_cast<const ast::NamedTypeNode *>(t);
+                        if (tc.struct_layouts().find(nt->name) != tc.struct_layouts().end()) {
+                            return "var local de tipo struct '" + nt->name
+                                 + "' en macro body (usa AST eval)";
+                        }
+                    }
+                }
+                if (vd->init) {
+                    return macro_body_unsupported_reason_expr(tc, vd->init.get());
+                }
+                return "";
+            }
+            case ast::NodeKind::ExprStmt: {
+                const auto *es = static_cast<const ast::ExprStmt *>(s);
+                return macro_body_unsupported_reason_expr(tc, es->expr.get());
+            }
+            case ast::NodeKind::ReturnStmt: {
+                const auto *rs = static_cast<const ast::ReturnStmt *>(s);
+                return macro_body_unsupported_reason_expr(tc, rs->value.get());
+            }
+            case ast::NodeKind::IfStmt: {
+                const auto *is = static_cast<const ast::IfStmt *>(s);
+                auto r = macro_body_unsupported_reason_expr(tc, is->cond.get());
+                if (!r.empty()) return r;
+                r = macro_body_unsupported_reason(tc, is->then_branch.get());
+                if (!r.empty()) return r;
+                if (is->else_branch) {
+                    return macro_body_unsupported_reason(tc, is->else_branch.get());
+                }
+                return "";
+            }
+            case ast::NodeKind::WhileStmt: {
+                const auto *ws = static_cast<const ast::WhileStmt *>(s);
+                auto r = macro_body_unsupported_reason_expr(tc, ws->cond.get());
+                if (!r.empty()) return r;
+                return macro_body_unsupported_reason(tc, ws->body.get());
+            }
+            case ast::NodeKind::DoWhileStmt: {
+                const auto *ds = static_cast<const ast::DoWhileStmt *>(s);
+                auto r = macro_body_unsupported_reason_expr(tc, ds->cond.get());
+                if (!r.empty()) return r;
+                return macro_body_unsupported_reason(tc, ds->body.get());
+            }
+            case ast::NodeKind::ForStmt: {
+                const auto *fs = static_cast<const ast::ForStmt *>(s);
+                if (fs->init) {
+                    auto r = macro_body_unsupported_reason(tc, fs->init.get());
+                    if (!r.empty()) return r;
+                }
+                if (fs->cond) {
+                    auto r = macro_body_unsupported_reason_expr(tc, fs->cond.get());
+                    if (!r.empty()) return r;
+                }
+                if (fs->step) {
+                    auto r = macro_body_unsupported_reason_expr(tc, fs->step.get());
+                    if (!r.empty()) return r;
+                }
+                return macro_body_unsupported_reason(tc, fs->body.get());
+            }
+            case ast::NodeKind::ComptimeBlockStmt:
+            case ast::NodeKind::ComptimeForStmt:
+                return "comptime block/for en macro body (requiere MC.5)";
+            default:
+                return "";
+        }
+    }
+
+    /* Pre-pase de annotation de tipos para body de @Macro.
+     *
+     * Los macros NO pasan por `check_functions` (los saltea porque su
+     * body se interpreta solo al call site).  Pero MC.1 los baja a IR para
+     * que la VM eval pueda ejecutarlos.  Sin annotation de tipos, los
+     * IdentExpr en el body tienen result_type=VOID -- `lower_binary` no
+     * detecta el caso `code == "OK"` con `code: string` y emite cmpjmp
+     * directo sobre los handles en lugar de STRCMP runtime.
+     *
+     * Este walker recorre el body y annota result_type de los IdentExpr
+     * cuyo nombre matchee un param del macro.  Es minimal -- solo cubre
+     * el caso de params; otras vars locales se annotan al llamarlas via
+     * lower_expr (que internamente usa el scope del lowering).  */
+    static void annotate_macro_param_idents(
+            ast::Stmt *s,
+            const std::unordered_map<std::string, Type> &param_types) {
+        if (!s) return;
+        std::function<void(ast::Expr *)> walk_expr = [&](ast::Expr *e) {
+            if (!e) return;
+            if (e->kind == ast::NodeKind::IdentExpr) {
+                auto *id = static_cast<ast::IdentExpr *>(e);
+                auto it = param_types.find(id->name);
+                if (it != param_types.end()) {
+                    /* Siempre sobreescribir: dentro del body del macro
+                     * los IdentExpr no fueron type-checkeados; el campo
+                     * puede tener un default heredado del parser. */
+                    id->result_type = it->second;
+                }
+                return;
+            }
+            if (e->kind == ast::NodeKind::BinaryExpr) {
+                auto *bn = static_cast<ast::BinaryExpr *>(e);
+                walk_expr(bn->lhs.get());
+                walk_expr(bn->rhs.get());
+                return;
+            }
+            if (e->kind == ast::NodeKind::UnaryExpr) {
+                auto *un = static_cast<ast::UnaryExpr *>(e);
+                walk_expr(un->operand.get());
+                return;
+            }
+            if (e->kind == ast::NodeKind::CallExpr) {
+                auto *ce = static_cast<ast::CallExpr *>(e);
+                walk_expr(ce->callee.get());
+                for (auto &a : ce->args) walk_expr(a.get());
+                return;
+            }
+            if (e->kind == ast::NodeKind::AssignExpr) {
+                auto *ae = static_cast<ast::AssignExpr *>(e);
+                walk_expr(ae->target.get());
+                walk_expr(ae->value.get());
+                return;
+            }
+            if (e->kind == ast::NodeKind::TernaryExpr) {
+                auto *te = static_cast<ast::TernaryExpr *>(e);
+                walk_expr(te->cond.get());
+                walk_expr(te->then_expr.get());
+                walk_expr(te->else_expr.get());
+                return;
+            }
+            if (e->kind == ast::NodeKind::IndexExpr) {
+                auto *ix = static_cast<ast::IndexExpr *>(e);
+                walk_expr(ix->base.get());
+                walk_expr(ix->index.get());
+                return;
+            }
+            if (e->kind == ast::NodeKind::FieldAccessExpr) {
+                auto *fa = static_cast<ast::FieldAccessExpr *>(e);
+                walk_expr(fa->base.get());
+                return;
+            }
+            if (e->kind == ast::NodeKind::CastExpr) {
+                auto *ca = static_cast<ast::CastExpr *>(e);
+                walk_expr(ca->operand.get());
+                return;
+            }
+            /* Otros tipos de expresion: no necesitan recursion para el
+             * caso de annotation de params (literals, ThisExpr, etc.). */
+        };
+        switch (s->kind) {
+            case ast::NodeKind::BlockStmt: {
+                auto *bs = static_cast<ast::BlockStmt *>(s);
+                for (auto &st : bs->body) annotate_macro_param_idents(st.get(), param_types);
+                break;
+            }
+            case ast::NodeKind::VarDeclStmt: {
+                auto *vd = static_cast<ast::VarDeclStmt *>(s);
+                if (vd->init) walk_expr(vd->init.get());
+                break;
+            }
+            case ast::NodeKind::ExprStmt: {
+                auto *es = static_cast<ast::ExprStmt *>(s);
+                walk_expr(es->expr.get());
+                break;
+            }
+            case ast::NodeKind::ReturnStmt: {
+                auto *rs = static_cast<ast::ReturnStmt *>(s);
+                if (rs->value) walk_expr(rs->value.get());
+                break;
+            }
+            case ast::NodeKind::IfStmt: {
+                auto *ifs = static_cast<ast::IfStmt *>(s);
+                walk_expr(ifs->cond.get());
+                annotate_macro_param_idents(ifs->then_branch.get(), param_types);
+                if (ifs->else_branch) annotate_macro_param_idents(ifs->else_branch.get(), param_types);
+                break;
+            }
+            case ast::NodeKind::WhileStmt: {
+                auto *ws = static_cast<ast::WhileStmt *>(s);
+                walk_expr(ws->cond.get());
+                annotate_macro_param_idents(ws->body.get(), param_types);
+                break;
+            }
+            case ast::NodeKind::DoWhileStmt: {
+                auto *ds = static_cast<ast::DoWhileStmt *>(s);
+                walk_expr(ds->cond.get());
+                annotate_macro_param_idents(ds->body.get(), param_types);
+                break;
+            }
+            case ast::NodeKind::ForStmt: {
+                auto *fs = static_cast<ast::ForStmt *>(s);
+                if (fs->init) annotate_macro_param_idents(fs->init.get(), param_types);
+                if (fs->cond) walk_expr(fs->cond.get());
+                if (fs->step) walk_expr(fs->step.get());
+                annotate_macro_param_idents(fs->body.get(), param_types);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
     void Lowering::lower_function(ast::FunctionDecl *fd, ir::IrModule &out) {
+        /* A.39: comptime fn (no-macro) NO se baja a IR.  Su body solo
+         * se evalua en compile-time cuando es invocada desde un contexto
+         * comptime.
+         *
+         * Phase MC.1 (A.43.22): @Macro bodies SI se lowean al IR (con
+         * nombre `__macro_<original>`) cuando el body es lowerable.
+         * Esto valida que la pipeline IR -> bytecode soporta el codigo
+         * del macro; futuros sprints MC.2+ ejecutan ese bytecode via
+         * una ComptimeVM para acelerar la metaprogramacion ~10-1000x.
+         * Por ahora el IR queda en el modulo como dead code; el call
+         * site del macro sigue usando el evaluator AST. */
+        if (fd->is_comptime) {
+            if (!fd->is_macro) return;
+            /* @Macro: intentar lowear el body al IR.  Si contiene
+             * caracteristicas no soportadas todavia (introspect,
+             * comptime var, builtins comptime-only), saltar limpiamente
+             * y dejar que el evaluator AST haga el trabajo. */
+            const std::string reason =
+                macro_body_unsupported_reason(tc_, fd->body.get());
+            if (!reason.empty()) {
+                /* No soportado -- fallback silencioso al AST eval.
+                 * Capturamos el reason para diagnostico via
+                 * VESTA_MC_VERBOSE (el usuario lo ve como
+                 * "[mc-lower] M_xxx: AST-only (usa Y)"). */
+                ++macro_skipped_count_;
+                macro_skip_reasons_.emplace_back(fd->name, reason);
+                return;
+            }
+            /* Pre-pase de annotation: los macros no pasan por
+             * `check_functions` asi que los IdentExpr en el body tienen
+             * result_type=VOID.  Anotamos los IdentExpr que matcheen
+             * params del macro para que `lower_binary` detecte el caso
+             * `code == "OK"` con `code: string` y emita STRCMP runtime.
+             *
+             * Bug en demo 162: comparaciones de string dentro del body
+             * del macro emitian `cmpjmp` directo sobre los handles GC
+             * sin invocar STRMAKE/STRCMP -> resultados incorrectos. */
+            std::unordered_map<std::string, Type> macro_param_types;
+            for (auto &p : fd->params) {
+                if (p && p->type) {
+                    macro_param_types[p->name] = tc_.resolve_type_node(p->type.get());
+                }
+            }
+            if (!macro_param_types.empty()) {
+                annotate_macro_param_idents(fd->body.get(), macro_param_types);
+            }
+            /* Continuar al lowering normal con nombre prefijado. */
+        }
+        /* Phase MC.17.1: setear flag para que lower_var_decl trate
+         * `comptime var/const` LOCALES como vars runtime regulares.
+         * Reset al salir de la funcion. */
+        const bool prev_is_macro = current_fn_is_macro_;
+        current_fn_is_macro_ = (fd->is_comptime && fd->is_macro);
+        struct ScopeGuard {
+            bool *flag;
+            bool  saved;
+            ~ScopeGuard() { *flag = saved; }
+        } macro_flag_guard{&current_fn_is_macro_, prev_is_macro};
+
         ir::IrFunction fn;
-        fn.name = fd->name;
+        /* Phase MC.1: nombre prefijado para macros lowered al IR.
+         * Asi no colisionan con funciones runtime y son identificables
+         * por el TypeChecker para invocacion desde ComptimeVM (MC.2). */
+        if (fd->is_macro && fd->is_comptime) {
+            fn.name              = "__macro_" + fd->name;
+            fn.is_macro_compiled = true;
+            ++macro_lowered_count_;
+            /* Phase MC.2: registrar en el ComptimeRuntime para que el
+             * TypeChecker pueda intentar invocar via VM en futuras
+             * iteraciones de la compilacion.  En MC.2 el entry_pc es
+             * 0 (placeholder) -- MC.3 lo populara con la direccion
+             * real tras el linker resolve. */
+            const_cast<TypeChecker &>(tc_).comptime_runtime()
+                .register_macro(fn.name, /*entry_pc=*/0);
+        } else {
+            fn.name = fd->name;
+        }
 
         // Tipo de retorno.  Aceptamos tipos primitivos directamente o
         // pasamos por resolve_type_node para PointerTypeNode/ArrayTypeNode
@@ -837,8 +1516,64 @@ namespace vex {
             case ast::NodeKind::BlockStmt:
                 lower_block(static_cast<ast::BlockStmt *>(s));
                 return;
-            case ast::NodeKind::VarDeclStmt:
-                lower_var_decl(static_cast<ast::VarDeclStmt *>(s));
+            case ast::NodeKind::VarDeclStmt: {
+                /* A.39: `comptime const NAME = expr;` local NO emite
+                 * codigo runtime.  Para comptime const declarados dentro
+                 * de un `comptime for` body, los re-evaluamos en CADA
+                 * iteracion via el stack dinamico del lowering -- el
+                 * type checker solo evalua una vez con el valor inicial.
+                 * Asi `comptime const SQ = j * j;` se actualiza por iter. */
+                auto *vd = static_cast<ast::VarDeclStmt *>(s);
+                /* Phase MC.17.1: cuando estamos dentro de un @Macro body
+                 * que se baja a IR, las VarDeclStmt marcadas
+                 * @c is_comptime se tratan como vars runtime regulares.
+                 * El macro corre en VM y los locales se computan en
+                 * cada invocacion -- mismo resultado semantico que la
+                 * evaluacion AST que ocurria one-time. */
+                if (vd->is_comptime && current_fn_is_macro_) {
+                    lower_var_decl(vd);
+                    return;
+                }
+                if (vd->is_comptime) {
+                    if (!lowering_comptime_scopes_.empty() && vd->init) {
+                        /* Re-evaluar el init con el stack dinamico actual. */
+                        auto &mut_tc = const_cast<TypeChecker &>(tc_);
+                        const ComptimeEvalResult r =
+                            comptime_eval_expr(mut_tc, vd->init.get());
+                        if (r.ok) {
+                            ComptimeLocalEntry ent;
+                            if (r.is_str) {
+                                ent.is_str = true; ent.str_value = r.str;
+                            } else {
+                                ent.value = r.value;
+                            }
+                            ent.ir_t = ir::IrType::I64;
+                            /* Bind en el scope DEL TOPE actual (cae al pop
+                             * del enclosing comptime for o block). */
+                            lowering_comptime_scopes_.back()[vd->name] = ent;
+                            /* Tambien actualizar tc para que evaluaciones
+                             * posteriores en el body lo vean. */
+                            TypeChecker::ComptimeConst c;
+                            c.type   = tc_.resolve_type_node(vd->type.get());
+                            c.is_str = r.is_str;
+                            if (r.is_str) c.str_value = r.str;
+                            else          c.value     = r.value;
+                            mut_tc.register_comptime_local(vd->name, std::move(c));
+                        }
+                    }
+                    return;
+                }
+                lower_var_decl(vd);
+                return;
+            }
+            case ast::NodeKind::ComptimeBlockStmt:
+                /* A.39: el bloque comptime no emite codigo runtime.  El
+                 * type checker ya proceso sus stmts (comptime const +
+                 * static_assert + comptime for/if).  Cualquier valor
+                 * comptime queda anotado en los IdentExpr correspondientes. */
+                return;
+            case ast::NodeKind::ComptimeForStmt:
+                lower_comptime_for(static_cast<ast::ComptimeForStmt *>(s));
                 return;
             case ast::NodeKind::ExprStmt: {
                 auto *es = static_cast<ast::ExprStmt *>(s);
@@ -978,14 +1713,20 @@ namespace vex {
                 lower_synchronized(static_cast<ast::SynchronizedStmt *>(s));
                 return;
             default:
-                unsupported(s->loc, "statement no soportado en A.1");
+                unsupported(s->loc, "statement no soportado por el lowering actual");
                 return;
         }
     }
 
     void Lowering::lower_var_decl(ast::VarDeclStmt *vd) {
         // Resolver el Type semantico (aplicando aliases y structs).
-        const Type sem_type = tc_.resolve_type_node(vd->type.get());
+        // A.43.7: con `auto`/`var` (vd->infer_type), el AST no tiene
+        // TypeNode -> el type checker ya computo y guardo el tipo en
+        // `vd->init->result_type` durante check_expr.  Lo reusamos sin
+        // re-evaluar el init.
+        Type sem_type = vd->type
+            ? tc_.resolve_type_node(vd->type.get())
+            : (vd->init ? vd->init->result_type : Type{});
 
         // Tracking para fix #1 newInstance: si el tipo declarado es alias
         // `Class` y el init es `Class.forName("X")` con X literal, registrar
@@ -1337,7 +2078,7 @@ namespace vex {
             // si el usuario intenta usar uno.
             if (vd->init) {
                 error_at(vd->loc,
-                         "lowering: inicializador de struct aun no soportado (A.3.3+)");
+                         "lowering: inicializador de struct aun no soportado en esta ruta");
             }
             return;
         }
@@ -1543,7 +2284,7 @@ namespace vex {
             bind(vd->name, addr);
             if (vd->init) {
                 error_at(vd->loc,
-                         "lowering: inicializador de array aun no soportado (A.3.5+)");
+                         "lowering: inicializador de array aun no soportado en esta ruta");
             }
             return;
         }
@@ -1753,8 +2494,9 @@ namespace vex {
         //
         // Limitacion: si el handle se devuelve (return xs) o se asigna a
         // otra variable que vive mas, el free aqui dejaria al caller con
-        // un handle invalido.  Para casos simples (variable local que no
-        // escapa) funciona correctamente.  Escape analysis es A.27+.
+        // un handle invalido.  El escape analysis basico marca esos
+        // locales en @c escaping_locals_ y omite el cleanup para ellos;
+        // los locales realmente locales si reciben el free automatico.
 
         // Destructor automatico (RAII) para instancias locales de
         // clase Vex que tienen `~ClassName()` declarado y NO escapan.
@@ -1906,6 +2648,27 @@ namespace vex {
     }
 
     void Lowering::lower_if(ast::IfStmt *s) {
+        // Sprint 3-B: `comptime if` -- dead-branch elimination.
+        // El type checker ya valido que `cond` es comptime-evaluable y
+        // ya descarto la rama no tomada del check.  Aqui simplemente
+        // bajamos al SIN if/branch/phi.  Cero overhead vs codigo
+        // hardcoded: el bytecode emitido es identico al de la rama
+        // tomada sin marcador alguno de la condicion.
+        if (s->is_comptime && s->cond) {
+            const ComptimeEvalResult r = comptime_eval_expr(tc_, s->cond.get());
+            if (r.ok) {
+                if (r.value != 0) {
+                    if (s->then_branch) lower_stmt(s->then_branch.get());
+                } else {
+                    if (s->else_branch) lower_stmt(s->else_branch.get());
+                }
+                return;
+            }
+            /* Si por algun motivo la evaluacion falla aqui (no deberia,
+             * el type checker ya valido), caemos al lowering normal --
+             * mas vale conservador que crash. */
+        }
+
         // Patron CFG: cond -> br_cond %c, then, else; cada rama termina
         // con br merge (si no aborto antes en otro terminador).
         //
@@ -1939,7 +2702,9 @@ namespace vex {
         const ir::IrValueId cond = lower_expr(s->cond.get());
         // Si el tipo no es BOOL ya, el optimizador / emisor lo trataran
         // como "non-zero is true".  Para mas claridad podriamos insertar
-        // un cmp_ne con 0; en A.1 lo dejamos al backend.
+        // un cmp_ne con 0 explicito, pero el bytecode @c jmp.jne ya hace
+        // exactamente esa comparacion contra 0 sin instruccion adicional,
+        // asi que delegar al backend es la opcion mas eficiente.
 
         const ir::IrBlockId then_bb  = fn_->new_block("if_then");
         const bool          has_else = s->else_branch != nullptr;
@@ -3522,9 +4287,20 @@ namespace vex {
             emit_finally_then_merge(current_block_, s->loc.line);
         }
 
-        // Restaurar bindings al estado de entry para que cada handler
-        // empiece con el mismo scope que tenia el try originalmente.
-        scopes_.back() = entry_bindings;
+        // NO resetear scopes_.back() = entry_bindings.  Esa operacion creaba
+        // shadows de outer-scope vars (e.g. el contador @c j de un while loop
+        // enclosing) en el inner scope, lo que rompia el back-edge phi del
+        // loop: cuando el inner scope se pop'aba, las actualizaciones de outer
+        // vars hechas DESPUES del try se perdian.
+        //
+        // El reset originalmente intentaba que cada catch viera el "estado
+        // entry" de las vars.  Eso esta garantizado por OTROS mecanismos:
+        //   - Vars asignadas en try o leidas en catch estan en try_spill_slots_
+        //     y se reload via LOAD desde el slot en el catch entry.
+        //   - Vars no tocadas en try mantienen su valor entry (ningun
+        //     update_scope se llamo para ellas).
+        // Asi el reset era redundante para vars relevantes y daninyo para
+        // vars outer-scope no relacionadas.
 
         // 3. Handlers (uno por catch).  do_throw consume el frame del
         //    catch que captura.  Los catches MAS EXTERNOS (declarados
@@ -3556,8 +4332,9 @@ namespace vex {
             const ast::CatchClause &cc = s->catches[ci];
             current_block_             = handler_bbs[ci];
             block_terminated_          = false;
-            // Restaurar scope al estado de entry antes de lower el catch.
-            scopes_.back() = entry_bindings;
+            // NO reset a entry_bindings (creaba shadows -- ver explicacion arriba).
+            // El catch reload via LOAD desde spill slots se encarga de restaurar
+            // las vars relevantes al valor entry.
             // Pop tryenters restantes (todos excepto el que se consumio).
             // Los restantes son: todos excepto el del catch[ci].
             // Como tryenter se apilaron en orden INVERSO (catch[n-1] en el
@@ -3689,8 +4466,19 @@ namespace vex {
         // 4. Merge + PHI.
         current_block_    = merge_bb;
         block_terminated_ = false;
-        // Restaurar al entry para insertar PHI sobre una base limpia.
-        scopes_.back() = entry_bindings;
+        // NO RESETEAMOS scopes_.back() a entry_bindings.  Esa operacion
+        // creaba sombras de variables outer-scope dentro del inner scope
+        // del while-body / for-body / etc, lo que rompia loops con
+        // try/catch dentro: cuando el inner scope se desapilaba al cierre
+        // del body, las actualizaciones de las vars outer (e.g. el
+        // contador de iteracion @c j en @c j=j+1) se perdian.  El PHI
+        // back-edge subsequent tomaba el valor STALE del outer scope,
+        // creando un self-loop @c j = phi[entry, j] -> loop infinito.
+        //
+        // En su lugar, propagamos las actualizaciones via @c update_scope
+        // que walks scopes inside-out y actualiza el binding en su scope
+        // nativo.  Asi outer-scope vars se actualizan en outer, inner-scope
+        // vars (e.g. catch var) en inner.  Sin shadowing.
 
         // Coleccionar todos los predecesores que alcanzan el merge.
         // Cada uno aporta su binding final para cada variable.
@@ -3753,12 +4541,24 @@ namespace vex {
                 fn_->blocks[merge_bb].instrs.insert(
                     fn_->blocks[merge_bb].instrs.begin(),
                     std::move(phi));
-                scopes_.back()[name] = v_phi;
+                // Update in-place en el scope NATIVO de la variable, no
+                // en scopes_.back() (que creaba shadow + perdia el update
+                // al pop_scope del while/for body).  Si la var no esta en
+                // ningun scope (debio ser declarada en outer pero por algun
+                // motivo no aparece), fallback a scopes_.back() crea binding
+                // local -- aceptable.
+                update_scope(name, v_phi);
             }
         } else if (contribs.size() == 1) {
-            // Solo un predecesor alcanza el merge: usar sus bindings.
+            // Solo un predecesor alcanza el merge: copiar SOLO los
+            // bindings que difieren del entry, y propagarlos a su scope
+            // nativo via update_scope (no shadow en scopes_.back()).
             for (const auto &kv: *contribs[0].bindings) {
-                scopes_.back()[kv.first] = kv.second;
+                auto it_entry = entry_bindings.find(kv.first);
+                if (it_entry == entry_bindings.end()
+                 || it_entry->second != kv.second) {
+                    update_scope(kv.first, kv.second);
+                }
             }
         }
 
@@ -3804,7 +4604,12 @@ namespace vex {
                 fn_->values[v_load].pointee_is_host_ptr =
                     src_val.pointee_is_host_ptr;
             }
-            scopes_.back()[name] = v_load;
+            // Update en scope nativo via update_scope (no shadow).
+            // Mismo razonamiento que el merge PHI arriba: la sombra
+            // en scopes_.back() se perdia al pop_scope del while body
+            // y dejaba al back-edge del while leyendo el binding stale
+            // del outer scope.
+            update_scope(name, v_load);
         }
 
         // Restaurar try_spill_slots_ del nivel exterior.
@@ -4021,9 +4826,9 @@ namespace vex {
                     break;
                 }
                 case CleanupAction::Kind::CALLN_FREE: {
-                    // A.30.next - CALLN al free nativo de la coleccion
-                    // (variante GC o no-GC).  Para la variante *_gc
-                    // prependemos un GETPROC como primer argumento; el
+                    // CALLN al free nativo de la coleccion (variante GC
+                    // o no-GC).  Para la variante *_gc prependemos un
+                    // GETPROC como primer argumento; el
                     // regalloc trata el CALLN como call normal y preserva
                     // los regs vivos del caller.
                     std::vector<ir::IrValueId> args;
@@ -4721,7 +5526,7 @@ namespace vex {
             ra.op        = ir::IrOp::RAW_ASM;
             ra.type      = ir::IrType::PTR;
             ra.dst       = env_ptr;
-            ra.func_name = "// === A.10 closures: leer env_ptr de R14 ===\n"
+            ra.func_name = "// === prologue de closure helper: leer env_ptr de R14 ===\n"
                     "mov {dst}, r14\n";
             ra.source_line = e->loc.line;
             child_fn.append(entry, std::move(ra));
@@ -4752,9 +5557,11 @@ namespace vex {
                 ir::IrValueId addr_i = env_ptr;
                 if (i > 0) {
                     addr_i = child_fn.new_value(ir::IrType::PTR);
-                    // A.15 (gap O): propagar is_host_ptr para que el LOAD
-                    // siguiente sepa emitir movh contra heap raw cuando
-                    // el env vive en heap.
+                    // Propagar is_host_ptr para que el LOAD siguiente sepa
+                    // emitir @c movh contra heap raw cuando el env vive en
+                    // heap (caso de closures retornadas por una funcion,
+                    // donde el env sobrevive al stack del creador via
+                    // alocacion en heap GC).
                     if (child_fn.values[env_ptr].is_host_ptr) {
                         child_fn.values[addr_i].is_host_ptr = true;
                     }
@@ -5991,8 +6798,9 @@ namespace vex {
             case ast::NodeKind::StringLitExpr:
                 return lower_string_lit(static_cast<ast::StringLitExpr *>(e));
             case ast::NodeKind::NullLitExpr:
-                // Null en A.1 no esta cableado al tipo de referencia;
-                // por ahora se emite como cero del tipo i64.
+                // Null se modela como el escalar 0 del tipo i64; el type
+                // checker valida que solo se asigne a punteros / handles
+                // (donde 0 es la representacion canonica de "ausente").
                 return emit_const(ir::IrType::I64, 0, e->loc.line);
             case ast::NodeKind::IdentExpr:
                 return lower_ident(static_cast<ast::IdentExpr *>(e));
@@ -6006,6 +6814,8 @@ namespace vex {
                 return lower_call(static_cast<ast::CallExpr *>(e));
             case ast::NodeKind::AssignExpr:
                 return lower_assign(static_cast<ast::AssignExpr *>(e));
+            case ast::NodeKind::TernaryExpr:
+                return lower_ternary(static_cast<ast::TernaryExpr *>(e));
             case ast::NodeKind::IndexExpr:
                 return lower_index(static_cast<ast::IndexExpr *>(e));
             case ast::NodeKind::ThisExpr:
@@ -6023,7 +6833,7 @@ namespace vex {
             case ast::NodeKind::CastExpr:
                 return lower_cast_expr(static_cast<ast::CastExpr *>(e));
             default:
-                unsupported(e->loc, "expresion no soportada en A.1");
+                unsupported(e->loc, "expresion no soportada por el lowering actual");
                 return ir::IR_NO_VALUE;
         }
     }
@@ -6215,6 +7025,136 @@ namespace vex {
     }
 
     ir::IrValueId Lowering::lower_ident(ast::IdentExpr *e) {
+        /* si estamos dentro de un @Macro body Y el name
+         * resuelve a un comptime global int, emit LOAD desde el slot
+         * @c static_data correspondiente.  Asi el macro ve el VALOR
+         * ACTUAL (mutado por invocaciones previas), no el inicial. */
+        if (current_fn_is_macro_) {
+            auto cit = tc_.comptime_const_values().find(e->name);
+            if (cit != tc_.comptime_const_values().end() && !cit->second.is_str) {
+                /* Pero PRIORIDAD a comptime_const_locals_ del lowering
+                 * (sobreescrito por comptime for body): si la var esta
+                 * en el stack dinamico, hicimos override -- usar ese
+                 * valor inline en lugar del slot global. */
+                bool overridden = false;
+                for (auto it = lowering_comptime_scopes_.rbegin();
+                     it != lowering_comptime_scopes_.rend(); ++it) {
+                    if (it->find(e->name) != it->end()) { overridden = true; break; }
+                }
+                if (!overridden) {
+                    const uint64_t slot_idx = get_or_create_comptime_global_slot(e->name);
+                    if (slot_idx != UINT64_MAX) {
+                        const int ln = e->loc.line;
+                        ir::IrValueId v_addr = fn_->new_value(ir::IrType::PTR); {
+                            ir::IrInstr is{};
+                            is.op          = ir::IrOp::STR_LIT_ADDR;
+                            is.type        = ir::IrType::PTR;
+                            is.dst         = v_addr;
+                            is.imm         = slot_idx;
+                            is.source_line = ln;
+                            fn_->append(current_block_, std::move(is));
+                        }
+                        ir::IrValueId v_val = fn_->new_value(ir::IrType::I64); {
+                            ir::IrInstr ld{};
+                            ld.op          = ir::IrOp::LOAD;
+                            ld.type        = ir::IrType::I64;
+                            ld.dst         = v_val;
+                            ld.operands    = {v_addr};
+                            ld.source_line = ln;
+                            fn_->append(current_block_, std::move(ld));
+                        }
+                        return v_val;
+                    }
+                }
+            }
+        }
+
+        // A.39: primero consultamos el stack dinamico de comptime const
+        // del lowering -- usado por `comptime for` para override del
+        // index por iteracion sin re-correr el type checker.
+        for (auto it = lowering_comptime_scopes_.rbegin();
+             it != lowering_comptime_scopes_.rend(); ++it) {
+            auto hit = it->find(e->name);
+            if (hit != it->end()) {
+                if (hit->second.is_str) {
+                    /* String comptime override (raro pero soportado). */
+                    std::vector<uint8_t> bytes(
+                        hit->second.str_value.begin(),
+                        hit->second.str_value.end());
+                    const uint64_t idx = out_mod_->intern_static_data(
+                        std::move(bytes));
+                    ir::IrValueId v_addr = fn_->new_value(ir::IrType::PTR);
+                    {
+                        ir::IrInstr is{};
+                        is.op          = ir::IrOp::STR_LIT_ADDR;
+                        is.type        = ir::IrType::PTR;
+                        is.dst         = v_addr;
+                        is.imm         = idx;
+                        is.source_line = e->loc.line;
+                        fn_->append(current_block_, std::move(is));
+                    }
+                    ir::IrValueId v_len = emit_const(ir::IrType::I64,
+                        static_cast<uint64_t>(hit->second.str_value.size()),
+                        e->loc.line);
+                    ir::IrValueId v_str = fn_->new_value(ir::IrType::I64);
+                    ir::IrInstr ra{};
+                    ra.op           = ir::IrOp::RAW_ASM;
+                    ra.type         = ir::IrType::I64;
+                    ra.dst          = v_str;
+                    ra.operands     = {v_addr, v_len};
+                    ra.func_name    = std::string("strmake {dst}, {src0}, {src1}\n");
+                    ra.is_call_site = true;
+                    ra.source_line  = e->loc.line;
+                    fn_->append(current_block_, std::move(ra));
+                    return v_str;
+                }
+                return emit_const(hit->second.ir_t,
+                    static_cast<uint64_t>(hit->second.value), e->loc.line);
+            }
+        }
+
+        // A.38/A.39: si el type checker ya resolvio este ident a un
+        // comptime const (annotacion en el AST), inline-amos el valor
+        // como CONST directo.  Cubre locales (que ya no estan en la
+        // tabla del type checker) y globales.  Strings comptime se
+        // materializan via STR_LIT_ADDR + STRMAKE.
+        if (e->comptime_const_resolved) {
+            if (e->comptime_const_is_str) {
+                /* Construir StringObject inline desde los bytes del
+                 * comptime string -- mismo patron que typename<T>(). */
+                std::vector<uint8_t> bytes(e->comptime_const_str.begin(),
+                                            e->comptime_const_str.end());
+                const uint64_t idx = out_mod_->intern_static_data(
+                    std::move(bytes));
+                ir::IrValueId v_addr = fn_->new_value(ir::IrType::PTR); {
+                    ir::IrInstr is{};
+                    is.op          = ir::IrOp::STR_LIT_ADDR;
+                    is.type        = ir::IrType::PTR;
+                    is.dst         = v_addr;
+                    is.imm         = idx;
+                    is.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(is));
+                }
+                ir::IrValueId v_len = emit_const(ir::IrType::I64,
+                    static_cast<uint64_t>(e->comptime_const_str.size()),
+                    e->loc.line);
+                ir::IrValueId v_str = fn_->new_value(ir::IrType::I64);
+                ir::IrInstr ra{};
+                ra.op           = ir::IrOp::RAW_ASM;
+                ra.type         = ir::IrType::I64;
+                ra.dst          = v_str;
+                ra.operands     = {v_addr, v_len};
+                ra.func_name    = std::string("strmake {dst}, {src0}, {src1}\n");
+                ra.is_call_site = true;
+                ra.source_line  = e->loc.line;
+                fn_->append(current_block_, std::move(ra));
+                return v_str;
+            }
+            ir::IrType t = ir_type_from_primitive(e->result_type.kind);
+            return emit_const(t,
+                static_cast<uint64_t>(e->comptime_const_int), e->loc.line);
+        }
+
         // const-globals - inlining de constantes globales `const T NAME = lit;`.
         // Vex aun no genera storage para variables globales (solo warning),
         // pero para const con inicializador literal podemos emitir un CONST
@@ -6252,8 +7192,9 @@ namespace vex {
             // -- a implementar cuando los necesite.
             break;
         }
-        // A.18 fase B.3 - Constantes ENC_* (encoding numerico).
-        // Cero overhead: emit const i32 inline en el call site.
+        // Constantes ENC_* (encoding numerico para builtins de string como
+        // @c str_convert(s, ENC_UTF16)).  Cero overhead: emit const i32
+        // inline en el call site -- no necesitan storage como simbolos.
         {
             static const struct {
                 const char *name;
@@ -6270,11 +7211,13 @@ namespace vex {
                 }
             }
         }
-        // A.16 - Identificadores ANSI magicos.  Si el nombre es una
-        // constante predefinida (RED, GREEN, BOLD, RESET, etc.), emitir
-        // un STR_LIT_ADDR a la cadena ANSI correspondiente.  Cero
-        // overhead vs un string literal explicito; la deteccion es un
-        // lookup O(1) en una tabla estatica.
+        // Identificadores ANSI magicos.  Si el nombre es una constante
+        // predefinida (RED, GREEN, BOLD, RESET, etc.), emitir un
+        // STR_LIT_ADDR a la cadena ANSI correspondiente.  Cero overhead
+        // vs un string literal explicito; la deteccion es un lookup O(1)
+        // en una tabla estatica.  Permite que el usuario escriba
+        // @c println("Error: ${RED}..${RESET}") sin necesidad de
+        // memorizar los codigos ANSI ni de declararlos como constantes.
         {
             static const struct {
                 const char *name;
@@ -6896,14 +7839,20 @@ namespace vex {
             }
             return lower_expr(ex);
         };
+        /* En el body de @Macro los StringLitExpr pueden no haber pasado
+         * por check_string (que setea result_type=PTR).  Aceptamos
+         * literales no interpolados como strings aunque su result_type
+         * sea VOID -- solo importa el StringLitExpr kind. */
+        auto is_string_lit_node = [](const ast::Expr *ex) -> bool {
+            return ex && ex->kind == ast::NodeKind::StringLitExpr
+                && !static_cast<const ast::StringLitExpr *>(ex)->is_interpolated();
+        };
         const bool lhs_is_str = (ltk == PrimitiveKind::STRING) ||
-        (ltk == PrimitiveKind::PTR && e->lhs &&
-            e->lhs->kind == ast::NodeKind::StringLitExpr &&
-            !static_cast<ast::StringLitExpr *>(e->lhs.get())->is_interpolated());
+            (is_string_lit_node(e->lhs.get())
+             && (ltk == PrimitiveKind::PTR || ltk == PrimitiveKind::VOID));
         const bool rhs_is_str = (rtk == PrimitiveKind::STRING) ||
-        (rtk == PrimitiveKind::PTR && e->rhs &&
-            e->rhs->kind == ast::NodeKind::StringLitExpr &&
-            !static_cast<ast::StringLitExpr *>(e->rhs.get())->is_interpolated());
+            (is_string_lit_node(e->rhs.get())
+             && (rtk == PrimitiveKind::PTR || rtk == PrimitiveKind::VOID));
         const bool any_real_str = (ltk == PrimitiveKind::STRING) ||
                 (rtk == PrimitiveKind::STRING);
         if (lhs_is_str && rhs_is_str && any_real_str) {
@@ -7455,6 +8404,95 @@ namespace vex {
     }
 
     ir::IrValueId Lowering::lower_call(ast::CallExpr *e) {
+        /* A.43.10: macros Lisp con splice/emit.  Si el type checker
+         * sustituyo la llamada por un AST expandido (campo macro_expanded
+         * no-null), bajamos directamente el AST sustituido en lugar de
+         * emitir una llamada al builtin.  Esto convierte el call site
+         * en codigo runtime real generado a partir de string compile-time. */
+        if (e->macro_expanded) {
+            return lower_expr(e->macro_expanded.get());
+        }
+        // A.39: si el callee es una `comptime fn` y todos los args son
+        // comptime-evaluables, ejecutamos la fn en compile-time y
+        // emitimos el resultado como CONST.  Caso comun: usar comptime
+        // fn dentro de un `comptime for` body donde los args son
+        // constantes por iteracion.
+        if (e->callee
+         && e->callee->kind == ast::NodeKind::IdentExpr) {
+            auto *cid = static_cast<ast::IdentExpr *>(e->callee.get());
+            const auto &cfns = tc_.comptime_fns();
+            auto cit = cfns.find(cid->name);
+            if (cit != cfns.end()) {
+                /* Phase MC.17.3: si estamos dentro de un @Macro body
+                 * lowereado a IR Y el callee es OTRO @Macro, NO
+                 * intentamos comptime-eval; en su lugar caemos al
+                 * lowering normal mas abajo que emitira CALLVM regular
+                 * a `__macro_<callee>`.  Los args pueden ser params del
+                 * macro contenedor (runtime values) lo cual es valido. */
+                if (current_fn_is_macro_
+                 && cit->second && cit->second->is_macro) {
+                    /* Caer al lowering normal de CallExpr -- no
+                     * intentar comptime eval aqui.  El rewrite del
+                     * nombre callee_name -> __macro_<name> se hace al
+                     * emitir el IrInstr::CALL al final de lower_call. */
+                    goto skip_comptime_eval_for_macro_to_macro;
+                }
+                ComptimeEvalResult r = comptime_eval_expr(tc_, e);
+                if (!r.ok) {
+                    error_at(e->loc,
+                        "llamada a comptime fn '" + cid->name +
+                        "' no es comptime-evaluable (argumento runtime?)");
+                    return ir::IR_NO_VALUE;
+                }
+                const uint32_t src_line = e->loc.line;
+                /* A.43.16: para @Macro fns, el type checker ya parseó +
+                 * type-checó la expresion generada y la guardó en
+                 * `e->macro_expanded`.  La rama temprana al inicio de
+                 * lower_call (A.43.10) ya hizo lower_expr del AST
+                 * sustituido y retornó antes de llegar aqui.  Asi que
+                 * en este punto NO esperamos un @Macro -- todos los
+                 * callees con string return son los comptime fns
+                 * regulares que materializan StringObject. */
+                if (r.is_str) {
+                    /* Construir StringObject inline. */
+                    std::vector<uint8_t> bytes(r.str.begin(), r.str.end());
+                    const uint64_t idx = out_mod_->intern_static_data(
+                        std::move(bytes));
+                    ir::IrValueId v_addr = fn_->new_value(ir::IrType::PTR); {
+                        ir::IrInstr is{};
+                        is.op          = ir::IrOp::STR_LIT_ADDR;
+                        is.type        = ir::IrType::PTR;
+                        is.dst         = v_addr;
+                        is.imm         = idx;
+                        is.source_line = src_line;
+                        fn_->append(current_block_, std::move(is));
+                    }
+                    ir::IrValueId v_len = emit_const(ir::IrType::I64,
+                        (uint64_t)r.str.size(), src_line);
+                    ir::IrValueId v_str = fn_->new_value(ir::IrType::I64);
+                    ir::IrInstr ra{};
+                    ra.op           = ir::IrOp::RAW_ASM;
+                    ra.type         = ir::IrType::I64;
+                    ra.dst          = v_str;
+                    ra.operands     = {v_addr, v_len};
+                    ra.func_name    = std::string("strmake {dst}, {src0}, {src1}\n");
+                    ra.is_call_site = true;
+                    ra.source_line  = src_line;
+                    fn_->append(current_block_, std::move(ra));
+                    return v_str;
+                }
+                /* Tipo de retorno declarado por la fn. */
+                ir::IrType t = ir::IrType::I64;
+                auto *fn_decl = cfns.at(cid->name);
+                if (fn_decl && fn_decl->return_type) {
+                    Type rt = tc_.resolve_type_node(fn_decl->return_type.get());
+                    t = ir_type_from_primitive(rt.kind);
+                }
+                return emit_const(t, (uint64_t)r.value, src_line);
+            }
+        }
+    skip_comptime_eval_for_macro_to_macro:
+
         // constructor de variante de enum: el type checker lo
         // marco con FieldAccessExpr::property_kind = 99.  Se trata como
         // un CallExpr cuyo callee es FieldAccessExpr(IdentExpr(enum_name),
@@ -7886,7 +8924,19 @@ namespace vex {
         ins.op          = ir::IrOp::CALL;
         ins.type        = callee_is_sret ? ir::IrType::VOID : ret_ir;
         ins.dst         = dst;
-        ins.func_name   = id->name;
+        /*   : si el callee es una @Macro user-defined,
+         * rewriting al nombre prefijado `__macro_<name>` que el lowering
+         * uso al generar la IrFunction.  Esto permite que un @Macro
+         * llame a otro via CALLVM normal sin pasar por AST eval. */
+        std::string callee_name = id->name;
+        {
+            auto fn_it = tc_.comptime_fns().find(id->name);
+            if (fn_it != tc_.comptime_fns().end()
+             && fn_it->second && fn_it->second->is_macro) {
+                callee_name = "__macro_" + id->name;
+            }
+        }
+        ins.func_name   = std::move(callee_name);
         ins.operands    = std::move(arg_ids);
         ins.source_line = e->loc.line;
         fn_->append(current_block_, std::move(ins));
@@ -8014,6 +9064,164 @@ namespace vex {
         return ast::BinOp::Add;
     }
 
+    /**
+     * @brief A.39 - emite el cuerpo de un `comptime for` desenrollado.
+     *
+     * Evalua lo/hi en compile-time (ya validados por type checker) y
+     * por cada valor del index push scope con i=valor, lower body, pop.
+     * Cero loop runtime: N copias del body emitidas en secuencia, con
+     * el index sustituido como CONST en cada copia via
+     * @c lowering_comptime_scopes_ (consultado por @c lower_ident).
+     */
+    void Lowering::lower_comptime_for(ast::ComptimeForStmt *s) {
+        if (!s || !s->lo_expr || !s->hi_expr || !s->body) return;
+        const ComptimeEvalResult lo = comptime_eval_expr(tc_, s->lo_expr.get());
+        const ComptimeEvalResult hi = comptime_eval_expr(tc_, s->hi_expr.get());
+        if (!lo.ok || !hi.ok || lo.is_str || hi.is_str) {
+            error_at(s->loc,
+                "comptime for: rango no evaluable (lo/hi deben ser enteros comptime)");
+            return;
+        }
+        /* Limite defensivo para evitar explosion de codigo. */
+        const int64_t lo_v = lo.value;
+        int64_t       hi_v = hi.value;
+        if (s->inclusive) hi_v += 1;
+        if (hi_v - lo_v > 4096) {
+            error_at(s->loc,
+                "comptime for: rango excede 4096 iteraciones; usar un "
+                "loop runtime en su lugar");
+            return;
+        }
+        /* A.39: el bind del index lo hacemos en DOS lugares:
+         *   1. `lowering_comptime_scopes_` para que @c lower_ident lo
+         *      inline como CONST en el codigo runtime emitido.
+         *   2. `tc.comptime_const_locals_` para que @c comptime_eval_expr
+         *      pueda resolverlo cuando aparezca como arg de un comptime fn
+         *      o builtin comptime.  Sin esto, `fact(k)` desde el body
+         *      del for fallaria con "no comptime-evaluable" porque k
+         *      no estaria en tc's stack. */
+        auto &mut_tc = const_cast<TypeChecker &>(tc_);
+        for (int64_t i = lo_v; i < hi_v; ++i) {
+            /* Push lowering scope. */
+            std::unordered_map<std::string, ComptimeLocalEntry> scope;
+            ComptimeLocalEntry ent;
+            ent.value = i;
+            ent.ir_t  = ir::IrType::I64;
+            scope[s->var_name] = ent;
+            lowering_comptime_scopes_.push_back(std::move(scope));
+            /* Push tc scope. */
+            mut_tc.push_comptime_scope();
+            TypeChecker::ComptimeConst c;
+            c.type  = Type{PrimitiveKind::I64};
+            c.value = i;
+            mut_tc.register_comptime_local(s->var_name, std::move(c));
+            /* Lower body. */
+            lower_stmt(s->body.get());
+            /* Pop. */
+            mut_tc.pop_comptime_scope();
+            lowering_comptime_scopes_.pop_back();
+        }
+    }
+
+    /**
+     * @brief A.38 - lowering del operador ternario `cond ? then : else`.
+     *
+     * Estructura CFG identica a lower_if con PHI en el merge:
+     *   current -> br_cond cond, then_bb, else_bb
+     *   then_bb -> lower(then_expr) -> br merge_bb
+     *   else_bb -> lower(else_expr) -> br merge_bb
+     *   merge   -> %r = phi [then_val, then_end] [else_val, else_end]
+     *
+     * El tipo resultado se toma del then_expr (ya validado por el type
+     * checker que tt y et son asignables entre si).  Si difieren, se
+     * aplica @c cast_if_needed al else para igualar.  Si then es un side-
+     * effecting expr y la cond es comptime-evaluable, una optimizacion
+     * futura podria dead-branch-eliminate; por ahora siempre emite el if.
+     */
+    ir::IrValueId Lowering::lower_ternary(ast::TernaryExpr *e) {
+        const uint32_t src_line = e->loc.line;
+        if (!e->cond || !e->then_expr || !e->else_expr) {
+            error_at(e->loc, "lowering: ternario incompleto");
+            return ir::IR_NO_VALUE;
+        }
+        /* Bajar cond y crear los 3 bloques. */
+        ir::IrValueId cond = lower_expr(e->cond.get());
+        if (cond == ir::IR_NO_VALUE) return ir::IR_NO_VALUE;
+        const ir::IrBlockId then_bb  = fn_->new_block(
+            "ter_then_" + std::to_string(ternary_counter_));
+        const ir::IrBlockId else_bb  = fn_->new_block(
+            "ter_else_" + std::to_string(ternary_counter_));
+        const ir::IrBlockId merge_bb = fn_->new_block(
+            "ter_merge_" + std::to_string(ternary_counter_));
+        ++ternary_counter_;
+        /* br_cond. */
+        {
+            ir::IrInstr br{};
+            br.op           = ir::IrOp::BR_COND;
+            br.operands.push_back(cond);
+            br.target_block = then_bb;
+            br.false_block  = else_bb;
+            br.source_line  = src_line;
+            fn_->append(current_block_, std::move(br));
+            fn_->blocks[current_block_].succs.push_back(then_bb);
+            fn_->blocks[current_block_].succs.push_back(else_bb);
+            fn_->blocks[then_bb].preds.push_back(current_block_);
+            fn_->blocks[else_bb].preds.push_back(current_block_);
+        }
+        /* Bajar then_expr en then_bb. */
+        current_block_ = then_bb;
+        ir::IrValueId then_val = lower_expr(e->then_expr.get());
+        ir::IrBlockId then_end = current_block_;
+        ir::IrType    then_t   = (then_val != ir::IR_NO_VALUE)
+            ? fn_->values[then_val].type
+            : ir::IrType::I64;
+        {
+            ir::IrInstr brm{};
+            brm.op           = ir::IrOp::BR;
+            brm.target_block = merge_bb;
+            brm.source_line  = src_line;
+            fn_->append(then_end, std::move(brm));
+            fn_->blocks[then_end].succs.push_back(merge_bb);
+            fn_->blocks[merge_bb].preds.push_back(then_end);
+        }
+        /* Bajar else_expr en else_bb. */
+        current_block_ = else_bb;
+        ir::IrValueId else_val = lower_expr(e->else_expr.get());
+        ir::IrBlockId else_end = current_block_;
+        /* Coerce else_val al tipo de then si difieren. */
+        if (else_val != ir::IR_NO_VALUE) {
+            const ir::IrType else_t = fn_->values[else_val].type;
+            if (else_t != then_t) {
+                else_val = cast_if_needed(else_val, else_t, then_t, src_line);
+            }
+        }
+        {
+            ir::IrInstr brm{};
+            brm.op           = ir::IrOp::BR;
+            brm.target_block = merge_bb;
+            brm.source_line  = src_line;
+            fn_->append(else_end, std::move(brm));
+            fn_->blocks[else_end].succs.push_back(merge_bb);
+            fn_->blocks[merge_bb].preds.push_back(else_end);
+        }
+        /* Merge: PHI. */
+        current_block_ = merge_bb;
+        if (then_val == ir::IR_NO_VALUE || else_val == ir::IR_NO_VALUE) {
+            error_at(e->loc, "ternario: una de las ramas no produjo valor");
+            return ir::IR_NO_VALUE;
+        }
+        ir::IrValueId result = fn_->new_value(then_t);
+        ir::IrInstr   phi{};
+        phi.op   = ir::IrOp::PHI;
+        phi.type = then_t;
+        phi.dst  = result;
+        phi.phi_args.push_back({then_val, then_end});
+        phi.phi_args.push_back({else_val, else_end});
+        phi.source_line = src_line;
+        fn_->append(merge_bb, std::move(phi));
+        return result;
+    }
+
     ir::IrValueId Lowering::lower_assign(ast::AssignExpr *e) {
         // admitimos como lvalue: IdentExpr (variable simple) o
         // FieldAccessExpr (p.x = v).  Otros lvalues (deref de puntero,
@@ -8102,11 +9310,12 @@ namespace vex {
             }
             rhs = cast_if_needed(rhs, fn_->values[rhs].type, ft, e->loc.line);
 
-            // A.18.x.1 - WRITE de bit field: read-modify-write.  Si el
-            // campo es bit field, leemos el storage word completo, le
-            // limpiamos los bits del rango con AND inverse_mask, le
-            // metemos el valor con OR ((rhs & mask) << bit_offset), y
-            // hacemos STORE de vuelta.  Para campo normal: STORE directo.
+            // WRITE de bit field: read-modify-write.  Si el campo es bit
+            // field, leemos el storage word completo, le limpiamos los
+            // bits del rango con AND inverse_mask, le metemos el valor
+            // con OR ((rhs & mask) << bit_offset), y hacemos STORE de
+            // vuelta.  Para campo normal (no-bitfield): STORE directo
+            // del rhs sin lectura previa.
             const Type bt = fa->base ? fa->base->result_type : Type{};
             if (bt.kind == PrimitiveKind::STRUCT) {
                 const auto &layouts = tc_.struct_layouts();
@@ -8289,6 +9498,95 @@ namespace vex {
         ir::IrValueId rhs = lower_expr(e->value.get());
         if (rhs == ir::IR_NO_VALUE) return ir::IR_NO_VALUE;
 
+        /* Phase MC.17.2: si estamos dentro de un @Macro Y el target es
+         * un comptime global int, emit STORE al slot @c static_data
+         * correspondiente.  Soporta `=` directo y compound `+=`/`-=`
+         * (el caller computa cur op rhs en `rhs` antes de llegar aqui). */
+        if (current_fn_is_macro_) {
+            auto cit = tc_.comptime_const_values().find(id->name);
+            if (cit != tc_.comptime_const_values().end() && !cit->second.is_str) {
+                const uint64_t slot_idx =
+                    get_or_create_comptime_global_slot(id->name);
+                if (slot_idx != UINT64_MAX) {
+                    const int ln = e->loc.line;
+                    /* Si compound assign, leer valor actual y combinar
+                     * con rhs ANTES del store.  Esto es paralelo al
+                     * camino general que sigue mas abajo, pero como
+                     * salimos antes de llegar a ese punto, lo
+                     * replicamos aqui inline para compound. */
+                    if (e->op != ast::AssignOp::Assign) {
+                        /* Compound assign sobre global: load cur from
+                         * slot + combine + store back. */
+                        ir::IrValueId v_addr_load = fn_->new_value(ir::IrType::PTR);
+                        {
+                            ir::IrInstr is{};
+                            is.op          = ir::IrOp::STR_LIT_ADDR;
+                            is.type        = ir::IrType::PTR;
+                            is.dst         = v_addr_load;
+                            is.imm         = slot_idx;
+                            is.source_line = ln;
+                            fn_->append(current_block_, std::move(is));
+                        }
+                        ir::IrValueId v_cur = fn_->new_value(ir::IrType::I64);
+                        {
+                            ir::IrInstr ld{};
+                            ld.op          = ir::IrOp::LOAD;
+                            ld.type        = ir::IrType::I64;
+                            ld.dst         = v_cur;
+                            ld.operands    = {v_addr_load};
+                            ld.source_line = ln;
+                            fn_->append(current_block_, std::move(ld));
+                        }
+                        /* Combine via emit_binop equivalent.  Mapeamos
+                         * AssignOp -> BinOp y emitimos.  Para simplicidad
+                         * solo cubrimos los compound mas comunes; otros
+                         * caen al camino general (que falla porque
+                         * write_local no encontrara el name). */
+                        ast::BinOp bop = ast::BinOp::Add;
+                        bool       supported = true;
+                        switch (e->op) {
+                            case ast::AssignOp::AddAssign: bop = ast::BinOp::Add; break;
+                            case ast::AssignOp::SubAssign: bop = ast::BinOp::Sub; break;
+                            case ast::AssignOp::MulAssign: bop = ast::BinOp::Mul; break;
+                            case ast::AssignOp::DivAssign: bop = ast::BinOp::Div; break;
+                            case ast::AssignOp::ModAssign: bop = ast::BinOp::Mod; break;
+                            case ast::AssignOp::BitAndAssign: bop = ast::BinOp::BitAnd; break;
+                            case ast::AssignOp::BitOrAssign:  bop = ast::BinOp::BitOr;  break;
+                            case ast::AssignOp::BitXorAssign: bop = ast::BinOp::BitXor; break;
+                            case ast::AssignOp::ShlAssign: bop = ast::BinOp::Shl; break;
+                            case ast::AssignOp::ShrAssign: bop = ast::BinOp::Shr; break;
+                            default: supported = false; break;
+                        }
+                        if (supported) {
+                            /* Use emit_binop_ir (mismo helper que el
+                             * camino normal de compound assign).  Common
+                             * = I64 (los globals son int de 64-bit). */
+                            rhs = emit_binop_ir(bop, v_cur, rhs,
+                                                 PrimitiveKind::I64, e->loc);
+                        }
+                    }
+                    /* STORE rhs al slot. */
+                    ir::IrValueId v_addr = fn_->new_value(ir::IrType::PTR);
+                    {
+                        ir::IrInstr is{};
+                        is.op          = ir::IrOp::STR_LIT_ADDR;
+                        is.type        = ir::IrType::PTR;
+                        is.dst         = v_addr;
+                        is.imm         = slot_idx;
+                        is.source_line = ln;
+                        fn_->append(current_block_, std::move(is));
+                    }
+                    ir::IrInstr st{};
+                    st.op          = ir::IrOp::STORE;
+                    st.type        = ir::IrType::I64;
+                    st.operands    = {rhs, v_addr};
+                    st.source_line = ln;
+                    fn_->append(current_block_, std::move(st));
+                    return rhs;
+                }
+            }
+        }
+
         // Tipo destino: el del simbolo en el scope (o el result_type del
         // target que el type checker dejo).
         const ir::IrType dst_ir = ir_type_from_primitive(e->target->result_type.kind);
@@ -8397,11 +9695,834 @@ namespace vex {
         const auto *       id   = static_cast<const ast::IdentExpr *>(e->callee.get());
         const std::string &name = id->name;
 
+        // -----------------------------------------------------------------
+        // Sprint 1: builtins comptime de introspection.
+        // Disparan SOLO cuando hay type_args.size()>=1.  Devuelven UN
+        // valor constante computado a partir del tipo resuelto:
+        //   sizeof<T>()   -> u64
+        //   alignof<T>()  -> u64
+        //   typename<T>() -> string (StringObject)
+        //   type_id<T>()  -> u32
+        //   kind<T>()     -> i32 (ComptimeKind enum)
+        // Cero overhead runtime: la salida es un solo IrOp::CONST (o
+        // STRMAKE para strings).
+        // -----------------------------------------------------------------
+        if (!e->type_args.empty()
+         && (name == "sizeof" || name == "alignof"
+          || name == "typename" || name == "type_id"
+          || name == "kind")) {
+            const Type t = tc_.resolve_type_node(e->type_args[0].get());
+            const uint32_t src_line = e->loc.line;
+            if (name == "sizeof") {
+                const uint64_t v = comptime_type_size(tc_, t);
+                out_value = emit_const(ir::IrType::U64, v, src_line);
+                return true;
+            }
+            if (name == "alignof") {
+                const uint64_t v = comptime_type_align(tc_, t);
+                out_value = emit_const(ir::IrType::U64, v, src_line);
+                return true;
+            }
+            if (name == "type_id") {
+                const uint32_t v = comptime_type_id(tc_, t);
+                out_value = emit_const(ir::IrType::U32, static_cast<uint64_t>(v), src_line);
+                return true;
+            }
+            if (name == "kind") {
+                const ComptimeKind k = comptime_type_kind(t);
+                out_value = emit_const(ir::IrType::I32,
+                    static_cast<uint64_t>(static_cast<int32_t>(k)), src_line);
+                return true;
+            }
+            /* typename<T>() -> StringObject construido inline desde el
+             * nombre canonico.  Reusa el mismo patron que el path no-
+             * interpolado de @c lower_string_literal_to_string_object:
+             * STR_LIT_ADDR a static_data + RAW_ASM strmake. */
+            if (name == "typename") {
+                const std::string nm = comptime_type_name(tc_, t);
+                std::vector<uint8_t> bytes(nm.begin(), nm.end());
+                const uint64_t idx = out_mod_->intern_static_data(std::move(bytes));
+                ir::IrValueId v_addr = fn_->new_value(ir::IrType::PTR);
+                {
+                    ir::IrInstr ins{};
+                    ins.op          = ir::IrOp::STR_LIT_ADDR;
+                    ins.type        = ir::IrType::PTR;
+                    ins.dst         = v_addr;
+                    ins.imm         = idx;
+                    ins.source_line = src_line;
+                    fn_->append(current_block_, std::move(ins));
+                }
+                ir::IrValueId v_len = emit_const(
+                    ir::IrType::I64, static_cast<uint64_t>(nm.size()), src_line);
+                ir::IrValueId v_str = fn_->new_value(ir::IrType::I64);
+                {
+                    ir::IrInstr ra{};
+                    ra.op            = ir::IrOp::RAW_ASM;
+                    ra.type          = ir::IrType::I64;
+                    ra.dst           = v_str;
+                    ra.operands      = {v_addr, v_len};
+                    ra.func_name     = std::string("strmake {dst}, {src0}, {src1}\n");
+                    ra.is_call_site  = true;
+                    ra.source_line   = src_line;
+                    fn_->append(current_block_, std::move(ra));
+                }
+                /* NO marcar is_gc_object: STRMAKE devuelve un GcHandle
+                 * (uint32 zero-extended a i64).  Los handles son estables
+                 * cross-GC -- la HandleTable los redirige tras evacuacion.
+                 * Marcarlo como host_ptr provocaria que el regalloc emita
+                 * gchandle/gcderef innecesarios y, peor, leyera la entrada
+                 * de ptr_to_handle_ para un handle (no un host_ptr) -> NULL.
+                 * Mismo patron que lower_string_literal_to_string_object. */
+                out_value = v_str;
+                return true;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // A.39: builtins comptime sobre strings.  Args ya validados como
+        // comptime-evaluables por type_checker.  Aqui evaluamos y emitimos:
+        //   comptime_concat -> STRMAKE inline con bytes concatenados
+        //   comptime_streq  -> CONST bool con resultado
+        //   comptime_strlen -> CONST u64 con size
+        // -----------------------------------------------------------------
+        if (name == "comptime_concat"
+         || name == "comptime_streq"
+         || name == "comptime_strlen") {
+            const ComptimeEvalResult r = comptime_eval_expr(tc_, e);
+            if (!r.ok) {
+                /* Phase MC.24: si el comptime eval falla (e.g. arg es
+                 * un comptime var que solo se resuelve en call-site
+                 * del macro padre), NO erroreamos.  En su lugar, dejamos
+                 * que el path runtime (str_concat/str_equals/str_length
+                 * via STRCAT/STRCMP/STRLEN bytecode) maneje el call.
+                 * El macro corre via VM al invocarse y produce el
+                 * resultado correcto.  Solo fallback si el caller es
+                 * NO un macro (en cuyo caso si hay error real). */
+                /* Caer al lowering normal abajo via is_str_concat/etc. */
+                /* Fall through. */
+            } else {
+            const uint32_t src_line = e->loc.line;
+            if (r.is_str) {
+                /* Materializar como StringObject inline. */
+                std::vector<uint8_t> bytes(r.str.begin(), r.str.end());
+                const uint64_t idx = out_mod_->intern_static_data(
+                    std::move(bytes));
+                ir::IrValueId v_addr = fn_->new_value(ir::IrType::PTR); {
+                    ir::IrInstr is{};
+                    is.op          = ir::IrOp::STR_LIT_ADDR;
+                    is.type        = ir::IrType::PTR;
+                    is.dst         = v_addr;
+                    is.imm         = idx;
+                    is.source_line = src_line;
+                    fn_->append(current_block_, std::move(is));
+                }
+                ir::IrValueId v_len = emit_const(ir::IrType::I64,
+                    (uint64_t)r.str.size(), src_line);
+                ir::IrValueId v_str = fn_->new_value(ir::IrType::I64);
+                ir::IrInstr ra{};
+                ra.op           = ir::IrOp::RAW_ASM;
+                ra.type         = ir::IrType::I64;
+                ra.dst          = v_str;
+                ra.operands     = {v_addr, v_len};
+                ra.func_name    = std::string("strmake {dst}, {src0}, {src1}\n");
+                ra.is_call_site = true;
+                ra.source_line  = src_line;
+                fn_->append(current_block_, std::move(ra));
+                out_value = v_str;
+                return true;
+            }
+            /* Int result: comptime_streq -> bool, comptime_strlen -> u64. */
+            ir::IrType t = (name == "comptime_streq")
+                ? ir::IrType::BOOL
+                : ir::IrType::U64;
+            out_value = emit_const(t, (uint64_t)r.value, src_line);
+            return true;
+            }  /* end else block (r.ok=true path) */
+        }
+
+        // -----------------------------------------------------------------
+        // A.38 - static_assert(cond, "msg") -- compile-time only.
+        // El type checker ya valido la cond (emite error si es false o no
+        // evaluable).  Aqui simplemente no emitimos codigo: la asercion es
+        // un no-op en runtime, su efecto fue rechazar la compilacion.
+        // -----------------------------------------------------------------
+        if (name == "static_assert") {
+            out_value = ir::IR_NO_VALUE;
+            return true;
+        }
+
+        // -----------------------------------------------------------------
+        // Sprint 4 (A.37.s4): builtins runtime de introspection.
+        //   find_type("Lit")                   -> direct mov al chunk
+        //   find_type(s)                       -> CALL al resolver runtime (TODO)
+        //   type_info_kind/size/align/field_count -> LOAD u32 con offset fijo
+        //   type_info_name(p) / _field_name(p, i) -> construye StringObject
+        //   type_info_field_offset / _field_size  -> LOAD u32 con stride 16
+        // -----------------------------------------------------------------
+        {
+            const bool is_find = (name == "find_type");
+            const bool is_simple_u32 =
+                name == "type_info_size"
+             || name == "type_info_align"
+             || name == "type_info_field_count";
+            const bool is_kind_i32 = (name == "type_info_kind");
+            const bool is_name_q   = (name == "type_info_name");
+            const bool is_field_name = (name == "type_info_field_name");
+            const bool is_field_u32 =
+                name == "type_info_field_offset"
+             || name == "type_info_field_size";
+            if (is_find || is_simple_u32 || is_kind_i32 || is_name_q
+             || is_field_name || is_field_u32) {
+                const uint32_t src_line = e->loc.line;
+                if (is_find) {
+                    /* Resolver literal -> chunk idx en compile-time.
+                     * Caso runtime string deferido a Sprint 5. */
+                    auto *slit = e->args.empty()
+                        ? nullptr
+                        : dynamic_cast<ast::StringLitExpr *>(e->args[0].get());
+                    if (slit && !slit->is_interpolated()) {
+                        auto it = introspect_idx_by_name_.find(slit->value);
+                        if (it == introspect_idx_by_name_.end()) {
+                            /* Tipo no registrado con @Introspect -> 0. */
+                            out_value = emit_const(ir::IrType::I64, 0, src_line);
+                            return true;
+                        }
+                        /* mov dst, @Absolute("code.s_<idx>") via RAW_ASM. */
+                        ir::IrValueId dst = fn_->new_value(ir::IrType::I64);
+                        std::ostringstream oss;
+                        oss << "mov {dst}, @Absolute(\"code.s_"
+                            << it->second << "\")\n";
+                        ir::IrInstr ra{};
+                        ra.op          = ir::IrOp::RAW_ASM;
+                        ra.type        = ir::IrType::I64;
+                        ra.dst         = dst;
+                        ra.func_name   = oss.str();
+                        ra.source_line = src_line;
+                        fn_->append(current_block_, std::move(ra));
+                        out_value = dst;
+                        return true;
+                    }
+                    /* Runtime string: para MVP devolvemos 0 (no soportado).
+                     * Sprint 5 anyade resolver sintetico. */
+                    error_at(e->loc,
+                        "find_type: en MVP solo se soporta literal string "
+                        "(runtime resolver pendiente en Sprint 5)");
+                    out_value = emit_const(ir::IrType::I64, 0, src_line);
+                    return true;
+                }
+                /* Resto: el primer arg es el handle del IntrospectInfo. */
+                if (e->args.empty()) {
+                    out_value = ir::IR_NO_VALUE;
+                    return true;
+                }
+                ir::IrValueId info_ptr = lower_expr(e->args[0].get());
+                if (info_ptr == ir::IR_NO_VALUE) {
+                    out_value = ir::IR_NO_VALUE;
+                    return true;
+                }
+                /* Helper: emite ADD ptr + offset_const + LOAD U32. */
+                auto emit_load_u32_at = [&](uint32_t offset) -> ir::IrValueId {
+                    ir::IrValueId addr;
+                    if (offset == 0) {
+                        addr = info_ptr;
+                    } else {
+                        ir::IrValueId off_val = emit_const(
+                            ir::IrType::I64, offset, src_line);
+                        addr = fn_->new_value(ir::IrType::PTR);
+                        ir::IrInstr ad{};
+                        ad.op          = ir::IrOp::ADD;
+                        ad.type        = ir::IrType::I64;
+                        ad.dst         = addr;
+                        ad.operands    = {info_ptr, off_val};
+                        ad.source_line = src_line;
+                        fn_->append(current_block_, std::move(ad));
+                    }
+                    ir::IrValueId dst = fn_->new_value(ir::IrType::U32);
+                    ir::IrInstr ld{};
+                    ld.op          = ir::IrOp::LOAD;
+                    ld.type        = ir::IrType::U32;
+                    ld.dst         = dst;
+                    ld.operands    = {addr};
+                    ld.source_line = src_line;
+                    fn_->append(current_block_, std::move(ld));
+                    return dst;
+                };
+                if (is_kind_i32) {
+                    /* kind vive en offset 0 como u32; el tipo de retorno
+                     * declarado es i32 asi que el caller ve un i32 (mismos
+                     * bits). */
+                    ir::IrValueId v = emit_load_u32_at(0);
+                    out_value = v;
+                    return true;
+                }
+                if (is_simple_u32) {
+                    uint32_t off = 0;
+                    if (name == "type_info_size")        off = 4;
+                    else if (name == "type_info_align")  off = 8;
+                    else if (name == "type_info_field_count") off = 12;
+                    out_value = emit_load_u32_at(off);
+                    return true;
+                }
+                if (is_name_q) {
+                    /* type_info_name(p): name_off = LOAD u32 [p+16],
+                     * name_len = LOAD u32 [p+20], addr = p + name_off,
+                     * STRMAKE(addr, name_len). */
+                    ir::IrValueId name_off = emit_load_u32_at(16);
+                    ir::IrValueId name_len = emit_load_u32_at(20);
+                    /* Promote name_off a i64 antes del ADD. */
+                    ir::IrValueId addr = fn_->new_value(ir::IrType::PTR);
+                    ir::IrInstr ad{};
+                    ad.op          = ir::IrOp::ADD;
+                    ad.type        = ir::IrType::I64;
+                    ad.dst         = addr;
+                    ad.operands    = {info_ptr, name_off};
+                    ad.source_line = src_line;
+                    fn_->append(current_block_, std::move(ad));
+                    /* STRMAKE necesita addr y len.  Para name_len que es u32
+                     * lo usamos como i64 directamente; en la VM ambos caben
+                     * en qword. */
+                    ir::IrValueId v_str = fn_->new_value(ir::IrType::I64);
+                    ir::IrInstr ra{};
+                    ra.op            = ir::IrOp::RAW_ASM;
+                    ra.type          = ir::IrType::I64;
+                    ra.dst           = v_str;
+                    ra.operands      = {addr, name_len};
+                    ra.func_name     = std::string("strmake {dst}, {src0}, {src1}\n");
+                    ra.is_call_site  = true;
+                    ra.source_line   = src_line;
+                    fn_->append(current_block_, std::move(ra));
+                    out_value = v_str;
+                    return true;
+                }
+                /* type_info_field_*: segundo arg es idx (u32). */
+                if (e->args.size() < 2) {
+                    out_value = ir::IR_NO_VALUE;
+                    return true;
+                }
+                ir::IrValueId idx_val = lower_expr(e->args[1].get());
+                /* field_addr = info_ptr + 24 + idx * 16 */
+                ir::IrValueId v16 = emit_const(ir::IrType::I64, 16, src_line);
+                ir::IrValueId idx_x16 = fn_->new_value(ir::IrType::I64); {
+                    ir::IrInstr mu{};
+                    mu.op          = ir::IrOp::MUL;
+                    mu.type        = ir::IrType::I64;
+                    mu.dst         = idx_x16;
+                    mu.operands    = {idx_val, v16};
+                    mu.source_line = src_line;
+                    fn_->append(current_block_, std::move(mu));
+                }
+                ir::IrValueId v24 = emit_const(ir::IrType::I64, 24, src_line);
+                ir::IrValueId field_off = fn_->new_value(ir::IrType::I64); {
+                    ir::IrInstr ad{};
+                    ad.op          = ir::IrOp::ADD;
+                    ad.type        = ir::IrType::I64;
+                    ad.dst         = field_off;
+                    ad.operands    = {idx_x16, v24};
+                    ad.source_line = src_line;
+                    fn_->append(current_block_, std::move(ad));
+                }
+                ir::IrValueId field_addr = fn_->new_value(ir::IrType::PTR); {
+                    ir::IrInstr ad{};
+                    ad.op          = ir::IrOp::ADD;
+                    ad.type        = ir::IrType::I64;
+                    ad.dst         = field_addr;
+                    ad.operands    = {info_ptr, field_off};
+                    ad.source_line = src_line;
+                    fn_->append(current_block_, std::move(ad));
+                }
+                /* Helper interno LOAD u32 at field_addr + offset. */
+                auto load_u32_field = [&](uint32_t off) -> ir::IrValueId {
+                    ir::IrValueId off_val = emit_const(
+                        ir::IrType::I64, off, src_line);
+                    ir::IrValueId addr = fn_->new_value(ir::IrType::PTR);
+                    {
+                        ir::IrInstr ad{};
+                        ad.op          = ir::IrOp::ADD;
+                        ad.type        = ir::IrType::I64;
+                        ad.dst         = addr;
+                        ad.operands    = {field_addr, off_val};
+                        ad.source_line = src_line;
+                        fn_->append(current_block_, std::move(ad));
+                    }
+                    ir::IrValueId dst = fn_->new_value(ir::IrType::U32);
+                    ir::IrInstr ld{};
+                    ld.op          = ir::IrOp::LOAD;
+                    ld.type        = ir::IrType::U32;
+                    ld.dst         = dst;
+                    ld.operands    = {addr};
+                    ld.source_line = src_line;
+                    fn_->append(current_block_, std::move(ld));
+                    return dst;
+                };
+                if (name == "type_info_field_offset") {
+                    out_value = load_u32_field(0);
+                    return true;
+                }
+                if (name == "type_info_field_size") {
+                    out_value = load_u32_field(4);
+                    return true;
+                }
+                if (is_field_name) {
+                    /* field_addr+8 = name_off; field_addr+12 = name_len */
+                    ir::IrValueId fname_off = load_u32_field(8);
+                    ir::IrValueId fname_len = load_u32_field(12);
+                    ir::IrValueId addr = fn_->new_value(ir::IrType::PTR); {
+                        ir::IrInstr ad{};
+                        ad.op          = ir::IrOp::ADD;
+                        ad.type        = ir::IrType::I64;
+                        ad.dst         = addr;
+                        ad.operands    = {info_ptr, fname_off};
+                        ad.source_line = src_line;
+                        fn_->append(current_block_, std::move(ad));
+                    }
+                    ir::IrValueId v_str = fn_->new_value(ir::IrType::I64);
+                    ir::IrInstr ra{};
+                    ra.op            = ir::IrOp::RAW_ASM;
+                    ra.type          = ir::IrType::I64;
+                    ra.dst           = v_str;
+                    ra.operands      = {addr, fname_len};
+                    ra.func_name     = std::string("strmake {dst}, {src0}, {src1}\n");
+                    ra.is_call_site  = true;
+                    ra.source_line   = src_line;
+                    fn_->append(current_block_, std::move(ra));
+                    out_value = v_str;
+                    return true;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Sprint 3-C introspection: for_each_field<T>(cb) / for_each_method.
+        // Loop completamente unrolled en compile-time: por cada field/
+        // method de T emitimos UNA invocacion CALLCLOSURE al callback
+        // con el nombre como string.  Cero overhead de loop runtime
+        // (vs map dinamico), pero N llamadas reales al callback.
+        // -----------------------------------------------------------------
+        if (!e->type_args.empty()
+         && (name == "for_each_field" || name == "for_each_method")) {
+            const bool is_fields = (name == "for_each_field");
+            const Type t = tc_.resolve_type_node(e->type_args[0].get());
+            if (e->args.empty()) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            /* Lower el callback una sola vez -> fv_addr (16 bytes en stack). */
+            const ir::IrValueId fv_addr = lower_expr(e->args[0].get());
+            if (fv_addr == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            /* LOAD fn_addr = [fv_addr]; LOAD env_addr = [fv_addr + 8]. */
+            ir::IrValueId fn_addr = fn_->new_value(ir::IrType::I64); {
+                ir::IrInstr ld{};
+                ld.op          = ir::IrOp::LOAD;
+                ld.type        = ir::IrType::I64;
+                ld.dst         = fn_addr;
+                ld.operands    = {fv_addr};
+                ld.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(ld));
+            }
+            ir::IrValueId env_addr = fn_->new_value(ir::IrType::I64); {
+                ir::IrValueId fv_plus_8 = fn_->new_value(ir::IrType::PTR);
+                ir::IrValueId off8 = emit_const(ir::IrType::I64, 8, e->loc.line);
+                {
+                    ir::IrInstr ad{};
+                    ad.op          = ir::IrOp::ADD;
+                    ad.type        = ir::IrType::I64;
+                    ad.dst         = fv_plus_8;
+                    ad.operands    = {fv_addr, off8};
+                    ad.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(ad));
+                }
+                ir::IrInstr ld{};
+                ld.op          = ir::IrOp::LOAD;
+                ld.type        = ir::IrType::I64;
+                ld.dst         = env_addr;
+                ld.operands    = {fv_plus_8};
+                ld.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(ld));
+            }
+            /* Iterar fields/methods y emitir una CALLCLOSURE por cada uno. */
+            const uint32_t n = is_fields
+                ? comptime_field_count(tc_, t)
+                : comptime_method_count(tc_, t);
+            for (uint32_t i = 0; i < n; ++i) {
+                const std::string nm = is_fields
+                    ? comptime_field_name(tc_, t, i)
+                    : (i < comptime_method_count(tc_, t)
+                        ? [&](){
+                            /* Buscar el i-esimo method name. */
+                            if (t.kind == PrimitiveKind::STRUCT
+                             || t.kind == PrimitiveKind::CLASS) {
+                                auto it = tc_.class_layouts().find(t.struct_name);
+                                if (it != tc_.class_layouts().end()
+                                 && i < it->second.methods.size()) {
+                                    return it->second.methods[i].name;
+                                }
+                            }
+                            return std::string();
+                          }()
+                        : std::string());
+                if (nm.empty()) continue;
+                /* Build StringObject para el nombre. */
+                std::vector<uint8_t> bytes(nm.begin(), nm.end());
+                const uint64_t idx = out_mod_->intern_static_data(
+                    std::move(bytes));
+                ir::IrValueId v_addr = fn_->new_value(ir::IrType::PTR); {
+                    ir::IrInstr is{};
+                    is.op          = ir::IrOp::STR_LIT_ADDR;
+                    is.type        = ir::IrType::PTR;
+                    is.dst         = v_addr;
+                    is.imm         = idx;
+                    is.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(is));
+                }
+                ir::IrValueId v_len = emit_const(
+                    ir::IrType::I64,
+                    static_cast<uint64_t>(nm.size()), e->loc.line);
+                ir::IrValueId v_str = fn_->new_value(ir::IrType::I64); {
+                    ir::IrInstr ra{};
+                    ra.op            = ir::IrOp::RAW_ASM;
+                    ra.type          = ir::IrType::I64;
+                    ra.dst           = v_str;
+                    ra.operands      = {v_addr, v_len};
+                    ra.func_name     = std::string("strmake {dst}, {src0}, {src1}\n");
+                    ra.is_call_site  = true;
+                    ra.source_line   = e->loc.line;
+                    fn_->append(current_block_, std::move(ra));
+                }
+                /* CALLCLOSURE(env_addr, v_str) -- void return. */
+                ir::IrInstr cl{};
+                cl.op          = ir::IrOp::CALLCLOSURE;
+                cl.type        = ir::IrType::VOID;
+                cl.dst         = ir::IR_NO_VALUE;
+                cl.func_ptr    = fn_addr;
+                cl.operands    = {env_addr, v_str};
+                cl.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(cl));
+            }
+            out_value = ir::IR_NO_VALUE;
+            return true;
+        }
+
+        // -----------------------------------------------------------------
+        // Sprint 3-A introspection: field_get<T>(obj, "f") / field_set.
+        // Bypass de getfield/setfield: usa offset compile-time via
+        // comptime_field_offset.  El type checker ya valido tipos y
+        // que el segundo arg sea string literal.
+        // -----------------------------------------------------------------
+        if (!e->type_args.empty()
+         && (name == "field_get" || name == "field_set")) {
+            const bool is_get = (name == "field_get");
+            const Type t = tc_.resolve_type_node(e->type_args[0].get());
+            std::string fname;
+            if (e->args.size() >= 2) {
+                if (auto *slit = dynamic_cast<ast::StringLitExpr *>(
+                        e->args[1].get())) {
+                    fname = slit->value;
+                }
+            }
+            const int64_t off = comptime_field_offset(tc_, t, fname);
+            if (off < 0) {
+                error_at(e->loc,
+                    name + ": el tipo '" + comptime_type_name(tc_, t)
+                    + "' no tiene campo '" + fname + "'");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const Type     ftype = comptime_field_type(tc_, t, fname);
+            const ir::IrType ir_t = ir_type_from_primitive(ftype.kind);
+            /* Lower obj: el primer arg.  Para CLASS el SSA value es un
+             * host_ptr al ObjectHeader; para STRUCT inline es la direccion
+             * VM del slot (resultado de la ALLOCA o del campo padre).
+             * Detectamos por el TIPO declarado en T (no por el resultado de
+             * check_expr del arg, que podria ser COUNT/inferido). */
+            const ir::IrValueId obj = lower_expr(e->args[0].get());
+            if (obj == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            /* Para CLASS la convencion del codegen es is_host_ptr=true sobre
+             * el resultado de NEWOBJ/__new_<X> (host_ptr al ObjectHeader).
+             * Para STRUCT la convencion es is_host_ptr=false (slot VM).
+             * NO usamos emit_field_addr aqui porque su shortcut offset==0
+             * MUTA el flag is_host_ptr del base SSA value (rompe init-lists
+             * anteriores que comparten el binding).  En su lugar emitimos
+             * un ADD i64 explicito que produce un nuevo SSA value distinto
+             * del base, y propagamos is_host_ptr/pointee_is_host_ptr segun
+             * la naturaleza de T. */
+            const bool t_is_class = (t.kind == PrimitiveKind::CLASS);
+            ir::IrValueId addr;
+            if (off == 0) {
+                addr = obj;
+            } else {
+                ir::IrValueId off_val = fn_->new_value(ir::IrType::I64);
+                fn_->values[off_val].is_const  = true;
+                fn_->values[off_val].const_val = static_cast<uint64_t>(off);
+                {
+                    ir::IrInstr c{};
+                    c.op          = ir::IrOp::CONST;
+                    c.type        = ir::IrType::I64;
+                    c.dst         = off_val;
+                    c.imm         = static_cast<uint64_t>(off);
+                    c.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(c));
+                }
+                addr = fn_->new_value(ir::IrType::PTR);
+                fn_->values[addr].is_host_ptr = t_is_class;
+                ir::IrInstr ad{};
+                ad.op          = ir::IrOp::ADD;
+                ad.type        = ir::IrType::I64;
+                ad.dst         = addr;
+                ad.operands    = {obj, off_val};
+                ad.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(ad));
+            }
+            /* Si offset==0 y T es CLASS, el obj YA debe tener is_host_ptr.
+             * Si T es STRUCT con offset==0, el slot VM se mantiene sin
+             * tocar el flag (heredamos el state del obj, que ya es lo
+             * correcto). */
+            if (is_get) {
+                const ir::IrValueId dst = fn_->new_value(ir_t);
+                ir::IrInstr ld{};
+                ld.op          = ir::IrOp::LOAD;
+                ld.type        = ir_t;
+                ld.dst         = dst;
+                ld.operands    = {addr};
+                ld.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(ld));
+                /* Propagar is_host_ptr para campos PTR no virtuales (mismo
+                 * tratamiento que lower_class_field_load). */
+                if (ftype.kind == PrimitiveKind::PTR && !ftype.is_virtual) {
+                    fn_->values[dst].is_host_ptr = true;
+                }
+                /* Campo CLASS: el slot guarda un GcHandle, no un host_ptr.
+                 * Hacemos gcderef para obtener host_ptr fresco post-GC. */
+                if (ftype.kind == PrimitiveKind::CLASS) {
+                    ir::IrValueId v_host = fn_->new_value(ir::IrType::I64);
+                    fn_->values[v_host].is_host_ptr  = true;
+                    fn_->values[v_host].is_gc_object = true;
+                    ir::IrInstr deref{};
+                    deref.op        = ir::IrOp::RAW_ASM;
+                    deref.type      = ir::IrType::I64;
+                    deref.dst       = v_host;
+                    deref.operands  = {dst};
+                    deref.func_name = std::string(
+                        "gcderef cur0, {src0}\n"
+                        "xchg cur0, {dst}\n");
+                    deref.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(deref));
+                    out_value = v_host;
+                    return true;
+                }
+                out_value = dst;
+                return true;
+            }
+            /* field_set: lower value y emit STORE. */
+            if (e->args.size() < 3) {
+                /* Type checker ya emitio error; salir limpio. */
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            ir::IrValueId val = lower_expr(e->args[2].get());
+            if (val == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            /* Coerce el valor al tipo del campo si difiere.  El SSA value
+             * de val ya tiene su tipo en fn_->values[val].type; el cast
+             * inserta truncate/sext/zext segun signos y anchos. */
+            const ir::IrType val_t = fn_->values[val].type;
+            val = cast_if_needed(val, val_t, ir_t, e->loc.line);
+            ir::IrInstr st{};
+            st.op          = ir::IrOp::STORE;
+            st.type        = ir_t;
+            st.dst         = ir::IR_NO_VALUE;
+            /* Convencion IR: operands = {value, addr} (no al reves). */
+            st.operands    = {val, addr};
+            st.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(st));
+            out_value = ir::IR_NO_VALUE;
+            return true;
+        }
+
+        // -----------------------------------------------------------------
+        // Sprint 2 introspection: 12 builtins de fields/methods/types.
+        // Mismas garantias que Sprint 1: cada llamada baja a UN solo
+        // IrOp::CONST (o STR_LIT_ADDR + STRMAKE para los que devuelven
+        // string).  El type checker ya valido aridad + que los args
+        // runtime sean literales compile-time.
+        // -----------------------------------------------------------------
+        {
+            const bool one_targ_no_args =
+                name == "field_count" || name == "method_count"
+             || name == "is_class"    || name == "is_struct"
+             || name == "is_primitive";
+            const bool one_targ_str_arg =
+                name == "offsetof"    || name == "has_field"
+             || name == "has_method"  || name == "field_type";
+            const bool one_targ_int_arg = (name == "field_name");
+            const bool two_targ_no_args =
+                name == "is_subtype"  || name == "is_same";
+
+            if ((one_targ_no_args || one_targ_str_arg
+              || one_targ_int_arg || two_targ_no_args)
+             && !e->type_args.empty()) {
+                const uint32_t src_line = e->loc.line;
+                const Type t1 = tc_.resolve_type_node(e->type_args[0].get());
+                /* Helper local: emite STRMAKE con el nombre canonico recibido. */
+                auto emit_strmake_for = [&](const std::string &nm)
+                                            -> ir::IrValueId {
+                    std::vector<uint8_t> bytes(nm.begin(), nm.end());
+                    const uint64_t idx = out_mod_->intern_static_data(
+                        std::move(bytes));
+                    ir::IrValueId v_addr = fn_->new_value(ir::IrType::PTR); {
+                        ir::IrInstr is{};
+                        is.op          = ir::IrOp::STR_LIT_ADDR;
+                        is.type        = ir::IrType::PTR;
+                        is.dst         = v_addr;
+                        is.imm         = idx;
+                        is.source_line = src_line;
+                        fn_->append(current_block_, std::move(is));
+                    }
+                    ir::IrValueId v_len = emit_const(
+                        ir::IrType::I64,
+                        static_cast<uint64_t>(nm.size()), src_line);
+                    ir::IrValueId v_str = fn_->new_value(ir::IrType::I64);
+                    ir::IrInstr ra{};
+                    ra.op            = ir::IrOp::RAW_ASM;
+                    ra.type          = ir::IrType::I64;
+                    ra.dst           = v_str;
+                    ra.operands      = {v_addr, v_len};
+                    ra.func_name     = std::string("strmake {dst}, {src0}, {src1}\n");
+                    ra.is_call_site  = true;
+                    ra.source_line   = src_line;
+                    fn_->append(current_block_, std::move(ra));
+                    return v_str;
+                };
+
+                /* Extraer el arg literal compile-time si lo hay. */
+                std::string slit_arg;
+                uint64_t    ilit_arg = 0;
+                if (one_targ_str_arg) {
+                    auto *slit = dynamic_cast<ast::StringLitExpr *>(
+                        e->args[0].get());
+                    if (slit) slit_arg = slit->value;
+                }
+                if (one_targ_int_arg) {
+                    auto *ilit = dynamic_cast<ast::IntLitExpr *>(
+                        e->args[0].get());
+                    if (ilit) ilit_arg = ilit->value;
+                }
+
+                if (name == "field_count") {
+                    const uint32_t v = comptime_field_count(tc_, t1);
+                    out_value = emit_const(ir::IrType::U32, v, src_line);
+                    return true;
+                }
+                if (name == "method_count") {
+                    const uint32_t v = comptime_method_count(tc_, t1);
+                    out_value = emit_const(ir::IrType::U32, v, src_line);
+                    return true;
+                }
+                if (name == "is_class") {
+                    const bool v = comptime_is_class(t1);
+                    out_value = emit_const(ir::IrType::BOOL,
+                        v ? 1ULL : 0ULL, src_line);
+                    return true;
+                }
+                if (name == "is_struct") {
+                    const bool v = comptime_is_struct(tc_, t1);
+                    out_value = emit_const(ir::IrType::BOOL,
+                        v ? 1ULL : 0ULL, src_line);
+                    return true;
+                }
+                if (name == "is_primitive") {
+                    const bool v = comptime_is_primitive(t1);
+                    out_value = emit_const(ir::IrType::BOOL,
+                        v ? 1ULL : 0ULL, src_line);
+                    return true;
+                }
+                if (name == "offsetof") {
+                    const int64_t off = comptime_field_offset(tc_, t1, slit_arg);
+                    /* off==-1 (campo no existe): emitir error claro y
+                     * usar 0 como fallback para no romper el flujo. */
+                    if (off < 0) {
+                        diags_.error(e->loc,
+                            "offsetof: el tipo '" + comptime_type_name(tc_, t1)
+                            + "' no tiene campo '" + slit_arg + "'");
+                    }
+                    out_value = emit_const(ir::IrType::U64,
+                        off < 0 ? 0ULL : static_cast<uint64_t>(off), src_line);
+                    return true;
+                }
+                if (name == "has_field") {
+                    const bool v = comptime_has_field(tc_, t1, slit_arg);
+                    out_value = emit_const(ir::IrType::BOOL,
+                        v ? 1ULL : 0ULL, src_line);
+                    return true;
+                }
+                if (name == "has_method") {
+                    const bool v = comptime_has_method(tc_, t1, slit_arg);
+                    out_value = emit_const(ir::IrType::BOOL,
+                        v ? 1ULL : 0ULL, src_line);
+                    return true;
+                }
+                if (name == "field_type") {
+                    const std::string tn = comptime_field_type_name(
+                        tc_, t1, slit_arg);
+                    if (tn.empty()) {
+                        diags_.error(e->loc,
+                            "field_type: el tipo '" + comptime_type_name(tc_, t1)
+                            + "' no tiene campo '" + slit_arg + "'");
+                    }
+                    out_value = emit_strmake_for(tn);
+                    return true;
+                }
+                if (name == "field_name") {
+                    const std::string nm_v = comptime_field_name(
+                        tc_, t1, static_cast<uint32_t>(ilit_arg));
+                    if (nm_v.empty()) {
+                        diags_.error(e->loc,
+                            "field_name: el tipo '" + comptime_type_name(tc_, t1)
+                            + "' no tiene campo en indice "
+                            + std::to_string(ilit_arg));
+                    }
+                    out_value = emit_strmake_for(nm_v);
+                    return true;
+                }
+                if (name == "is_same") {
+                    const Type t2 = tc_.resolve_type_node(
+                        e->type_args[1].get());
+                    const bool v = comptime_is_same(tc_, t1, t2);
+                    out_value = emit_const(ir::IrType::BOOL,
+                        v ? 1ULL : 0ULL, src_line);
+                    return true;
+                }
+                if (name == "is_subtype") {
+                    const Type t2 = tc_.resolve_type_node(
+                        e->type_args[1].get());
+                    const bool v = comptime_is_subtype(tc_, t1, t2);
+                    out_value = emit_const(ir::IrType::BOOL,
+                        v ? 1ULL : 0ULL, src_line);
+                    return true;
+                }
+            }
+        }
+
         // Conjunto de nombres builtin reconocidos.  Si el nombre no esta
         // aqui devolvemos false para que lower_call siga con la ruta
         // generica (CALL a una funcion del usuario).
         const bool is_print     = (name == "print");
-        const bool is_println   = (name == "println");
+        /* Phase MC.18: `comptime_print` / `ct_print` se aliasan a
+         * `println` -- en el path VM-lowered es exactamente eso (print
+         * a stderr).  El macro corre en compile time (porque la
+         * ComptimeRuntime ejecuta el body al type-checkear el call
+         * site), asi que el output aparece durante la compilacion
+         * igual que el AST eval. */
+        const bool is_println   = (name == "println"
+                                    || name == "comptime_print"
+                                    || name == "ct_print");
         const bool is_echo      = (name == "echo");  // alias de print
         const bool is_flush     = (name == "flush"); // vio_flush() sin args
         const bool is_print_int = (name == "print_int");
@@ -8536,17 +10657,34 @@ namespace vex {
         const bool is_move       = (name == "move");
         const bool is_get        = (name == "ptr_of");
         const bool is_use_count  = (name == "use_count");
-        // A.18 - builtins de string.
-        const bool is_str_length  = (name == "str_length");
+        // Builtins de string: cada uno baja a una sola instruccion bytecode
+        // dedicada (STRLEN, STRGETBYTES, STRRAW, etc.) sin pasar por CALLN.
+        /* Phase MC.15B: alias comptime_* a sus equivalentes runtime str_*
+         * cuando aparecen en cuerpos de @Macro lowereados a IR.  El
+         * type_checker ya valido el call con el comptime evaluator; aqui
+         * solo emitimos el bytecode que la VM ejecutara al invocar el
+         * macro lowereado.  Mismo path que el runtime str_* user-facing. */
+        const bool is_str_length  = (name == "str_length"  || name == "comptime_strlen");
         const bool is_str_bytes   = (name == "str_bytes");
         const bool is_str_cstr    = (name == "str_cstr");
         const bool is_str_wstr    = (name == "str_wstr");
         const bool is_str_hash    = (name == "str_hash");
         const bool is_str_intern  = (name == "str_intern");
-        const bool is_str_concat  = (name == "str_concat");
-        const bool is_str_equals  = (name == "str_equals");
+        const bool is_str_concat  = (name == "str_concat" || name == "comptime_concat");
+        const bool is_str_equals  = (name == "str_equals" || name == "comptime_streq");
         const bool is_str_make    = (name == "str_make");
         const bool is_str_convert = (name == "str_convert");
+        /* Phase MC.15C: aliases comptime adicionales que lowerean a
+         * codigo runtime (eliminando rejection en macro pre-validation). */
+        const bool is_to_str       = (name == "to_str" || name == "comptime_to_str");
+        const bool is_chr_b        = (name == "chr"    || name == "comptime_chr");
+        const bool is_ord_b        = (name == "ord"    || name == "comptime_ord");
+        const bool is_substr_b     = (name == "substr" || name == "comptime_substr");
+        const bool is_gensym_b     = (name == "gensym");
+        const bool is_repeat_b     = (name == "repeat"   || name == "comptime_repeat");
+        const bool is_replace_b    = (name == "replace"  || name == "comptime_replace");
+        const bool is_contains_b   = (name == "contains" || name == "comptime_contains");
+        const bool is_static_assert_b = (name == "static_assert");
         const bool is_any_builtin = is_print || is_println || is_echo
                 || is_flush || is_print_int
                 || is_print_uint || is_print_hex
@@ -8581,6 +10719,10 @@ namespace vex {
                 || is_str_hash || is_str_intern
                 || is_str_concat || is_str_equals
                 || is_str_make || is_str_convert
+                || is_to_str || is_chr_b || is_ord_b
+                || is_substr_b || is_gensym_b
+                || is_repeat_b || is_replace_b || is_contains_b
+                || is_static_assert_b
                 || is_any_math
                 || is_col_ctor
                 || is_dispose
@@ -9524,7 +11666,7 @@ namespace vex {
             return true;
         }
 
-        // ===== A.27.1 - dispose(xs) =====
+        // ===== Builtin dispose(xs) =====
         // Libera explicitamente una coleccion antes del exit del scope.
         // Emite CALLN al free fn correspondiente al tipo del local + reescribe
         // el binding local a 0 para que el cleanup automatico al exit pase
@@ -9897,6 +12039,461 @@ namespace vex {
             fn_->append(current_block_, std::move(ra));
             out_value = ir::IR_NO_VALUE;
             return true;
+        }
+
+        /* Phase MC.15C: builtins comptime aliasados a codigo runtime.
+         * Cuando aparecen en cuerpos de @Macro lowereados a IR, se
+         * compilan a una secuencia de bytecode equivalente al AST eval. */
+
+        if (is_to_str) {
+            /* to_str(int) -> string.  Reusa el helper
+             * stringify_primitive_via_native con vio_int_to_vmbuf. */
+            if (e->args.size() != 1) {
+                error_at(e->loc, "to_str: se esperaba 1 argumento");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_val = lower_expr(e->args[0].get());
+            if (v_val == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            out_value = stringify_primitive_via_native(
+                v_val, "vio_int_to_vmbuf", e->loc.line);
+            return true;
+        }
+
+        if (is_chr_b) {
+            /* chr(codepoint) -> string.  Reusa vio_char_to_vmbuf
+             * (codepoint -> UTF-8 bytes -> STRMAKE). */
+            if (e->args.size() != 1) {
+                error_at(e->loc, "chr: se esperaba 1 argumento (codepoint)");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_cp = lower_expr(e->args[0].get());
+            if (v_cp == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            out_value = stringify_primitive_via_native(
+                v_cp, "vio_char_to_vmbuf", e->loc.line);
+            return true;
+        }
+
+        if (is_ord_b) {
+            /* ord(s) -> u64.  Devuelve el primer codepoint del string.
+             * Fast path ASCII: emit strraw + LOAD u8 (host).  Para
+             * multi-byte UTF-8 retorna solo el primer byte (lead byte);
+             * el caller puede decodear si necesita el codepoint real. */
+            if (e->args.size() != 1) {
+                error_at(e->loc, "ord: se esperaba 1 argumento (string)");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_str = lower_expr(e->args[0].get());
+            if (v_str == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            /* strraw r_raw, r_str  -> host_ptr a bytes */
+            ir::IrValueId v_raw = fn_->new_value(ir::IrType::PTR);
+            fn_->values[v_raw].is_host_ptr = true;
+            {
+                ir::IrInstr ra{};
+                ra.op           = ir::IrOp::RAW_ASM;
+                ra.type         = ir::IrType::PTR;
+                ra.dst          = v_raw;
+                ra.operands     = {v_str};
+                ra.func_name    = "strraw {dst}, {src0}\n";
+                ra.source_line  = e->loc.line;
+                ra.is_call_site = true;
+                fn_->append(current_block_, std::move(ra));
+            }
+            /* LOAD.u8 al primer byte (host).  El IR LOAD con is_host_ptr
+             * en la fuente emite `movh` automaticamente. */
+            ir::IrValueId v_byte = fn_->new_value(ir::IrType::U64);
+            {
+                ir::IrInstr ld{};
+                ld.op          = ir::IrOp::LOAD;
+                ld.type        = ir::IrType::U8;
+                ld.dst         = v_byte;
+                ld.operands    = {v_raw};
+                ld.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(ld));
+            }
+            out_value = v_byte;
+            return true;
+        }
+
+        if (is_substr_b) {
+            /* substr(s, start, len) -> string.  Empaqueta start+len en
+             * un u64 (hi<<32 | lo) y emite strslice. */
+            if (e->args.size() != 3) {
+                error_at(e->loc, "substr: se esperaba 3 argumentos (string, start, len)");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_str   = lower_expr(e->args[0].get());
+            const ir::IrValueId v_start = lower_expr(e->args[1].get());
+            const ir::IrValueId v_len   = lower_expr(e->args[2].get());
+            if (v_str == ir::IR_NO_VALUE || v_start == ir::IR_NO_VALUE
+             || v_len == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            /* Pack: r_range = (start << 32) | len */
+            ir::IrValueId v_shifted = fn_->new_value(ir::IrType::U64);
+            {
+                ir::IrInstr sh{};
+                sh.op          = ir::IrOp::SHL;
+                sh.type        = ir::IrType::U64;
+                sh.dst         = v_shifted;
+                sh.operands    = {v_start, emit_const(ir::IrType::U64, 32, e->loc.line)};
+                sh.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(sh));
+            }
+            ir::IrValueId v_range = fn_->new_value(ir::IrType::U64);
+            {
+                ir::IrInstr orop{};
+                orop.op          = ir::IrOp::OR;
+                orop.type        = ir::IrType::U64;
+                orop.dst         = v_range;
+                orop.operands    = {v_shifted, v_len};
+                orop.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(orop));
+            }
+            ir::IrValueId v_dst = fn_->new_value(ir::IrType::I64);
+            {
+                ir::IrInstr sl{};
+                sl.op           = ir::IrOp::RAW_ASM;
+                sl.type         = ir::IrType::I64;
+                sl.dst          = v_dst;
+                sl.operands     = {v_str, v_range};
+                sl.func_name    = "strslice {dst}, {src0}, {src1}\n";
+                sl.source_line  = e->loc.line;
+                sl.is_call_site = true;
+                fn_->append(current_block_, std::move(sl));
+            }
+            out_value = v_dst;
+            return true;
+        }
+
+        if (is_static_assert_b) {
+            /* Phase MC.20: `static_assert(cond, msg)` se baja a CALLN
+             * a la virtual lib `vesta_comptime:static_assert`.  El fn
+             * recibe (cond_i64, msg_cstr) y emite diagnostic error si
+             * cond es 0.  Cuando el macro corre via VM en compile time,
+             * la check se ejecuta tambien en compile time -- mismo
+             * resultado que el AST eval inline. */
+            if (e->args.size() != 2) {
+                error_at(e->loc, "static_assert: se esperaba 2 args (cond, msg)");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const ir::IrValueId v_cond = lower_expr(e->args[0].get());
+            if (v_cond == ir::IR_NO_VALUE) {
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            /* msg: solo soportamos string literal no interpolado.  Lo
+             * pasamos como host_ptr al buffer estable de static_data
+             * (NUL-terminated por construccion). */
+            const ast::Expr *msg_e = e->args[1].get();
+            if (!msg_e || msg_e->kind != ast::NodeKind::StringLitExpr) {
+                error_at(e->loc, "static_assert: el msg debe ser string literal");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            const auto *slit = static_cast<const ast::StringLitExpr *>(msg_e);
+            if (slit->is_interpolated()) {
+                error_at(e->loc, "static_assert: msg no puede ser interpolado");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            /* Intern el msg como bytes + NUL terminator (asi c_str
+             * funciona sobre el host_ptr exportado por STR_LIT_ADDR). */
+            std::vector<uint8_t> bytes(slit->value.begin(), slit->value.end());
+            bytes.push_back('\0');
+            const uint64_t idx = out_mod_->intern_static_data(std::move(bytes));
+            ir::IrValueId v_msg = fn_->new_value(ir::IrType::PTR);
+            fn_->values[v_msg].is_host_ptr = true;
+            {
+                ir::IrInstr is{};
+                is.op          = ir::IrOp::STR_LIT_ADDR;
+                is.type        = ir::IrType::PTR;
+                is.dst         = v_msg;
+                is.imm         = idx;
+                is.source_line = e->loc.line;
+                fn_->append(current_block_, std::move(is));
+            }
+            /* CALLN @Method("vesta_comptime:static_assert") con (cond, msg). */
+            out_mod_->register_native_import("vesta_comptime", "static_assert");
+            ir::IrValueId v_dst = fn_->new_value(ir::IrType::I64);
+            ir::IrInstr cl{};
+            cl.op          = ir::IrOp::CALLN;
+            cl.type        = ir::IrType::I64;
+            cl.dst         = v_dst;
+            cl.func_name   = "vesta_comptime:static_assert";
+            cl.operands    = {v_cond, v_msg};
+            cl.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(cl));
+            out_value = v_dst;
+            return true;
+        }
+
+        if (is_gensym_b) {
+            /* gensym() -> u64.  Counter incrementado en cada call.
+             * Implementado via CALLN a vio_gensym() en el plugin
+             * vesta_io que mantiene un counter estatico. */
+            if (!e->args.empty()) {
+                error_at(e->loc, "gensym: no acepta argumentos");
+                out_value = ir::IR_NO_VALUE;
+                return true;
+            }
+            out_mod_->register_native_import(
+                std::string("stdlib/native/io/vesta_io"), "vio_gensym");
+            ir::IrValueId v_dst = fn_->new_value(ir::IrType::U64);
+            ir::IrInstr cl{};
+            cl.op          = ir::IrOp::CALLN;
+            cl.type        = ir::IrType::U64;
+            cl.dst         = v_dst;
+            cl.func_name   = "stdlib/native/io/vesta_io:vio_gensym";
+            cl.operands    = {};
+            cl.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(cl));
+            out_value = v_dst;
+            return true;
+        }
+
+        if (is_repeat_b || is_replace_b || is_contains_b) {
+            /* Phase MC.15D: builtins de string que requieren acceso a
+             * los bytes RAW de StringObjects (via STRRAW) y un buffer
+             * destino en vm_mem.  Layout comun:
+             *   1. Resolver SSA values de cada arg (string -> handle).
+             *   2. Para cada string arg: emitir STRRAW + STRGETBYTES
+             *      para obtener host_ptr + length.  Pasar host_ptr como
+             *      vm_addr al native (que internamente lo trata como
+             *      direccion VM via vm_read_bytes).
+             *
+             * NOTA: STRRAW devuelve host_ptr, no vm_addr.  Pero los
+             * helpers usan `vm_read_bytes` que toma direcciones VM.
+             * Para evitar confusion, copiamos cada string a un buffer
+             * VM via ALLOCA + copia byte-por-byte... mucho overhead.
+             *
+             * Alternativa: el helper acepta DIRECTAMENTE el host_ptr
+             * (uint64) y lo dereferencea como tal.  Re-disenamos los
+             * natives para tomar host_ptr en lugar de vm_addr.  Para
+             * mantener consistencia con vio_*_to_vmbuf, los repeat/
+             * replace todavia usan vm_addr para el DESTINO; el caller
+             * debe pasar un buffer ALLOCA fresco.
+             *
+             * Plan v1 simplificado: TODOS los args string se materializan
+             * a buffer VM via ALLOCA + write.  Costoso para strings
+             * grandes pero correcto.  Optimizable despues. */
+
+            auto materialize_str_to_vmbuf =
+                [&](ir::IrValueId v_str, int ln) ->
+                std::pair<ir::IrValueId, ir::IrValueId> {
+                /* Returns (vm_addr, byte_len).  Aloca buffer VM,
+                 * llama STRRAW + STRGETBYTES, copia bytes a buffer VM. */
+                ir::IrValueId v_raw = fn_->new_value(ir::IrType::PTR);
+                fn_->values[v_raw].is_host_ptr = true;
+                {
+                    ir::IrInstr ra{};
+                    ra.op           = ir::IrOp::RAW_ASM;
+                    ra.type         = ir::IrType::PTR;
+                    ra.dst          = v_raw;
+                    ra.operands     = {v_str};
+                    ra.func_name    = "strraw {dst}, {src0}\n";
+                    ra.source_line  = ln;
+                    ra.is_call_site = true;
+                    fn_->append(current_block_, std::move(ra));
+                }
+                ir::IrValueId v_byte_len = fn_->new_value(ir::IrType::U64);
+                {
+                    ir::IrInstr ra{};
+                    ra.op           = ir::IrOp::RAW_ASM;
+                    ra.type         = ir::IrType::U64;
+                    ra.dst          = v_byte_len;
+                    ra.operands     = {v_str};
+                    ra.func_name    = "strgetbytes {dst}, {src0}\n";
+                    ra.source_line  = ln;
+                    ra.is_call_site = true;
+                    fn_->append(current_block_, std::move(ra));
+                }
+                /* v_raw es host_ptr -- los helpers nativos lo aceptan
+                 * directamente via `(void *)(uint64_t)host_ptr` y
+                 * leen con memcpy.  Pero g_api->vm_read_bytes toma
+                 * VM address, no host_ptr.  Para usar vm_read_bytes
+                 * necesitamos un VM address.
+                 *
+                 * Workaround: ya que los helpers necesitan VM address,
+                 * vamos a alocar un buffer en VM (ALLOCA) y copiar via
+                 * un nuevo intrinsic 'memcpyh_to_v' que copia desde
+                 * host_ptr a vm_mem.  PERO ese intrinsic no existe.
+                 *
+                 * Solucion simple: cambiar los helpers nativos para
+                 * que tomen host_ptr.  Asi pasamos v_raw directo. */
+                return {v_raw, v_byte_len};
+            };
+
+            if (is_repeat_b) {
+                if (e->args.size() != 2) {
+                    error_at(e->loc, "repeat: se esperaba 2 argumentos (string, n)");
+                    out_value = ir::IR_NO_VALUE;
+                    return true;
+                }
+                const ir::IrValueId v_str = lower_expr(e->args[0].get());
+                const ir::IrValueId v_n   = lower_expr(e->args[1].get());
+                if (v_str == ir::IR_NO_VALUE || v_n == ir::IR_NO_VALUE) {
+                    out_value = ir::IR_NO_VALUE;
+                    return true;
+                }
+                auto [v_src_addr, v_src_len] =
+                    materialize_str_to_vmbuf(v_str, e->loc.line);
+                /* Aloca buffer destino (max 16 MB).  Tamano runtime no
+                 * conocido en compile-time; reservamos ALLOCA grande
+                 * (64 KB) como cap razonable.  El helper devuelve la
+                 * longitud escrita y abortara con 0 si excede 16 MB. */
+                ir::IrValueId v_dst_buf = fn_->new_value(ir::IrType::PTR);
+                {
+                    ir::IrInstr al{};
+                    al.op          = ir::IrOp::ALLOCA;
+                    al.type        = ir::IrType::I8;
+                    al.dst         = v_dst_buf;
+                    al.imm         = 65536;
+                    al.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(al));
+                }
+                const ir::IrValueId v_proc = emit_getproc(e->loc.line);
+                out_mod_->register_native_import(
+                    "stdlib/native/io/vesta_io", "vstr_repeat_to_vmbuf");
+                ir::IrValueId v_len = fn_->new_value(ir::IrType::U64);
+                {
+                    ir::IrInstr cl{};
+                    cl.op          = ir::IrOp::CALLN;
+                    cl.type        = ir::IrType::U64;
+                    cl.dst         = v_len;
+                    cl.func_name   = "stdlib/native/io/vesta_io:vstr_repeat_to_vmbuf";
+                    cl.operands    = {v_proc, v_dst_buf, v_src_addr, v_src_len, v_n};
+                    cl.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(cl));
+                }
+                /* STRMAKE desde el buffer dst. */
+                ir::IrValueId v_h = fn_->new_value(ir::IrType::I64);
+                {
+                    ir::IrInstr ra{};
+                    ra.op           = ir::IrOp::RAW_ASM;
+                    ra.type         = ir::IrType::I64;
+                    ra.dst          = v_h;
+                    ra.operands     = {v_dst_buf, v_len};
+                    ra.func_name    = "strmake {dst}, {src0}, {src1}\n";
+                    ra.source_line  = e->loc.line;
+                    ra.is_call_site = true;
+                    fn_->append(current_block_, std::move(ra));
+                }
+                out_value = v_h;
+                return true;
+            }
+
+            if (is_contains_b) {
+                if (e->args.size() != 2) {
+                    error_at(e->loc, "contains: se esperaba 2 argumentos (string, substring)");
+                    out_value = ir::IR_NO_VALUE;
+                    return true;
+                }
+                const ir::IrValueId v_hay    = lower_expr(e->args[0].get());
+                const ir::IrValueId v_needle = lower_expr(e->args[1].get());
+                if (v_hay == ir::IR_NO_VALUE || v_needle == ir::IR_NO_VALUE) {
+                    out_value = ir::IR_NO_VALUE;
+                    return true;
+                }
+                auto [v_h_addr, v_h_len] =
+                    materialize_str_to_vmbuf(v_hay, e->loc.line);
+                auto [v_n_addr, v_n_len] =
+                    materialize_str_to_vmbuf(v_needle, e->loc.line);
+                const ir::IrValueId v_proc = emit_getproc(e->loc.line);
+                out_mod_->register_native_import(
+                    "stdlib/native/io/vesta_io", "vstr_contains");
+                ir::IrValueId v_dst = fn_->new_value(ir::IrType::BOOL);
+                {
+                    ir::IrInstr cl{};
+                    cl.op          = ir::IrOp::CALLN;
+                    cl.type        = ir::IrType::BOOL;
+                    cl.dst         = v_dst;
+                    cl.func_name   = "stdlib/native/io/vesta_io:vstr_contains";
+                    cl.operands    = {v_proc, v_h_addr, v_h_len, v_n_addr, v_n_len};
+                    cl.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(cl));
+                }
+                out_value = v_dst;
+                return true;
+            }
+
+            if (is_replace_b) {
+                if (e->args.size() != 3) {
+                    error_at(e->loc, "replace: se esperaba 3 argumentos (string, from, to)");
+                    out_value = ir::IR_NO_VALUE;
+                    return true;
+                }
+                const ir::IrValueId v_src  = lower_expr(e->args[0].get());
+                const ir::IrValueId v_from = lower_expr(e->args[1].get());
+                const ir::IrValueId v_to   = lower_expr(e->args[2].get());
+                if (v_src == ir::IR_NO_VALUE || v_from == ir::IR_NO_VALUE
+                 || v_to == ir::IR_NO_VALUE) {
+                    out_value = ir::IR_NO_VALUE;
+                    return true;
+                }
+                auto [v_src_addr,  v_src_len ] =
+                    materialize_str_to_vmbuf(v_src,  e->loc.line);
+                auto [v_from_addr, v_from_len] =
+                    materialize_str_to_vmbuf(v_from, e->loc.line);
+                auto [v_to_addr,   v_to_len  ] =
+                    materialize_str_to_vmbuf(v_to,   e->loc.line);
+                /* Buffer destino (64 KB ALLOCA). */
+                ir::IrValueId v_dst_buf = fn_->new_value(ir::IrType::PTR);
+                {
+                    ir::IrInstr al{};
+                    al.op          = ir::IrOp::ALLOCA;
+                    al.type        = ir::IrType::I8;
+                    al.dst         = v_dst_buf;
+                    al.imm         = 65536;
+                    al.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(al));
+                }
+                const ir::IrValueId v_proc = emit_getproc(e->loc.line);
+                out_mod_->register_native_import(
+                    "stdlib/native/io/vesta_io", "vstr_replace_to_vmbuf");
+                ir::IrValueId v_len = fn_->new_value(ir::IrType::U64);
+                {
+                    ir::IrInstr cl{};
+                    cl.op          = ir::IrOp::CALLN;
+                    cl.type        = ir::IrType::U64;
+                    cl.dst         = v_len;
+                    cl.func_name   = "stdlib/native/io/vesta_io:vstr_replace_to_vmbuf";
+                    cl.operands    = {v_proc, v_dst_buf,
+                                       v_src_addr,  v_src_len,
+                                       v_from_addr, v_from_len,
+                                       v_to_addr,   v_to_len};
+                    cl.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(cl));
+                }
+                ir::IrValueId v_h = fn_->new_value(ir::IrType::I64);
+                {
+                    ir::IrInstr ra{};
+                    ra.op           = ir::IrOp::RAW_ASM;
+                    ra.type         = ir::IrType::I64;
+                    ra.dst          = v_h;
+                    ra.operands     = {v_dst_buf, v_len};
+                    ra.func_name    = "strmake {dst}, {src0}, {src1}\n";
+                    ra.source_line  = e->loc.line;
+                    ra.is_call_site = true;
+                    fn_->append(current_block_, std::move(ra));
+                }
+                out_value = v_h;
+                return true;
+            }
         }
 
         // ----- builtins de string -----
@@ -11443,8 +14040,10 @@ namespace vex {
             }
             // Si el owner es unique<T>/shared<T>, equivale a ptr_of(owner)
             // que carga slot+0.  Si es una variable plain, devolvemos
-            // &owner (su SSA value, que ya tiene is_host_ptr correcto via
-            // address-taken promotion del A.3.4.a).
+            // &owner (su SSA value, que ya tiene is_host_ptr correcto
+            // gracias al pre-pase de address-taken promotion: cualquier
+            // local cuya direccion se toma con @c & se promociona a slot
+            // estable en stack en lugar de vivir solo en un SSA value).
             const Type owner_t = e->args[0]->result_type;
             // F3 reborrow: si el arg ES un borrow/borrow_mut (var o param),
             // su SSA value YA ES el host_ptr al payload.  No queremos
@@ -12040,8 +14639,11 @@ namespace vex {
                 const ir::IrValueId vid = fn.new_value(pt, "%" + p->name);
                 fn.values[vid].is_param = true;
                 if (param_is_class) {
-                    // A.32.fix - param de tipo CLASS es host_ptr GC; el
-                    // regalloc debe refrescarlo via gchandle/gcderef.
+                    // Param de tipo CLASS es host_ptr a un objeto GC.
+                    // Marcamos @c is_gc_object para que el regalloc, al
+                    // salvar este reg alrededor de un CALL que pueda
+                    // disparar GC, lo haga via @c gchandle (handle estable)
+                    // y restaure con @c gcderef (host_ptr fresco post-GC).
                     fn.values[vid].is_host_ptr  = true;
                     fn.values[vid].is_gc_object = true;
                 } else if (param_is_host_ptr) {
@@ -13444,7 +16046,10 @@ namespace vex {
             if (!a) return ir::IR_NO_VALUE;
             // Auto-promocion literal -> StringObject cuando el parametro
             // espera STRING y el arg es un StringLit no interpolado.
-            // Mismo patron que lower_call para funciones libres (A.34.fix).
+            // Mismo patron que @c lower_call usa para funciones libres:
+            // sin esto, pasar @c helper("hola") a @c void helper(string s)
+            // pushearia la direccion cruda del literal como i64 (PTR) y
+            // el callee crashearia al hacer @c strraw s con ptr invalido.
             // Sin esto, str_cstr/str_bytes dentro del metodo trataban el
             // PTR del literal como GcHandle invalido y leian garbage.
             const bool param_is_string =
@@ -13718,6 +16323,89 @@ namespace vex {
         return v;
     }
 
+    /**
+     * @brief Phase MC.17.2 -- obtiene (o aloca) el slot de @c static_data
+     * para un comptime global.
+     *
+     * Lookup en @c comptime_global_slots_; si no esta, lee el valor
+     * inicial desde @c tc_.comptime_const_values_, emite un slot de 8
+     * bytes con esos bits y registra el mapping name -> idx.
+     *
+     * Solo soporta valores int (i64/u64/bool) en v1.  Strings/structs
+     * requeririan inicializacion en @c __module_init via STRMAKE/etc.,
+     * lo que es un sprint adicional.
+     *
+     * @return Indice valido (`s_<idx>` referenciable via STR_LIT_ADDR),
+     *         o @c UINT64_MAX si el global no es soportado en v1.
+     */
+    uint64_t Lowering::get_or_create_comptime_global_slot(const std::string &name) {
+        auto it = comptime_global_slots_.find(name);
+        if (it != comptime_global_slots_.end()) return it->second;
+        const auto &cgv = tc_.comptime_const_values();
+        auto cit = cgv.find(name);
+        if (cit == cgv.end()) return UINT64_MAX;
+        /* Solo int en v1 -- strings serializados requieren STRMAKE en
+         * __module_init que no esta integrado todavia. */
+        if (cit->second.is_str) return UINT64_MAX;
+        /* Empaquetar el valor inicial como 8 bytes little-endian. */
+        const uint64_t init_val = static_cast<uint64_t>(cit->second.value);
+        std::vector<uint8_t> bytes(8);
+        for (int i = 0; i < 8; ++i) {
+            bytes[i] = static_cast<uint8_t>((init_val >> (i * 8)) & 0xFFu);
+        }
+        const uint64_t idx = out_mod_->intern_static_data(std::move(bytes));
+        comptime_global_slots_[name] = idx;
+        return idx;
+    }
+
+    ir::IrValueId Lowering::stringify_primitive_via_native(
+            ir::IrValueId v_val,
+            const char   *native_fn,
+            uint32_t      source_line)
+    {
+        const int ln = static_cast<int>(source_line);
+        /* 1. ALLOCA 32 bytes -- buffer en stack VM.  Suficiente para
+         *    todos los tipos: i64=20+signo, hex=18, "false"=5, UTF-8 4 B. */
+        ir::IrValueId v_buf = fn_->new_value(ir::IrType::PTR); {
+            ir::IrInstr al{};
+            al.op          = ir::IrOp::ALLOCA;
+            al.type        = ir::IrType::I8;
+            al.dst         = v_buf;
+            al.imm         = 32;
+            al.source_line = ln;
+            fn_->append(current_block_, std::move(al));
+        }
+        /* 2. proc_ptr via getproc. */
+        const ir::IrValueId v_proc = emit_getproc(ln);
+        /* 3. CALLN al native: devuelve length escrita en buf. */
+        out_mod_->register_native_import(
+            std::string("stdlib/native/io/vesta_io"), native_fn);
+        ir::IrValueId v_len = fn_->new_value(ir::IrType::I64); {
+            ir::IrInstr cl{};
+            cl.op          = ir::IrOp::CALLN;
+            cl.type        = ir::IrType::I64;
+            cl.dst         = v_len;
+            cl.func_name   = std::string("stdlib/native/io/vesta_io:")
+                          + native_fn;
+            cl.operands    = {v_proc, v_buf, v_val};
+            cl.source_line = ln;
+            fn_->append(current_block_, std::move(cl));
+        }
+        /* 4. STRMAKE desde buf vm_mem. */
+        ir::IrValueId v_h = fn_->new_value(ir::IrType::I64); {
+            ir::IrInstr ra{};
+            ra.op           = ir::IrOp::RAW_ASM;
+            ra.type         = ir::IrType::I64;
+            ra.dst          = v_h;
+            ra.operands     = {v_buf, v_len};
+            ra.func_name    = std::string("strmake {dst}, {src0}, {src1}\n");
+            ra.source_line  = ln;
+            ra.is_call_site = true;
+            fn_->append(current_block_, std::move(ra));
+        }
+        return v_h;
+    }
+
     ir::IrValueId Lowering::cast_if_needed(ir::IrValueId v,
                                            ir::IrType    from, ir::IrType to,
                                            uint32_t      source_line,
@@ -13929,10 +16617,13 @@ namespace vex {
                     return;
                 }
                 case ast::NodeKind::LambdaExpr: {
-                    // A.10 closures: las captures mutadas dentro del body
-                    // de la lambda deben ser address-taken en el outer
-                    // scope (capture-by-reference).  El env block guarda
-                    // su PUNTERO; el helper hace LOAD/STORE indirectos.
+                    // Captures mutables: las variables modificadas dentro
+                    // del cuerpo de la lambda deben ser address-taken en
+                    // el outer scope para que el modelo de captura-por-
+                    // referencia funcione.  El env block guarda el PUNTERO
+                    // al slot del owner; el helper de la lambda hace
+                    // LOAD/STORE indirectos sobre ese puntero, de modo
+                    // que las mutaciones se ven desde fuera del lambda.
                     auto *lam = static_cast<ast::LambdaExpr *>(e);
                     for (const auto &nm: lam->mutable_captures) {
                         address_taken_locals_.insert(nm);
@@ -13954,9 +16645,10 @@ namespace vex {
                 }
                 case ast::NodeKind::CallExpr: {
                     auto *c = static_cast<ast::CallExpr *>(e);
-                    // Borrow checker (A.36): lend(x) / lend_mut(x) sobre
-                    // una variable local plain requiere tomar su direccion
-                    // (el borrow ES un host_ptr al slot del local).
+                    // Borrow checker: lend(x) / lend_mut(x) sobre una
+                    // variable local plain requiere tomar su direccion
+                    // (un borrow ES, en runtime, un host_ptr al slot
+                    // donde vive el local; cero overhead vs un T*).
                     // Forzamos address-taken promotion para que el lowering
                     // deje el local en stack via ALLOCA + LOAD/STORE en
                     // lugar de en registro SSA puro.  Sin esto, lend(local)
@@ -14320,9 +17012,13 @@ namespace vex {
                                ir::IrType         ir_ty, uint32_t     source_line) {
         if (!address_taken_locals_.count(name)) {
             update_scope(name, v);
-            // A.17.y - Si la variable tiene slot activo en un try, ALSO
-            // emitir STORE al slot para que el throw + catch vea el ultimo
-            // valor escrito incluso tras corrupcion de registros.
+            // Si la variable tiene slot activo en un try, ADICIONALMENTE
+            // emitir STORE al slot.  El motivo: cuando ocurre un @c throw
+            // dentro del body del try, el handler en el catch necesita el
+            // ultimo valor de la variable, pero do_throw restaura el RSP
+            // y descarta cualquier @c push del save/restore alrededor de
+            // los CALLs.  Sin este STORE redundante, el catch leeria un
+            // registro con un valor obsoleto o corrupto.
             auto it_slot = try_spill_slots_.find(name);
             if (it_slot != try_spill_slots_.end()) {
                 // Usar el tipo real del valor para que el STORE escriba
@@ -14376,7 +17072,7 @@ namespace vex {
 
     void Lowering::unsupported(SourceLoc loc, const char *feature) {
         diags_.error(std::move(loc),
-                     std::string("lowering: caracteristica aun no soportada en A.1: ") + feature);
+                     std::string("lowering: caracteristica aun no soportada: ") + feature);
     }
 
     void Lowering::error_at(SourceLoc loc, std::string msg) {

@@ -1,6 +1,10 @@
 # archivos ocultos y de configuración
 .*
 
+# archivos de memoria temporales
+memoria_*
+
+
 # carpetas de configuración de IDEs y entornos virtuales
 .idea
 .xmake
@@ -63,3 +67,4 @@ tests/vex/test_vex_e2e.sh
 tem
 temp
 tmp
+presentacion

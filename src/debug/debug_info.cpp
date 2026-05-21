@@ -169,37 +169,89 @@ namespace debug {
         uint32_t best_off  = UINT32_MAX;
         uint32_t best_line = UINT32_MAX;
 
-        auto check_match = [&](uint32_t bc_off, uint32_t ln, uint32_t file_off) {
-            // file_target puede ser solo el basename o el path completo;
-            // hacemos match por sufijo: si file_target es sufijo de
-            // strings_+file_off, consideramos match.  Esto cubre tanto
-            // "vexed_modular.vex" como "examples/.../vexed_modular.vex".
+        // Normalizamos un path para comparacion: backslashes -> forward y
+        // toda en minusculas.  Asi `F:\C\VM\file.vex` matchea con
+        // `f:/c/vm/file.vex` y `F:/C/VM/file.vex`.  Necesario porque el
+        // IDE Electron envia paths en estilo forward-slash mientras que
+        // el frontend Vex incrusta el path original (Windows backslash)
+        // en la debug section del .velb.
+        auto norm_path = [](const char *p, size_t len) {
+            std::string out;
+            out.reserve(len);
+            for (size_t i = 0; i < len; i++) {
+                char c = p[i];
+                if (c == '\\') c = '/';
+                else if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+                out.push_back(c);
+            }
+            return out;
+        };
+        const std::string nt = norm_path(file_target.data(), file_target.size());
+
+        // Path match helper.  file_target puede ser basename o path
+        // completo; hacemos match por sufijo CASE/SLASH-INSENSITIVE.
+        auto path_matches = [&](uint32_t file_off) -> bool {
             const char *fname = strings_ + file_off;
             const size_t flen = std::strlen(fname);
-            const size_t tlen = file_target.size();
+            const size_t tlen = nt.size();
             if (tlen == 0) return false;
             if (tlen > flen) return false;
-            if (std::strcmp(fname + (flen - tlen), file_target.c_str()) != 0) {
-                return false;
+            const std::string nf = norm_path(fname, flen);
+            return nf.compare(nf.size() - tlen, tlen, nt) == 0;
+        };
+
+        // PASE 1: buscar MATCH EXACTO de linea.  Si existe una entrada
+        // con ln == line_target, devolvemos el menor bc_off entre ellas.
+        // Esto evita que un BP en la linea N (sin entry directo, e.g.
+        // linea de comentario o firma `i32 main() {`) se solape con el
+        // BP en la linea N+1 (que SI tiene entries), causando que ambos
+        // BPs queden registrados con el MISMO addr.  Dos BPs al mismo
+        // addr provocan que solo el primero registrado dispare (el
+        // segundo queda enmascarado por last_bp_pc tras el continue),
+        // sintoma reportado: "BP en linea de println no triggea pero
+        // BP en return SI triggea".
+        if (line_target != 0) {
+            uint32_t exact_off = UINT32_MAX;
+            if (level_ >= DEBUG_LEVEL_FULL && lines3_) {
+                for (uint32_t i = 0; i < line_count_; ++i) {
+                    if (lines3_[i].line_number == line_target
+                     && path_matches(lines3_[i].file_offset)
+                     && lines3_[i].bytecode_offset < exact_off) {
+                        exact_off = lines3_[i].bytecode_offset;
+                    }
+                }
+            } else if (lines1_) {
+                for (uint32_t i = 0; i < line_count_; ++i) {
+                    if (lines1_[i].line_number == line_target
+                     && path_matches(lines1_[i].file_offset)
+                     && lines1_[i].bytecode_offset < exact_off) {
+                        exact_off = lines1_[i].bytecode_offset;
+                    }
+                }
             }
-            // Match: chequeamos si line_target == ln (exacto), o si
-            // ln > line_target Y ln es la mas pequena vista.
+            if (exact_off != UINT32_MAX) return exact_off;
+        }
+
+        // PASE 2: fallback "siguiente linea conocida >= target".  Solo
+        // se usa cuando la linea target NO tiene entries (e.g. comentario,
+        // linea en blanco, firma de funcion).  En este caso resolvemos
+        // a la primera instruccion despues del target -- comportamiento
+        // tradicional de GDB.
+        auto check_match = [&](uint32_t bc_off, uint32_t ln, uint32_t file_off) {
+            if (!path_matches(file_off)) return;
             if (line_target == 0) {
                 if (bc_off < best_off) {
                     best_off  = bc_off;
                     best_line = ln;
                 }
-                return true;
+                return;
             }
-            if (ln >= line_target && ln <= best_line) {
-                // Preferimos la linea mas cercana (>= target) y, dentro
-                // de la misma linea, el offset mas temprano.
-                if (ln < best_line || bc_off < best_off) {
+            if (ln > line_target) {
+                if (ln < best_line || (ln == best_line && bc_off < best_off)) {
                     best_off  = bc_off;
                     best_line = ln;
                 }
             }
-            return true;
         };
 
         if (level_ >= DEBUG_LEVEL_FULL && lines3_) {

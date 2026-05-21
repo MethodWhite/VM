@@ -1,0 +1,68 @@
+// metaprogramacion sin limitaciones.
+// (1) comptime var/const en for-init
+// (2) arrays comptime con indexing/asignacion
+// (3) comptime fn con type params (type-level metaprog)
+// (4) structs first-class como valores comptime
+
+struct Vec3 { f64 x; f64 y; f64 z; }
+struct Vec4 { f64 x; f64 y; f64 z; f64 w; }
+struct Item { i32 id; i32 weight; }
+
+// (3) Type-level fn: dimension de un vector dado su tipo.
+comptime <T> u32 vec_dim() {
+    return field_count<T>();
+}
+
+// (3) Combinar type params y value args.
+comptime <T> u64 stride_of(i64 count) {
+    return sizeof<T>() * count;
+}
+
+// (1)+(2) Generar tabla de fibs con comptime for-init + array.
+comptime const i64[10] FIB = {0, 1, 1, 2, 3, 5, 8, 13, 21, 34};
+static_assert(FIB[8] == 21,  "fib(8)");
+static_assert(FIB[9] == 34,  "fib(9)");
+
+// (4) Struct comptime const.
+comptime const Item ITEMS_FIRST = {.id = 7, .weight = 50};
+static_assert(ITEMS_FIRST.id == 7,      "items first id");
+static_assert(ITEMS_FIRST.weight == 50, "items first weight");
+
+// (3) Type-level + global const.
+comptime const u32 DIM_V3   = vec_dim<Vec3>();          // 3
+comptime const u32 DIM_V4   = vec_dim<Vec4>();          // 4
+comptime const u64 ARR_BYTES = stride_of<Vec3>(100);    // 24*100 = 2400
+static_assert(DIM_V3 == 3,         "dim Vec3");
+static_assert(DIM_V4 == 4,         "dim Vec4");
+static_assert(ARR_BYTES == 2400,   "stride Vec3 100");
+
+i32 main() {
+    // (1) comptime const en for-init dentro de comptime fn body.
+    comptime {
+        // (2)+(4) Construir array via while + assignment.
+        comptime var i64[8] squares = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (comptime var i64 i = 0; i < 8; i = i + 1) {
+            squares[i] = i * i;
+        }
+        static_assert(squares[0] == 0,   "0^2");
+        static_assert(squares[3] == 9,   "3^2");
+        static_assert(squares[7] == 49,  "7^2");
+
+        // (4) Struct mutable: simular un acumulador con dos counters.
+        comptime var Item totals = {.id = 0, .weight = 0};
+        for (comptime var i64 j = 1; j <= 5; j = j + 1) {
+            totals.id += 1;
+            totals.weight += (i32)(j * 10);
+        }
+        static_assert(totals.id == 5,     "totals.id");
+        static_assert(totals.weight == 150, "totals.weight (10+20+30+40+50)");
+    }
+
+    // (3) Llamadas a generics inline en runtime: emiten CONST inline.
+    u32 dv3 = vec_dim<Vec3>();   // CONST u32 3
+    u32 dv4 = vec_dim<Vec4>();   // CONST u32 4
+    i32 ok = 0;
+    if (dv3 == 3) ok = ok + 21;
+    if (dv4 == 4) ok = ok + 21;
+    return ok;   // 42
+}

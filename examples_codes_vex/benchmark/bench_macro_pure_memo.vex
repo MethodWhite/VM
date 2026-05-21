@@ -1,0 +1,35 @@
+// Benchmark @Pure: macro pesada llamada N veces.
+// Sin @Pure: cada call ejecuta el body completo.
+// Con @Pure: cache hit en el 2do+ con mismos args -> casi instant.
+
+@Pure @Macro
+comptime string heavy_macro(i64 n) {
+    comptime var string s = "";
+    comptime var i64 i = 0;
+    while (i < n) {
+        s = s + "X";
+        i = i + 1;
+    }
+    return "(" + to_str(strlen(s)) + ")";
+}
+
+i32 main() {
+    // Llamar 10 veces con MISMOS args: con @Pure solo el primer call
+    // ejecuta el body completo, los siguientes 9 hit el cache memoization
+    // y retornan al instante.  N=100 -> string de "X" * 100 -> strlen=100.
+    // El macro retorna "(100)" que parsea como literal int = 100.
+    i32 r = 0;
+    r = r + heavy_macro(100);
+    r = r + heavy_macro(100);
+    r = r + heavy_macro(100);
+    r = r + heavy_macro(100);
+    r = r + heavy_macro(100);
+    r = r + heavy_macro(100);
+    r = r + heavy_macro(100);
+    r = r + heavy_macro(100);
+    r = r + heavy_macro(100);
+    r = r + heavy_macro(100);
+    // 100 * 10 = 1000
+    if (r != 1000) return 91;
+    return 42;
+}

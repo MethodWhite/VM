@@ -1,0 +1,9 @@
+// Test negativo de static_assert: este programa NO debe compilar.
+// La condicion `sizeof<i32>() == 8` es false (i32 ocupa 4 bytes), asi
+// que el compilador rechaza el .velb con el mensaje del segundo arg.
+
+static_assert(sizeof<i32>() == 8, "i32 debe ser 8 bytes (test deliberadamente falso)");
+
+i32 main() {
+    return 0;
+}

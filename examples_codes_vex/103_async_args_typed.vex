@@ -70,5 +70,6 @@ i32 main() {
     // 25 + 600 (cast a i32 = 600) + 13 + 1 (true) - 597 = 42
     i32 total = r1 + 13 + 1;       // 25 + 13 + 1 = 39
     if (r4) total = total + 3;     // 39 + 3 = 42
+    println("${total}");
     return total;
 }

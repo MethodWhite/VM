@@ -160,7 +160,10 @@ namespace jit {
         const std::vector<ir::IrFunction> *ir_functions = nullptr,
         const std::unordered_map<std::string, uint64_t> *symbol_table = nullptr,
         std::function<uint64_t(const std::string &)> resolve_native_fn = nullptr,
-        std::function<uint64_t(uint64_t)> read_vmem_u64 = nullptr);
+        std::function<uint64_t(uint64_t)> read_vmem_u64 = nullptr,
+        int32_t exc_frame_stack_offset = 0,
+        int32_t exc_free_list_offset = 0,
+        uint64_t jit_instr_counter_addr = 0);
 
 } // namespace jit
 

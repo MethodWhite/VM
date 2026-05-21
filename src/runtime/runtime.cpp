@@ -40,7 +40,7 @@ namespace runtime {
         ManageVM &mgr_vm_,
         uint64_t  id_vm,
         size_t    num_schedulers
-    ) : pool(num_schedulers > 0 ? num_schedulers : 1), // A.7.2.5-rev3 perf: solo crear los threads necesarios para los schedulers (antes ThreadPool por defecto creaba hardware_concurrency() = 8-16 threads, costando 8-16ms en Windows aunque solo se use 1)
+    ) : pool(num_schedulers > 0 ? num_schedulers : 1), // right-sized: crear solo los threads que se usaran como schedulers (el default hardware_concurrency() = 8-16 desperdiciaba 8-16ms en spawn de threads inactivos en Windows)
         manager_mem_public(mgr_vm_.manager_mem),               // referencia al ArenaManager publico del gestor
         loader_priv(std::make_unique<loader::Loader>(mgr_vm_)), // cargador privado de esta instancia
         loader_public(mgr_vm_.loader),                          // referencia al cargador publico del gestor

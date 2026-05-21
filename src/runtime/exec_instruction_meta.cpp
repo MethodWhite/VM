@@ -515,7 +515,7 @@ namespace runtime {
     }
 
     // -------------------------------------------------------------------------
-    // A.24 - FFI runtime dinamico: dlopen (0x62), dlsym (0x63), callni (0x64).
+    // FFI runtime dinamico: dlopen (0x62), dlsym (0x63), callni (0x64).
     //
     // Los tres opcodes complementan al @c calln estatico (declarado en el
     // .velb por el linker via tabla de imports).  Permiten al usuario Vex

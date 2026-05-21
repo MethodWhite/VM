@@ -57,10 +57,12 @@
 
 #if defined(_WIN32)
 #  include <conio.h>
+#  include <windows.h>    // Sleep()
 #else
 #  include <termios.h>
 #  include <unistd.h>
 #  include <cerrno>
+#  include <poll.h>       // poll() para readline_impl no-bloqueante
 #endif
 
 namespace cli {
@@ -982,16 +984,21 @@ namespace cli {
      */
     static void command_cmd(const std::string &args) {
         if (args.empty()) { std::cout << "Uso: cmd <comando de shell>\n"; return; }
-        std::thread([args]() {
-            try {
-                std::string out = execute_shell_command(args);
-                std::lock_guard<std::mutex> lk(vesta::cout_mutex);
-                std::cout << out << std::endl;
-            } catch (const std::exception &e) {
-                std::lock_guard<std::mutex> lk(vesta::cout_mutex);
-                std::cerr << "Error ejecutando shell: " << e.what() << std::endl;
-            }
-        }).detach();
+        // IMPORTANTE: ejecutar SINCRONICAMENTE.  Antes este comando spawneaba
+        // un std::thread detached y retornaba al instante, lo que rompia
+        // `execute_repl_line` (el cliente TCP perdia toda la salida porque
+        // la captura via rdbuf ya se habia restaurado cuando el thread
+        // escribia a cout).  Ahora bloqueamos hasta tener el output completo
+        // del shell, lo emitimos a cout (que execute_repl_line redirige a su
+        // buffer) y solo entonces volvemos.
+        try {
+            std::string out = execute_shell_command(args);
+            std::lock_guard<std::mutex> lk(vesta::cout_mutex);
+            std::cout << out << std::endl;
+        } catch (const std::exception &e) {
+            std::lock_guard<std::mutex> lk(vesta::cout_mutex);
+            std::cerr << "Error ejecutando shell: " << e.what() << std::endl;
+        }
     }
 
     /**
@@ -3704,10 +3711,27 @@ namespace cli {
 
         for (;;) {
             // ---- leer tecla: normalizar a codigo entero ----
+            //
+            // El bucle de poll permite que stop() externo desbloquee el
+            // readline sin necesidad de inyectar un caracter sintetico en
+            // stdin.  Cada ~50 ms despierta para chequear el flag
+            // I.running; si paso a false (server_shutdown remoto, etc.)
+            // salimos limpiamente devolviendo @c eof_out=true.  La latencia
+            // anyadida al input interactivo es indistinguible para el
+            // usuario y el coste CPU es nulo (el thread duerme).
             int key;
 
 #if defined(_WIN32)
             {
+                // Espera no bloqueante via _kbhit() + Sleep.
+                while (!_kbhit()) {
+                    if (!I.running.load(std::memory_order_acquire)) {
+                        std::cout << "\n" << std::flush;
+                        eof_out = true;
+                        return buf;
+                    }
+                    Sleep(50);
+                }
                 int c = _getch();
                 if (c == 0 || c == 224) { // prefijo de tecla especial en Windows
                     int c2 = _getch();
@@ -3728,9 +3752,25 @@ namespace cli {
 #else
             {
                 unsigned char c;
-                ssize_t n;
-                // reintentar si la lectura fue interrumpida por una senal
-                do { n = ::read(STDIN_FILENO, &c, 1); } while (n < 0 && errno == EINTR);
+                ssize_t n = -1;
+                // Esperar input via poll() con timeout para permitir el
+                // chequeo periodico del flag I.running.
+                struct pollfd pfd { STDIN_FILENO, POLLIN, 0 };
+                for (;;) {
+                    int pr = ::poll(&pfd, 1, 50); // 50 ms
+                    if (pr > 0 && (pfd.revents & POLLIN)) {
+                        do { n = ::read(STDIN_FILENO, &c, 1); }
+                        while (n < 0 && errno == EINTR);
+                        break;
+                    }
+                    if (!I.running.load(std::memory_order_acquire)) {
+                        restore_tios();
+                        std::cout << "\n" << std::flush;
+                        eof_out = true;
+                        return buf;
+                    }
+                    // pr == 0 (timeout) o EINTR: re-poll.
+                }
 
                 if (n <= 0) { // EOF o error irrecuperable
                     restore_tios();
@@ -4270,8 +4310,12 @@ namespace cli {
     }
 
     void VestaViewManager::stop() {
-        if (!impl_->running) return;
-        impl_->running = false;
+        // Compare-exchange atomico para serializar el shutdown cuando
+        // stop() se llama desde varios hilos a la vez (caso server-mode:
+        // el watcher remoto + el propio run() al terminar el bucle).
+        bool expected = true;
+        if (!impl_->running.compare_exchange_strong(expected, false))
+            return;
         cmd_queue_close_impl(*impl_);
         if (impl_->worker_thread.joinable()) impl_->worker_thread.join();
         save_history_impl(*impl_);
@@ -4279,5 +4323,87 @@ namespace cli {
         g_current_impl = nullptr;
         global_interrupt_ptr = nullptr;
         std::signal(SIGINT, SIG_DFL);
+    }
+
+    /* =====================================================================
+     * execute_repl_line: enruta una linea hacia el dispatcher del REPL
+     * local y devuelve la salida capturada.
+     *
+     * Por que existe: el debugger TCP (servidor persistente) tiene un
+     * comando @c repl_exec que permite al cliente remoto enviar lineas
+     * al MISMO motor que ejecuta el prompt `vesta>` local.  Asi el
+     * cliente Electron no tiene que reimplementar `ps`, `regs`, `mem`,
+     * `build`, `disasm`, etc.: enruta y muestra lo que el local
+     * imprimiria.
+     *
+     * Concurrencia: redirigir @c std::cout es un cambio global del
+     * proceso; usamos un mutex para serializar entre clientes
+     * remotos.  Los comandos del REPL no son CPU-bound, asi que la
+     * contencion es despreciable.
+     * ===================================================================== */
+    std::string execute_repl_line(const std::string &line) {
+        static std::mutex repl_mu;
+        std::lock_guard<std::mutex> lk(repl_mu);
+
+        // Trim defensivo de la linea para los matches de comandos
+        // especiales (help, history, etc.).
+        auto trim = [](const std::string &s) -> std::string {
+            auto a = s.find_first_not_of(" \t\r\n");
+            if (a == std::string::npos) return "";
+            auto b = s.find_last_not_of(" \t\r\n");
+            return s.substr(a, b - a + 1);
+        };
+        const std::string trimmed = trim(line);
+
+        // Capturar stdout y stderr a una ostringstream.  Restauramos el
+        // rdbuf ORIGINAL siempre (incluso si dispatch_table_cmd lanza).
+        std::ostringstream captured;
+        std::streambuf *old_out = std::cout.rdbuf(captured.rdbuf());
+        std::streambuf *old_err = std::cerr.rdbuf(captured.rdbuf());
+
+        bool handled = false;
+        std::string err_msg;
+        try {
+            // Comandos ESPECIALES del REPL que no estan en cmd_table:
+            // los manejamos aqui imprimiendo a stdout (que ya esta
+            // redirigido al buffer).
+            if (trimmed == "help" || trimmed == "?") {
+                std::cout << "Comandos disponibles via repl_exec:\n";
+                for (size_t i = 0; i < CMD_TABLE_SIZE; ++i) {
+                    std::cout << "  " << std::left << std::setw(40)
+                              << cmd_table[i].usage
+                              << "  " << cmd_table[i].brief << "\n";
+                }
+                std::cout << "\nNota: los comandos interactivos del REPL "
+                             "local (`exit`, `history`, `interprete`) NO se "
+                             "enrutan al cliente remoto.\n";
+                handled = true;
+            } else if (trimmed == "history" || trimmed == "exit" ||
+                       trimmed == "interprete" ||
+                       trimmed.rfind("!", 0) == 0) {
+                std::cout << "comando interactivo '" << trimmed
+                          << "' no se enruta al cliente remoto.\n";
+                handled = true;
+            } else {
+                handled = dispatch_table_cmd(line);
+            }
+        } catch (const std::exception &e) {
+            err_msg = std::string("\nexcepcion: ") + e.what();
+        } catch (...) {
+            err_msg = "\nexcepcion desconocida";
+        }
+
+        std::cout.rdbuf(old_out);
+        std::cerr.rdbuf(old_err);
+
+        std::string out = captured.str();
+        if (!handled && out.empty()) {
+            // El dispatcher no reconocio la linea (comando no
+            // registrado) y nadie escribio nada al stdout capturado.
+            out = "comando no reconocido por el REPL local: '" + line +
+                  "' -- prueba con 'help'.";
+        }
+        if (!err_msg.empty()) out += err_msg;
+        return out;
     }
 }

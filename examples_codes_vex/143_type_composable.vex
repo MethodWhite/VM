@@ -1,0 +1,70 @@
+//  Type-returning builtins composables.
+//   parent_class<T>()    -> Type del super de una CLASS (vacio si no tiene)
+//   element_type<T>()    -> Type interior de T*/T[N]/Optional<T>/Future<T>/borrow<T>
+//   error_type<T>()      -> E de Result<V,E>
+//   field_type_at<T>(i)  -> Type del campo i-esimo (vs field_type<T>("name") que da string)
+
+struct Vec3 { f64 x; f64 y; f64 z; }
+
+class Animal {
+    public i32 age;
+    public Animal(i32 a) { this.age = a; }
+}
+
+class Perro : Animal {
+    public string nombre;
+    public Perro(i32 a, string n) {
+        this.age = a;        // field heredado de Animal
+        this.nombre = n;
+    }
+}
+
+// (1) parent_class<T>: Perro -> Animal.
+comptime const Type Padre = parent_class<Perro>();
+static_assert(comptime_streq(typename<Padre>(), "Animal"), "padre Perro = Animal");
+static_assert(field_count<Padre>() == 1, "Animal tiene 1 campo");
+
+// Animal no tiene padre explicito -> sentinela TYPE_META vacio.
+// (No podemos usar typename sobre TYPE_META vacio, asi que solo verificamos
+// que parent_class<Perro>() == Animal por sustitucion).
+
+// (2) element_type sobre punteros y arrays.
+comptime const Type Inner = element_type<i32*>();
+static_assert(sizeof<Inner>() == 4,                  "i32* -> i32");
+static_assert(comptime_streq(typename<Inner>(), "i32"), "element_type i32* = i32");
+
+comptime const Type ArrElem = element_type<Vec3[8]>();
+static_assert(sizeof<ArrElem>() == 24,                "Vec3[8] -> Vec3");
+static_assert(comptime_streq(typename<ArrElem>(), "Vec3"), "Vec3[N] elem");
+
+// (3) element_type sobre Optional<T>, Future<T>.
+comptime const Type OptInner = element_type<Optional<i64>>();
+static_assert(sizeof<OptInner>() == 8,                "Optional<i64> -> i64");
+static_assert(comptime_streq(typename<OptInner>(), "i64"), "Opt elem i64");
+
+comptime const Type FutInner = element_type<Future<f32>>();
+static_assert(sizeof<FutInner>() == 4,                "Future<f32> -> f32");
+
+// (4) error_type sobre Result<V,E>.
+comptime const Type ErrT = error_type<Result<i32, i64>>();
+static_assert(sizeof<ErrT>() == 8,                    "Result<i32,i64> err = i64");
+static_assert(comptime_streq(typename<ErrT>(), "i64"), "err = i64");
+
+// (5) field_type_at<T>(i): el tipo del campo i-esimo como Type.
+comptime const Type F0 = field_type_at<Vec3>(0);
+static_assert(sizeof<F0>() == 8,                      "Vec3.0 = f64");
+static_assert(comptime_streq(typename<F0>(), "f64"),  "f0 = f64");
+
+// (6) Composicion: pick + size del field 0 = pick(2).field0_size.
+comptime Type pick(i64 k) {
+    if (k == 0) return comptime_type<i32>();
+    if (k == 1) return comptime_type<i64>();
+    if (k == 2) return comptime_type<Vec3>();
+    return comptime_type<bool>();
+}
+
+comptime const Type Pk2 = pick(2);
+comptime const Type Pk2Field = field_type_at<Pk2>(0);   // f64 (Vec3.x)
+static_assert(sizeof<Pk2Field>() == 8,                  "pick(2).f0 = f64");
+
+i32 main() { return 42; }

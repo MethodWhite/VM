@@ -1,0 +1,129 @@
+// Demo de metaprogramacion real: macro `walk` que parsea un DSL
+// arbitrario tipo `base -> 0x90 -> 0x10 -> 0x20` y emite codigo Vex
+// valido de pointer chase anidado.
+//
+// El call site escribe sintaxis natural:
+//     u64 v = walk(p -> 0x10);
+// y el compilador inyecta en su lugar:
+//     u64 v = *(u64*)((u64)( p ) + 0x10);
+//
+// Para varios niveles:
+//     u64 v = walk(p -> 0x10 -> 0x20);
+// se transforma en:
+//     u64 v = *(u64*)((u64)( *(u64*)((u64)( p ) + 0x10) ) + 0x20);
+//
+// Equivalente al patron `*(u64*)((char*)... + off)` de C/C++, pero
+// expresado de forma compacta y editable en sintaxis propia.
+//
+// Notas:
+// - El cuerpo de un `@Macro` ya se evalua integramente en compile-time,
+//   asi que las vars locales son implicitamente comptime y NO requieren
+//   prefijo `comptime var`.
+// - Operadores nativos sobre strings: `+` (concat) y `==`/`!=` (equals).
+// - Builtins cortos: `length(s)`, `substr(s, start, len)`.  Las versiones
+//   con prefijo `comptime_` son aliases legacy del mismo lowering.
+// - Helpers de trim aplanados en el body para que el macro sea single-fn
+//   (las llamadas a `@Pure comptime fn` auxiliares fuerzan al fallback
+//   del AST evaluator; mantener todo inline permite VM-eval rapida).
+
+@Macro
+comptime string walk(expr code) {
+    i64 n = strlen(code);
+    i64 i = 0;
+    i64 last_start = 0;
+    string current = "";
+    i64 token_count = 0;
+
+    while (i < n) {
+        // Buscar el separador "->".
+        i64 found = 0;
+        if (i + 1 < n) {
+            if (substr(code, i, 1) == "-") {
+                if (substr(code, i + 1, 1) == ">") {
+                    found = 1;
+                }
+            }
+        }
+        if (found != 0) {
+            // Extraer token [last_start, i) y trim espacios (inline).
+            i64 ts = last_start;
+            i64 te = i;
+            while (ts < te && substr(code, ts, 1) == " ") {
+                ts = ts + 1;
+            }
+            while (te > ts && substr(code, te - 1, 1) == " ") {
+                te = te - 1;
+            }
+            string tok = substr(code, ts, te - ts);
+            if (token_count == 0) {
+                current = "( " + tok + " )";
+            } else {
+                current = "( *(u64*)((u64)" + current + " + " + tok + ") )";
+            }
+            token_count = token_count + 1;
+            last_start = i + 2;
+            i = i + 2;
+        } else {
+            i = i + 1;
+        }
+    }
+    // Ultimo token (despues del ultimo "->", o el unico si no hay "->").
+    i64 ts = last_start;
+    i64 te = n;
+    while (ts < te && substr(code, ts, 1) == " ") {
+        ts = ts + 1;
+    }
+    while (te > ts && substr(code, te - 1, 1) == " ") {
+        te = te - 1;
+    }
+    string last_tok = substr(code, ts, te - ts);
+    if (token_count == 0) {
+        return "( " + last_tok + " )";
+    }
+    return "*(u64*)((u64)" + current + " + " + last_tok + ")";
+}
+
+i32 main() {
+    // Reservar buffer host y poblarlo con un mini-grafo de punteros.
+    u64* root = (u64*)malloc(256);
+
+    // Nivel 0: root[0..3] son valores escalares.
+    root[0] = 111;
+    root[1] = 222;
+    root[2] = 333;
+
+    // Nivel 1: en root + 0x40 guardamos una direccion (puntero) a
+    // root + 0x80.  En root + 0x80 guardamos un valor escalar.
+    u64* p_level1 = (u64*)((u64)root + 0x80);
+    p_level1[0] = 999;
+    *(u64*)((u64)root + 0x40) = (u64)p_level1;
+
+    // Nivel 2: en root + 0x100 guardamos un puntero a root + 0x180.
+    // En root + 0x180 guardamos otro puntero a root + 0x1C0.
+    // En root + 0x1C0 guardamos el valor final.
+    *(u64*)((u64)root + 0x1C0) = 42;
+    *(u64*)((u64)root + 0x180) = (u64)root + 0x1C0;
+    *(u64*)((u64)root + 0x100) = (u64)root + 0x180;
+
+    // Test 1: 1 nivel de deref.  Equivalente a *(u64*)(root + 0x40)
+    // pero sin acceso al campo guardado en root+0x80 -- aqui pedimos
+    // SOLO la cadena de 1 hop, asi que recibimos el VALOR almacenado
+    // en root+0x40, que es la direccion p_level1.  Para llegar a 999
+    // necesitariamos otro hop (deref del valor leido).
+    u64 addr1 = walk(root -> 0x40);
+    if (addr1 != (u64)p_level1) return 91;
+
+    // Test 2: 2 niveles.  Hace deref del puntero en root+0x100
+    // (= root+0x180), luego hace deref de root+0x180 con offset 0,
+    // obteniendo (root+0x1C0).
+    u64 addr2 = walk(root -> 0x100 -> 0);
+    if (addr2 != (u64)root + 0x1C0) return 92;
+
+    // Test 3: 3 niveles -> valor final 42.
+    // root + 0x100 -> [root+0x180] + 0 -> [root+0x1C0] + 0 -> 42.
+    u64 v = walk(root -> 0x100 -> 0 -> 0);
+    if (v != 42) return 93;
+
+    free(root);
+    return 42;
+}

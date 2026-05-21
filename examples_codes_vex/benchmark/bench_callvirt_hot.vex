@@ -19,5 +19,6 @@ i32 main() {
         sum = c.inc(1);
         i = i + 1;
     }
+
     return sum;
 }

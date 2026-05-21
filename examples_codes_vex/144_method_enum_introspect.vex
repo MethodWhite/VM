@@ -1,0 +1,43 @@
+// introspeccion de metodos + enums + comptime_print.
+//   method_name<T>(idx)        -> string del metodo idx-esimo
+//   method_return_type<T>(idx) -> Type del return del metodo idx
+//   field_name<EnumT>(idx)     -> nombre de variante (ya soportado)
+//   field_count<EnumT>()       -> num de variantes (ya soportado)
+//   comptime_print(val)        -> emite a stderr en compile-time
+
+class Calc {
+    public i32 v;
+    public Calc(i32 x) { this.v = x; }
+    public i32 get() { return this.v; }
+    public i64 doble() { return 2 * 1; }
+    public string mark() { return "ok"; }
+}
+
+// (1) method_count + method_name iterando por indice.
+static_assert(method_count<Calc>() >= 4,             "Calc tiene >=4 metodos");
+static_assert(comptime_streq(method_name<Calc>(0), "Calc"), "m0 = ctor");
+static_assert(comptime_streq(method_name<Calc>(1), "get"),  "m1 = get");
+static_assert(comptime_streq(method_name<Calc>(2), "doble"), "m2 = doble");
+static_assert(comptime_streq(method_name<Calc>(3), "mark"), "m3 = mark");
+
+// (2) method_return_type devuelve Type.
+comptime const Type RGet  = method_return_type<Calc>(1);
+comptime const Type RDob  = method_return_type<Calc>(2);
+comptime const Type RMark = method_return_type<Calc>(3);
+static_assert(sizeof<RGet>() == 4,                       "get -> i32");
+static_assert(sizeof<RDob>() == 8,                       "doble -> i64");
+static_assert(comptime_streq(typename<RMark>(), "string"), "mark -> string");
+
+// (3) Enum introspection: field_count = num variantes, field_name = variante.
+enum Direccion { Norte, Sur, Este, Oeste }
+static_assert(field_count<Direccion>() == 4,             "4 variantes");
+static_assert(comptime_streq(field_name<Direccion>(0), "Norte"), "v0");
+static_assert(comptime_streq(field_name<Direccion>(2), "Este"), "v2");
+
+// (4) comptime_print: debug en compile-time (a stderr al compilar).
+// El retorno es u64=0 y se compone con static_assert para mantenerlo en el AST.
+static_assert(comptime_print("=== a43.6 init ===") == 0, "print str");
+static_assert(comptime_print(method_count<Calc>())  == 0, "print int");
+static_assert(comptime_print(typename<RGet>())      == 0, "print typename");
+
+i32 main() { return 42; }

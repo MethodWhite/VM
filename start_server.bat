@@ -1,0 +1,1 @@
+vesta --server-mode --server-port 9229 --auth-db users.db --admin-password admin1234

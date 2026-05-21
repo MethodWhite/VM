@@ -255,9 +255,12 @@ namespace Assembly::Bytecode {
         // Builtins Vex: getMethodAt(cls, i), getFieldAt(cls, i).
         {"getmethat", {{0x00, 0x6E, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
         {"getfldat",  {{0x00, 0x6F, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
-        // A.17.x: panic r_msg_addr, r_msg_len -- lanza FatalError USER_ABORT.
+        // panic r_msg_addr, r_msg_len -- lanza FatalError USER_ABORT con el
+        // mensaje leido desde vm_mem.  Capturable via try/catch FatalError.
         {"panic",   {{0x00, 0x5A, InstrSizeMode::FIXED_4, AddressingMode::REG,  emit_instr_reg}}},
-        // A.17.y: setmethdbg r_method, r_params -- debug info para method.
+        // setmethdbg r_method, r_params -- registra debug info para el
+        // MethodInfo* (file + start_line).  Consumido por build_stack_trace
+        // para mostrar @file:line en cada frame del stack trace de errores.
         {"setmethdbg", {{0x00, 0x5B, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
         {"swapctx", {{0x00, 0xEF, InstrSizeMode::FIXED_4, AddressingMode::REG,  emit_instr_reg}}},
 

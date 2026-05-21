@@ -1,0 +1,65 @@
+// introspeccion comptime: 3 caracteristicas avanzadas.
+//
+// (A) field_get<T>(obj, "f") / field_set<T>(obj, "f", v)
+//     Acceso directo a campos via offset compile-time, bypass de
+//     getfield/setfield (sin propiedades, sin RMW bit fields).
+//
+// (B) comptime if (cond) { ... } else { ... }
+//     Si cond es comptime-evaluable, el lowering descarta la rama
+//     no tomada completamente -- 0 branches y 0 phi nodes en el IR.
+//
+// (C) for_each_field<T>(callback) / for_each_method<T>(callback)
+//     Loop completamente unrolled en compile-time: el callback se
+//     invoca UNA VEZ por cada field/method del tipo.
+
+struct Punto {
+    i32 x;
+    i32 y;
+    i32 z;
+}
+
+class Caja {
+    i32 valor;
+    void op() {}
+    void op2() {}
+}
+
+i32 main() {
+    // Bloque A: field_get / field_set.
+    Punto p = {10, 20, 30};
+    i32 a1 = field_get<Punto>(p, "x");       // 10
+    field_set<Punto>(p, "y", 200);
+    i32 a2 = field_get<Punto>(p, "y");       // 200
+    i32 score_a = 0;
+    if (a1 == 10 && a2 == 200) score_a = 14;
+
+    // Bloque B: comptime if.
+    i32 score_b = 0;
+    comptime if (sizeof<Punto>() >= 12 && is_struct<Punto>()) {
+        score_b = 14;   // rama tomada en compile-time
+    } else {
+        score_b = 0;    // descartada
+    }
+    // Anidado.
+    comptime if (kind<i32>() == 0) {
+        comptime if (alignof<i32>() == 4) {
+            score_b = score_b + 0;
+        } else {
+            score_b = score_b - 100;   // descartada
+        }
+    }
+
+    // Bloque C: for_each_field + for_each_method.
+    i32 nf = 0;
+    for_each_field<Punto>((string fname) => {
+        nf = nf + 1;   // 3 iteraciones (x, y, z)
+    });
+    i32 nm = 0;
+    for_each_method<Caja>((string mname) => {
+        nm = nm + 1;   // 2 iteraciones (op, op2)
+    });
+    i32 score_c = 0;
+    if (nf == 3 && nm == 2) score_c = 14;
+
+    return score_a + score_b + score_c;  // 14 + 14 + 14 = 42
+}

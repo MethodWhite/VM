@@ -150,6 +150,57 @@ namespace jit {
         /// = host_ptr al GcHeader, register handle solo).  Si es 0, el
         /// JIT no puede inlinear (fallback a @c vrt_newobj).
         uint64_t register_alloc_addr = 0;
+
+        /// Offset en bytes desde @c ProcessVM* hasta @c exc_frame_stack.
+        /// Computado en runtime con @c offsetof porque @c ProcessVM no es
+        /// standard-layout y el offset depende del libstdc++ del compilador.
+        /// Si != 0, el JIT inlinea @c tryleave como un pop de linked list
+        /// en 5 instrucciones x86-64 (vs ~20-30 de runtime call):
+        ///
+        ///     mov rax, [rbx + EXC_FRAME_OFF]      ; top
+        ///     test rax, rax
+        ///     je skip
+        ///     mov rcx, [rax + 168]                 ; prev (VESTA_EXC_FRAME_PREV_OFFSET)
+        ///     mov [rbx + EXC_FRAME_OFF], rcx       ; head = prev
+        ///   skip:
+        ///
+        /// El frame popped queda leaked en heap raw (~176 bytes); este
+        /// coste se considera aceptable v1 (1MB cada 5680 tries).  Future
+        /// sprint: free list per-proc.
+        ///
+        /// Si es 0, el JIT cae al runtime call @c vrt_tryleave (correcto pero ~5x mas lento).
+        int32_t exc_frame_stack_offset = 0;
+
+        /// Direccion absoluta de @c proc->scheduler.profiler_jit_instr_counter.
+        /// Si != 0, el JIT emite al inicio de cada metodo:
+        ///   @c mov rax, imm64  (counter_addr)
+        ///   @c add qword [rax], N   (N = ir_fn.values.size() approx)
+        /// Asi cada invocacion JIT contribuye N "instrucciones VM" al
+        /// contador, permitiendo que @c --stats calcule MIPS reales aunque
+        /// el codigo este corriendo en JIT (donde el dispatch loop del
+        /// interp NUNCA se ejecuta).  Coste: 2 instr (~3 ns) al entry de
+        /// cada metodo.  Si es 0, el contador queda sin actualizar (MIPS
+        /// JIT subestimado pero programa OK).
+        uint64_t jit_instr_counter_addr = 0;
+
+        /// Offset en bytes desde @c ProcessVM* hasta @c exc_free_list (head
+        /// de la pila de @c ExceptionFrames reciclables).  Si != 0, el JIT
+        /// inlinea tryleave anyadiendo PUSH a este free list en lugar de
+        /// dejar el frame leaked.  Patron x86-64 emitido (7 instr total):
+        ///
+        ///     mov rax, [rbx + EXC_FRAME_OFF]       ; top
+        ///     test rax, rax; je skip
+        ///     mov rcx, [rax + 168]                  ; prev (linked list)
+        ///     mov [rbx + EXC_FRAME_OFF], rcx        ; head = prev
+        ///     mov rcx, [rbx + EXC_FREE_LIST_OFF]    ; free head
+        ///     mov [rax + 168], rcx                  ; popped.prev = free head
+        ///     mov [rbx + EXC_FREE_LIST_OFF], rax    ; free head = popped
+        ///   skip:
+        ///
+        /// Coste: 2 instrucciones extra vs version con leak.  Elimina leak
+        /// de 176 bytes/try -> 0.  El siguiente tryenter (runtime call)
+        /// pop-ea del free list en lugar de hacer new.
+        int32_t exc_free_list_offset = 0;
     };
 
     /**

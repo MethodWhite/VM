@@ -1,6 +1,6 @@
 /**
  * @file vesta_io.c
- * @brief Modulo de E/S de la stdlib nativa de VestaVM (A.16 fast I/O).
+ * @brief Modulo de E/S de la stdlib nativa de VestaVM (fast I/O buffered).
  *
  * Reemplaza la version original basada en @c fputs / @c printf con un buffer
  * global de 64 KB que delega en @c WriteConsoleW / @c WriteFile (Windows) o
@@ -264,7 +264,19 @@ static void vio_buffer_append(const char *buf, size_t len) {
     }
     memcpy(g_out_buf + g_out_len, buf, len);
     g_out_len += len;
-    if (g_out_len >= VIO_FLUSH_THRESHOLD) {
+    /* Line-buffered: si el bloque contiene un '\n' flusheamos.  Esto es
+     * lo que un TTY hace por defecto y lo que cualquier consumidor
+     * interactivo espera (la IDE que envuelve la VM como subprocess
+     * pipe, el REPL del server, scripts de tests, etc.).  Sin esto,
+     * programas cortos como "Hola Mundo" nunca emiten porque su salida
+     * cabe holgadamente en el buffer de 64 KB y el server persistente
+     * nunca dispara `atexit`.  El coste de buscar '\n' es marginal
+     * comparado con el WriteFile que se evitaba. */
+    int has_nl = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] == '\n') { has_nl = 1; break; }
+    }
+    if (has_nl || g_out_len >= VIO_FLUSH_THRESHOLD) {
         vio_flush_locked();
     }
 
@@ -276,7 +288,8 @@ static void vio_buffer_putc(char c) {
     vio_mutex_lock(&g_out_mtx);
     if (g_out_len + 1 > VIO_BUF_SIZE) vio_flush_locked();
     g_out_buf[g_out_len++] = c;
-    if (g_out_len >= VIO_FLUSH_THRESHOLD) vio_flush_locked();
+    /* Line-buffered: flush en '\n' (ver vio_buffer_append). */
+    if (c == '\n' || g_out_len >= VIO_FLUSH_THRESHOLD) vio_flush_locked();
     vio_mutex_unlock(&g_out_mtx);
 }
 
@@ -478,7 +491,7 @@ VESTA_PLUGIN_EXPORT void vesta_init(const VestaPluginAPI *api) {
         g_atexit_registered = 1;
     }
 #if VESTA_IO_DEBUG
-    if (api) api->log("[vesta_io] cargado (A.16 buffered)");
+    if (api) api->log("[vesta_io] cargado (buffered I/O)");
 #endif
 }
 
@@ -575,6 +588,136 @@ VESTA_PLUGIN_EXPORT uint64_t vio_char_to_vmbuf(uint64_t proc_ptr,
     return (uint64_t) k;
 }
 
+/* -------------------------------------------------------------------------
+ * counter monotonico para `gensym()` builtin de Vex.
+ *
+ * Cada llamada incrementa y retorna un valor unico.  El counter es
+ * @c static (vive en el plugin) y resetea cuando el plugin se descarga.
+ * Para Vex esto significa que cada compile fresh empieza desde 0.
+ *
+ * Suficiente para generar identificadores unicos dentro de un compile.
+ * El TypeChecker tiene su propio @c gensym_counter_ para el AST
+ * evaluator; este es para el runtime path (cuando un @Macro lowereado
+ * a IR llama `gensym()`).  Ambos caminos producen secuencias distintas
+ * pero monotonicas y unicas dentro de cada compile.
+ * ----------------------------------------------------------------------- */
+static uint64_t g_vio_gensym_counter = 0;
+VESTA_PLUGIN_EXPORT uint64_t vio_gensym(void) {
+    return g_vio_gensym_counter++;
+}
+
+/* -------------------------------------------------------------------------
+ * helpers para builtins `repeat`, `replace`, `contains`.
+ *
+ * Reciben (proc, vm_addr_dst, vm_addr_src*, ...) y escriben el resultado
+ * en vm_addr_dst.  El caller invoca STRMAKE despues sobre ese buffer.
+ *
+ * El `proc_ptr` se usa para vm_read_bytes / vm_write_bytes.  Limites de
+ * seguridad: longitud maxima resultante 16 MB para evitar OOM en compiles
+ * malicioiosos.
+ * ----------------------------------------------------------------------- */
+
+/* Repeat: lee `src_len` bytes desde HOST pointer `src_host`, los escribe
+ * `n` veces en VM address `dst_addr`.  Devuelve longitud total escrita.
+ * Si `src_len * n` excede 16 MB, retorna 0.
+ *
+ * IMPORTANT: `src_host` es un puntero HOST (resultado de STRRAW); se
+ * castea directamente a `const char*`.  `dst_addr` es VM address. */
+VESTA_PLUGIN_EXPORT uint64_t vstr_repeat_to_vmbuf(uint64_t proc_ptr,
+                                                   uint64_t dst_addr,
+                                                   uint64_t src_host,
+                                                   uint64_t src_len,
+                                                   uint64_t n) {
+    if (src_len == 0 || n == 0) return 0;
+    if (n > 0 && src_len > (16u << 20) / n) return 0;
+    const char *src = (const char *) (uintptr_t) src_host;
+    /* Escribir N copias directamente desde host_ptr. */
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < n; ++i) {
+        g_api->vm_write_bytes((void *) proc_ptr,
+                               dst_addr + total, src, (size_t) src_len);
+        total += src_len;
+    }
+    return total;
+}
+
+/* Contains: lee hay y needle desde HOST pointers, devuelve 1 si needle
+ * es substring de hay, 0 si no.  Cero-copy: trabaja directamente sobre
+ * los buffers host. */
+VESTA_PLUGIN_EXPORT uint64_t vstr_contains(uint64_t proc_ptr,
+                                            uint64_t hay_host,
+                                            uint64_t hay_len,
+                                            uint64_t needle_host,
+                                            uint64_t needle_len) {
+    (void) proc_ptr;
+    if (needle_len == 0) return 1;
+    if (needle_len > hay_len) return 0;
+    const char *hay = (const char *) (uintptr_t) hay_host;
+    const char *nd  = (const char *) (uintptr_t) needle_host;
+    for (size_t i = 0; i + needle_len <= (size_t) hay_len; ++i) {
+        if (memcmp(hay + i, nd, (size_t) needle_len) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Replace: lee `src`/`from`/`to` desde HOST pointers, reemplaza todas las
+ * ocurrencias de `from` con `to`, escribe el resultado en VM addr
+ * `dst_addr`.  Retorna la longitud total escrita (o 0 si error). */
+VESTA_PLUGIN_EXPORT uint64_t vstr_replace_to_vmbuf(uint64_t proc_ptr,
+                                                    uint64_t dst_addr,
+                                                    uint64_t src_host,
+                                                    uint64_t src_len,
+                                                    uint64_t from_host,
+                                                    uint64_t from_len,
+                                                    uint64_t to_host,
+                                                    uint64_t to_len) {
+    const char *src  = (const char *) (uintptr_t) src_host;
+    if (from_len == 0) {
+        /* No-op: copia src tal cual. */
+        if (src_len > 0) {
+            g_api->vm_write_bytes((void *) proc_ptr, dst_addr, src, (size_t) src_len);
+        }
+        return src_len;
+    }
+    if (src_len > (16u << 20) || from_len > (1u << 16) || to_len > (1u << 20)) return 0;
+
+    const char *from = (const char *) (uintptr_t) from_host;
+    const char *to   = (const char *) (uintptr_t) to_host;
+
+    /* Worst case: si src es todo from, out_len = src_len/from_len * to_len. */
+    uint64_t worst_out;
+    if (to_len > from_len) {
+        worst_out = (src_len / from_len) * to_len + from_len + to_len;
+    } else {
+        worst_out = src_len + to_len;
+    }
+    if (worst_out > (16u << 20)) return 0;
+
+    static char *out_buf = NULL;
+    static size_t out_cap = 0;
+    if (worst_out > out_cap) {
+        char *n = (char *) realloc(out_buf, (size_t) worst_out + 1024);
+        if (!n) return 0;
+        out_buf = n; out_cap = (size_t) worst_out + 1024;
+    }
+
+    /* Walk src, look for from, replace.  Directo sobre host_ptrs. */
+    size_t out_n = 0;
+    size_t i = 0;
+    while (i < (size_t) src_len) {
+        if (i + (size_t) from_len <= (size_t) src_len
+         && memcmp(src + i, from, (size_t) from_len) == 0) {
+            memcpy(out_buf + out_n, to, (size_t) to_len);
+            out_n += (size_t) to_len;
+            i += (size_t) from_len;
+        } else {
+            out_buf[out_n++] = src[i++];
+        }
+    }
+    g_api->vm_write_bytes((void *) proc_ptr, dst_addr, out_buf, out_n);
+    return (uint64_t) out_n;
+}
+
 VESTA_PLUGIN_EXPORT uint64_t vio_ptr_to_vmbuf(uint64_t proc_ptr,
                                                uint64_t vm_addr,
                                                uint64_t addr) {
@@ -612,8 +755,9 @@ VESTA_PLUGIN_EXPORT uint64_t vio_println(uint64_t proc_ptr,
 
 /* -----------------------------------------------------------------------
  * Salida de valores numericos (sin acceso a memoria VM).
- * Cambio v A.16: vio_print_int / _uint / _hex / _float YA NO emiten '\n'.
- * Usar vio_println_int / _uint / _hex / _float si quieres salto.
+ * Convencion: las funciones @c vio_print_* NO emiten '\n' al final
+ * (consistencia semantica con @c print vs @c println).  Para incluir
+ * un salto de linea, usar las variantes @c vio_println_*.
  * ----------------------------------------------------------------------- */
 
 VESTA_PLUGIN_EXPORT uint64_t vio_print_int(uint64_t n) {
@@ -988,7 +1132,7 @@ VESTA_PLUGIN_EXPORT uint64_t vio_println_float(uint64_t bits) {
 }
 
 /* -----------------------------------------------------------------------
- * Builtins nuevos A.16: bool, char, color, flush.
+ * Builtins de salida especializada: bool, char, color, flush.
  * ----------------------------------------------------------------------- */
 
 /**

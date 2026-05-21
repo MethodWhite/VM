@@ -25,6 +25,8 @@ add_library(vex_lib STATIC
     compiler.cpp
     mermaid_diagrams.cpp
     graphviz_diagrams.cpp
+    comptime_introspect.cpp
+    # comptime_vm.cpp vive en src/runtime/ (depende del runtime VM).
     # Transpiler IR -> codigo fuente (C inicial; Java/JS/etc futuro).
     # Vive aqui porque compiler.cpp lo invoca como ultimo paso opcional.
     # Si en el futuro se quiere usar el transpiler standalone, se extrae

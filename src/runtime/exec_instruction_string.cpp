@@ -63,6 +63,7 @@
 #include "runtime/runtime.h"           // para acceder a vm->scheduler.vm_reference.script_args
 #include "runtime/scheduler.h"
 #include "runtime/string_intern.h"
+#include "runtime/string_runtime.h"    // Phase MC.13: API publica make_string_flat
 #include "gc/gc_heap.h"
 #include "loader/oop_types.h"
 #include "loader/string_object.h"
@@ -1248,6 +1249,31 @@ void exec_instr_getarg(ProcessVM *vm, const DecodedInstr &instr) {
     gc::GcHandle h = alloc_flat(vm, data, byte_len, length,
                                 loader::StringEncoding::UTF8);
     vm->registers.regs[r_dst].qword(static_cast<uint64_t>(h));
+}
+
+/* =========================================================================
+ * Phase MC.13: API publica `make_string_flat` -- reusa el mismo path
+ * que las instrucciones STRMAKE/STRCAT/STRCONV de la VM para construir
+ * un StringObject FLAT desde C++.  Sin reimplementar nada: delega al
+ * helper `alloc_flat` interno (alloc_pinned + populacion de header +
+ * hash precomputado para strings cortos).
+ *
+ * Usado por @c vex::ComptimeRuntime para marshalar args @c string del
+ * compile-time al VM antes de invocar @Macros lowered.
+ * =========================================================================
+ */
+gc::GcHandle make_string_flat(ProcessVM *vm,
+                               const uint8_t *data,
+                               uint32_t byte_len,
+                               uint32_t length,
+                               loader::StringEncoding enc) noexcept {
+    if (!vm) return gc::GC_NULL_HANDLE;
+    /* Si el caller no proveio length (UINT32_MAX sentinela), asumimos
+     * ASCII puro y usamos byte_len.  Para UTF-8 multi-byte el caller
+     * deberia computar el code-point count con count_codepoints. */
+    const uint32_t effective_length =
+        (length == UINT32_MAX) ? byte_len : length;
+    return alloc_flat(vm, data, byte_len, effective_length, enc);
 }
 
 } // namespace runtime

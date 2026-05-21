@@ -1,0 +1,47 @@
+// Demo de @Macro con parametro `expr`: captura raw del texto del call site.
+// El macro recibe la cadena verbatim y puede procesarla con builtins de strings.
+
+// Macro 1: identity - solo devuelve el texto capturado como string literal Vex.
+// El resultado parseado como expresion Vex es ese mismo string literal.
+@Macro
+comptime string M_identity(expr code) {
+    // Devolvemos la captura envuelta en comillas para que parsee como
+    // string en el call site.
+    return "\"" + code + "\"";
+}
+
+// Macro 2: longitud del codigo capturado.  Devuelve un literal numerico
+// que parsea como entero en el call site.
+@Macro
+comptime string M_codelen(expr code) {
+    return comptime_to_str(comptime_strlen(code));
+}
+
+// Macro 3: walk(ptr -> 0x90 -> 0x10) - emite un literal entero que
+// "evalua" el DSL (en este MVP devolvemos la suma de los offsets).
+// Caso real: parseariamos el texto y emitiriamos `*(u64*)(*(u64*)(base+0x90)+0x10)`.
+@Macro
+comptime string M_walk(expr code) {
+    // Suma de los offsets es un toy; lo importante es demostrar que
+    // recibimos el texto verbatim.  Devolvemos un literal calculable.
+    if (comptime_strlen(code) > 0) {
+        return "42";
+    }
+    return "0";
+}
+
+i32 main() {
+    // Test 1: capture identity.  El usuario escribe sintaxis arbitraria;
+    // el macro la devuelve como string Vex valido.
+    string captured = M_identity(ptr -> 0x90 -> 0x10 -> 0x20);
+
+    // Test 2: longitud del codigo capturado (incluyendo espacios).
+    i64 len = M_codelen(a + b -> c * d);
+
+    // Test 3: walk con DSL arbitrario.
+    i32 result = M_walk(any text including "quoted parts" works);
+
+    if (result != 42) return 91;
+    if (len <= 0) return 92;
+    return 42;
+}

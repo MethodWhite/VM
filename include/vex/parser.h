@@ -37,7 +37,7 @@
  *   10. aditivo            + -
  *   11. multiplicativo     * / %
  *   12. unario prefijo     ! ~ - + ++ --
- *   13. postfijo           ()  ++  --  (solo en A.1)
+ *   13. postfijo           ()  ++  --  []  .  ?.  ?.[ ]  ?
  *   14. primaria           literales, identificadores, ( expr )
  */
 
@@ -45,6 +45,9 @@
 #define VEX_PARSER_H
 
 #include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "vex/ast.h"
 #include "vex/diagnostic.h"
@@ -78,6 +81,18 @@ namespace vex {
          *         consultar @c Diagnostics::has_errors() antes de bajar a IR.
          */
         std::unique_ptr<ast::ModuleNode> parse_program();
+
+        /**
+         * @brief parsea UNA expresion sobre el lexer actual.
+         *
+         * Util para macros estilo Lisp (`comptime_compile(str)`) que
+         * construyen codigo a partir de un string en compile-time.  El
+         * caller crea un Lexer sobre la cadena, instancia un Parser y
+         * llama a este metodo.  Tras el parse el lexer queda en el token
+         * que no consumio (tipicamente END_OF_FILE).  Si hay error
+         * sintactico, se reporta via @c Diagnostics y devuelve nullptr.
+         */
+        std::unique_ptr<ast::Expr> parse_one_expr() { return parse_expr(); }
 
     private:
         // -----------------------------------------------------------------
@@ -237,6 +252,7 @@ namespace vex {
 
         std::unique_ptr<ast::Expr> parse_expr();
         std::unique_ptr<ast::Expr> parse_assignment();
+        std::unique_ptr<ast::Expr> parse_ternary();  ///< cond ? then : else 
         std::unique_ptr<ast::Expr> parse_logical_or();
         std::unique_ptr<ast::Expr> parse_logical_and();
         std::unique_ptr<ast::Expr> parse_bitwise_or();
@@ -296,6 +312,20 @@ namespace vex {
         Lexer       &lex_;
         Diagnostics &diags_;
         Token        current_;
+        /// contador para nombres unicos de static_asserts top-level
+        /// que se modelan como GlobalVarDecl dummy.  El type checker los
+        /// procesa en la pasada de globales sin generar storage runtime.
+        uint32_t     static_assert_counter_ = 0;
+        /// Registry de macros con params @c expr.  Llave: nombre del @Macro.
+        /// Valor: indices (0-based) de los params declarados con tipo `expr`.
+        /// Poblado cuando se parsea la FunctionDecl del macro; consultado
+        /// en @c parse_postfix al construir un @c CallExpr para hacer
+        /// raw-text capture en las posiciones marcadas.
+        ///
+        /// Limitacion Phase A: el @Macro debe estar declarado ANTES de su
+        /// llamada en el archivo (single-pass parser). Forward refs requieren
+        /// un pre-scanner (Phase B futura).
+        std::unordered_map<std::string, std::vector<int>> macro_expr_params_;
     };
 
 } // namespace vex

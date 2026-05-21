@@ -151,6 +151,13 @@ cat /tmp/fact.ir
 ./build/vm --vex examples_codes_vex/01_factorial.vex -o /tmp/fact --diagram-all
 ls /tmp/fact.*.mmd
 # -> /tmp/fact.ast.mmd, /tmp/fact.ir.pre.mmd, /tmp/fact.ir.post.mmd, /tmp/fact.vel.mmd
+
+# Map file de simbolos y secciones (debug; opt-in porque cuesta ~60% del linker)
+./build/vm --vex examples_codes_vex/01_factorial.vex -o /tmp/fact --emit-map
+cat /tmp/fact.velb-map        # tabla de symbols + sections + addresses
+
+# Debug info (file:line) embebida en el .velb para el debugger TCP
+./build/vm --vex examples_codes_vex/01_factorial.vex -o /tmp/fact --vex-debug
 ```
 
 ---

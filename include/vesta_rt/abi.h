@@ -185,6 +185,13 @@ extern "C" {
 /// Numero total de registros VM (R0..R15).
 #define VESTA_PROC_REGISTER_COUNT          16
 
+/// El offset de @c exc_frame_stack dentro de @c ProcessVM NO es estable
+/// cross-build porque la struct tiene miembros no-POD antes (atomicos,
+/// vectores, GcHeap).  En lugar de un #define, se computa en runtime
+/// con @c offsetof y se pasa al selector via @c SelectorOptions::exc_frame_stack_offset.
+/// El JIT lo embebe como disp32 en las instrucciones inline.  Mismo patron
+/// que @c nursery_bump_offset.
+
 /* ----------------------------------------------------------------------- */
 /* ClassInfo + MethodInfo offsets (inline dispatch CALLVIRT)  */
 /* ----------------------------------------------------------------------- */
@@ -229,6 +236,38 @@ extern "C" {
  * la cadena se ejecute correctamente.  Sin esto, el JIT salta al body
  * del metodo target ignorando todos los advices. */
 #define VESTA_METHODINFO_ADVICE_CHAIN_OFFSET 152
+
+/* ========================================================================= */
+/* ExceptionFrame + ProcessVM::exc_frame_stack (inline tryleave en JIT)       */
+/* ========================================================================= */
+/*
+ * Layout de ProcessVM::ExceptionFrame (struct anidada en proceso_runtime.h):
+ *   +0  [8]   handler_pc         direccion absoluta del catch
+ *   +8  [8]   type               ClassInfo* (NULL = catch-all)
+ *   +16 [8]   saved_rsp
+ *   +24 [8]   saved_rbp
+ *   +32 [8]   saved_frame_stack
+ *   +40 [128] saved_regs[16]     snapshot R0..R15
+ *   +168 [8]  prev               siguiente frame (linked list)
+ *   total: 176 bytes
+ *
+ * El JIT inlinea tryleave como:
+ *
+ *   mov rax, [rbx + EXC_FRAME_STACK_OFFSET]   ; top
+ *   test rax, rax
+ *   je  no_op
+ *   mov rcx, [rax + EXC_FRAME_PREV_OFFSET]    ; prev
+ *   mov [rbx + EXC_FRAME_STACK_OFFSET], rcx   ; head = prev
+ *  no_op:
+ *
+ * 5 instrucciones x86-64 (~5-8 ciclos).  El frame popped queda leaked en
+ * heap raw (~176 bytes/try); el coste por programa con N tries es N*176B.
+ * Aceptable para v1; un free-list per-proc podria eliminar el leak.
+ *
+ * Verificado en abi_checks.cpp con static_assert.
+ */
+#define VESTA_EXC_FRAME_PREV_OFFSET        168
+#define VESTA_EXC_FRAME_SIZE               176
 
 /* ========================================================================= */
 /* Codigos de FatalError (usados por vrt_throw_fatal)                         */

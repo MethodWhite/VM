@@ -31,7 +31,8 @@ namespace asm_multi_process {
                    const std::string &output_prefix,
                    bool skip_preprocessor,
                    bool keep_labels,
-                   const std::vector<uint8_t> *ir_section_bytes) {
+                   const std::vector<uint8_t> *ir_section_bytes,
+                   bool emit_map) {
         //if (arch.empty()) {
         //    std::cerr << "--arch es requerido en modo --worker\n";
         //    return EXIT_FAILURE;
@@ -157,17 +158,31 @@ namespace asm_multi_process {
         // LINKER
         Assembly::Bytecode::Linker::LinkerOptions opts;
         opts.optimize_bytecode = true;
-        opts.generate_map_file = true;
+        /* Map file es DEBUG-only y muy costoso de generar (~64% del linker_us
+         * para programas reales).  Off por defecto; opt-in via flag CLI
+         * --emit-map (propagado como `emit_map=true`). */
+        opts.generate_map_file = emit_map;
         opts.strip_labels      = !keep_labels;  // por defecto strip
         opts.output_path = output_prefix + ".velb";
         opts.map_file_path = output_prefix + ".velb-map";
         opts.verbose = true;
 
         Timer t_linker;
+        const bool prof_link = []() {
+            const char *v = std::getenv("VESTA_LINKER_PROFILE");
+            return v && v[0] == '1';
+        }();
+
+        Timer t_link_ctor;
         Linker::Linker linker(opts);
+        if (prof_link) vesta::scout() << "[linker-prof-outer] ctor                  "
+                                       << t_link_ctor.us() << " us\n";
 
         // Anadir el ensamblado crudo
+        Timer t_link_addunit;
         linker.add_assembly_unit(bytecode, &asmblr.ctx);
+        if (prof_link) vesta::scout() << "[linker-prof-outer] add_assembly_unit     "
+                                       << t_link_addunit.us() << " us\n";
 
         // anadir objetos externos
         // linker.add_object_file("libmath.velo");
@@ -181,11 +196,18 @@ namespace asm_multi_process {
         }
 
         // Construir ejecutable
+        Timer t_link_write;
         linker.write_to_file(opts.output_path);
+        if (prof_link) vesta::scout() << "[linker-prof-outer] write_to_file (build+disk) "
+                                       << t_link_write.us() << " us\n";
 
         // Generar map file
-        if (opts.generate_map_file)
+        if (opts.generate_map_file) {
+            Timer t_link_map;
             linker.write_map_file(opts.map_file_path);
+            if (prof_link) vesta::scout() << "[linker-prof-outer] write_map_file        "
+                                           << t_link_map.us() << " us\n";
+        }
 
         // Reporte
         const auto &report = linker.get_report();

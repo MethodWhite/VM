@@ -1,0 +1,34 @@
+// Benchmark: @Macro con LOOP ARITMETICO PESADO.
+//
+// Este bench ejercita el patron que mas se beneficia de JIT:
+//   - Loop con muchas iteraciones (100K)
+//   - Aritmetica simple (sum += i)
+//   - Cero alocaciones de strings durante el loop
+//   - Solo al final, comptime_to_str() del resultado
+//
+// Medicion previa (post MC.22):
+//   interp: ~15 ms total compile
+//   JIT (VESTA_MC_JIT=1): ~2.6 ms total compile
+//   speedup: ~5.8x
+//
+// Compare con bench_macro_pyramid/stress/exponential que estan dominados
+// por linker overhead (no por macro execution) -- esos no se benefician
+// del JIT porque el linker es C++ nativo, no codigo VM.
+
+@Macro
+comptime string heavy_loop(i64 n) {
+    i64 sum = 0;
+    i64 i = 0;
+    while (i < n) {
+        sum = sum + i;
+        i = i + 1;
+    }
+    return comptime_to_str(sum);
+}
+
+i32 main() {
+    // N=10000 -> sum(0..10000) = 49995000 (fits in i32, no truncation).
+    i32 r = heavy_loop(10000);
+    if (r != 49995000) return 91;
+    return 42;
+}

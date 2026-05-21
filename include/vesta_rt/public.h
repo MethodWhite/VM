@@ -229,6 +229,39 @@ void vrt_tryenter(vrt_proc *proc, uint64_t handler_pc, vrt_class *type_class);
 /** @brief Pop del tope del exc_frame_stack (salida normal del try). */
 void vrt_tryleave(vrt_proc *proc);
 
+/**
+ * @brief Lanza una excepcion user-defined desde codigo JIT.
+ *
+ * Toma un GcHandle (codificado como i64) de un objeto excepcion previamente
+ * construido (typically @c new MyException(...)).  Delega a @c do_throw del
+ * runtime que:
+ *   1. Recorre @c proc->exc_frame_stack buscando el frame matching por tipo.
+ *   2. Si encuentra match: restaura RSP/RBP/regs del snapshot del tryenter
+ *      y salta al @c handler_pc del frame.
+ *   3. Si no hay handler matching: marca el proceso DEAD y dispara EVT_ERROR.
+ *
+ * Nunca retorna normalmente.  La calling convention del handler es:
+ *   - R0 contiene el GcHandle de la excepcion (replicado por do_throw).
+ *
+ * @param proc proceso actual.
+ * @param exc_handle handle (uint32 zero-extendido a uint64) del objeto excepcion.
+ */
+void vrt_throw_user(vrt_proc *proc, uint64_t exc_handle);
+
+/**
+ * @brief Relanza la excepcion activa (@c proc->current_exception).
+ *
+ * Equivalente a @c rethrow del bytecode: invoca @c do_throw con el handle
+ * de la excepcion que esta actualmente siendo manejada (capturada por el
+ * catch enclosing).  Usado tipicamente por synchronized handlers que hacen
+ * monexit + rethrow para propagar la excepcion al frame externo.
+ *
+ * Nunca retorna normalmente (igual que @c vrt_throw_user).
+ *
+ * @param proc proceso actual.  Debe tener @c current_exception != 0.
+ */
+void vrt_rethrow(vrt_proc *proc);
+
 /* ========================================================================= */
 /* FFI nativo                                                                */
 /* ========================================================================= */
@@ -329,6 +362,46 @@ uint64_t vrt_callm(vrt_proc *proc, uint8_t *obj_payload, void *method);
  * @return valor de retorno (de @c proc->registers.regs[0]).
  */
 uint64_t vrt_callclosure(vrt_proc *proc, uint64_t fn_addr, uint64_t env_addr);
+
+/**
+ * @brief Trampoline JIT->interp para llamar a una funcion bytecode user-defined.
+ *
+ * Cuando codigo JIT necesita invocar una funcion cuyo IR no se pudo
+ * JIT-compilar (raw_asm complejo, monenter, synchronized, float arith no
+ * soportada, etc.), el selector emite una CALL a este wrapper en lugar
+ * de marcar el caller como unsupported.  De esa forma main + helpers
+ * basicos pueden JIT-compilar aunque algunas callees caigan a interp.
+ *
+ * Calling convention identica a CALLVM bytecode:
+ *   - args ya en @c proc->registers.regs[1..N] (puestos por el caller JIT
+ *     ANTES de invocar este wrapper)
+ *   - argc en @c proc->registers.regs[15]
+ *   - retorno final en @c proc->registers.regs[0]
+ *
+ * Internamente:
+ *   1. Salva rip/rsp/frame_stack/decoded_ptr del proceso.
+ *   2. Push un sentinel ret_addr al stack VM (@c VRT_BYTECODE_RET_SENTINEL).
+ *   3. Setea proc->rip = @p bc_entry_va.
+ *   4. Mini run-loop: decode + execute hasta que rip == sentinel
+ *      (i.e. el RET final del bytecode pop-eo el sentinel y salto a el).
+ *   5. Restaura estado y retorna @c proc->registers.regs[0].
+ *
+ * Limitaciones documentadas:
+ *   - Si la funcion lanza una excepcion sin handler interno y la catch
+ *     esperada esta en codigo JIT-eated del caller, el unwind cruzaria
+ *     la frontera JIT/interp -- comportamiento indefinido en v1.
+ *     Solucion futura: Phase D.13 (native unwinding).
+ *   - Si la funcion bloquea por IO/wait, este wrapper aborta con
+ *     FATAL_ILLEGAL_INSTRUCTION (no se puede esperar IO sincronicamente
+ *     desde dentro de un JIT frame).
+ *
+ * @param proc proceso actual.
+ * @param bc_entry_va direccion VM (entry point) del bytecode de la funcion,
+ *        tipicamente resuelta via symbol_table del @c .velb por el JIT
+ *        selector (lookup de @c "code.<func_name>").
+ * @return valor de @c proc->registers.regs[0] al terminar.
+ */
+uint64_t vrt_call_bc_function(vrt_proc *proc, uint64_t bc_entry_va);
 
 /**
  * @brief CALLN nativo desde JIT (FFI estatico resuelto en runtime).

@@ -482,7 +482,7 @@ namespace ir {
                 break;
 
             case IrOp::CALLCLOSURE:
-                // A.10 closures: callclosure.T %fn_ptr, %env(args...)
+                // Invocacion de closure: callclosure.T %fn_ptr, %env(args...)
                 // %fn_ptr en func_ptr, %env en operands[0], args declarados
                 // en operands[1..].  Notacion textual elegida para que sea
                 // visualmente similar a CALLIND pero exhiba el env.

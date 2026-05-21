@@ -33,7 +33,7 @@
  *
  * Invocan este helper:
  *   - @c exec_instr_calln (FFI estatico declarado en el .velb por el linker).
- *   - @c exec_instr_callni (FFI dinamico runtime: A.24, llamada via puntero
+ *   - @c exec_instr_callni (FFI dinamico runtime: llamada via puntero
  *                            obtenido por @c dlsym/@c GetProcAddress en runtime).
  *
  * Header inline para que ambos cpp compartan la misma implementacion sin

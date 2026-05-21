@@ -1,0 +1,79 @@
+// introspeccion comptime: queries de fields/methods/types.
+// cada llamada baja a UN solo
+// IrOp::CONST (o STR_LIT_ADDR + STRMAKE para field_name/field_type).
+//
+// Builtins anyadidos:
+//   field_count<T>()        -> u32
+//   method_count<T>()       -> u32
+//   offsetof<T>("field")    -> u64
+//   has_field<T>("name")    -> bool
+//   has_method<T>("name")   -> bool
+//   field_name<T>(idx)      -> string
+//   field_type<T>("name")   -> string
+//   is_class<T>()           -> bool
+//   is_struct<T>()          -> bool
+//   is_primitive<T>()       -> bool
+//   is_subtype<A,B>()       -> bool
+//   is_same<A,B>()          -> bool
+
+struct Vec3 {
+    f64 x;
+    f64 y;
+    f64 z;
+}
+
+class Animal {
+    i32 age;
+    void hablar() {}
+    i32 getAge() { return this.age; }
+}
+
+class Perro : Animal {
+    i32 ladridos;
+    void ladrar() {}
+}
+
+i32 main() {
+    // Layouts (offsets calculados estaticamente sobre Vec3 con 3 f64).
+    u32 n_vec3   = field_count<Vec3>();            // 3
+    u64 off_x    = offsetof<Vec3>("x");            // 0
+    u64 off_y    = offsetof<Vec3>("y");            // 8
+    u64 off_z    = offsetof<Vec3>("z");            // 16
+
+    // Herencia (Perro hereda fields + methods de Animal).
+    u32 n_perro  = field_count<Perro>();           // 2 (age + ladridos)
+    u32 m_perro  = method_count<Perro>();          // 3 (hablar + getAge + ladrar)
+
+    // Predicados.
+    bool hf_x    = has_field<Vec3>("x");           // true
+    bool hf_w    = has_field<Vec3>("w");           // false
+    bool hm_h    = has_method<Animal>("hablar");   // true
+    bool hm_v    = has_method<Animal>("volar");    // false
+    bool ic      = is_class<Animal>();             // true
+    bool is_v3   = is_struct<Vec3>();              // true
+    bool ip      = is_primitive<i32>();            // true
+
+    // Jerarquia.
+    bool s_pa    = is_subtype<Perro, Animal>();    // true (down chain)
+    bool s_ap    = is_subtype<Animal, Perro>();    // false (other way)
+    bool s_aa    = is_subtype<Animal, Animal>();   // true (reflexivo)
+
+    // Strings: field_name / field_type.
+    string fn0   = field_name<Vec3>(0);            // "x"
+    string ft0   = field_type<Vec3>("x");          // "f64"
+
+    // Sumamos 3 puntos por cada chequeo OK -> esperado 42.
+    i32 ok = 0;
+    if (n_vec3 == 3)          ok = ok + 3;
+    if (off_x == 0)           ok = ok + 3;
+    if (off_y == 8)           ok = ok + 3;
+    if (off_z == 16)          ok = ok + 3;
+    if (n_perro == 2)         ok = ok + 3;
+    if (m_perro == 3)         ok = ok + 3;
+    if (hf_x && !hf_w)        ok = ok + 3;
+    if (hm_h && !hm_v)        ok = ok + 3;
+    if (ic && is_v3 && ip)    ok = ok + 3;
+    if (s_pa && !s_ap && s_aa) ok = ok + 3;
+    if (fn0.length() == 1 && ft0.length() == 3) ok = ok + 12;
+    return ok;
+}

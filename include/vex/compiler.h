@@ -160,6 +160,51 @@ namespace vex {
         /// Warnings emitidos por el transpiler (IR ops no soportadas por
         /// el backend, etc.).  Vacio si no hubo issues.
         std::vector<std::string> port_warnings;
+
+        /**
+         * @brief expectaciones capturadas por el
+         * TypeChecker al evaluar @Macros via el AST evaluator.
+         *
+         * Cada entrada describe un call site con su (nombre, args,
+         * resultado AST esperado, ubicacion).  El caller las pasa a
+         * @c ComptimeRuntime::record_expectation tras cargar el
+         * bytecode con @c load_macros_from_bytes, y luego invoca
+         * @c shadow_validate para comparar AST vs VM end-to-end.
+         *
+         * Si los conteos del shadow validate divergen, indica un bug
+         * en la lowering del @Macro a IR (o en el AST evaluator).
+         * Cuando todo coincide, MC.9 podra hacer el switch a VM-only
+         * con confianza.
+         */
+        struct MacroExpectation {
+            std::string           macro_name;
+            std::vector<uint64_t> args;
+            std::string           expected_str;
+            std::string           src_loc;
+        };
+        std::vector<MacroExpectation> macro_expectations;
+
+        /**
+         * @brief @c true si el modulo contiene AL MENOS
+         * UNA declaracion @Macro que fue lowereada al IR.  Independiente
+         * de @c macro_expectations (que solo se popula con call sites
+         * cuyos args son codificables como uint64 directo).
+         *
+         * Usado por @c main.cpp como gate para disparar el two-phase
+         * compile + cache populate.  Esto permite que macros con args
+         * @c string (marshalados con @c runtime::make_string_flat) o
+         * structs/arrays (futuros) tambien se beneficien del path VM.
+         */
+        bool has_lowerable_macros = false;
+
+        /**
+         * @brief por cada @Macro que el lowering rechazo
+         * por usar features no soportados en el path VM (builtins
+         * comptime-only, comptime globals, etc.), guarda
+         * @c (macro_name, reason).  El main.cpp los imprime via
+         * @c VESTA_MC_VERBOSE para diagnostico.
+         */
+        std::vector<std::pair<std::string, std::string>> macro_skip_reasons;
     };
 
     /**

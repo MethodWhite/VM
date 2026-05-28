@@ -1,0 +1,66 @@
+// Benchmark: crear + descartar structs (3 modalidades comparadas).
+//
+// Mide tres patrones de alocacion de tipos planos:
+//
+//   1. stack_struct() - struct en VM stack (ALLOCA + leave).  CERO heap.
+//      Equivalente a `Punto p;` en C local.  El slot se libera implicit
+//      al RET via el `leave` que restaura RSP.
+//
+//   2. unique_struct() - unique<Punto> en host heap (RAW_ALLOC + RAW_FREE).
+//      Construccion in-place (M7 / Opcion B) escribe campos directo al
+//      heap, sin memcpy.  Cleanup automatico al exit del scope.
+//
+//   3. malloc_struct() - Punto* via malloc explicito + free explicito.
+//      Path mas low-level, sin smart pointer ni borrow checker.
+//
+// Las tres rutas hacen la misma "carga util": leer x+y y devolverlo.
+// El reporter compara MIPS para que el usuario vea el coste relativo
+// de cada estrategia.
+//
+// Ejecuta: vm --run bench_mem_struct.velb --stats [-m jit]
+// Configura ITER abajo segun tu CPU (5M default).
+
+struct Punto {
+    i32 x;
+    i32 y;
+}
+
+// Ruta 1: stack ALLOCA puro.  Cero alloc/free runtime.
+i32 stack_struct(i32 base) {
+    Punto p = {.x = base, .y = base + 1};
+    // Acceso via field access (slot vive en VM stack; emit `mov`).
+    return p.x + p.y;
+}
+
+// Ruta 2: unique<Punto> en host heap.  RAW_ALLOC + RAW_FREE por iter.
+i32 unique_struct(i32 base) {
+    unique<Punto> p = {.x = base, .y = base + 1};
+    i32* raw = (i32*)ptr_of(p);
+    return *raw + *(raw + 1);
+    // Cleanup automatico aqui: RAW_FREE(host_ptr).
+}
+
+// Ruta 3: malloc + free manuales.
+i32 malloc_struct(i32 base) {
+    Punto* p = malloc(8);
+    (*p).x = base;
+    (*p).y = base + 1;
+    i32 r = (*p).x + (*p).y;
+    free(p);
+    return r;
+}
+
+// 1M iter * 3 rutas = 3M operaciones medidas.  En interp es ~30 s; con
+// JIT debe bajar significativamente.  Reduzcase ITER si quieres ciclos
+// mas cortos durante desarrollo iterativo.
+i32 main() {
+    i64 sum = 0;
+    i64 i   = 0;
+    while (i < 1000000) {
+        sum = sum + stack_struct(1);
+        sum = sum + unique_struct(1);
+        sum = sum + malloc_struct(1);
+        i = i + 1;
+    }
+    return sum;
+}

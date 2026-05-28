@@ -91,7 +91,32 @@ set(ENABLE_LOONGARCH_TARGET OFF CACHE BOOL "")
 set(ENABLE_XTENSA_TARGET OFF CACHE BOOL "")
 set(ENABLE_ARC_TARGET OFF CACHE BOOL "")
 
-project(VMProject)
+project(VMProject
+        VERSION 1.0.0
+        DESCRIPTION "VestaVM: register-based VM + Vex frontend"
+        LANGUAGES C CXX)
+
+# versiones del compilador y la VM expuestas al @Target.
+# Permite que usuarios escriban @Target("compiler>=1.0") y obtengan
+# resolucion en compile-time sin hardcodear los numeros en C++.  Se
+# bumpean al subir mayor/minor; un sprint futuro puede separar
+# vex-compiler vs runtime-VM si divergen.
+set(VEX_COMPILER_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
+set(VEX_COMPILER_VERSION_MINOR ${PROJECT_VERSION_MINOR})
+set(VEX_COMPILER_VERSION_PATCH ${PROJECT_VERSION_PATCH})
+set(VEX_VM_VERSION_MAJOR       ${PROJECT_VERSION_MAJOR})
+set(VEX_VM_VERSION_MINOR       ${PROJECT_VERSION_MINOR})
+set(VEX_VM_VERSION_PATCH       ${PROJECT_VERSION_PATCH})
+
+# Generar include/vex/version_generated.h con las constantes para que
+# el frontend lea las versiones desde un solo punto.  Build incremental
+# regenera automaticamente cuando cambia el numero en este CMakeLists.
+configure_file(
+    "${CMAKE_SOURCE_DIR}/cmake/version_generated.h.in"
+    "${CMAKE_BINARY_DIR}/generated/include/vex/version_generated.h"
+    @ONLY
+)
+include_directories(BEFORE "${CMAKE_BINARY_DIR}/generated/include")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

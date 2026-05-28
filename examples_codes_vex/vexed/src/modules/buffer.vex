@@ -1,0 +1,317 @@
+// =============================================================================
+// modules/buffer.vex - documento + cursor
+// =============================================================================
+//
+// Buffer plano de bytes (LF como separadores) + cursor en byte-offset.
+// Diseno simple para evitar listas enlazadas de objetos GC anidados que
+// estresan al regalloc + GC dance.
+
+public class Buffer {
+    public u8* data;        // contenido en bytes
+    public i32 length;      // bytes usados
+    public i32 capacity;    // bytes alocados
+    public i32 cursor;      // offset del cursor (0..length)
+    public i32 dirty;       // 1 si hubo modificacion desde load/save
+    public i32 sel_anchor;  // -1 = sin seleccion; otro = ancla del rango
+
+    public Buffer() {
+        this.capacity = 1024;
+        this.data = malloc(1024);
+        this.length = 0;
+        this.cursor = 0;
+        this.dirty = 0;
+        this.sel_anchor = -1;
+        this.data[0] = 0;
+    }
+
+    public ~Buffer() {
+        if (this.data != null) {
+            free(this.data);
+        }
+    }
+
+    public void ensure_capacity(i32 need) {
+        if (need + 1 <= this.capacity) { return; }
+        i32 new_cap = this.capacity;
+        while (new_cap < need + 1) {
+            new_cap = new_cap * 2;
+        }
+        u8* nbuf = malloc(new_cap);
+        i32 i = 0;
+        while (i < this.length) {
+            nbuf[i] = this.data[i];
+            i = i + 1;
+        }
+        nbuf[this.length] = 0;
+        free(this.data);
+        this.data = nbuf;
+        this.capacity = new_cap;
+    }
+
+    public void insert_char(i32 c) {
+        this.ensure_capacity(this.length + 1);
+        i32 i = this.length;
+        while (i > this.cursor) {
+            this.data[i] = this.data[i - 1];
+            i = i - 1;
+        }
+        this.data[this.cursor] = c;
+        this.length = this.length + 1;
+        this.data[this.length] = 0;
+        this.cursor = this.cursor + 1;
+        this.dirty = 1;
+    }
+
+    public void newline() {
+        this.insert_char(10);
+    }
+
+    public void backspace() {
+        if (this.cursor == 0) { return; }
+        i32 i = this.cursor;
+        while (i < this.length) {
+            this.data[i - 1] = this.data[i];
+            i = i + 1;
+        }
+        this.length = this.length - 1;
+        this.data[this.length] = 0;
+        this.cursor = this.cursor - 1;
+        this.dirty = 1;
+    }
+
+    public i32 line_count() {
+        i32 n = 1;
+        i32 i = 0;
+        while (i < this.length) {
+            if (this.data[i] == 10) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // Devuelve (row, col) del cursor.
+    public i32 cursor_row() {
+        i32 r = 0;
+        i32 i = 0;
+        while (i < this.cursor) {
+            if (this.data[i] == 10) { r = r + 1; }
+            i = i + 1;
+        }
+        return r;
+    }
+
+    public i32 cursor_col() {
+        i32 col = 0;
+        i32 i = this.cursor - 1;
+        while (i >= 0) {
+            if (this.data[i] == 10) { return col; }
+            col = col + 1;
+            i = i - 1;
+        }
+        return col;
+    }
+
+    // Devuelve el offset (byte) donde inicia la linea `n` (0-based).
+    // Si n >= line_count, devuelve length.
+    public i32 line_offset(i32 n) {
+        if (n == 0) return 0;
+        i32 cur_line = 0;
+        i32 i = 0;
+        while (i < this.length) {
+            if (this.data[i] == 10) {
+                cur_line = cur_line + 1;
+                if (cur_line == n) return i + 1;
+            }
+            i = i + 1;
+        }
+        return this.length;
+    }
+
+    // Mueve el cursor hacia la izquierda 1 byte (sin cruzar offset 0).
+    public void move_left() {
+        if (this.cursor > 0) this.cursor = this.cursor - 1;
+    }
+
+    // Mueve el cursor hacia la derecha 1 byte (sin pasar length).
+    public void move_right() {
+        if (this.cursor < this.length) this.cursor = this.cursor + 1;
+    }
+
+    // Mueve el cursor una linea arriba conservando la columna preferida.
+    public void move_up() {
+        i32 row = this.cursor_row();
+        if (row == 0) return;
+        i32 col = this.cursor_col();
+        i32 prev_start = this.line_offset(row - 1);
+        i32 prev_end = this.line_offset(row) - 1;     // antes del \n
+        i32 prev_len = prev_end - prev_start;
+        if (prev_len < 0) prev_len = 0;
+        i32 want = col;
+        if (want > prev_len) want = prev_len;
+        this.cursor = prev_start + want;
+    }
+
+    public void move_down() {
+        i32 row = this.cursor_row();
+        i32 total = this.line_count();
+        if (row + 1 >= total) return;
+        i32 col = this.cursor_col();
+        i32 next_start = this.line_offset(row + 1);
+        i32 next_end;
+        if (row + 2 < total) {
+            next_end = this.line_offset(row + 2) - 1;
+        } else {
+            next_end = this.length;
+        }
+        i32 next_len = next_end - next_start;
+        if (next_len < 0) next_len = 0;
+        i32 want = col;
+        if (want > next_len) want = next_len;
+        this.cursor = next_start + want;
+    }
+
+    public void move_home() {
+        i32 row = this.cursor_row();
+        this.cursor = this.line_offset(row);
+    }
+
+    public void move_end() {
+        i32 row = this.cursor_row();
+        i32 total = this.line_count();
+        if (row + 1 >= total) {
+            this.cursor = this.length;
+            return;
+        }
+        this.cursor = this.line_offset(row + 1) - 1;
+    }
+
+    // === Seleccion ===
+
+    // Marca el anclaje en el cursor actual si no estaba activo.
+    public void sel_begin() {
+        if (this.sel_anchor < 0) this.sel_anchor = this.cursor;
+    }
+
+    public void sel_clear() {
+        this.sel_anchor = -1;
+    }
+
+    public i32 sel_active() {
+        if (this.sel_anchor < 0) return 0;
+        if (this.sel_anchor == this.cursor) return 0;
+        return 1;
+    }
+
+    public i32 sel_start() {
+        if (this.sel_anchor < 0) return this.cursor;
+        if (this.sel_anchor < this.cursor) return this.sel_anchor;
+        return this.cursor;
+    }
+
+    public i32 sel_end() {
+        if (this.sel_anchor < 0) return this.cursor;
+        if (this.sel_anchor > this.cursor) return this.sel_anchor;
+        return this.cursor;
+    }
+
+    // Borra el rango [from, to) y posiciona el cursor en `from`.  Devuelve
+    // la cantidad de bytes borrados.
+    public i32 delete_range(i32 from, i32 to) {
+        if (from < 0) from = 0;
+        if (to > this.length) to = this.length;
+        if (from >= to) return 0;
+        i32 n = to - from;
+        i32 i = to;
+        while (i < this.length) {
+            this.data[i - n] = this.data[i];
+            i = i + 1;
+        }
+        this.length = this.length - n;
+        this.data[this.length] = 0;
+        this.cursor = from;
+        this.dirty = 1;
+        return n;
+    }
+
+    // Borra la seleccion activa si la hay y devuelve cuantos bytes elimino.
+    public i32 delete_selection() {
+        if (this.sel_active() == 0) {
+            this.sel_anchor = -1;
+            return 0;
+        }
+        i32 s = this.sel_start();
+        i32 e = this.sel_end();
+        i32 n = this.delete_range(s, e);
+        this.sel_anchor = -1;
+        return n;
+    }
+
+    // === Movimiento por palabras ===
+
+    // Es caracter de palabra (alfanumerico + '_').
+    public i32 is_word_byte(i32 c) {
+        if (c >= 48 && c <= 57)  return 1;
+        if (c >= 65 && c <= 90)  return 1;
+        if (c >= 97 && c <= 122) return 1;
+        if (c == 95) return 1;
+        return 0;
+    }
+
+    public void move_word_left() {
+        if (this.cursor == 0) return;
+        i32 i = this.cursor - 1;
+        // Saltar separadores.
+        while (i > 0 && this.is_word_byte((i32) this.data[i]) == 0) {
+            i = i - 1;
+        }
+        // Retroceder mientras siga siendo palabra.
+        while (i > 0 && this.is_word_byte((i32) this.data[i - 1]) == 1) {
+            i = i - 1;
+        }
+        this.cursor = i;
+    }
+
+    public void move_word_right() {
+        if (this.cursor >= this.length) return;
+        i32 i = this.cursor;
+        // Avanzar mientras sea palabra.
+        while (i < this.length && this.is_word_byte((i32) this.data[i]) == 1) {
+            i = i + 1;
+        }
+        // Saltar separadores.
+        while (i < this.length && this.is_word_byte((i32) this.data[i]) == 0) {
+            i = i + 1;
+        }
+        this.cursor = i;
+    }
+
+    // Posiciona el cursor al inicio de la linea `target_row` (0-based).
+    public void goto_line(i32 target_row) {
+        i32 total = this.line_count();
+        if (target_row < 0) target_row = 0;
+        if (target_row >= total) target_row = total - 1;
+        this.cursor = this.line_offset(target_row);
+    }
+
+    // Inserta `n` bytes desde `src` en la posicion del cursor.
+    public void insert_bytes(u8* src, i32 n) {
+        if (n <= 0) return;
+        this.ensure_capacity(this.length + n);
+        // Desplaza cola para hacer hueco.
+        i32 i = this.length - 1;
+        while (i >= this.cursor) {
+            this.data[i + n] = this.data[i];
+            i = i - 1;
+        }
+        // Copia bytes nuevos.
+        i32 j = 0;
+        while (j < n) {
+            this.data[this.cursor + j] = src[j];
+            j = j + 1;
+        }
+        this.length = this.length + n;
+        this.cursor = this.cursor + n;
+        this.data[this.length] = 0;
+        this.dirty = 1;
+    }
+}

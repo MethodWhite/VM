@@ -113,6 +113,14 @@ namespace vex {
             instrument_mode_ = mode;
         }
 
+        /// Wrapper publico para que helpers estaticos del modulo (e.g.
+        /// @c collect_spawn_captures_in_expr) puedan resolver un nombre
+        /// recorriendo todos los scopes activos del lowering.
+        /// @return @c IrValueId del binding o @c IR_NO_VALUE si no existe.
+        ir::IrValueId spawn_capture_resolve_public(const std::string &name) {
+            return spawn_capture_resolve(name);
+        }
+
     private:
         // -----------------------------------------------------------------
         // Helpers de tipo y constante.
@@ -166,6 +174,16 @@ namespace vex {
          *         (strings/structs no soportados en v1).
          */
         uint64_t get_or_create_comptime_global_slot(const std::string &name);
+
+        /**
+         * @brief L2.2: allocate a slot en static_data para una variable
+         * global runtime no-const.  El slot guarda el valor (i64-encoded:
+         * GcHandle para STRING, valor escalar para i64/u64/etc.).
+         *
+         * Idempotente: si ya existe slot para @p name lo devuelve.
+         * Init: el slot empieza zero-filled; @c __module_init lo inicializa.
+         */
+        uint64_t get_or_create_runtime_global_slot(const std::string &name);
 
         /**
          * @brief Inserta una conversion de tipo si difiere; identidad si igual.
@@ -811,6 +829,8 @@ namespace vex {
         /// de memoria distintos pero cada pase del two-phase compile
         /// se mantiene consistente internamente.
         std::unordered_map<std::string, uint64_t> comptime_global_slots_;
+        /// L2.2: slots para globales runtime no-const (string/int/etc.)
+        std::unordered_map<std::string, uint64_t> runtime_global_slots_;
 
         /// sret en call sites: cache nombre-de-funcion -> PrimitiveKind
         /// del tipo de retorno semantico (antes de la transformacion sret).
@@ -872,6 +892,128 @@ namespace vex {
         /// IrValue propagado a traves de @c &x.  Documentado como gap
         /// remanente; requiere acuerdo de diseno antes de implementarse.
         std::unordered_set<std::string> host_bearing_locals_;
+
+        /// Conjunto de clases instanciadas alguna vez via @c new ClassName()
+        /// con modificador @c shared (vd->is_shared).  Lo rellena
+        /// @c lower_var_decl al detectar el patron.  @c generate_new_helpers
+        /// lo consulta para emitir adicionalmente un helper
+        /// @c __new_<X>_shared (que internamente usa @c newobjs en lugar de
+        /// @c newobj).  Sin esto, una instancia compartida apuntaria al
+        /// helper local-only y el child no podria deref el host_ptr.
+        std::unordered_set<std::string> classes_used_shared_;
+
+        /// Vars locales declaradas con modificador @c shared.  El escape
+        /// analyzer de @c spawn las omite del warning "objeto GC local-only
+        /// capturado" (declarar @c shared es la solucion sugerida).
+        std::unordered_set<std::string> shared_locals_;
+
+        /// Slot stack del @c unique<T>/shared<T> que el caller pasa como
+        /// retbuf SRET cuando devuelve smart pointer (signature @c VOID +
+        /// retbuf hidden).  Si @c lower_return detecta que el return value
+        /// es un @c CallExpr a @c unique_box/shared_box/_with, asigna este
+        /// slot al lowering del builtin para que el smart pointer se
+        /// construya IN-PLACE en el retbuf sin copia qword-a-qword al final.
+        /// @c IR_NO_VALUE = sin in-place SRET (lowering normal).
+        ir::IrValueId unique_box_target_slot_ = ir::IR_NO_VALUE;
+
+        /// SSA values de las capturas del spawn body, en el orden en que
+        /// fueron resueltas en el caller (sus nombres viven en
+        /// @c spawn_captured_names_).  Usado por @c generate_spawn_helper
+        /// para propagar @c is_host_ptr / @c is_gc_object a los params del
+        /// helper hijo y por el escape analyzer del spawn capture.
+        std::vector<ir::IrValueId> spawn_captured_ssa_values_;
+
+        /// Nombres de las capturas del spawn body, paralelo a
+        /// @c spawn_captured_ssa_values_.
+        std::vector<std::string>   spawn_captured_names_;
+
+        /// Wrapper publico para que @c collect_spawn_captures_in_expr (que
+        /// vive como helper estatico) pueda resolver un nombre en TODOS
+        /// los scopes activos del lowering.  Equivale a @c lookup(name)
+        /// pero accesible desde el contexto estatico.
+        /// @return @c IrValueId del binding o @c IR_NO_VALUE si no existe.
+        ir::IrValueId spawn_capture_resolve(const std::string &name);
+
+        /// Emite la instruccion @c MVTAKE_IR (move-and-take) que copia un
+        /// qword desde @c [v_src_addr] a @c [v_dst_addr] y zerifica el
+        /// slot fuente en una sola operacion atomica.  Usado por
+        /// @c move(p) sobre smart pointers para implementar move-ownership
+        /// con la garantia de que la fuente queda invalidada.
+        void emit_mvtake(ir::IrValueId v_dst_addr, ir::IrValueId v_src_addr,
+                          uint32_t source_line);
+
+        /// Emite @c IrOp::LABEL_ADDR que se interpreta en el bajado a .vel
+        /// como @c @Absolute("code.<label_name>"), produciendo la direccion
+        /// absoluta del label resuelta por el linker.  Util para invocar
+        /// helpers sintetizados, slots estaticos, etc.
+        ir::IrValueId emit_label_addr(const std::string &label_name,
+                                       uint32_t line);
+
+        /// Construye en stack un @c FindClassParams (name_addr + name_len),
+        /// invoca @c IrOp::FINDCLASS y devuelve el SSA value con el
+        /// @c ClassInfo* resuelto (host_ptr).  @p name_idx referencia el
+        /// slot de strings @c "s_<idx>" emitido previamente.
+        ir::IrValueId emit_findclass_by_name(uint64_t name_idx,
+                                              uint32_t name_len,
+                                              uint32_t line);
+
+        /// Emite @c IrOp::GC_HANDLE_FOR_PTR que toma un host_ptr al payload
+        /// de un objeto GC y devuelve su @c GcHandle (uint32 zero-extended
+        /// a i64).  Util cuando una operacion runtime requiere el handle
+        /// (monitor, weak ref, drop) en lugar del puntero directo.
+        ir::IrValueId emit_gc_handle_for_ptr(ir::IrValueId v_host_ptr,
+                                              uint32_t source_line);
+
+        // --- Helpers de operaciones sobre cadenas (StringObject) ---
+        ir::IrValueId emit_strmake(ir::IrValueId v_buf, ir::IrValueId v_len,
+                                    uint32_t source_line);
+        ir::IrValueId emit_strcat(ir::IrValueId v_a, ir::IrValueId v_b,
+                                   uint32_t source_line);
+        ir::IrValueId emit_strraw(ir::IrValueId v_str, uint32_t source_line);
+        ir::IrValueId emit_strconv(ir::IrValueId v_str, uint64_t enc_imm,
+                                    uint32_t source_line);
+        ir::IrValueId emit_strgetbytes(ir::IrValueId v_str, uint32_t source_line);
+
+        // --- Reflexion / meta-OOP / Phase Z extras ---
+        ir::IrValueId emit_findmethod(ir::IrValueId v_params, uint32_t line);
+        ir::IrValueId emit_findfield(ir::IrValueId v_params, uint32_t line);
+        ir::IrValueId emit_findclass(ir::IrValueId v_params, uint32_t line);
+        ir::IrValueId emit_defclass(ir::IrValueId v_params, uint32_t line);
+        void          emit_deffield(ir::IrValueId v_cls, ir::IrValueId v_params,
+                                    uint32_t line);
+        void          emit_defmethod(ir::IrValueId v_cls, ir::IrValueId v_params,
+                                     uint32_t line);
+        void          emit_addadvice(ir::IrValueId v_target, ir::IrValueId v_advice,
+                                     uint64_t kind, uint32_t line);
+
+        // --- GC primitives / Phase Z atomics ---
+        ir::IrValueId emit_gc_allocp(ir::IrValueId v_size, uint32_t line);
+        ir::IrValueId emit_gc_promote(ir::IrValueId v_src, uint32_t line);
+        ir::IrValueId emit_gc_demote(ir::IrValueId v_src, uint32_t line);
+        ir::IrValueId emit_atomic_ld_i64(ir::IrValueId v_addr, uint32_t line);
+        void          emit_atomic_st_i64(ir::IrValueId v_addr, ir::IrValueId v_val,
+                                         uint32_t line);
+        ir::IrValueId emit_atomic_cas_i64(ir::IrValueId v_addr, ir::IrValueId v_exp,
+                                           ir::IrValueId v_des, uint32_t line);
+        ir::IrValueId emit_atomic_add_i64(ir::IrValueId v_addr, ir::IrValueId v_delta,
+                                           uint32_t line);
+
+        // --- Static fields + AOP proceed + Async fusion + Intrinsics ---
+        ir::IrValueId emit_getstatic(ir::IrValueId v_cls, uint64_t offset,
+                                      uint32_t line);
+        void          emit_setstatic(ir::IrValueId v_cls, ir::IrValueId v_val,
+                                     uint64_t offset, uint32_t line);
+        ir::IrValueId emit_proceed(uint32_t line);
+        ir::IrValueId emit_getpid(uint32_t line);
+        ir::IrValueId emit_getargc(uint32_t line);
+        ir::IrValueId emit_getarg(ir::IrValueId v_idx, uint32_t line);
+        void          emit_fulfill_hlt(ir::IrValueId v_fut, ir::IrValueId v_val,
+                                       uint32_t line);
+
+        // --- Lowering helpers para expresiones nuevas ---
+        ir::IrValueId lower_try_expr(ast::TryExpr *e);
+        ir::IrValueId lower_super_call_expr(ast::SuperCallExpr *e);
+        ir::IrValueId lower_super_method_call_expr(ast::SuperMethodCallExpr *e);
 
         /// Mapa de variables locales tipo `Class` cuyo origen es un
         /// `Class.forName("X")` con literal X.  Permite que el lowering
@@ -972,7 +1114,14 @@ namespace vex {
             ///   SHAREDPTR_REL: decremento del refcount de un @c shared<T> al
             ///                  exit del scope.  Si llega a 0 invoca el
             ///                  deleter sobre payload (ctrl_block + 16).
-            enum class Kind { RAW_ASM, CALL_DTOR, CALLN_FREE, SMARTPTR_FREE, SHAREDPTR_REL };
+            enum class Kind {
+                RAW_ASM,        ///< Cleanup opaco (no preserva regs caller-saved).
+                CALL_DTOR,      ///< CALLVIRT real al destructor de la clase.
+                CALLN_FREE,     ///< CALLN a libreria nativa (e.g. free de colecciones).
+                SMARTPTR_FREE,  ///< Liberar @c unique<T> al exit del scope.
+                SHAREDPTR_REL,  ///< Decrementar refcount de @c shared<T>.
+                SYNC_EXIT       ///< Exit de @c synchronized {} : TRYLEAVE + MONEXIT como IR ops.
+            };
             Kind                         kind = Kind::RAW_ASM;
             // --- Comun ---
             std::vector<ir::IrValueId>   operands;     ///< valores SSA referenciados
@@ -984,6 +1133,15 @@ namespace vex {
             std::string                  asm_text;     ///< plantilla con {src0..}
             // --- CALL_DTOR ---
             uint32_t                     dtor_vtable_index = 0;
+            // --- SMARTPTR_FREE con inner GC class (e.g. @c unique<Resource>) ---
+            /// @c true si el contenido apunta a un objeto GC (no a memoria
+            /// RAW_ALLOC).  Cuando se setea, el cleanup invoca el destructor
+            /// del inner via @c CALLVIRT (@c inner_dtor_vtable_index) y NO
+            /// hace @c RAW_FREE del host_ptr (rompedria el heap GC).
+            bool                         inner_is_gc_class = false;
+            /// Indice en la vtable del destructor del tipo contenido (>0).
+            /// Usado solo si @c inner_is_gc_class.
+            uint32_t                     inner_dtor_vtable_index = 0;
             // --- CALLN_FREE / SMARTPTR_FREE / SHAREDPTR_REL ---
             std::string                  func_name;    ///< "lib:symbol" para CALLN
             bool                         needs_proc = false; ///< prepend GETPROC
@@ -1043,6 +1201,19 @@ namespace vex {
             /// continue_preds.
             std::vector<std::vector<std::unordered_map<std::string, ir::IrValueId>>>
                 continue_scopes;
+            /// Lista de bloques predecesores que saltaron al `break_bb`
+            /// via la sentencia `break`.  Equivalente a continue_preds
+            /// pero para el exit_bb.  Sin esto, las variables modificadas
+            /// en el body antes del break no se propagan al exit del loop
+            /// (bug del PHI del exit con multiples paths que ven distintos
+            /// SSA values).
+            std::vector<ir::IrBlockId> break_preds;
+            /// Snapshot del scope en el instante de cada `break`, paralelo
+            /// a break_preds.  Usado por lower_while/for/do-while para
+            /// emitir PHIs en el exit_bb cuando hay paths con valores
+            /// distintos.
+            std::vector<std::vector<std::unordered_map<std::string, ir::IrValueId>>>
+                break_scopes;
         };
         std::vector<LoopTargets> loop_targets_;
 

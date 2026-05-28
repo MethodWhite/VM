@@ -25,6 +25,7 @@
 #include "vex/lowering.h"
 #include "vex/mermaid_diagrams.h"
 #include "vex/graphviz_diagrams.h"
+#include "vex/namespace_flatten.h"
 #include "vex/parser.h"
 #include "vex/type_checker.h"
 
@@ -67,8 +68,35 @@ namespace vex {
             return res;
         }
 
+        // 1.5. Phase M.7.c: aplanar namespaces inline (`namespace ui { ... }`).
+        //      Tras este pre-pass, el AST no tiene NamespaceDecl wrappers;
+        //      los simbolos internos llevan prefix `<ns>__` (cero overhead
+        //      runtime; compatible con port-c).  Cada namespace encontrado
+        //      se registra en el TypeChecker como Symbol::Namespace para
+        //      que el resolver de `ns.X` lo encuentre.
+        auto inline_namespaces = flatten_namespaces(*mod);
+
         // 2. TypeChecker: rellena result_type y valida semantica.
         TypeChecker tc(*mod, res.diagnostics);
+        // Registrar namespaces inline en el checker ANTES de run().
+        for (const auto &ins : inline_namespaces) {
+            const uint32_t ns_idx = tc.register_imported_namespace(
+                ins.name, ins.name);
+            for (const auto &sym : ins.symbols) {
+                TypeChecker::ImportedNamespace::Sym ns_sym;
+                ns_sym.kind          = (sym.kind == FlattenedNamespace::Sym::Function)
+                    ? 0
+                    : (sym.kind == FlattenedNamespace::Sym::Type ? 2 : 1);
+                ns_sym.mangled_label = sym.mangled_label;
+                // Para funciones, las firmas se rellenaran en check_function
+                // del propio TypeChecker.  Aqui solo registramos la
+                // existencia + mangled_label.  Esto basta porque la
+                // funcion estara TAMBIEN en function_sigs_ (con el nombre
+                // mangled como key), por lo que el lookup puede ir alli.
+                tc.register_namespace_symbol(ns_idx, sym.public_name,
+                                              std::move(ns_sym));
+            }
+        }
         if (!tc.run()) {
             res.ok = false;
             return res;

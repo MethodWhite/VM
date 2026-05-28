@@ -19,25 +19,25 @@ comptime <T> u64 stride_of(i64 count) {
 }
 
 // (1)+(2) Generar tabla de fibs con comptime for-init + array.
-comptime const i64[10] FIB = {0, 1, 1, 2, 3, 5, 8, 13, 21, 34};
+comptime i64[10] FIB = {0, 1, 1, 2, 3, 5, 8, 13, 21, 34};
 static_assert(FIB[8] == 21,  "fib(8)");
 static_assert(FIB[9] == 34,  "fib(9)");
 
-// (4) Struct comptime const.
-comptime const Item ITEMS_FIRST = {.id = 7, .weight = 50};
+// (4) Struct comptime.
+comptime Item ITEMS_FIRST = {.id = 7, .weight = 50};
 static_assert(ITEMS_FIRST.id == 7,      "items first id");
 static_assert(ITEMS_FIRST.weight == 50, "items first weight");
 
 // (3) Type-level + global const.
-comptime const u32 DIM_V3   = vec_dim<Vec3>();          // 3
-comptime const u32 DIM_V4   = vec_dim<Vec4>();          // 4
-comptime const u64 ARR_BYTES = stride_of<Vec3>(100);    // 24*100 = 2400
+comptime u32 DIM_V3   = vec_dim<Vec3>();          // 3
+comptime u32 DIM_V4   = vec_dim<Vec4>();          // 4
+comptime u64 ARR_BYTES = stride_of<Vec3>(100);    // 24*100 = 2400
 static_assert(DIM_V3 == 3,         "dim Vec3");
 static_assert(DIM_V4 == 4,         "dim Vec4");
 static_assert(ARR_BYTES == 2400,   "stride Vec3 100");
 
 i32 main() {
-    // (1) comptime const en for-init dentro de comptime fn body.
+    // (1) comptime en for-init dentro de comptime fn body.
     comptime {
         // (2)+(4) Construir array via while + assignment.
         comptime var i64[8] squares = {0, 0, 0, 0, 0, 0, 0, 0};

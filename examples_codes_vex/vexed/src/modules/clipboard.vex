@@ -1,0 +1,81 @@
+// =============================================================================
+// modules/clipboard.vex - portapapeles global (proceso-locales).
+// =============================================================================
+//
+// Buffer raw global compartido por la sesion del editor.  Almacena la
+// ultima copia/corte.  No interactua con el portapapeles del SO (Win32
+// OpenClipboard/SetClipboardData se deferira a un sprint futuro si se
+// necesita interop con apps externas).
+
+i64 g_buf  = 0;  // u8* en host memory; 0 = vacio
+i32 g_len  = 0;
+i32 g_cap  = 0;
+
+// Sustituye el contenido del portapapeles por una copia de `n` bytes de
+// `src`.  Hace realloc transparente si la capacidad actual no alcanza.
+public void clip_set(u8* src, i32 n) {
+    if (n < 0) n = 0;
+    if (n > g_cap) {
+        i32 new_cap = 64;
+        while (new_cap < n) new_cap = new_cap * 2;
+        if (g_buf != 0) {
+            u8* old = (u8*)g_buf;
+            free(old);
+        }
+        u8* nbuf = malloc(new_cap);
+        g_buf = (i64) nbuf;
+        g_cap = new_cap;
+    }
+    u8* dst = (u8*) g_buf;
+    i32 i = 0;
+    while (i < n) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    g_len = n;
+}
+
+// Anyade `n` bytes al final del portapapeles (kill-ring estilo emacs).
+public void clip_append(u8* src, i32 n) {
+    if (n <= 0) return;
+    if (g_len + n > g_cap) {
+        i32 new_cap = g_cap;
+        if (new_cap < 64) new_cap = 64;
+        while (new_cap < g_len + n) new_cap = new_cap * 2;
+        u8* nbuf = malloc(new_cap);
+        u8* old = (u8*) g_buf;
+        i32 j = 0;
+        while (j < g_len) {
+            nbuf[j] = old[j];
+            j = j + 1;
+        }
+        if (g_buf != 0) free(old);
+        g_buf = (i64) nbuf;
+        g_cap = new_cap;
+    }
+    u8* dst = (u8*) g_buf;
+    i32 i = 0;
+    while (i < n) {
+        dst[g_len + i] = src[i];
+        i = i + 1;
+    }
+    g_len = g_len + n;
+}
+
+// Devuelve puntero al buffer (no consume).  Si vacio, devuelve 0 (null).
+public u8* clip_data() {
+    return (u8*) g_buf;
+}
+
+public i32 clip_len() {
+    return g_len;
+}
+
+public i32 clip_empty() {
+    if (g_len == 0) return 1;
+    return 0;
+}
+
+public void clip_clear() {
+    g_len = 0;
+}

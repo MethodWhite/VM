@@ -350,7 +350,12 @@ namespace runtime {
         //      RET de ese callvm anidado lee de su slot, no del nuestro.
         // El write_bytes que estaba aqui (~30 ns) era trabajo desperdiciado.
         auto push_step = [&](loader::MethodInfo *m, uint64_t ret_to,
-                             loader::MethodInfo *around_target = nullptr) {
+                             loader::MethodInfo *around_target = nullptr,
+                             loader::MethodInfo **chain = nullptr,
+                             uint32_t chain_len = 0,
+                             bool owns_chain = false,
+                             bool save_regs = false,
+                             uint8_t inject_r0_reg = 0 /* LR3 */) {
             const uint64_t cur_rsp = vm->registers.stack_pointer.qword();
             auto *frame            = vm->frame_pool.acquire();
             frame->prev            = vm->frame_stack;
@@ -358,6 +363,20 @@ namespace runtime {
             frame->return_pc       = ret_to;
             frame->frame_base      = cur_rsp;
             frame->proceed_target  = around_target;
+            frame->around_chain    = chain;
+            frame->around_chain_len = chain_len;
+            frame->around_chain_owns = owns_chain ? 1 : 0;
+            frame->has_saved_regs   = save_regs ? 1 : 0;
+            frame->inject_r0_to_reg = inject_r0_reg;
+            // BugFix P0-E2: en advice chain dispatch, los pasos comparten
+            // la calling convention del CALLVIRT original (r1=this, r2..rN=args).
+            // Un advice puede corromper estos regs (e.g. getstatic r1, ...).
+            // Snapshot al push; RET restaura antes del siguiente paso.
+            if (save_regs) {
+                for (int i = 0; i < 12; ++i) {
+                    frame->saved_r1_r12[i] = vm->registers.regs[i + 1].qword();
+                }
+            }
             vm->frame_stack        = frame;
             vm->registers.stack_pointer.qword(cur_rsp - 8);
         };
@@ -425,37 +444,78 @@ namespace runtime {
             return;
         }
 
-        // Recolectar BEFORE/AFTER/AROUND en orden de declaracion.  Para
-        //  ext soportamos UN AROUND (el primero); sucesivos AROUNDs
-        // se ignoran silenciosamente (multi-AROUND nesting requiere stack
-        // de targets, deferido).
+        // B5: Recolectar BEFORE/AFTER/AROUND en orden de declaracion.
+        // Multi-AROUND nesting soportado via around_chain en FrameHeader.
+        // Bug fix 2026-05-23: AFTER_RETURNING se trata como AFTER (mismo
+        // dispatch).  El advice ejecuta tras el target; R0 (return value)
+        // sigue en su reg al entrar al advice -- el advice puede leerlo si
+        // su primer parametro es i64 (el frontend lowering ya lo bindea).
         loader::MethodInfo *befores[16];
         loader::MethodInfo *afters [16];
-        loader::MethodInfo *around = nullptr;
-        size_t n_b = 0, n_a = 0;
+        bool                afters_is_returning[16] = {0};  // LR3
+        loader::MethodInfo *arounds[16];
+        size_t n_b = 0, n_a = 0, n_around = 0;
         for (loader::AdviceEntry *e = method->advice_chain; e != nullptr; e = e->next) {
             if (e->kind == loader::ADVICE_BEFORE && n_b < 16) {
                 befores[n_b++] = e->advice_method;
-            } else if (e->kind == loader::ADVICE_AFTER && n_a < 16) {
-                afters[n_a++]  = e->advice_method;
-            } else if (e->kind == loader::ADVICE_AROUND && around == nullptr) {
-                around = e->advice_method;
+            } else if ((e->kind == loader::ADVICE_AFTER
+                     || e->kind == loader::ADVICE_AFTER_RETURNING) && n_a < 16) {
+                afters[n_a] = e->advice_method;
+                afters_is_returning[n_a] = (e->kind == loader::ADVICE_AFTER_RETURNING);
+                n_a++;
+            } else if (e->kind == loader::ADVICE_AROUND && n_around < 16) {
+                arounds[n_around++] = e->advice_method;
             }
         }
 
-        if (n_b == 0 && n_a == 0 && around == nullptr) {
+        if (n_b == 0 && n_a == 0 && n_around == 0) {
             push_step(method, ret_addr);
             vm->registers.rip.qword(method->code_vaddr);
             vm->decoded_ptr->flags_info.did_jump = true;
             return;
         }
 
-        // Si hay AROUND, M se reemplaza por el advice AROUND en la
-        // secuencia.  El advice puede invocar @c proceed para llamar al
-        // M original (almacenado en frame.proceed_target).  Si el advice
-        // no llama a proceed, M nunca se ejecuta (semantica esperada).
-        loader::MethodInfo *m_slot = (around != nullptr) ? around : method;
-        loader::MethodInfo *proceed_tgt = (around != nullptr) ? method : nullptr;
+        // Si hay >=1 AROUNDs, m_slot = arounds[0] (outer-most).  Su
+        // proceed_target = arounds[1] (o M si solo hay 1 AROUND).  El
+        // resto de la cadena vive en around_chain (alocado en heap;
+        // se libera en el RET del frame de arounds[0]).
+        loader::MethodInfo *m_slot = (n_around > 0) ? arounds[0] : method;
+        loader::MethodInfo *proceed_tgt = nullptr;
+        loader::MethodInfo **around_chain = nullptr;
+        uint32_t            chain_len     = 0;
+        if (n_around > 0) {
+            // proceed_target = next layer: arounds[1] o M si solo hay 1.
+            proceed_tgt = (n_around > 1) ? arounds[1] : method;
+            // around_chain = [arounds[2], arounds[3], ..., arounds[N-1], M]
+            // Si n_around == 1, chain queda con solo [M] o vacio segun convencion.
+            // Convencion: chain_len es lo QUE QUEDA TRAS proceed_target.
+            // Cuando proceed() se ejecuta, lee proceed_target Y avanza la chain.
+            //
+            // n_around=1: chain = [M], len=1.  proceed invoca arounds[1]=M
+            //   (que sera el proceed_target del nuevo frame), chain vacio.
+            //   Pero proceed_tgt ya es M; chain debe ser vacio para que
+            //   el nuevo frame de M no tenga mas proceed_target (M no es AROUND).
+            //   Asi: si proceed_tgt == M (final), chain_len=0.
+            //   Si proceed_tgt es otro AROUND, chain trae los siguientes.
+            // Implementacion:
+            if (n_around == 1) {
+                // proceed_tgt = M, no hay mas wrappers.
+                around_chain = nullptr;
+                chain_len    = 0;
+            } else {
+                // proceed_tgt = arounds[1] (otro AROUND).  chain = arounds[2..N-1] + M.
+                // chain_len = (n_around - 2) + 1 = n_around - 1.
+                chain_len    = static_cast<uint32_t>(n_around - 1);
+                // Alocar heap.  Sera liberado en exec_instr_ret cuando el
+                // frame de arounds[0] (m_slot) muera.  Convencion: el frame
+                // que TIENE around_chain != nullptr es responsable de free().
+                around_chain = new loader::MethodInfo*[chain_len];
+                for (size_t i = 0; i < n_around - 2; ++i) {
+                    around_chain[i] = arounds[i + 2];
+                }
+                around_chain[n_around - 2] = method; // M al final
+            }
+        }
 
         loader::MethodInfo *seq[33];
         size_t n_seq = 0;
@@ -465,13 +525,39 @@ namespace runtime {
         for (size_t i = 0; i < n_a; ++i) seq[n_seq++] = afters[i];
 
         // Push del ultimo al primero.  Cada paso recibe su own return_pc;
-        // el slot de M (o de AROUND) recibe ademas proceed_target.
+        // el slot de M (o de AROUND) recibe ademas proceed_target + chain.
+        // Solo m_slot tiene around_chain_owns=true (alocado en este CALL).
+        // BugFix P0-E2: cada paso del chain guarda r1..r12 para que los
+        // advices BEFORE/AFTER (que pueden corromper estos regs) no rompan
+        // la calling convention vista por los siguientes pasos.
+        // LR3: helper para determinar inject_r0_to_reg de cada step.
+        // Si seq[k] es un advice AFTER_RETURNING, inject_r0_to_reg = 2
+        // (r1 = this implicito del aspect class; r2 = primer arg declarado
+        // = result).  El advice method en @Aspect class recibe `this` como
+        // r1 igual que cualquier metodo de instancia; el primer parametro
+        // del usuario empieza en r2.
+        auto inject_for_step = [&](size_t k) -> uint8_t {
+            if (k <= m_slot_index) return 0;  // before / m_slot
+            const size_t after_idx = k - m_slot_index - 1;
+            if (after_idx >= n_a) return 0;
+            return afters_is_returning[after_idx] ? 2 : 0;
+        };
         push_step(seq[n_seq - 1], ret_addr,
-                  (n_seq - 1 == m_slot_index) ? proceed_tgt : nullptr);
+                  (n_seq - 1 == m_slot_index) ? proceed_tgt : nullptr,
+                  (n_seq - 1 == m_slot_index) ? around_chain : nullptr,
+                  (n_seq - 1 == m_slot_index) ? chain_len    : 0,
+                  (n_seq - 1 == m_slot_index) && around_chain != nullptr,
+                  /*save_regs=*/true,
+                  inject_for_step(n_seq - 1));
         for (size_t i = n_seq - 1; i > 0; --i) {
             const size_t idx = i - 1;
             push_step(seq[idx], seq[i]->code_vaddr,
-                      (idx == m_slot_index) ? proceed_tgt : nullptr);
+                      (idx == m_slot_index) ? proceed_tgt : nullptr,
+                      (idx == m_slot_index) ? around_chain : nullptr,
+                      (idx == m_slot_index) ? chain_len    : 0,
+                      (idx == m_slot_index) && around_chain != nullptr,
+                      /*save_regs=*/true,
+                      inject_for_step(idx));
         }
 
         vm->registers.rip.qword(seq[0]->code_vaddr);
@@ -507,17 +593,34 @@ namespace runtime {
         const uint64_t ret_addr = vm->registers.rip.raw()
                                 + static_cast<uint64_t>(instr.flags_info.size_instr);
 
-        // Push frame para target (sin nuevo proceed_target: el target
-        // no es AROUND de si mismo).  La calling convention preserva
-        // r1=this y args ya en su sitio.
-        // Pool intrusivo en lugar de new/delete: O(1) acquire/release.
-        auto *frame            = vm->frame_pool.acquire();
-        frame->prev            = vm->frame_stack;
-        frame->method          = target;
-        frame->return_pc       = ret_addr;
-        frame->frame_base      = vm->registers.stack_pointer.qword();
-        frame->proceed_target  = nullptr;
-        vm->frame_stack        = frame;
+        // B5 multi-AROUND: si la chain del current frame tiene mas
+        // entradas, el nuevo frame (que ejecuta `target`) hereda:
+        //   proceed_target = chain[0]  (siguiente AROUND o M)
+        //   around_chain   = chain + 1
+        //   chain_len      = cur->chain_len - 1
+        // Si la chain esta vacia, el nuevo frame NO tiene proceed_target
+        // (es el ultimo AROUND y target es M, que no es AROUND).
+        loader::MethodInfo  *next_proceed_target = nullptr;
+        loader::MethodInfo **next_chain          = nullptr;
+        uint32_t             next_chain_len      = 0;
+        if (cur->around_chain_len > 0 && cur->around_chain != nullptr) {
+            next_proceed_target = cur->around_chain[0];
+            if (cur->around_chain_len > 1) {
+                next_chain     = cur->around_chain + 1;
+                next_chain_len = cur->around_chain_len - 1;
+            }
+        }
+
+        auto *frame             = vm->frame_pool.acquire();
+        frame->prev             = vm->frame_stack;
+        frame->method           = target;
+        frame->return_pc        = ret_addr;
+        frame->frame_base       = vm->registers.stack_pointer.qword();
+        frame->proceed_target   = next_proceed_target;
+        frame->around_chain     = next_chain;
+        frame->around_chain_len = next_chain_len;
+        frame->around_chain_owns = 0;  // proceed() nunca aloca; solo CALLVIRT
+        vm->frame_stack         = frame;
         vm->registers.stack_pointer.qword(
             vm->registers.stack_pointer.qword() - 8);
         // Mantener el write para callvm anidado dentro del callee.
@@ -581,6 +684,9 @@ namespace runtime {
             frame->return_pc  = ret_to;
             frame->frame_base = cur_rsp;
             frame->proceed_target = nullptr;
+            frame->around_chain      = nullptr;
+            frame->around_chain_len  = 0;
+            frame->around_chain_owns = 0;
             vm->frame_stack   = frame;
             vm->registers.stack_pointer.qword(cur_rsp - 8);
         };
@@ -667,6 +773,9 @@ namespace runtime {
         frame->return_pc  = ret_addr;
         frame->frame_base = cur_rsp;
         frame->proceed_target = nullptr;
+        frame->around_chain      = nullptr;
+        frame->around_chain_len  = 0;
+        frame->around_chain_owns = 0;
         vm->frame_stack   = frame;
 
         // RSP -= 8 (reserva slot).  No escribimos ret_addr: RET de este
@@ -689,9 +798,11 @@ namespace runtime {
      * @param instr Instruccion descodificada con reg_data.reg1 (objeto excepcion).
      */
     void exec_instr_throw(ProcessVM *vm, const DecodedInstr &instr) {
-        const uint8_t r_obj = instr.data_instruction.reg_data.reg1; // registro con el objeto excepcion
+        const uint8_t r_obj = instr.data_instruction.reg_data.reg1;
         uint64_t exception_ptr = vm->registers.regs[r_obj].qword();
-        do_throw(vm, exception_ptr); // delegar en el helper comun
+        std::fprintf(stderr, "[throw] r_obj=%u exc_ptr=0x%llx\n",
+            (unsigned)r_obj, (unsigned long long)exception_ptr);
+        do_throw(vm, exception_ptr);
     }
 
     // =========================================================================

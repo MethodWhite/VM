@@ -28,6 +28,7 @@
 
 #include "vex/parser.h"
 
+#include <iostream>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -57,6 +58,7 @@ namespace vex {
             "field_name", "field_type",
             "is_subtype", "is_same",
             "is_class", "is_struct", "is_primitive",
+            "is_newtype", "is_opaque", "underlying_of",
             /* iteracion + acceso directo */
             "field_get", "field_set",
             "for_each_field", "for_each_method",
@@ -81,6 +83,103 @@ namespace vex {
         : lex_(lex), diags_(diags), current_(lex.next()) {
         // current_ se carga con el primer token al construir.  A partir
         // de aqui consume() avanza siempre.
+    }
+
+
+    // Phase M.L24: skip una decl top-level cuando @Target no matchea.
+    // Consume tokens hasta el final natural de la decl: para decls con
+    // cuerpo `{ ... }`, hasta cerrar el `}` matching; para decls simples
+    // (typedef, using, global var), hasta el siguiente `;` top-level.
+    void Parser::skip_target_skipped_decl() {
+        int brace_depth = 0;
+        bool entered_body = false;
+        while (current_.kind != TokenKind::END_OF_FILE) {
+            const auto k = current_.kind;
+            if (k == TokenKind::LBRACE) {
+                ++brace_depth;
+                entered_body = true;
+                (void)consume();
+            } else if (k == TokenKind::RBRACE) {
+                if (brace_depth > 0) --brace_depth;
+                (void)consume();
+                if (entered_body && brace_depth == 0) break;
+            } else if (k == TokenKind::SEMICOLON && brace_depth == 0
+                       && !entered_body) {
+                (void)consume();
+                break;
+            } else {
+                (void)consume();
+            }
+        }
+    }
+
+    // Phase M.L24: evalua un spec de @Target("k:v") contra los build
+    // tags del binario actual.  Tags soportados:
+    //   os:windows / os:linux / os:macos / os:posix
+    //   arch:x86_64 / arch:arm64 / arch:x86
+    // Match exacto; si el spec usa ! como prefijo, se niega.
+    static bool target_matches_(const std::string &spec_in) noexcept {
+        if (spec_in.empty()) return true;
+        std::string spec = spec_in;
+        bool negate = false;
+        if (spec[0] == '!') {
+            negate = true;
+            spec.erase(0, 1);
+        }
+        // Tags compilados desde macros del compilador host.
+        std::vector<std::string> tags;
+#if defined(_WIN32)
+        tags.push_back("os:windows");
+#elif defined(__APPLE__)
+        tags.push_back("os:macos");
+        tags.push_back("os:posix");
+#elif defined(__linux__)
+        tags.push_back("os:linux");
+        tags.push_back("os:posix");
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+        tags.push_back("arch:x86_64");
+#elif defined(__aarch64__) || defined(_M_ARM64)
+        tags.push_back("arch:arm64");
+#elif defined(__i386__) || defined(_M_IX86)
+        tags.push_back("arch:x86");
+#endif
+        bool match = false;
+        for (const auto &t : tags) {
+            if (t == spec) { match = true; break; }
+        }
+        return negate ? !match : match;
+    }
+
+    // Phase M6.a L.3: aplica @c pending_visibility_ al nodo si soporta
+    // @c is_public.  Limpia el flag al final para que sub-decls nested
+    // no hereden la visibilidad del top-level que los envuelve.
+    void Parser::apply_pending_visibility(ast::Node *n) noexcept {
+        if (n == nullptr || pending_visibility_ == 0) return;
+        const bool is_public = (pending_visibility_ == 1);
+        switch (n->kind) {
+            case ast::NodeKind::FunctionDecl:
+                static_cast<ast::FunctionDecl*>(n)->is_public = is_public;
+                break;
+            case ast::NodeKind::GlobalVarDecl:
+                static_cast<ast::GlobalVarDecl*>(n)->is_public = is_public;
+                break;
+            case ast::NodeKind::TypeAliasDecl:
+                static_cast<ast::TypeAliasDecl*>(n)->is_public = is_public;
+                break;
+            case ast::NodeKind::StructDecl:
+                static_cast<ast::StructDecl*>(n)->is_public = is_public;
+                break;
+            case ast::NodeKind::EnumDecl:
+                static_cast<ast::EnumDecl*>(n)->is_public = is_public;
+                break;
+            case ast::NodeKind::ClassDecl:
+                static_cast<ast::ClassDecl*>(n)->is_public = is_public;
+                break;
+            default: break;
+        }
+        // Limpiar para no propagar a nested decls.
+        pending_visibility_ = 0;
     }
 
     // ---------------------------------------------------------------------
@@ -183,6 +282,7 @@ namespace vex {
                 case TokenKind::KW_CLASS:
                 case TokenKind::KW_STRUCT:
                 case TokenKind::KW_IMPORT:
+                case TokenKind::KW_NAMESPACE:
                 case TokenKind::KW_CONST:
                 case TokenKind::KW_FN:
                     return;
@@ -214,6 +314,11 @@ namespace vex {
             auto decl = parse_top_level_decl();
             if (decl) {
                 mod->decls.push_back(std::move(decl));
+            } else if (last_decl_was_target_skip_) {
+                // L.24: skip intencional via @Target no matcheado.
+                // El skip_target_skipped_decl ya consumio la decl
+                // completa.  NO sincronizar (el siguiente token ya es
+                // el inicio de la siguiente decl valida).
             } else {
                 // El parser ya reporto el error; intentar seguir.
                 synchronize();
@@ -334,6 +439,39 @@ namespace vex {
     // ---------------------------------------------------------------------
 
     std::unique_ptr<ast::Node> Parser::parse_top_level_decl() {
+        // namespace foo { ... }  (Phase M.7.c, inline namespace estilo C++).
+        if (current_.kind == TokenKind::KW_NAMESPACE) {
+            return parse_namespace_decl();
+        }
+        // import "path" [as alias] [only A, B];  (Phase M sistema de modulos).
+        if (current_.kind == TokenKind::KW_IMPORT) {
+            return parse_import_decl(/*is_public_reexport=*/false);
+        }
+        // public import "x";  (re-export transitivo).
+        if (current_.kind == TokenKind::KW_PUBLIC
+         && lex_.peek_at(0).kind == TokenKind::KW_IMPORT) {
+            (void)consume(); // 'public'
+            return parse_import_decl(/*is_public_reexport=*/true);
+        }
+        // Phase M6.a L.3: visibilidad de top-level decl.  Capturamos
+        // `public`/`private` y guardamos en pending_visibility_; cada
+        // sub-parser que produzca un decl top-level consulta el flag al
+        // final (helper @c apply_pending_visibility_) y lo limpia.  Sin
+        // keyword: el nodo conserva su default (is_public=true) -- compat
+        // con codigo existente.  Un futuro sprint M.future flipeara el
+        // default a privado tras migrar stdlib + editor.
+        if (current_.kind == TokenKind::KW_PUBLIC) {
+            (void)consume();
+            pending_visibility_   = 1;     // 1 = public explicito
+        } else if (current_.kind == TokenKind::KW_PRIVATE) {
+            (void)consume();
+            pending_visibility_   = 2;     // 2 = private explicito
+        }
+        // Cleanup garantizado al salir de parse_top_level_decl.
+        struct VisGuard {
+            uint8_t &flag;
+            ~VisGuard() { flag = 0; }
+        } guard{pending_visibility_};
         // typedef <tipo> <nombre> ;
         if (current_.kind == TokenKind::KW_TYPEDEF) {
             // typedef struct/enum C-style.
@@ -342,34 +480,100 @@ namespace vex {
             // soportaba `typedef i32 Foo;` (alias de tipo basico).
             const TokenKind nk = lex_.peek_at(0).kind;
             if (nk == TokenKind::KW_STRUCT || nk == TokenKind::KW_ENUM) {
-                return parse_typedef_struct_or_enum();
+                auto n = parse_typedef_struct_or_enum();
+                apply_pending_visibility(n.get());
+                return n;
             }
-            return parse_typedef_decl();
+            auto n = parse_typedef_decl();
+            apply_pending_visibility(n.get());
+            return n;
         }
         // using <nombre> = <tipo> ;
         if (current_.kind == TokenKind::KW_USING) {
-            return parse_using_decl();
+            auto n = parse_using_decl();
+            apply_pending_visibility(n.get());
+            return n;
         }
         // Anotaciones top-level que preceden a una clase o funcion:
         //   @Aspect:     clase de aspectos
         //   @Async:      funcion async, transformada a wrapper future + spawn
         //   @Introspect: clase/struct/enum runtime-introspectable (Sprint 4 A.37.s4)
+        //   @Target("os:linux"): Phase M.L24 - compilacion condicional;
+        //                la decl se descarta si no matchea el target actual.
         //   Otras se aceptan y se ignoran silenciosamente.
         bool top_is_aspect     = false;
         bool top_is_async      = false;
         bool top_is_introspect = false;
         bool top_is_macro      = false;  /* A.43.16: @Macro */
         bool top_is_pure       = false;  /* A.43.20: @Pure -- memoizable */
+        bool top_target_skip   = false;  /* L.24: @Target no matchea */
+        // v4: atributos para comptime const a nivel modulo.
+        bool     top_attr_hot   = false;
+        bool     top_attr_cold  = false;
+        uint16_t top_attr_align = 0;
+        std::string top_attr_section;
         while (current_.kind == TokenKind::AT) {
             (void)consume();
             if (current_.kind == TokenKind::IDENTIFIER) {
+                const bool is_target = (current_.lexeme == "Target");
                 if (current_.lexeme == "Aspect") top_is_aspect = true;
                 else if (current_.lexeme == "Async") top_is_async = true;
                 else if (current_.lexeme == "Introspect") top_is_introspect = true;
                 else if (current_.lexeme == "Macro") top_is_macro = true;
                 else if (current_.lexeme == "Pure")  top_is_pure  = true;
+                // v4: atributos para comptime const.
+                const bool is_align   = (current_.lexeme == "align");
+                const bool is_hot     = (current_.lexeme == "hot");
+                const bool is_cold    = (current_.lexeme == "cold");
+                const bool is_section = (current_.lexeme == "section");
                 (void)consume();
-                if (current_.kind == TokenKind::LPAREN) {
+                if (is_hot)  { top_attr_hot  = true; continue; }
+                if (is_cold) { top_attr_cold = true; continue; }
+                if (is_align) {
+                    (void)expect(TokenKind::LPAREN, "se esperaba '(' tras @align");
+                    if (current_.kind != TokenKind::INT_LIT) {
+                        error_here("@align(N) requiere un entero literal");
+                    } else {
+                        const int64_t n = current_.int_val;
+                        (void)consume();
+                        if (n <= 0 || n > 4096
+                         || (n & (n - 1)) != 0) {
+                            error_here("@align(N): N debe ser potencia de 2 en [1,4096]");
+                        } else {
+                            top_attr_align = static_cast<uint16_t>(n);
+                        }
+                    }
+                    (void)expect(TokenKind::RPAREN, "se esperaba ')' tras N en @align(N)");
+                    continue;
+                }
+                if (is_section) {
+                    (void)expect(TokenKind::LPAREN, "se esperaba '(' tras @section");
+                    if (current_.kind != TokenKind::STRING_LIT) {
+                        error_here("@section requiere un string literal");
+                    } else {
+                        top_attr_section = current_.str_val;
+                        (void)consume();
+                    }
+                    (void)expect(TokenKind::RPAREN, "se esperaba ')' tras @section");
+                    continue;
+                }
+                if (is_target) {
+                    // L.24: @Target("os:linux"|"arch:x86_64"|...).  Si la
+                    // condicion NO matchea con los build tags actuales,
+                    // marcamos top_target_skip para descartar la decl.
+                    (void)expect(TokenKind::LPAREN, "se esperaba '(' tras @Target");
+                    std::string spec;
+                    if (current_.kind == TokenKind::STRING_LIT) {
+                        spec = current_.str_val;
+                        (void)consume();
+                    } else {
+                        error_here("@Target requiere un string literal");
+                    }
+                    (void)expect(TokenKind::RPAREN, "se esperaba ')' tras @Target");
+                    if (!target_matches_(spec)) {
+                        top_target_skip = true;
+                    }
+                } else if (current_.kind == TokenKind::LPAREN) {
                     int depth = 0;
                     do {
                         if (current_.kind == TokenKind::LPAREN) ++depth;
@@ -383,10 +587,35 @@ namespace vex {
                 break;
             }
         }
+        // Phase M.L24: si @Target no matcheo, descartar la decl completa
+        // SIN parsearla.  Esto evita diagnosticos espurios por simbolos
+        // que solo existen en el otro target.  La pending_visibility se
+        // limpia automaticamente via VisGuard al salir.
+        if (top_target_skip) {
+            // L.24: indicamos "skip intencional" para que parse_program no
+            // ejecute synchronize() (que descartaria tokens validos de la
+            // siguiente decl).
+            last_decl_was_target_skip_ = true;
+            skip_target_skipped_decl();
+            return nullptr;
+        }
+        last_decl_was_target_skip_ = false;
+        // L.24: si las annotations consumieron tokens y el siguiente
+        // token es `public`/`private` (caso `@Target("..") public i32 fn`),
+        // re-chequear visibilidad aqui.  El bloque de KW_PUBLIC original
+        // esta ANTES del while AT, por lo que las decls con annotations
+        // +visibility necesitan este segundo chequeo.
+        if (pending_visibility_ == 0
+         && (current_.kind == TokenKind::KW_PUBLIC
+          || current_.kind == TokenKind::KW_PRIVATE)) {
+            pending_visibility_ = (current_.kind == TokenKind::KW_PUBLIC) ? 1 : 2;
+            (void)consume();
+        }
         // struct <nombre> { ... }
         if (current_.kind == TokenKind::KW_STRUCT) {
             auto sd = parse_struct_decl();
             if (sd && top_is_introspect) sd->is_introspect = true;
+            apply_pending_visibility(sd.get());
             return sd;
         }
         // class <nombre> { ... }
@@ -394,6 +623,7 @@ namespace vex {
             auto cd = parse_class_decl();
             if (cd && top_is_aspect)     cd->is_aspect     = true;
             if (cd && top_is_introspect) cd->is_introspect = true;
+            apply_pending_visibility(cd.get());
             return cd;
         }
         // interface <nombre> { metodos abstractos }
@@ -402,31 +632,69 @@ namespace vex {
         if (current_.kind == TokenKind::KW_INTERFACE) {
             auto cd = parse_interface_decl();
             if (cd && top_is_introspect) cd->is_introspect = true;
+            apply_pending_visibility(cd.get());
             return cd;
         }
         // ADTs: enum <nombre> { Variante1, Variante2(T1, T2), ... }
         if (current_.kind == TokenKind::KW_ENUM) {
             auto ed = parse_enum_decl();
             if (ed && top_is_introspect) ed->is_introspect = true;
+            apply_pending_visibility(ed.get());
             return ed;
         }
 
-        // 'comptime const T NAME = expr;' a nivel modulo.  Marca
-        // la const como evaluable en compile-time; los usos se inlinean
-        // como CONST IR.  El parser detecta IDENT(comptime) + KW_CONST
-        // contextualmente.
-        // 'comptime <TYPE> <NAME>(params) { body }' a nivel modulo
-        // declara una funcion comptime que se interpreta al compilar.
-        // No emite codigo runtime.
-        bool is_comptime_const = false;
+        // Sintaxis canonica (post-hard-break v4):
+        //   comptime T NAME = expr;          -- const inmutable comptime
+        //   comptime var T NAME = init;      -- mutable (solo usable en eval AST)
+        //   comptime auto NAME = expr;       -- inferido inmutable
+        //   comptime <T,U> RET fn(...) {...} -- funcion comptime generica
+        //   comptime T fn(...) {...}         -- funcion comptime no generica
+        //
+        // `comptime const T X = ...;` (forma vieja con `const` redundante)
+        // se REJECTA con error claro -- el const sobra porque comptime
+        // implica constancia.  Hard break v4.
+        bool is_comptime_const = false;     // canonico: `comptime T X = ...`
         bool is_comptime_var   = false;
         bool is_comptime_fn    = false;
         std::vector<std::string> comptime_type_params;
         if (current_.kind == TokenKind::IDENTIFIER
          && current_.lexeme == "comptime") {
             Lexer &mut_lex = const_cast<Lexer &>(lex_);
+            // LANG.fix-2: `comptime { stmts }` a nivel modulo.  Permite
+            // metaprogramacion que muta `comptime var` globales, llena
+            // arrays con loops, etc.  Antes solo se aceptaba dentro de
+            // funciones (parse_statement).  El cuerpo se ejecuta en el
+            // TypeChecker via comptime_eval_stmt sobre los globales.
+            if (mut_lex.peek_at(0).kind == TokenKind::LBRACE) {
+                const SourceLoc cb_loc = current_.loc;
+                (void)consume();                            // 'comptime'
+                (void)expect(TokenKind::LBRACE,
+                             "se esperaba '{' tras 'comptime'");
+                auto cb = std::make_unique<ast::ComptimeBlockStmt>();
+                cb->loc = cb_loc;
+                while (current_.kind != TokenKind::RBRACE
+                    && current_.kind != TokenKind::END_OF_FILE) {
+                    /* sugar: `NAME = expr;` dentro del bloque NO se
+                     * trata como decl comptime const (a nivel modulo el
+                     * usuario raramente quiere eso, suele querer mutar
+                     * un global existente).  Solo parse_statement
+                     * normal.  Si quieres una const local al bloque,
+                     * escribe `comptime T NAME = expr;` explicito. */
+                    auto inner = parse_statement();
+                    if (inner) cb->stmts.push_back(std::move(inner));
+                    else synchronize();
+                }
+                (void)expect(TokenKind::RBRACE,
+                             "se esperaba '}' al cerrar comptime block");
+                return cb;
+            }
             if (mut_lex.peek_at(0).kind == TokenKind::KW_CONST) {
+                // Forma vieja `comptime const T X = ...`: hard error v4.
+                const SourceLoc bad_loc = current_.loc;
                 (void)consume();   /* 'comptime' */
+                (void)consume();   /* 'const' redundante */
+                diags_.error(bad_loc,
+                    "'comptime const' es redundante; usa 'comptime T X = ...' (comptime ya implica const, salvo 'comptime var')");
                 is_comptime_const = true;
             } else if (mut_lex.peek_at(0).kind == TokenKind::IDENTIFIER
                     && (mut_lex.peek_at(0).lexeme == "var"
@@ -483,25 +751,22 @@ namespace vex {
                              "se esperaba ';' al final de la decl comptime");
                 return gv;
             } else {
-                /* `comptime` seguido de un tipo => funcion comptime.
-                 * Heuristica: tras `comptime`, el siguiente token comienza
-                 * un tipo (primitivo, identifier de struct/class, etc.)
-                 * y la decl es por lo tanto una funcion (ya que vars usan
-                 * `comptime const`).  Si lo que sigue NO es un tipo
-                 * (e.g. otro ident generico), dejamos `comptime` sin
-                 * consumir y el flujo regular emitira error. */
-                /* Aseguramos que tras `comptime` venga algo parseable
-                 * como tipo Y luego un `(` -- senal de funcion. */
-                /* Sin consumir, just chequeamos.  Por simplicidad:
-                 * consumimos `comptime`, marcamos el flag, y si luego no
-                 * encontramos un tipo + `(`, el error sera lanzado por
-                 * el parser regular abajo. */
+                /* `comptime <TYPE> ...` -- puede ser:
+                 *   (a) `comptime T NAME = expr;`  -> comptime const var (v4 canonico)
+                 *   (b) `comptime T fn(args) {...}` -> comptime function
+                 *   (c) `comptime <T,U> RET fn(args) {...}` -> generic comptime fn
+                 *
+                 * El parser consume `comptime`, captura type-params opcionales,
+                 * y deja que el flujo regular (type + name + `=` vs `(`) decida
+                 * si es var o fn.  Si es var, marcamos como comptime const en
+                 * el cierre.  Si es fn, ya marcamos `is_comptime_fn`. */
                 (void)consume();   /* 'comptime' */
-                is_comptime_fn = true;
                 /* A.41: type params opcionales `<T, U, ...>` para
-                 * comptime fn genericos.  El parser los captura aqui y
-                 * los asignara al FunctionDecl despues de parsearlo. */
+                 * comptime fn genericos.  Solo aplica a funciones; si
+                 * aparecen tras `comptime` directamente, marcamos como fn
+                 * temprano porque solo funciones tienen type params. */
                 if (current_.kind == TokenKind::LT) {
+                    is_comptime_fn = true;
                     (void)consume();   /* '<' */
                     while (current_.kind == TokenKind::IDENTIFIER) {
                         comptime_type_params.push_back(consume().lexeme);
@@ -512,16 +777,21 @@ namespace vex {
                         break;
                     }
                     (void)expect_close_angle("se esperaba '>' al cerrar type params");
+                } else {
+                    /* Sin `<>`: la diferencia entre var y fn la decide la
+                     * forma posterior (`= expr;` vs `(args) {...}`).  Marcamos
+                     * tentativamente como comptime_const; si luego resulta
+                     * que es funcion (`(` tras el nombre), revertimos el flag
+                     * antes de devolver el FunctionDecl. */
+                    is_comptime_const = true;
                 }
             }
         }
 
-        // Manejar 'const' opcional al principio.
+        // Manejar 'const' opcional al principio.  En v4, comptime ya implica
+        // const, asi que el `const` aparece solo en declaraciones runtime.
         bool is_const = false;
         if (match(TokenKind::KW_CONST)) is_const = true;
-        if (is_comptime_const && !is_const) {
-            error_here("'comptime' debe ir seguido de 'const'");
-        }
 
         // `static_assert(cond, "msg");` a nivel modulo.  Lo
         // parseamos como una ExprStmt envuelto en un GlobalVarDecl
@@ -569,6 +839,13 @@ namespace vex {
             if (is_const) {
                 diags_.warning(loc, "'const' ignorado en declaracion de funcion");
             }
+            // v4: si veniamos marcados como `comptime const` (caso tentativo
+            // sin type-params) y resulto ser una funcion, promocionar a
+            // comptime fn.
+            if (is_comptime_const && !is_comptime_fn) {
+                is_comptime_fn   = true;
+                is_comptime_const = false;
+            }
             auto fd = parse_function_decl(std::move(type_node), std::move(name), loc);
             // propagar @Async leida en el bucle de annotations.
             // El lowering trata estas funciones distinto: las envuelve en
@@ -594,16 +871,28 @@ namespace vex {
                     macro_expr_params_[fd->name] = std::move(positions);
                 }
             }
+            apply_pending_visibility(fd.get());
             return fd;
         }
-        // `comptime T NAME = expr;` sin `(` -- comptime var
-        // mutable (NO error como antes; cae al global var path arriba).
-        // Es una variable global.
-        // `comptime var T NAME = expr;` -> comptime var mutable
-        // a nivel modulo.  `comptime const ...` mantiene semantica
-        // inmutable
+        // `comptime T NAME = expr;` (forma canonica v4) -> comptime const
+        // (inmutable, exportable, va al .vexi).
+        // `comptime var T NAME = init;` -> comptime mutable (local al eval AST).
+        // v4: si veniamos como `is_comptime_const` (set tentativamente cuando
+        // se vio `comptime` sin `var`/`auto`/`<>`), forzamos @c is_const=true
+        // porque comptime SIEMPRE implica const en var-decls top-level.
+        if (is_comptime_const) {
+            is_const = true;
+        }
         auto gv = parse_global_var_decl(std::move(type_node), std::move(name), loc, is_const);
         if (gv && (is_comptime_const || is_comptime_var)) gv->is_comptime = true;
+        if (gv) {
+            // v4: propagar atributos de usuario (@hot, @cold, @align, @section).
+            gv->attr_hot     = top_attr_hot;
+            gv->attr_cold    = top_attr_cold;
+            gv->attr_align   = top_attr_align;
+            gv->attr_section = std::move(top_attr_section);
+        }
+        apply_pending_visibility(gv.get());
         return gv;
     }
 
@@ -648,6 +937,16 @@ namespace vex {
 
         // Cuerpo: bloque obligatorio para funciones Vex; las funciones
         // sin cuerpo (FFI extern) se modelan via @c ExternFnDecl aparte.
+        // Bug fix 2026-05-23: forward declaration `i32 fn(args);` -- si
+        // vemos `;` en lugar de `{`, registramos la firma sin body.  El
+        // type checker debe ver una definicion (con body) mas adelante o
+        // reportar error de simbolo sin definicion.
+        if (current_.kind == TokenKind::SEMICOLON) {
+            (void)consume(); // ';'
+            fn->body = nullptr;
+            fn->is_forward_decl = true;
+            return fn;
+        }
         if (current_.kind != TokenKind::LBRACE) {
             error_here("se esperaba '{' para abrir el cuerpo de la funcion");
             return fn;
@@ -677,6 +976,17 @@ namespace vex {
             }
             p->name = consume().lexeme;
             return p;
+        }
+        // Z.6: aceptar `shared T name` en params (con disambiguation vs
+        // `shared<T>` smart pointer).  Hoy es sugar documental; el type
+        // system trata `T` y `shared T` como mismo tipo en parametros
+        // (la sharing-ness vive en el HANDLE, no en el TIPO referenciado).
+        // Util para que el autor de la libreria documente intent.
+        if (current_.kind == TokenKind::KW_SHARED
+         && lex_.peek_at(0).kind != TokenKind::LT) {
+            (void)consume();  // 'shared' modificador documental
+            // No registramos un flag en ParamDecl: la sharing-ness se
+            // determina dinamicamente del bit 31 del handle en runtime.
         }
         if (!starts_type()) {
             error_here("se esperaba un tipo en parametro");
@@ -753,7 +1063,13 @@ namespace vex {
                 primitive_kind_from_token(first_kind) != PrimitiveKind::COUNT
                 || first_kind == TokenKind::KW_FN
                 || (first_kind == TokenKind::IDENTIFIER
-                    && first.lexeme == "VirtualPtr");
+                    && first.lexeme == "VirtualPtr")
+                // Item 19: identifier declarado como typedef/using
+                // tambien es un type-starter valido para casts.
+                // Single-pass: el alias debe estar declarado antes
+                // del cast en el archivo.
+                || (first_kind == TokenKind::IDENTIFIER
+                    && declared_aliases_.count(first.lexeme) > 0);
         if (!is_type_starter) return false;
         ++off;
 
@@ -863,6 +1179,12 @@ namespace vex {
 
         Lexer &mut_lex = const_cast<Lexer &>(lex_);
         size_t off = 0;
+        // Phase M.7.c: namespace qualified type `ui.Button name`.
+        // Saltar pares `DOT IDENT` antes del check de generics.
+        while (mut_lex.peek_at(off).kind == TokenKind::DOT
+            && mut_lex.peek_at(off + 1).kind == TokenKind::IDENTIFIER) {
+            off += 2;
+        }
         // Optional: skip generic angle-brackets `<...>` con balance.
         // El lexer tokeniza `>>` como un solo SHR (mismo problema que en
         // C++ <17): aqui tratamos SHR como dos GTs cerrados a la vez.
@@ -905,7 +1227,16 @@ namespace vex {
         }
         // aceptar `T !!name` (BANG_BANG entre tipo y nombre).
         if (mut_lex.peek_at(off).kind == TokenKind::BANG_BANG) ++off;
-        return mut_lex.peek_at(off).kind == TokenKind::IDENTIFIER;
+        const TokenKind nm = mut_lex.peek_at(off).kind;
+        // El nombre del campo/metodo/var puede ser un IDENTIFIER o un
+        // keyword contextual usado como nombre.  `get` y `set` son
+        // contextuales (solo aplican a properties), asi que tambien pueden
+        // ser nombres de metodo normales (ej. `HashMap.get`, `Queue.set`).
+        // Sin esto, `public V get(K key)` no se reconocia como inicio de
+        // metodo porque `get` no era IDENTIFIER.
+        return nm == TokenKind::IDENTIFIER
+            || nm == TokenKind::KW_GET
+            || nm == TokenKind::KW_SET;
     }
 
     std::unique_ptr<ast::TypeNode> Parser::parse_type_node() {
@@ -1031,6 +1362,16 @@ namespace vex {
             auto nt = std::make_unique<ast::NamedTypeNode>();
             nt->loc  = current_.loc;
             nt->name = consume().lexeme;
+            // Phase M.7.c: namespace qualified type (`ui.Button`).
+            // Si seguidos vienen `.IDENT`, concatenamos al nombre con
+            // separador `.` que el type checker traduce a mangled
+            // `ui__Button` al resolver via imported_namespaces_.
+            while (current_.kind == TokenKind::DOT
+                && lex_.peek_at(0).kind == TokenKind::IDENTIFIER) {
+                (void)consume(); // '.'
+                nt->name += ".";
+                nt->name += consume().lexeme;
+            }
             // si despues del nombre viene `<`, parseamos
             // type args.  En contexto de tipo no hay ambiguedad: `<` solo
             // puede iniciar argumentos de tipo aqui.  Aceptamos uno o mas
@@ -1224,7 +1565,104 @@ namespace vex {
             return nullptr;
         }
         a->name = consume().lexeme;
+        // Newtype + opaque + align + explicit from/to (extension 2026-05-23):
+        //   typedef u64 ptr new;
+        //   typedef u64 ptr new @opaque;
+        //   typedef u8  v   new @align(16);            // SIMD alignment
+        //   typedef u64 fd  new @opaque {              // bloque de conversiones
+        //       explicit from u64;                     // cast (fd) raw -- privado al fichero
+        //       public explicit to u64;                // cast (u64) f  -- cross-file ok
+        //   }
+        // El `new` reutiliza el keyword existente.  `@opaque` y `@align(N)`
+        // se parsean como anotaciones contextuales en cualquier orden.
+        if (current_.kind == TokenKind::KW_NEW) {
+            (void)consume();
+            a->is_newtype = true;
+            // Loop sobre anotaciones contextuales @opaque / @align(N).
+            while (current_.kind == TokenKind::AT) {
+                (void)consume(); // '@'
+                if (current_.kind != TokenKind::IDENTIFIER) {
+                    error_here("se esperaba nombre de anotacion tras '@'");
+                    break;
+                }
+                const std::string ann = current_.lexeme;
+                (void)consume();
+                if (ann == "opaque") {
+                    a->is_opaque = true;
+                } else if (ann == "align") {
+                    (void)expect(TokenKind::LPAREN, "se esperaba '(' tras '@align'");
+                    if (current_.kind != TokenKind::INT_LIT) {
+                        error_here("@align(N) requiere un entero literal");
+                        break;
+                    }
+                    const uint64_t n = current_.int_val;
+                    (void)consume();
+                    (void)expect(TokenKind::RPAREN, "se esperaba ')' tras N en @align(N)");
+                    // Validar potencia de 2 en [1, 4096].
+                    if (n == 0 || n > 4096 || (n & (n - 1)) != 0) {
+                        error_here("@align(N): N debe ser potencia de 2 en [1, 4096]");
+                    } else {
+                        a->align_override = static_cast<uint16_t>(n);
+                    }
+                } else {
+                    error_here(("anotacion desconocida tras 'new': '@"
+                                + ann + "'; esperaba '@opaque' o '@align(N)'").c_str());
+                    break;
+                }
+            }
+            // Bloque opcional de conversiones explicit from/to.
+            if (current_.kind == TokenKind::LBRACE) {
+                (void)consume(); // '{'
+                while (current_.kind != TokenKind::RBRACE
+                    && current_.kind != TokenKind::END_OF_FILE) {
+                    bool is_public = false;
+                    if (current_.kind == TokenKind::KW_PUBLIC) {
+                        (void)consume();
+                        is_public = true;
+                    }
+                    if (current_.kind != TokenKind::IDENTIFIER
+                     || current_.lexeme != "explicit") {
+                        error_here("se esperaba 'explicit' [from|to] T;"
+                                   " dentro del bloque de typedef");
+                        break;
+                    }
+                    (void)consume(); // 'explicit'
+                    if (current_.kind != TokenKind::IDENTIFIER
+                     || (current_.lexeme != "from"
+                       && current_.lexeme != "to")) {
+                        error_here("se esperaba 'from' o 'to' tras 'explicit'");
+                        break;
+                    }
+                    const bool is_from = (current_.lexeme == "from");
+                    (void)consume(); // 'from'|'to'
+                    if (!starts_type()) {
+                        error_here("se esperaba un tipo tras 'from'/'to'");
+                        break;
+                    }
+                    auto tn = parse_type_node();
+                    (void)expect(TokenKind::SEMICOLON,
+                        "se esperaba ';' al final de 'explicit from/to T'");
+                    ast::TypeAliasDecl::ExplicitConv ec;
+                    ec.type      = std::move(tn);
+                    ec.is_public = is_public;
+                    if (is_from) a->explicit_from.push_back(std::move(ec));
+                    else         a->explicit_to.push_back(std::move(ec));
+                }
+                (void)expect(TokenKind::RBRACE, "se esperaba '}' tras el bloque del typedef");
+                // Bloque sin punto y coma final: la sintaxis es similar
+                // a class/struct.  Aceptar `}` solo sin ';' obligatorio.
+                if (current_.kind == TokenKind::SEMICOLON) {
+                    (void)consume();
+                }
+                // Item 19 + extension: registrar el alias antes del return
+                declared_aliases_.insert(a->name);
+                return a;
+            }
+        }
         (void)expect(TokenKind::SEMICOLON, "se esperaba ';' al final de 'typedef'");
+        // Item 19: registrar alias para que `looks_like_cast` lo reconozca
+        // en `(MyTypedef) x`.
+        declared_aliases_.insert(a->name);
         return a;
     }
 
@@ -1248,7 +1686,135 @@ namespace vex {
         if (!a->aliased) return nullptr;
 
         (void)expect(TokenKind::SEMICOLON, "se esperaba ';' al final de 'using'");
+        declared_aliases_.insert(a->name);
         return a;
+    }
+
+    // -----------------------------------------------------------------
+    // import: declaracion de importacion de modulo (Phase M).
+    //
+    // Sintaxis aceptada:
+    //   import "path";
+    //   import "path" as alias;
+    //   import "path" only A, B;
+    //   import "path" only A as A2, B;
+    //   import "path" as alias only A, B;     <- alias para namespace y only
+    //                                            para seleccion no se anyaden
+    //                                            al mismo namespace; el alias
+    //                                            queda inactivo si hay only
+    //   public import "path" [as alias] [only ...];
+    //
+    // El path es siempre un string literal sin interpolacion.  Por
+    // consistencia con extern "lib.dll", loadmodule(path), y @Method.
+    // El sufijo .vex se anyade automaticamente al resolver.
+    // -----------------------------------------------------------------
+    std::unique_ptr<ast::ImportDecl> Parser::parse_import_decl(bool is_public_reexport) {
+        auto im = std::make_unique<ast::ImportDecl>();
+        im->loc                 = current_.loc;
+        im->is_public_reexport  = is_public_reexport;
+
+        (void)consume(); // 'import'
+
+        // El path debe ser un literal string puro.  Strings interpolados
+        // arrancan con ISTR_BEGIN (no STRING_LIT) -- el check con
+        // STRING_LIT/RAW_STRING_LIT garantiza implicitamente que no hay
+        // interpolacion en la ruta.
+        if (current_.kind != TokenKind::STRING_LIT
+         && current_.kind != TokenKind::RAW_STRING_LIT) {
+            error_here("se esperaba un literal string como ruta del modulo, "
+                       "e.g. import \"editor/buffer\";");
+            return nullptr;
+        }
+        im->path = current_.str_val;
+        (void)consume();
+
+        // Opcional: as alias  (contextual 'as').
+        if (current_.kind == TokenKind::IDENTIFIER
+         && current_.lexeme == "as") {
+            (void)consume(); // 'as'
+            if (current_.kind != TokenKind::IDENTIFIER) {
+                error_here("se esperaba un identificador para el alias tras 'as'");
+                return nullptr;
+            }
+            im->alias = consume().lexeme;
+        }
+
+        // Opcional: only A [as A2], B [as B2], ...  (contextual 'only').
+        if (current_.kind == TokenKind::IDENTIFIER
+         && current_.lexeme == "only") {
+            (void)consume(); // 'only'
+            for (;;) {
+                if (current_.kind != TokenKind::IDENTIFIER) {
+                    error_here("se esperaba un identificador en la lista 'only'");
+                    return nullptr;
+                }
+                ast::ImportDecl::OnlySymbol os;
+                os.name = consume().lexeme;
+                if (current_.kind == TokenKind::IDENTIFIER
+                 && current_.lexeme == "as") {
+                    (void)consume(); // 'as'
+                    if (current_.kind != TokenKind::IDENTIFIER) {
+                        error_here("se esperaba un identificador tras 'as' en 'only'");
+                        return nullptr;
+                    }
+                    os.rename = consume().lexeme;
+                }
+                im->only_symbols.push_back(std::move(os));
+                if (current_.kind == TokenKind::COMMA) {
+                    (void)consume();
+                    continue;
+                }
+                break;
+            }
+        }
+
+        (void)expect(TokenKind::SEMICOLON, "se esperaba ';' al final de 'import'");
+        return im;
+    }
+
+    // -----------------------------------------------------------------
+    // namespace: agrupacion inline estilo C++ (Phase M.7.c).
+    //
+    //   namespace foo {
+    //       class Button { ... }
+    //       struct Point { ... }
+    //       i32 helper() { ... }
+    //   }
+    //
+    // Soporta anidamiento:
+    //   namespace a { namespace b { class C {} } }
+    //
+    // El contenido se parsea con parse_top_level_decl recursivamente; el
+    // pre-pass de mangling (compiler_project.cpp::mangle_top_level_)
+    // recorrera el AST anyadiendo el prefijo `foo__` a todos los nombres.
+    // -----------------------------------------------------------------
+    std::unique_ptr<ast::NamespaceDecl> Parser::parse_namespace_decl() {
+        auto ns = std::make_unique<ast::NamespaceDecl>();
+        ns->loc = current_.loc;
+        (void)consume(); // 'namespace'
+
+        if (current_.kind != TokenKind::IDENTIFIER) {
+            error_here("se esperaba el nombre del namespace tras 'namespace'");
+            return nullptr;
+        }
+        ns->name = consume().lexeme;
+
+        (void)expect(TokenKind::LBRACE, "se esperaba '{' tras el nombre del namespace");
+
+        while (current_.kind != TokenKind::RBRACE
+            && current_.kind != TokenKind::END_OF_FILE) {
+            auto inner = parse_top_level_decl();
+            if (!inner) {
+                // Error de parse en una decl interna -- skipear hasta el
+                // siguiente token aprovechable para no quedarnos en bucle.
+                synchronize();
+                continue;
+            }
+            ns->decls.push_back(std::move(inner));
+        }
+        (void)expect(TokenKind::RBRACE,
+            "se esperaba '}' al final del namespace");
+        return ns;
     }
 
     // -----------------------------------------------------------------
@@ -1283,6 +1849,20 @@ namespace vex {
             return nullptr;
         }
         e->name = consume().lexeme;
+
+        // L2.3: generics opcionales `<T>`, `<K, V>` tras el nombre del enum.
+        // Mismo patron que parse_class_decl: cada parametro es un identificador
+        // simple; el enum se trata como plantilla y se monomorphiza en cada
+        // uso `Maybe<i32>` en el type checker.
+        if (current_.kind == TokenKind::LT) {
+            (void)consume(); // '<'
+            while (current_.kind == TokenKind::IDENTIFIER) {
+                e->type_params.push_back(consume().lexeme);
+                if (!match(TokenKind::COMMA)) break;
+            }
+            (void)expect_close_angle("se esperaba '>' al cerrar parametros de tipo");
+        }
+
         (void)expect(TokenKind::LBRACE, "se esperaba '{' al abrir el cuerpo del enum");
 
         while (current_.kind != TokenKind::RBRACE
@@ -1389,6 +1969,17 @@ namespace vex {
                     if (!match(TokenKind::COMMA)) break;
                 }
                 (void)expect(TokenKind::RPAREN, "se esperaba ')' al cerrar bindings del patron");
+            }
+            // Bug fix 2026-05-23: match guards `case Pat if cond =>`.
+            // Tras parsear el patron (con o sin bindings), aceptar `if expr`
+            // opcional antes del `=>`.  La expr se guarda en @c arm.guard
+            // y se evalua DESPUES del tag match en runtime.
+            if (current_.kind == TokenKind::KW_IF) {
+                (void)consume(); // 'if'
+                arm.guard = parse_expr();
+                if (!arm.guard) {
+                    error_here("se esperaba una expresion para el guard del case");
+                }
             }
             (void)expect(TokenKind::FAT_ARROW, "se esperaba '=>' tras el patron del case");
             // Body del arm: aceptamos cualquier statement (bloque,
@@ -1551,10 +2142,16 @@ namespace vex {
                     const std::string aname = current_.lexeme;
                     (void)consume();
                     // Detectar kind de advice por nombre.
+                    // Bug fix 2026-05-23: @AfterReturning alias para @After
+                    // que recibe el valor de retorno como ultimo arg.  El
+                    // codigo runtime de AOP chain trata kind=2 (AFTER) igual
+                    // que kind=4 (AFTER_RETURNING); el frontend baja un
+                    // load extra del r0 del callee para el param result.
                     uint8_t this_kind = 0;
-                    if      (aname == "Before") this_kind = 1;
-                    else if (aname == "After")  this_kind = 2;
-                    else if (aname == "Around") this_kind = 3;
+                    if      (aname == "Before")          this_kind = 1;
+                    else if (aname == "After")           this_kind = 2;
+                    else if (aname == "Around")          this_kind = 3;
+                    else if (aname == "AfterReturning")  this_kind = 4;
                     if (aname == "Override") annot_override = true;
                     if (aname == "Inline")   annot_inline   = true;
 
@@ -2210,6 +2807,15 @@ namespace vex {
                 cf->body = parse_statement();
                 return cf;
             }
+            // BugFix R6: `foreach (T x : col) body` como alias de
+            // `for (T x : col) body`.  `foreach` no es keyword reservada;
+            // se reconoce contextualmente solo cuando aparece en posicion
+            // de statement seguido de `(`.  parse_for_stmt acepta ambos
+            // tokens (KW_FOR o IDENT("foreach")) al inicio.
+            if (current_.lexeme == "foreach"
+             && mut_lex.peek_at(0).kind == TokenKind::LPAREN) {
+                return parse_for_stmt();
+            }
         }
         switch (current_.kind) {
             case TokenKind::LBRACE:        return parse_block();
@@ -2276,6 +2882,17 @@ namespace vex {
         auto vd = std::make_unique<ast::VarDeclStmt>();
         vd->loc      = current_.loc;
         vd->is_const = is_const;
+        /* Z.6: modificador `shared` en var-decl marca el storage class.
+         * Disambiguacion con el smart pointer `shared<T>`: si tras `shared`
+         * viene `<`, NO es modificador (es el tipo smart pointer); si
+         * viene cualquier otro starter de tipo (identificador, keyword
+         * primitivo, etc.), SI es modificador y consumimos.  El parser
+         * de @c parse_type_node luego ve el tipo "limpio" sin shared. */
+        if (current_.kind == TokenKind::KW_SHARED
+         && lex_.peek_at(0).kind != TokenKind::LT) {
+            (void)consume();                  /* descartar 'shared' modifier */
+            vd->is_shared = true;
+        }
         /* `auto NAME = init;` o `var NAME = init;` -- inferencia
          * local de tipo desde el init.  `auto`/`var` se reconocen como
          * IDENTIFIER contextual seguido de OTRO IDENTIFIER (el nombre);
@@ -2310,18 +2927,38 @@ namespace vex {
         // ArrayTypeNode(N).  Acepta tambien `T name[]` (sin tamano,
         // tipico de parametros con decay-to-ptr).  Cadena permitida
         // para matrices: `T name[N][M]`.
-        while (current_.kind == TokenKind::LBRACKET) {
-            const SourceLoc abr_loc = current_.loc;
-            (void)consume(); // '['
-            auto an = std::make_unique<ast::ArrayTypeNode>();
-            an->loc          = abr_loc;
-            an->element_type = std::move(vd->type);
-            if (current_.kind != TokenKind::RBRACKET) {
-                an->size_expr = parse_expr();
+        //
+        // Bug fix 2026-05-23: para matrices `T name[N][M][K]`, la dimension
+        // MAS A LA IZQUIERDA es la EXTERIOR (igual que C).  Sea result =
+        // T[N][M][K] significa: array de N de array de M de array de K de T.
+        // El orden de los `[N]`, `[M]`, `[K]` en el wrap es:
+        //   outer = N -> element = (array M de (array K de T)).
+        // El wrap NAIVE (siguiente bracket envuelve al previo) invierte el
+        // orden y produce T[K][M][N].  Coleccionamos los tamanyos en
+        // vector y wrappeamos de DERECHA a IZQUIERDA.
+        if (current_.kind == TokenKind::LBRACKET) {
+            std::vector<std::pair<SourceLoc, std::unique_ptr<ast::Expr>>> dims;
+            while (current_.kind == TokenKind::LBRACKET) {
+                const SourceLoc abr_loc = current_.loc;
+                (void)consume(); // '['
+                std::unique_ptr<ast::Expr> sz;
+                if (current_.kind != TokenKind::RBRACKET) {
+                    sz = parse_expr();
+                }
+                (void)expect(TokenKind::RBRACKET,
+                             "se esperaba ']' al cerrar el tamano del array");
+                dims.emplace_back(abr_loc, std::move(sz));
             }
-            (void)expect(TokenKind::RBRACKET,
-                         "se esperaba ']' al cerrar el tamano del array");
-            vd->type = std::move(an);
+            // Wrap de derecha a izquierda: la ULTIMA dimension envuelve al
+            // tipo base; cada dimension anterior envuelve la previa.  Asi
+            // T[N][M][K] -> ArrayType(N, ArrayType(M, ArrayType(K, T))).
+            for (auto it = dims.rbegin(); it != dims.rend(); ++it) {
+                auto an = std::make_unique<ast::ArrayTypeNode>();
+                an->loc          = it->first;
+                an->element_type = std::move(vd->type);
+                an->size_expr    = std::move(it->second);
+                vd->type         = std::move(an);
+            }
         }
         if (match(TokenKind::ASSIGN)) {
             vd->init = parse_expr();
@@ -2385,8 +3022,11 @@ namespace vex {
 
     std::unique_ptr<ast::Stmt> Parser::parse_for_stmt() {
         const SourceLoc for_loc = current_.loc;
-        (void)consume(); // 'for'
-        (void)expect(TokenKind::LPAREN, "se esperaba '(' tras 'for'");
+        // Aceptar tanto KW_FOR como IDENT("foreach") contextual.  Ambos
+        // delegan al mismo handler que detecta automaticamente la
+        // sintaxis foreach (`T x : col`) vs counted-for (`init; cond; step`).
+        (void)consume(); // 'for' o 'foreach'
+        (void)expect(TokenKind::LPAREN, "se esperaba '(' tras 'for'/'foreach'");
 
         // aceptar `comptime const/var T NAME = expr` como init del for.
         // Esto permite usar el counter como comptime value dentro del body
@@ -2878,6 +3518,74 @@ namespace vex {
                     expr = std::move(u);
                     break;
                 }
+
+                case TokenKind::QUESTION: {
+                    // P2: operador postfix `?` para Result -- early-return.
+                    // Disambiguacion con el ternario `cond ? a : b`:
+                    //   - ternario: '?' seguido de algo que empieza una
+                    //     expresion (ident, literal, '(', '!', '-', etc.).
+                    //   - postfix-?: '?' seguido de un token que no puede
+                    //     empezar una expresion (';', ',', ')', ']', '}',
+                    //     binop, etc.).
+                    // Si NO es postfix-?, retornamos sin consumir el '?'
+                    // para que parse_ternary lo procese arriba.
+                    Lexer &mut_lex = const_cast<Lexer &>(lex_);
+                    // peek_at(0) es el token DESPUES del actual (current_ ya
+                    // contiene el `?`, asi que peek_at(0) es lo que viene
+                    // tras el `?`).
+                    const Token &next = mut_lex.peek_at(0);
+                    bool is_postfix_q = false;
+                    switch (next.kind) {
+                        case TokenKind::SEMICOLON:
+                        case TokenKind::COMMA:
+                        case TokenKind::RPAREN:
+                        case TokenKind::RBRACKET:
+                        case TokenKind::RBRACE:
+                        // binops + asignacion + comparacion + dot (chain)
+                        case TokenKind::PLUS:
+                        case TokenKind::STAR:
+                        case TokenKind::SLASH:
+                        case TokenKind::PERCENT:
+                        case TokenKind::AMP:
+                        case TokenKind::PIPE:
+                        case TokenKind::CARET:
+                        case TokenKind::AND_AND:
+                        case TokenKind::OR_OR:
+                        case TokenKind::SHL:
+                        case TokenKind::SHR:
+                        case TokenKind::ASSIGN:
+                        case TokenKind::EQ:
+                        case TokenKind::NEQ:
+                        case TokenKind::LE:
+                        case TokenKind::GE:
+                        case TokenKind::PLUS_ASSIGN:
+                        case TokenKind::MINUS_ASSIGN:
+                        case TokenKind::STAR_ASSIGN:
+                        case TokenKind::SLASH_ASSIGN:
+                        case TokenKind::DOT:
+                        case TokenKind::QUESTION:    // chain a?b? -> primero postfix
+                        case TokenKind::END_OF_FILE:
+                            is_postfix_q = true;
+                            break;
+                        default:
+                            // MINUS y LT/GT son ambiguos pero por defecto
+                            // se quedan como ternario (mas comun el ternario).
+                            // Si el usuario quiere postfix-? en estos casos,
+                            // puede agrupar: (expr?) + x.
+                            is_postfix_q = false;
+                            break;
+                    }
+                    if (!is_postfix_q) {
+                        return expr;  // dejar el '?' para parse_ternary
+                    }
+                    const SourceLoc loc = current_.loc;
+                    (void)consume();  // consume '?'
+                    auto t = std::make_unique<ast::TryExpr>();
+                    t->loc     = loc;
+                    t->operand = std::move(expr);
+                    expr = std::move(t);
+                    break;
+                }
                 case TokenKind::LT: {
                     /* Soporte para builtins comptime con type args:
                      * @c sizeof<T>(), @c offsetof<T>("field"), etc.
@@ -3300,16 +4008,80 @@ namespace vex {
                 (void)consume();
                 return e;
             }
+            case TokenKind::KW_SUPER: {
+                // BugFix R1: `super(args)` para delegacion al ctor de la
+                // superclase, o `super.method(args)` para llamar al metodo
+                // del super sin dispatch virtual.
+                (void)consume();  // 'super'
+                if (current_.kind == TokenKind::LPAREN) {
+                    // super(args) -- delegacion ctor
+                    auto e = std::make_unique<ast::SuperCallExpr>();
+                    e->loc = loc;
+                    (void)consume();  // '('
+                    while (current_.kind != TokenKind::RPAREN
+                        && current_.kind != TokenKind::END_OF_FILE) {
+                        auto arg = parse_expr();
+                        if (arg) e->args.push_back(std::move(arg));
+                        if (!match(TokenKind::COMMA)) break;
+                    }
+                    (void)expect(TokenKind::RPAREN, "se esperaba ')' tras args de super(...)");
+                    return e;
+                }
+                if (current_.kind == TokenKind::DOT) {
+                    // super.method(args)
+                    (void)consume();  // '.'
+                    if (current_.kind != TokenKind::IDENTIFIER) {
+                        error_here("se esperaba nombre de metodo tras 'super.'");
+                        return nullptr;
+                    }
+                    auto e = std::make_unique<ast::SuperMethodCallExpr>();
+                    e->loc         = loc;
+                    e->method_name = consume().lexeme;
+                    if (current_.kind != TokenKind::LPAREN) {
+                        error_here("se esperaba '(' tras 'super.<metodo>'");
+                        return nullptr;
+                    }
+                    (void)consume();  // '('
+                    while (current_.kind != TokenKind::RPAREN
+                        && current_.kind != TokenKind::END_OF_FILE) {
+                        auto arg = parse_expr();
+                        if (arg) e->args.push_back(std::move(arg));
+                        if (!match(TokenKind::COMMA)) break;
+                    }
+                    (void)expect(TokenKind::RPAREN, "se esperaba ')' tras args de super.method(...)");
+                    return e;
+                }
+                error_here("'super' debe ir seguido de '(' (delegacion ctor) o '.metodo(' (llamada no-virtual)");
+                return nullptr;
+            }
             case TokenKind::KW_NEW: {
                 // Creacion de instancia: 'new' <ClassName> '(' args... ')'.
+                // bug4: tambien 'new T[N]' donde T puede ser primitivo
+                // (i32/i64/string/bool/etc) o nombre de clase/enum/struct.
                 (void)consume();
-                if (current_.kind != TokenKind::IDENTIFIER) {
-                    error_here("se esperaba un nombre de clase tras 'new'");
-                    return nullptr;
-                }
                 auto e = std::make_unique<ast::NewExpr>();
                 e->loc        = loc;
-                e->class_name = consume().lexeme;
+                // Aceptar IDENTIFIER (clases, enums, structs, typedefs) o
+                // primitive_kind_from_token (i32, i64, string, bool, f32...).
+                if (current_.kind == TokenKind::IDENTIFIER) {
+                    e->class_name = consume().lexeme;
+                    // Phase M.7.c: namespace qualified `new ui.Button(...)`.
+                    // Concatenamos con `.` igual que en parse_type_node;
+                    // el TypeChecker traduce a mangled label.
+                    while (current_.kind == TokenKind::DOT
+                        && lex_.peek_at(0).kind == TokenKind::IDENTIFIER) {
+                        (void)consume(); // '.'
+                        e->class_name += ".";
+                        e->class_name += consume().lexeme;
+                    }
+                } else if (primitive_kind_from_token(current_.kind) != PrimitiveKind::COUNT) {
+                    // Captura lexeme del primitivo para que el lowering
+                    // pueda mapearlo a IrType correcto.
+                    e->class_name = consume().lexeme;
+                } else {
+                    error_here("se esperaba un nombre de tipo tras 'new'");
+                    return nullptr;
+                }
                 // Argumentos de tipo opcionales `<T1, T2, ...>` para
                 // instanciaciones genericas: @c new Box<i32>(42).
                 if (current_.kind == TokenKind::LT) {
@@ -3323,6 +4095,20 @@ namespace vex {
                     }
                     (void)expect_close_angle(
                         "se esperaba '>' al cerrar argumentos de tipo en new");
+                }
+                // bug4: array allocation `new T[N]`.  En lugar de `(args)`,
+                // si vemos `[<expr>]` parseamos como array_size.  Resultado
+                // semantico: aloca N * sizeof(T) bytes en host heap y
+                // devuelve un host_ptr al primer elemento (decay-to-T*).
+                if (current_.kind == TokenKind::LBRACKET) {
+                    (void)consume(); // '['
+                    e->array_size = parse_expr();
+                    if (!e->array_size) {
+                        error_here("se esperaba expresion del tamano del array en 'new T[N]'");
+                    }
+                    (void)expect(TokenKind::RBRACKET,
+                        "se esperaba ']' al cerrar el tamano del array en 'new T[N]'");
+                    return e;
                 }
                 (void)expect(TokenKind::LPAREN, "se esperaba '(' tras el nombre de la clase");
                 while (current_.kind != TokenKind::RPAREN

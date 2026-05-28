@@ -1,0 +1,44 @@
+// Bench 3: GC sweep latency.
+// Alocar batches de N shared objects, descartar refs, ejecutar
+// shared_gc_collect(), repetir K veces.  Mide tiempo de sweep amortizado.
+//
+// Configuracion:
+//   - 100 ciclos GC
+//   - Cada ciclo aloca 1000 shared objects + descarta + collect
+//   - Total: 100_000 allocs + 100 sweeps
+//
+// Esperado:
+//   - Sweep es O(slots_vivos + size_total_fields).
+//   - Para 1000 objetos pequenyos: ~50-200 us per sweep.
+//   - Total wall time dominado por allocs (100K * ~150 ns = ~15 ms) + GC.
+class Node {
+    public i64 a;
+    public i64 b;
+    public i64 c;
+    public Node() { this.a = 0; this.b = 0; this.c = 0; }
+}
+
+i32 main() {
+    i32 K = 100;       // ciclos GC
+    i32 N = 1000;      // allocs por ciclo
+    i32 total_swept = 0;
+    i32 cycle = 0;
+    while (cycle < K) {
+        // Aloc N shared, descartar inmediatamente (slot stack overwrite).
+        i32 i = 0;
+        while (i < N) {
+            shared Node n = new Node();
+            n.a = i;
+            // n queda en slot stack del while body; se sobreescribe en
+            // la proxima iter.  GC stack scan no encontrara ref tras exit.
+            i = i + 1;
+        }
+        // Trigger GC.
+        u32 before = shared_heap_live_count();
+        shared_gc_collect();
+        u32 after = shared_heap_live_count();
+        total_swept = total_swept + (i32)(before - after);
+        cycle = cycle + 1;
+    }
+    return total_swept > 0 ? 42 : 0;  // sanity: al menos algo se barrio
+}

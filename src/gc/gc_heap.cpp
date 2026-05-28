@@ -25,6 +25,8 @@
 // Solo en el .cpp (no en gc_heap.h) para evitar incluir gc_heap.h en
 // proceso_runtime.h (gc_heap.h ya esta en proceso_runtime.h).
 #include "runtime/proceso_runtime.h"
+#include "runtime/runtime.h"            // Phase Z: acceso a vm.shared_handle_table
+#include "gc/shared_handle_table.h"     // Phase Z: SHARED_HANDLE_BIT
 #include "loader/oop_types.h"
 
 #include <cstring>
@@ -314,7 +316,31 @@ namespace gc {
         // new_handle/release_handle/do_evacuate, asi que aqui no hay
         // escaneo lineal: una sola sonda en la tabla hash.
         if (host_payload_ptr == nullptr) return GC_NULL_HANDLE;
-        return ptr_to_handle_.find(host_payload_ptr);
+        GcHandle local = ptr_to_handle_.find(host_payload_ptr);
+        if (local != GC_NULL_HANDLE) return local;
+
+        // Phase Z.6: si no esta en el mapa local, puede ser un objeto
+        // del @c SharedHeap.  Su handle (con bit 31 set) se guarda en
+        // @c ObjectHeader.hash_code al alocar (exec_instr_newobjs).
+        // Leer el handle directo desde el header del objeto.
+        // El cast aqui es legal porque @c host_payload_ptr apunta al
+        // inicio del @c ObjectHeader por construccion (mismo offset
+        // que devolveria @c SharedHandleTable::lookup).
+        const auto *hdr = reinterpret_cast<const loader::ObjectHeader *>(
+            host_payload_ptr);
+        const uint32_t maybe_shared = hdr->hash_code;
+        if (maybe_shared & SHARED_HANDLE_BIT) {
+            // Validar que el handle realmente resuelve al mismo ptr
+            // (defensa contra hash_code colisiones casuales con bit 31).
+            if (owner_proc_) {
+                uint8_t *resolved = owner_proc_->scheduler.vm_reference
+                                     .shared_handle_table.lookup(maybe_shared);
+                if (resolved == host_payload_ptr) {
+                    return maybe_shared;
+                }
+            }
+        }
+        return GC_NULL_HANDLE;
     }
 
     // -------------------------------------------------------------------------
@@ -865,6 +891,20 @@ namespace gc {
     // -------------------------------------------------------------------------
 
     uint8_t *GcHeap::deref(GcHandle h) {
+        // Phase Z.5/Z.6: bit 31 = SHARED_HANDLE_BIT.  Si esta set, el
+        // handle apunta a un objeto del @c SharedHeap (cross-process,
+        // accesible por todos los procesos de la misma VM); resolvemos
+        // via la tabla global @c shared_handle_table.
+        //
+        // Branch predicted always-not-taken para objetos locales (caso
+        // dominante).  Coste estimado en x86-64 moderno: ~0 ns para
+        // handles locales (branch predicho), ~5 ns para handles shared
+        // (2 atomic loads: chunk + slot).
+        if (h & SHARED_HANDLE_BIT) {
+            if (!owner_proc_) return nullptr;
+            return owner_proc_->scheduler.vm_reference
+                       .shared_handle_table.lookup(h);
+        }
         if (h >= handles_.size() || !handles_[h].live) return nullptr;
         return handles_[h].addr + sizeof(GcHeader);
     }
@@ -917,7 +957,13 @@ namespace gc {
         if (!src_raw) return;
 
         auto *hdr = reinterpret_cast<GcHeader *>(src_raw);
-        if (hdr->color == GcColor::BLACK || hdr->gen == GcGen::OLD) return;
+        // Bug fix 2026-05-23: NO skipear si color == BLACK.  El scan_stack_roots
+        // (y mi BFS de minor_gc) marca BLACK ANTES de invocar do_evacuate; el
+        // check anterior `color == BLACK` causaba que do_evacuate se saltara
+        // los roots reciem marcados -> nunca movian a OldGen -> al resetear
+        // nursery_bump_ sus addr quedaban dangling -> linked list corrupta.
+        // Solo skipear si ya esta en OLD (donde no aplica evacuacion).
+        if (hdr->gen == GcGen::OLD) return;
 
         const size_t total = (sizeof(GcHeader) + hdr->size + 7) & ~7ULL;
         // (iv) alloc_in_old_with_total reporta el slot REAL en OldGen
@@ -1105,6 +1151,39 @@ namespace gc {
                     hdr->color = GcColor::BLACK;
                     worklist.push_back(pending_alloc_root_);
                 }
+            }
+        }
+
+        // Bug fix 2026-05-23: BFS transitivo sobre YOUNG.  Sin esto, solo
+        // los roots inmediatos (cur, head desde regs/stack) se marcaban,
+        // pero la cadena interna `head.next.next.next...` quedaba WHITE
+        // y el sweep la mataba.  Sintoma: linked list pierde ~87% de
+        // nodos al cruzar el limite del nursery.
+        //
+        // Patron: por cada h en worklist (YOUNG BLACK), escanear su payload
+        // buscando handles a otros YOUNG vivos.  Si esta WHITE, marcar
+        // BLACK + push al worklist (que se procesa en el mismo loop).
+        for (size_t wi = 0; wi < worklist.size(); ++wi) {
+            const GcHandle h = worklist[wi];
+            if (h >= handles_.size() || !handles_[h].live || !handles_[h].addr) continue;
+            uint8_t *raw = handles_[h].addr;
+            if (raw < nursery_base_ || raw >= nursery_end_) continue; // solo YOUNG
+            auto    *hdr     = reinterpret_cast<GcHeader *>(raw);
+            uint8_t *payload = raw + sizeof(GcHeader);
+            const size_t sz  = hdr->size;
+            for (size_t off = 0; off + sizeof(GcHandle) <= sz;
+                 off += sizeof(GcHandle)) {
+                GcHandle ref;
+                std::memcpy(&ref, payload + off, sizeof(GcHandle));
+                if (ref == GC_NULL_HANDLE
+                 || ref >= static_cast<GcHandle>(handles_.size())) continue;
+                if (!handles_[ref].live || !handles_[ref].addr) continue;
+                uint8_t *ref_raw = handles_[ref].addr;
+                if (ref_raw < nursery_base_ || ref_raw >= nursery_end_) continue;
+                auto *ref_hdr = reinterpret_cast<GcHeader *>(ref_raw);
+                if (ref_hdr->color != GcColor::WHITE) continue;
+                ref_hdr->color = GcColor::BLACK;
+                worklist.push_back(ref);
             }
         }
 
@@ -1584,19 +1663,37 @@ namespace gc {
      * @param local_pid PID local del proceso solicitante.
      * @return true si el monitor fue adquirido o incrementado.
      */
-    bool GcHeap::monitor_try_acquire(GcHandle h, uint32_t local_pid) {
+    bool GcHeap::monitor_try_acquire(GcHandle h, uint64_t owner_encoded) {
         uint8_t *ptr = deref(h);
         if (ptr == nullptr) return false; // handle invalido: no se puede adquirir
 
         auto *hdr = reinterpret_cast<loader::ObjectHeader *>(ptr);
 
-        if (hdr->owner_pid == 0) {
-            hdr->owner_pid  = local_pid; // adquirir el monitor
-            hdr->lock_depth = 1;
-            return true;
+        // Z.2: CAS lock-free de 0 -> (owner_encoded, 1).  Fast path para monitor libre.
+        // Memory order acquire: garantiza que las lecturas posteriores ven el
+        // estado consistente publicado por el ultimo release del owner anterior.
+        uint64_t expected = 0;
+        uint64_t desired  = loader::monitor_make(owner_encoded, 1);
+        if (hdr->monitor_word.compare_exchange_strong(
+                expected, desired,
+                std::memory_order_acquire,
+                std::memory_order_relaxed)) {
+            return true; // FAST PATH: monitor libre, adquirido en 1 CAS (~5 ns)
         }
-        if (hdr->owner_pid == local_pid) {
-            hdr->lock_depth++; // lock reentrante: incrementar profundidad
+
+        // CAS fallo: alguien posee el monitor.  Si soy yo, reentrante.
+        // El CAS poblo @c expected con el valor actual del word.
+        // Z.11 ext: comparamos los 48 bits de owner_encoded (sched<<32|local)
+        // para garantizar unicidad cross-scheduler (antes solo local_pid -> data loss).
+        if (loader::monitor_owner(expected) == (owner_encoded & loader::MONITOR_OWNER_MASK)) {
+            // Reentrante: solo nosotros tocamos esto.  No hace falta CAS
+            // (no hay race posible: nadie mas puede tocar el monitor mientras
+            // lo poseemos).  Store relaxed es suficiente: ya hay barrera
+            // acquire del CAS inicial que adquirio el monitor.
+            uint32_t d = loader::monitor_depth(expected);
+            hdr->monitor_word.store(
+                loader::monitor_make(owner_encoded, d + 1),
+                std::memory_order_relaxed);
             return true;
         }
         return false; // monitor ocupado por otro proceso
@@ -1611,68 +1708,103 @@ namespace gc {
      *
      * @param h         Handle del objeto cuyo monitor se libera.
      * @param local_pid PID local del propietario actual (para validar).
-     * @return PID codificado del siguiente proceso en cola (0 si vacia).
+     * @return PID codificado del siguiente proceso en cola
+     *         (@c UINT64_MAX si vacia / no aplica).  Z.6: sentinel
+     *         cambiado de 0 a UINT64_MAX porque encoded_pid=0 es valido
+     *         (main process en scheduler 0).
      */
-    uint64_t GcHeap::monitor_release(GcHandle h, uint32_t local_pid) {
+    uint64_t GcHeap::monitor_release(GcHandle h, uint64_t owner_encoded) {
         uint8_t *ptr = deref(h);
-        if (ptr == nullptr) return 0;
+        if (ptr == nullptr) return UINT64_MAX;
 
         auto *hdr = reinterpret_cast<loader::ObjectHeader *>(ptr);
-        if (hdr->owner_pid != local_pid) return 0; // no es el propietario
 
-        if (hdr->lock_depth > 1) {
-            hdr->lock_depth--; // reducir nivel de reentrada sin liberar el monitor
-            return 0;
+        // Load relaxed: el word solo es modificado por el owner (nosotros)
+        // mientras estamos dentro del monitor; nadie puede haberlo cambiado
+        // de un valor con owner==owner_encoded a otra cosa.
+        uint64_t cur = hdr->monitor_word.load(std::memory_order_relaxed);
+        if (loader::monitor_owner(cur) != (owner_encoded & loader::MONITOR_OWNER_MASK)) {
+            return UINT64_MAX; // no soy owner
         }
 
-        // lock_depth llega a 0: liberar el monitor
-        hdr->owner_pid  = 0;
-        hdr->lock_depth = 0;
+        uint32_t d = loader::monitor_depth(cur);
+        if (d > 1) {
+            // Reentrante: decrementar sin liberar.  Relaxed (no hay handoff).
+            hdr->monitor_word.store(
+                loader::monitor_make(owner_encoded, d - 1),
+                std::memory_order_relaxed);
+            return UINT64_MAX;
+        }
 
-        return monitor_pop_waiter(h); // devolver el siguiente proceso a despertar
+        // Ultima liberacion: store 0 con release semantics.  El release
+        // sincroniza con el acquire del proximo monenter (capa CAS), de
+        // modo que sus reads sobre el objeto ven los writes nuestros.
+        hdr->monitor_word.store(0, std::memory_order_release);
+
+        return monitor_pop_waiter(h); // siguiente proceso a despertar (o UINT64_MAX)
     }
 
+    // ----------------------------------------------------------------------
+    // Wait queues (Phase Z.4 + Z.6): delegacion a WaitTable lock-free
+    //
+    // Antes (v1): @c std::unordered_map<GcHandle, std::vector<uint64_t>>
+    // separados (monitor_waiters_ + condvar_waiters_).  NO thread-safe,
+    // requerian mutex global implicito.
+    //
+    // Z.4: un solo @c WaitTable con spinlock per-bucket.  Thread-safe.
+    //
+    // Z.6: handles con bit 31 set (SHARED_HANDLE_BIT) dispatch al
+    // @c vm.shared_wait_table (compartido cross-process).  Sin esto,
+    // un @c wait en el padre y un @c notify en el hijo sobre el mismo
+    // objeto shared NO se ven (cada uno tendria su propia cola).
+    // ----------------------------------------------------------------------
+
     /**
-     * @brief Anade un PID codificado a la cola de espera del monitor de @p h.
+     * @brief Selecciona la WaitTable apropiada segun el bit 31 del handle.
      *
-     * @param h           Handle del objeto cuyo monitor tiene la cola.
-     * @param encoded_pid PID codificado: (scheduler_id << 32) | local_pid.
+     * Inline en hot path; branch predicted always-not-taken para objetos
+     * locales (caso dominante).
      */
+    inline WaitTable &GcHeap::wait_table_for(GcHandle h) noexcept {
+        if (h & SHARED_HANDLE_BIT) {
+            // Shared: usar la tabla per-VM (cross-process visible).
+            return owner_proc_->scheduler.vm_reference.shared_wait_table;
+        }
+        // Local: tabla per-process.
+        return wait_table_;
+    }
+
     void GcHeap::monitor_add_waiter(GcHandle h, uint64_t encoded_pid) {
-        monitor_waiters_[h].push_back(encoded_pid); // insertar al final de la cola FIFO
+        wait_table_for(h).push(static_cast<uint32_t>(h),
+                                WaitKind::MONITOR,
+                                encoded_pid);
     }
 
-    /**
-     * @brief Extrae y devuelve el primer PID de la cola de espera del monitor de @p h.
-     *
-     * @param h Handle del objeto cuya cola de espera se consulta.
-     * @return PID codificado del primer proceso en cola, o 0 si la cola esta vacia.
-     */
     uint64_t GcHeap::monitor_pop_waiter(GcHandle h) {
-        auto it = monitor_waiters_.find(h);
-        if (it == monitor_waiters_.end() || it->second.empty()) return 0;
-
-        uint64_t pid = it->second.front(); // extraer el primero de la cola FIFO
-        it->second.erase(it->second.begin());
-        if (it->second.empty()) monitor_waiters_.erase(it); // limpiar entrada vacia
-        return pid;
+        return wait_table_for(h).pop_one(static_cast<uint32_t>(h),
+                                          WaitKind::MONITOR);
     }
 
-    /**
-     * @brief Extrae y devuelve todos los PID de la cola de espera del monitor de @p h.
-     *
-     * La cola queda vacia tras la llamada.
-     *
-     * @param h Handle del objeto cuya cola de espera se vacia.
-     * @return Vector con todos los PID codificados.
-     */
     std::vector<uint64_t> GcHeap::monitor_pop_all_waiters(GcHandle h) {
-        auto it = monitor_waiters_.find(h);
-        if (it == monitor_waiters_.end()) return {}; // cola inexistente: devolver vacio
-
-        std::vector<uint64_t> result = std::move(it->second); // mover para evitar copia
-        monitor_waiters_.erase(it); // limpiar la entrada
-        return result;
+        return wait_table_for(h).pop_all(static_cast<uint32_t>(h),
+                                          WaitKind::MONITOR);
     }
 
+    void GcHeap::condvar_add_waiter(GcHandle h, uint64_t encoded_pid) {
+        wait_table_for(h).push(static_cast<uint32_t>(h),
+                                WaitKind::CONDVAR,
+                                encoded_pid);
+    }
+
+    uint64_t GcHeap::condvar_pop_waiter(GcHandle h) {
+        return wait_table_for(h).pop_one(static_cast<uint32_t>(h),
+                                          WaitKind::CONDVAR);
+    }
+
+    std::vector<uint64_t> GcHeap::condvar_pop_all_waiters(GcHandle h) {
+        return wait_table_for(h).pop_all(static_cast<uint32_t>(h),
+                                          WaitKind::CONDVAR);
+    }
+
+    // set_owner_process esta inlineada en el header (gc_heap.h).
 } // namespace gc

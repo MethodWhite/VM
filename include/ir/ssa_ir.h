@@ -47,7 +47,9 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 #include <memory>
 #include <unordered_map>
@@ -148,6 +150,10 @@ namespace ir {
                               ///<   El emisor genera "mov rDst, @Absolute(\"code.s_<imm>\")"
                               ///<   resolviendo a la direccion VM del literal en la seccion data
                               ///<   adjuntada al final de la seccion "code".  Tipo destino: PTR.
+        LABEL_ADDR   = 0x04, ///< %dst = label_addr.ptr  func_name=label_name
+                              ///<   Devuelve la direccion absoluta de un label resuelta por
+                              ///<   el linker, expresada como @c @Absolute("code.<func_name>").
+                              ///<   Util para slots estaticos, helpers sintetizados, etc.
 
         // ---- aritmetica entera (0x10-0x1F) ----
         ADD      = 0x10, ///< %dst = add.T    %a, %b
@@ -302,6 +308,14 @@ namespace ir {
         RAW_ALLOC = 0x94, ///< %dst = raw_alloc.ptr %size  (rawalloc; dst es puntero host)
         RAW_FREE  = 0x95, ///< raw_free %ptr               (rawfree)
         GC_ALLOC  = 0x96, ///< %dst = gc_alloc.ptr %size   (alloc en heap GC, dst es host_ptr al payload).
+        MVTAKE_IR = 0x97, ///< mvtake [dst_addr], [src_addr]  (move-and-zero atomic intra-thread)
+        GC_ALLOCP = 0x98, ///< %dst = gc_allocp.ptr %size  (gcallocp: alloc + deref + xchg en 1 instr)
+        GETSTATIC = 0x99, ///< %dst = getstatic.i64 %cls, imm=offset   (carga campo estatico)
+        SETSTATIC = 0x9A, ///< setstatic.i64 %cls, %val, imm=offset    (almacena campo estatico)
+        ATOMIC_LD_I64  = 0x9B, ///< %dst = atomic_ld.i64 [%addr]   (atomic load i64)
+        ATOMIC_ST_I64  = 0x9C, ///< atomic_st.i64 [%addr], %val
+        ATOMIC_CAS_I64 = 0x9D, ///< %dst = atomic_cas.i64 [%addr], %expected, %desired
+        ATOMIC_ADD_I64 = 0x9E, ///< %dst = atomic_add.i64 [%addr], %delta (fetch-and-add)
                           ///< El bloque queda en HandleTable y participa del mark/sweep.
                           ///< Si nada lo referencia (stack/regs/external_refs), se libera en major_gc.
                           ///< Usado por @c lower_lambda_expr cuando @c env_in_heap=true (closures que escapan).
@@ -347,6 +361,25 @@ namespace ir {
         AWAIT     = 0xC1, ///< %dst = await.T %future_handle    (bloquear hasta resolver)
         FULFILL   = 0xC2, ///< fulfill  %future_handle, %value  (resolver con valor)
         REJECT    = 0xC3, ///< reject   %future_handle, %error  (rechazar con codigo)
+        FULFILL_HLT = 0xC4, ///< fulfillhlt %fut, %val           (fusion atomica fulfill+hlt)
+        STRGETBYTES = 0xC5, ///< %n = strgetbytes.i64 %str       (byte_len del StringObject)
+
+        // ---- Meta-OOP / reflexion / Phase Z extras (0x71-0x7C) ----
+        // Movido fuera del 0xA0-0xAF (OOP/GC) y 0x80-0x8F (llamadas) que
+        // estaban llenos.  Estos ops bajan a opcodes bytecode extended ya
+        // existentes en la VM.
+        GC_HANDLE_FOR_PTR = 0x71, ///< %dst = gchandle.i64 %host_ptr   (host_ptr -> GcHandle uint32)
+        GC_PROMOTE        = 0x72, ///< %dst = gcpromote %host_ptr      (local -> SharedHeap)
+        GC_DEMOTE         = 0x73, ///< %dst = gcdemote %host_ptr       (SharedHeap -> local)
+        FINDCLASS         = 0x74, ///< %dst = findclass %params        (lookup ClassInfo* by name)
+        DEFCLASS          = 0x75, ///< %dst = defclass %params         (define clase en runtime)
+        DEFFIELD          = 0x76, ///< deffield %cls, %params          (anyade field a clase)
+        DEFMETHOD         = 0x77, ///< defmethod %cls, %params         (anyade metodo a clase)
+        ADDADVICE         = 0x78, ///< addadvice %target, %advice, kind  (AOP: BEFORE/AFTER/AROUND)
+        FINDMETHOD        = 0x79, ///< %dst = findmethod %params       (lookup MethodInfo* by name)
+        FINDFIELD         = 0x7A, ///< %dst = findfield %params        (lookup FieldInfo* by name)
+        CALLSUPER         = 0x7B, ///< %dst = callsuper %method, args  (invoca super.method())
+        PROCEED           = 0x7C, ///< %dst = proceed                  (re-invoca target dentro de @Around)
 
         // ---- distribucion (0xD0-0xDF) ----
         MSGSEND   = 0xD0, ///< %dst = msgsend %pid, %buf_addr, %len -> bool (1=ok)
@@ -373,6 +406,12 @@ namespace ir {
                             ///<   al child (calling convention CALLVM).  Devuelve PID encoded
                             ///<   en %dst.  Usa parallel-move correcto del regalloc para evitar
                             ///<   conflictos al colocar args en sus regs destino.
+        HLT       = 0xF8, ///< hlt                            (terminar proceso virtual)
+        GETPID    = 0xF9, ///< %dst = getpid                  (PID encoded del proceso actual)
+        GETARGC   = 0xFA, ///< %dst = getargc                 (numero de args del programa)
+        GETARG    = 0xFB, ///< %dst = getarg %idx             (StringObject del arg [i])
+        SPAWN_ON  = 0xFC, ///< %dst = spawnon %fn_ptr, %hint  (spawn con scheduler hint)
+        PANIC     = 0xFD, ///< panic %msg_addr, %msg_len      (FatalError USER_ABORT)
 
         // ---- codigo ensamblador incrustado (0xFF) ----
         RAW_ASM   = 0xFF, ///< raw_asm "texto"  (ensamblador .vel verbatim; nunca optimizado)
@@ -857,18 +896,128 @@ namespace ir {
         std::vector<IrClass> classes;
 
         /**
+         * @brief v4: metadatos de cada entrada en @c static_data.
+         *
+         * Permite al JIT/AOT/PGO consumir hints sobre cada entrada:
+         *   - inmutabilidad para inlinear el ptr directo (JIT C2 opt).
+         *   - alignment para emitir loads alineados.
+         *   - source_module_idx para patch tables (loadmodule rebase).
+         *   - hot_hint para layout en .rodata segregado (AOT).
+         */
+        struct StaticDataMeta {
+            uint64_t content_hash      = 0;     ///< FNV-1a 64 sobre bytes; 0 = no calculado
+            uint16_t alignment         = 1;     ///< multiplo potencia de 2
+            uint8_t  flags             = 0;     ///< bit0=immutable, bit1=imported, bit2=hot, bit3=cold
+            uint16_t source_module_idx = 0;     ///< 0 = local; !=0 = imported (futuro)
+            std::string section_name;            ///< vacio = default; usado por AOT
+        };
+
+        /**
          * @brief Datos estaticos del modulo: cada entrada es la imagen de bytes
          *        de un literal de cadena u otro blob inmutable.
          *
-         * El emisor IR genera al final del .vel una etiqueta @c s_<i> por cada
-         * entrada con la directiva @c db ... bytes.  El opcode @c STR_LIT_ADDR
-         * con @c imm=i carga la direccion VM de @c s_i en un registro.
+         * **M.staticdata-pool full**: storage unificado en un solo
+         * @c vector<uint8_t> con entries que apuntan a (offset, len).
+         * Beneficios concretos:
+         *   - Cache locality al iterar (1 alocacion vs N).
+         *   - mmap shared cross-process (1 mapping vs N).
+         *   - Port-to-C trivial (1 array global vs N variables).
+         *   - JIT/AOT pueden cargar el pool tal cual a @c .rodata sin reasamblaje.
          *
-         * Layout: @c std::vector<std::vector<uint8_t>> garantiza memoria
-         * contigua por entrada (cache-friendly al iterar) y permite que
-         * cualquier byte (incluido @c '\0') aparezca en el contenido.
+         * Cada entry arranca en multiplo de @c alignment_default (8 por
+         * defecto); si @c StaticDataMeta::alignment de una entry es mayor,
+         * recibe padding adicional para respetar ese alineamiento local.
+         *
+         * Garantia de offsets: el orden de @c push_back determina el orden
+         * de las entries; dos builds del mismo source producen el mismo
+         * pool byte-a-byte (estable cross-build) tras el dedup deterministico
+         * en @c compile_vex_project.
          */
-        std::vector<std::vector<uint8_t>> static_data;
+        struct StaticDataStore {
+            /// Pool contiguo: todos los blobs concatenados con padding.
+            std::vector<uint8_t> bytes;
+            /// Entries que indican rangos dentro de @c bytes + meta.
+            struct Entry {
+                uint32_t       byte_offset;     ///< offset dentro de bytes[]
+                uint32_t       byte_len;
+                StaticDataMeta meta;
+            };
+            std::vector<Entry> entries;
+            /// Alineamiento global por defecto (entries individuales con
+            /// @c meta.alignment mayor reciben padding adicional).
+            uint8_t alignment_default = 8;
+
+            /* ---- Accesores de tamano ---- */
+            size_t size()  const noexcept { return entries.size(); }
+            bool   empty() const noexcept { return entries.empty(); }
+
+            /* ---- Lectura de bytes ---- */
+            const uint8_t *data(size_t i) const noexcept {
+                return bytes.data() + entries[i].byte_offset;
+            }
+            size_t len(size_t i) const noexcept { return entries[i].byte_len; }
+            std::pair<const uint8_t*, size_t> bytes_at(size_t i) const noexcept {
+                return {data(i), len(i)};
+            }
+
+            /* ---- Lectura/escritura de meta ---- */
+            const StaticDataMeta &meta_at(size_t i) const noexcept {
+                return entries[i].meta;
+            }
+            StaticDataMeta &meta_at(size_t i) noexcept {
+                return entries[i].meta;
+            }
+
+            /* ---- Comparacion de bytes ---- */
+            bool equals(size_t i, const uint8_t *p, size_t n) const noexcept {
+                if (entries[i].byte_len != n) return false;
+                if (n == 0) return true;
+                return std::memcmp(data(i), p, n) == 0;
+            }
+            bool equals(size_t i, const std::vector<uint8_t> &v) const noexcept {
+                return equals(i, v.data(), v.size());
+            }
+
+            /* ---- Mutaciones: anyadir entries ---- */
+            /// Anyade bytes al pool con padding de alineamiento.  Devuelve
+            /// el indice de la nueva entry.  La @c meta queda con defaults;
+            /// llamar @c meta_at(i) para ajustarla.
+            size_t push_back(const uint8_t *p, size_t n);
+            size_t push_back(const std::vector<uint8_t> &v) {
+                return push_back(v.data(), v.size());
+            }
+            size_t push_back(std::vector<uint8_t> &&v);
+
+            /// Append directo del backing pool (sin dedup).  Usado por el
+            /// merge cross-module.  Toma ownership.
+            void   append_raw_entries(StaticDataStore &&other);
+
+            /* ---- Helpers ---- */
+            void clear() { bytes.clear(); entries.clear(); }
+            void reserve(size_t n) { entries.reserve(n); }
+
+            /// Copia los bytes de la entry @c i a un @c vector<uint8_t>
+            /// (helper para call sites que necesitan ownership).
+            std::vector<uint8_t> to_vector(size_t i) const {
+                return std::vector<uint8_t>(data(i), data(i) + len(i));
+            }
+        };
+
+        /// Storage canonico de los datos estaticos.  Reemplaza los antiguos
+        /// pares @c static_data + @c static_data_meta a partir de
+        /// M.staticdata-pool full.
+        StaticDataStore static_data;
+
+        /// Flags para @c StaticDataMeta::flags.
+        static constexpr uint8_t SD_FLAG_IMMUTABLE  = 1 << 0;
+        static constexpr uint8_t SD_FLAG_IMPORTED   = 1 << 1;
+        static constexpr uint8_t SD_FLAG_HOT        = 1 << 2;
+        static constexpr uint8_t SD_FLAG_COLD       = 1 << 3;
+        /// Marca el slot como storage mutable: el dedup post-merge NO
+        /// debe colapsarlo aunque dos slots tengan los mismos bytes
+        /// iniciales (caso comun: globals `i64 g = 0;` empiezan en 0
+        /// pero deben tener storage independiente).
+        static constexpr uint8_t SD_FLAG_NON_DEDUP  = 1 << 4;
 
         /**
          * @brief Funciones nativas que el modulo declara importar.

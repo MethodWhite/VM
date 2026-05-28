@@ -234,9 +234,42 @@ namespace ir {
         {"getvm",      IrOp::GETVM},
         {"getmgr",     IrOp::GETMGR},
         {"spawn",      IrOp::SPAWN},
+        {"spawnon",    IrOp::SPAWN_ON},
         {"resume",     IrOp::RESUME},
         {"yield",      IrOp::YIELD},
         {"swapctx",    IrOp::SWAPCTX},
+        {"hlt",        IrOp::HLT},
+        {"getpid",     IrOp::GETPID},
+        {"getargc",    IrOp::GETARGC},
+        {"getarg",     IrOp::GETARG},
+        {"panic",      IrOp::PANIC},
+        // constante: direccion absoluta de un label resuelta por el linker
+        {"label_addr", IrOp::LABEL_ADDR},
+        // memoria extra (move-and-take, gcallocp, static fields, atomics)
+        {"mvtake_ir",       IrOp::MVTAKE_IR},
+        {"gc_allocp",       IrOp::GC_ALLOCP},
+        {"getstatic",       IrOp::GETSTATIC},
+        {"setstatic",       IrOp::SETSTATIC},
+        {"atomic_ld_i64",   IrOp::ATOMIC_LD_I64},
+        {"atomic_st_i64",   IrOp::ATOMIC_ST_I64},
+        {"atomic_cas_i64",  IrOp::ATOMIC_CAS_I64},
+        {"atomic_add_i64",  IrOp::ATOMIC_ADD_I64},
+        // async fusion + string extra
+        {"fulfill_hlt",  IrOp::FULFILL_HLT},
+        {"strgetbytes",  IrOp::STRGETBYTES},
+        // meta-OOP / reflexion / Phase Z extras
+        {"gc_handle_for_ptr", IrOp::GC_HANDLE_FOR_PTR},
+        {"gc_promote",       IrOp::GC_PROMOTE},
+        {"gc_demote",        IrOp::GC_DEMOTE},
+        {"findclass",        IrOp::FINDCLASS},
+        {"defclass",         IrOp::DEFCLASS},
+        {"deffield",         IrOp::DEFFIELD},
+        {"defmethod",        IrOp::DEFMETHOD},
+        {"addadvice",        IrOp::ADDADVICE},
+        {"findmethod",       IrOp::FINDMETHOD},
+        {"findfield",        IrOp::FINDFIELD},
+        {"callsuper",        IrOp::CALLSUPER},
+        {"proceed",          IrOp::PROCEED},
         // ensamblador incrustado
         {"raw_asm",    IrOp::RAW_ASM},
         {nullptr,      IrOp::NOP},
@@ -327,12 +360,77 @@ namespace ir {
      * tamanos tipicos de modulo.  Si el coste se vuelve relevante en
      * el futuro, sustituir por una std::unordered_map<hash, idx>.
      */
-    uint64_t IrModule::intern_static_data(std::vector<uint8_t> bytes) {
-        for (size_t i = 0; i < static_data.size(); ++i) {
-            if (static_data[i] == bytes) return static_cast<uint64_t>(i);
+    namespace {
+        /**
+         * @brief FNV-1a 64 sobre un buffer.  Mismo algoritmo que el .vexi.
+         *        Local al TU para no introducir dep circular con vex/.
+         */
+        inline uint64_t fnv1a_local_64(const uint8_t *p, size_t n) noexcept {
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (size_t i = 0; i < n; ++i) {
+                h ^= static_cast<uint64_t>(p[i]);
+                h *= 0x100000001b3ull;
+            }
+            return h;
         }
-        static_data.push_back(std::move(bytes));
-        return static_cast<uint64_t>(static_data.size() - 1);
+    } // namespace
+
+    /* ==================== StaticDataStore: implementacion ==================== */
+
+    size_t IrModule::StaticDataStore::push_back(const uint8_t *p, size_t n) {
+        // Padding hasta multiplo de alignment_default.
+        if (alignment_default > 1) {
+            while (bytes.size() % alignment_default != 0) bytes.push_back(0);
+        }
+        const uint32_t off = static_cast<uint32_t>(bytes.size());
+        bytes.insert(bytes.end(), p, p + n);
+        Entry e;
+        e.byte_offset = off;
+        e.byte_len    = static_cast<uint32_t>(n);
+        e.meta.content_hash = fnv1a_local_64(p, n);
+        entries.push_back(e);
+        return entries.size() - 1;
+    }
+
+    size_t IrModule::StaticDataStore::push_back(std::vector<uint8_t> &&v) {
+        // Mismo path: copia desde el vector al pool (no se puede evitar
+        // copia porque el pool requiere bytes contiguos en su propio buffer).
+        return push_back(v.data(), v.size());
+    }
+
+    void IrModule::StaticDataStore::append_raw_entries(StaticDataStore &&other) {
+        // Anyade los bytes de @c other.bytes al final del pool propio
+        // (con padding intermedio) y ajusta los offsets de las entries.
+        if (other.entries.empty()) return;
+        // Padding hasta alignment_default antes del bloque del dep.
+        if (alignment_default > 1) {
+            while (bytes.size() % alignment_default != 0) bytes.push_back(0);
+        }
+        const uint32_t base_offset = static_cast<uint32_t>(bytes.size());
+        bytes.insert(bytes.end(), other.bytes.begin(), other.bytes.end());
+        entries.reserve(entries.size() + other.entries.size());
+        for (auto &e : other.entries) {
+            e.byte_offset += base_offset;
+            entries.push_back(std::move(e));
+        }
+        other.bytes.clear();
+        other.entries.clear();
+    }
+
+    /* ==================== intern_static_data ==================== */
+
+    uint64_t IrModule::intern_static_data(std::vector<uint8_t> bytes) {
+        // Dedup lineal por bytes.  Para programas tipicos (decenas a
+        // cientos de literales) el coste es despreciable; arquitectura
+        // futura podria anyadir un map<hash, idx> si el problema escala.
+        const uint64_t h = fnv1a_local_64(bytes.data(), bytes.size());
+        for (size_t i = 0; i < static_data.size(); ++i) {
+            if (static_data.meta_at(i).content_hash == h
+             && static_data.equals(i, bytes)) {
+                return static_cast<uint64_t>(i);
+            }
+        }
+        return static_cast<uint64_t>(static_data.push_back(std::move(bytes)));
     }
 
     /**

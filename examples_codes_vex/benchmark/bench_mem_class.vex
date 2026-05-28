@@ -1,0 +1,39 @@
+// Benchmark: crear + descartar instancias de clase (GC heap).
+//
+// Cada iteracion hace `new Foo(i)` que aloca un ObjectHeader (24 bytes) +
+// fields en el GC heap.  El objeto se vuelve unreachable al final de
+// `helper()`; el GC lo colecta automaticamente en un minor_gc futuro
+// cuando el nursery se llena.
+//
+// Este es el path "managed" de Vex: cero free manual, GC se encarga.
+// Equivalente conceptual a `new MyClass()` en Java/C#.
+//
+// Comparable contra `bench_mem_malloc_free.vex` (raw malloc/free) para
+// ver el overhead relativo del GC vs allocator directo.
+//
+// Ejecuta: vm --run bench_mem_class.velb --stats [-m jit]
+// Esperado: MIPS dominado por el cost de gc_alloc (~50-100 ns) + ctor +
+// el minor_gc ocasional (cada N allocs, escanea + evacua nursery).
+
+class Foo {
+    public i32 x;
+    public Foo(i32 v) {
+        this.x = v;
+    }
+}
+
+i32 helper(i32 i) {
+    // Instancia heap-allocated via GC.  Sale del scope -> unreachable.
+    Foo f = new Foo(i);
+    return f.x;
+}
+
+i32 main() {
+    i64 sum = 0;
+    i64 i   = 0;
+    while (i < 1000000) {
+        sum = sum + helper(1);
+        i = i + 1;
+    }
+    return sum;
+}

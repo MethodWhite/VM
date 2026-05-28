@@ -282,6 +282,23 @@ namespace runtime {
     void Scheduler::run_loop() {
         // continuar mientras no se solicite parada y la VM siga activa
         while (!should_kill && vm_reference.vm_running) {
+            // Phase Z.10 ext: STW poll para shared GC.  Si shared_gc_active
+            // esta set, ACK + dormir hasta que el GC termine.  Esto es un
+            // safe point: estamos entre batches, sin instr en flight, regs
+            // y stack del proceso anterior ya commiteados a memoria.
+            if (vm_reference.shared_gc_active.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lk(vm_reference.shared_gc_mtx);
+                // ACK: incrementar contador y notificar al GC thread.
+                vm_reference.shared_gc_acks.fetch_add(1, std::memory_order_acq_rel);
+                vm_reference.shared_gc_cv.notify_all();
+                // Esperar hasta que GC limpie el flag.
+                vm_reference.shared_gc_cv.wait(lk, [&]{
+                    return !vm_reference.shared_gc_active.load(std::memory_order_acquire);
+                });
+                // Restar nuestro ACK del contador para que el GC pueda
+                // re-usar el contador en una collection futura.
+                vm_reference.shared_gc_acks.fetch_sub(1, std::memory_order_acq_rel);
+            }
             // Limpiar el TLS del proc en ejecucion al inicio de cada
             // iteracion.  Si entre batches ocurre un AV (codigo del
             // scheduler accediendo memoria invalida), el handler vera
@@ -419,12 +436,27 @@ namespace runtime {
                     instance->av_recovery_active = true;
                     if (setjmp(instance->av_recovery_jmpbuf) != 0) {
                         char msg[128];
-                        std::snprintf(msg, sizeof(msg),
-                            "host access violation at 0x%llx (deref de puntero invalido)",
-                            (unsigned long long)instance->pending_av_addr);
-                        runtime::throw_fatal(instance,
-                                             runtime::FATAL_SEGMENTATION_FAULT,
-                                             msg);
+                        // Bug fix 2026-05-23: distinguir AV vs div0 / overflow.
+                        if (instance->pending_av_kind == 1) {
+                            std::snprintf(msg, sizeof(msg),
+                                "host division by zero (operacion entera ilegal)");
+                            runtime::throw_fatal(instance,
+                                                 runtime::FATAL_DIVISION_BY_ZERO,
+                                                 msg);
+                        } else if (instance->pending_av_kind == 2) {
+                            std::snprintf(msg, sizeof(msg),
+                                "host integer overflow (operacion entera ilegal)");
+                            runtime::throw_fatal(instance,
+                                                 runtime::FATAL_DIVISION_BY_ZERO,
+                                                 msg);
+                        } else {
+                            std::snprintf(msg, sizeof(msg),
+                                "host access violation at 0x%llx (deref de puntero invalido)",
+                                (unsigned long long)instance->pending_av_addr);
+                            runtime::throw_fatal(instance,
+                                                 runtime::FATAL_SEGMENTATION_FAULT,
+                                                 msg);
+                        }
                     }
                 }
 
@@ -1310,12 +1342,27 @@ namespace runtime {
                     instance->av_recovery_active = true;
                     if (setjmp(instance->av_recovery_jmpbuf) != 0) {
                         char msg[128];
-                        std::snprintf(msg, sizeof(msg),
-                            "host access violation at 0x%llx (deref de puntero invalido)",
-                            (unsigned long long)instance->pending_av_addr);
-                        runtime::throw_fatal(instance,
-                                             runtime::FATAL_SEGMENTATION_FAULT,
-                                             msg);
+                        // Bug fix 2026-05-23: distinguir AV vs div0 / overflow.
+                        if (instance->pending_av_kind == 1) {
+                            std::snprintf(msg, sizeof(msg),
+                                "host division by zero (operacion entera ilegal)");
+                            runtime::throw_fatal(instance,
+                                                 runtime::FATAL_DIVISION_BY_ZERO,
+                                                 msg);
+                        } else if (instance->pending_av_kind == 2) {
+                            std::snprintf(msg, sizeof(msg),
+                                "host integer overflow (operacion entera ilegal)");
+                            runtime::throw_fatal(instance,
+                                                 runtime::FATAL_DIVISION_BY_ZERO,
+                                                 msg);
+                        } else {
+                            std::snprintf(msg, sizeof(msg),
+                                "host access violation at 0x%llx (deref de puntero invalido)",
+                                (unsigned long long)instance->pending_av_addr);
+                            runtime::throw_fatal(instance,
+                                                 runtime::FATAL_SEGMENTATION_FAULT,
+                                                 msg);
+                        }
                     }
                 }
                 while (instance->reductions_remaining > 0) {

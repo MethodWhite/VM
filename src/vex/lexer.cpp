@@ -102,6 +102,7 @@ namespace vex {
             case TokenKind::KW_NONNULL:      return "nonnull";
             case TokenKind::KW_TYPEDEF:      return "typedef";
             case TokenKind::KW_USING:        return "using";
+            case TokenKind::KW_NAMESPACE:    return "namespace";
             case TokenKind::KW_STRUCT:       return "struct";
             case TokenKind::KW_CLASS:        return "class";
             case TokenKind::KW_INTERFACE:    return "interface";
@@ -309,9 +310,10 @@ namespace vex {
                 VEX_KW_EXACT("match",   TokenKind::KW_MATCH);
                 break;
             case 'n':
-                VEX_KW_EXACT("new",     TokenKind::KW_NEW);
-                VEX_KW_EXACT("null",    TokenKind::NULL_KW);
-                VEX_KW_EXACT("nonnull", TokenKind::KW_NONNULL);
+                VEX_KW_EXACT("new",       TokenKind::KW_NEW);
+                VEX_KW_EXACT("null",      TokenKind::NULL_KW);
+                VEX_KW_EXACT("nonnull",   TokenKind::KW_NONNULL);
+                VEX_KW_EXACT("namespace", TokenKind::KW_NAMESPACE);
                 break;
             case 'o':
                 VEX_KW_EXACT("override", TokenKind::KW_OVERRIDE);
@@ -770,6 +772,10 @@ namespace vex {
         if (peek_char(1) == '"' && peek_char(2) == '"') {
             advance(); advance(); advance(); // consumir """
             std::string value; value.reserve(64);
+            // Item 12: detectar interpolacion ${...} dentro de triple-quoted.
+            // Si hay ${, emitir cola multi-token igual que el path normal pero
+            // con cierre `"""` (3 chars) en lugar de `"`.  Newlines literales
+            // siguen permitidos en triple.
             while (pos_ < source_.size()) {
                 // Cierre con """.
                 if (source_[pos_] == '"' && peek_char(1) == '"'
@@ -784,6 +790,162 @@ namespace vex {
                     return t;
                 }
                 const char c = source_[pos_];
+                if (!raw && c == '$' && peek_char(1) == '{') {
+                    // Switch al modo multi-token: emite ISTR_BEGIN +
+                    // ISTR_TEXT(value acumulado) + procesa ${...} y resto
+                    // del string hasta """.
+                    SourceLoc loc_begin = start;
+                    loc_begin.length = 0;
+                    string_emit_queue_.push_back(
+                        make_token(TokenKind::ISTR_BEGIN, "", loc_begin));
+                    if (!value.empty()) {
+                        Token tt = make_token(TokenKind::ISTR_TEXT, "", loc_begin);
+                        tt.str_val = std::move(value);
+                        string_emit_queue_.push_back(std::move(tt));
+                        value.clear();
+                    }
+                    // Loop principal de interpolacion + tramos texto.
+                    while (pos_ < source_.size()) {
+                        SourceLoc loc_dollar{filename_, line_, column_,
+                                             (uint32_t)pos_, 2};
+                        advance(); // '$'
+                        advance(); // '{'
+                        string_emit_queue_.push_back(
+                            make_token(TokenKind::ISTR_EXPR_BEGIN, "", loc_dollar));
+                        // Lex tokens internos hasta cerrar el '{' matching.
+                        int depth = 1;
+                        while (pos_ < source_.size() && depth > 0) {
+                            skip_trivia();
+                            if (pos_ >= source_.size()) break;
+                            const char ic = source_[pos_];
+                            Token inner;
+                            if (ic == 'r' && peek_char(1) == '"') {
+                                advance();
+                                inner = lex_string(true);
+                            } else if ((ic >= 'a' && ic <= 'z')
+                                    || (ic >= 'A' && ic <= 'Z') || ic == '_') {
+                                inner = lex_identifier();
+                            } else if (ic >= '0' && ic <= '9') {
+                                inner = lex_number();
+                            } else if (ic == '"') {
+                                inner = lex_string(false);
+                            } else if (ic == '\'') {
+                                inner = lex_char();
+                            } else {
+                                inner = lex_symbol();
+                            }
+                            if (inner.kind == TokenKind::LBRACE) {
+                                ++depth;
+                            } else if (inner.kind == TokenKind::RBRACE) {
+                                --depth;
+                                if (depth == 0) {
+                                    Token tend = make_token(
+                                        TokenKind::ISTR_EXPR_END, "", inner.loc);
+                                    string_emit_queue_.push_back(std::move(tend));
+                                    break;
+                                }
+                            } else if (inner.kind == TokenKind::COLON && depth == 1) {
+                                // Format spec (mismo patron que el path normal).
+                                std::string fmt;
+                                const SourceLoc fmt_loc = inner.loc;
+                                while (pos_ < source_.size()) {
+                                    const char fc = source_[pos_];
+                                    if (fc == '}') {
+                                        Token tfmt = make_token(
+                                            TokenKind::ISTR_EXPR_FMT, "", fmt_loc);
+                                        tfmt.str_val = std::move(fmt);
+                                        string_emit_queue_.push_back(std::move(tfmt));
+                                        SourceLoc rb_loc{filename_, line_, column_,
+                                                         (uint32_t)pos_, 1};
+                                        advance();
+                                        Token tend = make_token(
+                                            TokenKind::ISTR_EXPR_END, "", rb_loc);
+                                        string_emit_queue_.push_back(std::move(tend));
+                                        depth = 0;
+                                        break;
+                                    }
+                                    if (fc == '\n') {
+                                        error_at(fmt_loc,
+                                            "salto de linea dentro del formato ${...:fmt}");
+                                        break;
+                                    }
+                                    fmt.push_back(fc);
+                                    advance();
+                                }
+                                break;
+                            }
+                            string_emit_queue_.push_back(std::move(inner));
+                        }
+                        if (depth > 0) {
+                            error_at(loc_dollar,
+                                "interpolacion ${...} sin '}' de cierre");
+                            break;
+                        }
+                        // Texto literal hasta proximo ${ o """ (cierre triple).
+                        std::string chunk;
+                        bool string_done = false;
+                        bool nested_interp = false;
+                        while (pos_ < source_.size()) {
+                            if (source_[pos_] == '"' && peek_char(1) == '"'
+                             && peek_char(2) == '"') {
+                                advance(); advance(); advance();
+                                string_done = true;
+                                break;
+                            }
+                            const char tc = source_[pos_];
+                            if (!raw && tc == '$' && peek_char(1) == '{') {
+                                nested_interp = true;
+                                break;
+                            }
+                            if (!raw && tc == '\\') {
+                                advance();
+                                const uint64_t cp = decode_escape(this, source_,
+                                    pos_, line_, column_, diags_, filename_);
+                                chunk.push_back(static_cast<char>(cp & 0xFF));
+                                continue;
+                            }
+                            if (tc == '\n') {
+                                ++line_; column_ = 1; ++pos_;
+                                chunk.push_back('\n');
+                                continue;
+                            }
+                            chunk.push_back(tc);
+                            advance();
+                        }
+                        if (!chunk.empty()) {
+                            Token tt = make_token(TokenKind::ISTR_TEXT, "", start);
+                            tt.str_val = std::move(chunk);
+                            string_emit_queue_.push_back(std::move(tt));
+                        }
+                        if (string_done) {
+                            SourceLoc loc_end{filename_, line_, column_,
+                                              (uint32_t)pos_, 0};
+                            string_emit_queue_.push_back(
+                                make_token(TokenKind::ISTR_END, "", loc_end));
+                            Token first = std::move(string_emit_queue_.front());
+                            string_emit_queue_.pop_front();
+                            return first;
+                        }
+                        if (!nested_interp) {
+                            error_at(start, "string triple-quoted interpolado sin cerrar");
+                            SourceLoc loc_end{filename_, line_, column_,
+                                              (uint32_t)pos_, 0};
+                            string_emit_queue_.push_back(
+                                make_token(TokenKind::ISTR_END, "", loc_end));
+                            Token first = std::move(string_emit_queue_.front());
+                            string_emit_queue_.pop_front();
+                            return first;
+                        }
+                    }
+                    error_at(start, "string triple-quoted interpolado sin cerrar (EOF)");
+                    SourceLoc loc_end{filename_, line_, column_,
+                                      (uint32_t)pos_, 0};
+                    string_emit_queue_.push_back(
+                        make_token(TokenKind::ISTR_END, "", loc_end));
+                    Token first = std::move(string_emit_queue_.front());
+                    string_emit_queue_.pop_front();
+                    return first;
+                }
                 if (!raw && c == '\\') {
                     advance();
                     const uint64_t cp = decode_escape(this, source_, pos_,

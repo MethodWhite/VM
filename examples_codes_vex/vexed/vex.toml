@@ -1,0 +1,23 @@
+[package]
+name        = "vexed"
+version     = "1.0.0"
+authors     = ["VestaVM team"]
+license     = "MIT"
+edition     = 1
+
+[capabilities]
+# El editor lee y escribe archivos via FFI a msvcrt.dll.
+declared = ["fs:read", "fs:write", "ffi:call=msvcrt.dll"]
+
+# Sin dependencias externas; todo el editor es self-contained.
+[dependencies]
+
+[scripts]
+# Compila el proyecto a vexed.velb listo para ejecutar.
+build = "vm --vex src/main.vex -o vexed"
+
+# Ejecuta el binario compilado en modo interactivo (lee de stdin).
+run   = "vm --run vexed.velb"
+
+# Ejecuta y muestra estadisticas (instrucciones, MIPS, GC stats).
+stats = "vm --run vexed.velb --stats"

@@ -1,0 +1,213 @@
+// =============================================================================
+// modules/file_io.vex - I/O de archivos via FFI runtime + Result<T,E>
+// =============================================================================
+//
+// Stress test: usa `ffi_open`/`ffi_sym`/`ffi_call` (FFI dinamico runtime,
+// A.24) en lugar de `extern "lib.dll"` estatico.  Evita el clash con los
+// builtins Vex `fopen`/`fwrite`/`fclose` que solo aceptan string literal.
+//
+// El manejo de errores usa `Result<i64, i32>` con `Ok(...)` / `Err(...)`
+// + `isOk(r) / value(r) / error(r)` para consumirlo.
+//
+// Tras Phase M.x_sret_fix (2026-05-26), class methods cross-module
+// retornando Result/Optional usan SRET ABI correcto.  Por eso este
+// modulo expone tanto el `class FileReader` (OO) como free fns.
+
+import "modules/buffer";
+
+// Codigos de error como comptime: cero overhead, el codigo emitido es
+// un literal i64 inline.
+public comptime i32 FE_OK         = 0;
+public comptime i32 FE_NOT_FOUND  = 1;
+public comptime i32 FE_READ_FAIL  = 2;
+public comptime i32 FE_WRITE_FAIL = 3;
+public comptime i32 FE_BAD_HANDLE = 4;
+
+// Modos de apertura como strings inmutables.  Atributo `@cold` porque
+// solo se leen al abrir un archivo (no en el hot loop del editor).
+@cold public comptime string MODE_READ   = "rb";
+@cold public comptime string MODE_WRITE  = "wb";
+@cold public comptime string MODE_APPEND = "ab";
+
+// Cache del handle DLL + simbolos: alocado una vez al primer uso.
+// PRIVADOS al modulo (no `public`): el lowering Vex actual no soporta
+// acceso cross-module a runtime globals via namespace -- solo
+// `comptime const`.  Los metodos de @c FileReader del mismo modulo si
+// los pueden leer/escribir libremente.
+i64 g_msvcrt = 0;
+i64 g_fopen  = 0;
+i64 g_fwrite = 0;
+i64 g_fclose = 0;
+i64 g_fread  = 0;
+i64 g_fseek  = 0;
+i64 g_ftell  = 0;
+i64 g_findfirst = 0;
+i64 g_findnext  = 0;
+i64 g_findclose = 0;
+i64 g_getcwd    = 0;
+
+void ensure_loaded() {
+    if (g_msvcrt != 0) {
+        return;
+    }
+    g_msvcrt = ffi_open("msvcrt.dll");
+    g_fopen  = ffi_sym(g_msvcrt, "fopen");
+    g_fwrite = ffi_sym(g_msvcrt, "fwrite");
+    g_fclose = ffi_sym(g_msvcrt, "fclose");
+    g_fread  = ffi_sym(g_msvcrt, "fread");
+    g_fseek  = ffi_sym(g_msvcrt, "fseek");
+    g_ftell  = ffi_sym(g_msvcrt, "ftell");
+    g_findfirst = ffi_sym(g_msvcrt, "_findfirst64");
+    g_findnext  = ffi_sym(g_msvcrt, "_findnext64");
+    g_findclose = ffi_sym(g_msvcrt, "_findclose");
+    g_getcwd    = ffi_sym(g_msvcrt, "_getcwd");
+}
+
+// =============================================================================
+// Helpers de directorio via msvcrt _findfirst64/_findnext64/_findclose.
+//
+// _finddata64_t layout (Windows MSVC):
+//   +0    u32 attrib    (bit 0x10 = directory, 0x02 = hidden, etc.)
+//   +4    u32 _pad
+//   +8    i64 time_create
+//   +16   i64 time_access
+//   +24   i64 time_write
+//   +32   i64 size
+//   +40   u8[260] name
+// Total 300 bytes; alocamos 320 redondeado a 8.
+// =============================================================================
+
+// Abre la enumeracion de `path/*`.  Devuelve handle opaco i64 o -1.
+@cold
+public i64 dir_open(u8* spec, u8* finddata) {
+    ensure_loaded();
+    return ffi_call(g_findfirst, spec, finddata);
+}
+
+@cold
+public i32 dir_next(i64 handle, u8* finddata) {
+    ensure_loaded();
+    return (i32) ffi_call(g_findnext, handle, finddata);
+}
+
+@cold
+public void dir_close(i64 handle) {
+    ensure_loaded();
+    ffi_call(g_findclose, handle);
+}
+
+// Obtiene el directorio de trabajo actual (max `cap` bytes).  Devuelve
+// el puntero al buffer (mismo que `out`) o null si falla.
+@cold
+public u8* getcwd_into(u8* out, i32 cap) {
+    ensure_loaded();
+    i64 r = ffi_call(g_getcwd, out, cap);
+    if (r == 0) return null;
+    return (u8*) r;
+}
+
+// =============================================================================
+// FileReader: abre + lee todo el archivo a un buffer host.
+// =============================================================================
+
+public class FileReader {
+    public i64 fp;          // FILE* opaco
+    public u8* data;        // contenido leido (heap-alloc)
+    public i64 length;      // bytes leidos
+
+    public FileReader() {
+        this.fp     = 0;
+        this.data   = null;
+        this.length = 0;
+    }
+
+    public ~FileReader() {
+        // Cleanup deferido (test: el dtor cross-module + FFI parece
+        // tropezar con el regalloc/GC dance; investigar como sprint
+        // independiente).  El proceso al exit libera estos handles.
+    }
+
+    // Abre el archivo + lee TODO el contenido en `this.data`.
+    // Returns: Result<i64, i32> donde Ok = bytes leidos, Err = codigo FE_*.
+    public Result<i64, i32> read_all(string path) {
+        ensure_loaded();
+        u8* path_c = str_cstr(path);
+        u8* mode_c = str_cstr(MODE_READ);
+        if (path_c == null || mode_c == null) return Err(FE_READ_FAIL);
+        i64 fp = ffi_call(g_fopen, path_c, mode_c);
+        if (fp == 0) return Err(FE_NOT_FOUND);
+        // seek to end (SEEK_END=2) y ftell para obtener el tamano.
+        ffi_call(g_fseek, fp, 0, 2);
+        i64 size = ffi_call(g_ftell, fp);
+        // rewind: fseek SEEK_SET=0 con offset=0.
+        ffi_call(g_fseek, fp, 0, 0);
+        if (size < 0) {
+            ffi_call(g_fclose, fp);
+            return Err(FE_READ_FAIL);
+        }
+        u8* buf = malloc(size + 1);
+        i64 nread = ffi_call(g_fread, buf, 1, size, fp);
+        ffi_call(g_fclose, fp);
+        if (nread != size) {
+            free(buf);
+            return Err(FE_READ_FAIL);
+        }
+        buf[size] = 0;  // NUL terminator defensivo
+        this.fp     = 0;
+        this.data   = buf;
+        this.length = size;
+        return Ok(size);
+    }
+}
+
+// =============================================================================
+// Free fns: cobertura adicional para usar SIN crear instancia FileReader.
+// =============================================================================
+
+// Abre el archivo en modo `mode_str` y devuelve el FILE* opaco como i64.
+@hot
+public Result<i64, i32> open_file(string path, string mode_str) {
+    ensure_loaded();
+    u8* path_c = str_cstr(path);
+    u8* mode_c = str_cstr(mode_str);
+    if (path_c == null) return Err(FE_NOT_FOUND);
+    if (mode_c == null) return Err(FE_NOT_FOUND);
+    i64 fp = ffi_call(g_fopen, path_c, mode_c);
+    if (fp == 0) return Err(FE_NOT_FOUND);
+    return Ok(fp);
+}
+
+// Cierra un FILE* opaco.  No-op si fp == 0.
+public void close_file(i64 fp) {
+    if (fp == 0) return;
+    ensure_loaded();
+    ffi_call(g_fclose, fp);
+}
+
+// Escribe `n` bytes desde `buf` al FILE* `fp`.  Devuelve bytes escritos.
+public i64 write_bytes(i64 fp, u8* buf, i32 n) {
+    if (fp == 0 || n <= 0) return 0;
+    ensure_loaded();
+    return ffi_call(g_fwrite, buf, 1, n, fp);
+}
+
+// Helper: serializar un Buffer al disco.  @hot porque es el camino
+// critico de save (Ctrl+S en el hot path del editor).
+// =============================================================================
+
+@hot
+public Result<i64, i32> save_buffer(string path, buffer.Buffer buf) {
+    ensure_loaded();
+    u8* path_c = str_cstr(path);
+    u8* mode_c = str_cstr(MODE_WRITE);
+    i64 fp = ffi_call(g_fopen, path_c, mode_c);
+    if (fp == 0) {
+        return Err(FE_NOT_FOUND);
+    }
+    i64 wrote = ffi_call(g_fwrite, buf.data, 1, buf.length, fp);
+    ffi_call(g_fclose, fp);
+    if (wrote != buf.length) {
+        return Err(FE_WRITE_FAIL);
+    }
+    return Ok(wrote);
+}

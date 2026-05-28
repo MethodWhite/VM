@@ -1,0 +1,82 @@
+// =============================================================================
+// modules/keys.vex - constantes de teclas para la TUI
+// =============================================================================
+
+// Codigos ASCII de control y especiales.
+public comptime i32 KEY_NONE      = 0;
+public comptime i32 KEY_CTRL_A    = 1;
+public comptime i32 KEY_CTRL_B    = 2;
+public comptime i32 KEY_CTRL_C    = 3;
+public comptime i32 KEY_CTRL_D    = 4;
+public comptime i32 KEY_CTRL_E    = 5;
+public comptime i32 KEY_CTRL_F    = 6;
+public comptime i32 KEY_CTRL_G    = 7;
+public comptime i32 KEY_BACKSPACE = 8;
+public comptime i32 KEY_TAB       = 9;
+public comptime i32 KEY_LF        = 10;
+public comptime i32 KEY_CTRL_K    = 11;
+public comptime i32 KEY_CTRL_L    = 12;
+public comptime i32 KEY_ENTER     = 13;
+public comptime i32 KEY_CTRL_N    = 14;
+public comptime i32 KEY_CTRL_O    = 15;
+public comptime i32 KEY_CTRL_P    = 16;
+public comptime i32 KEY_CTRL_Q    = 17;
+public comptime i32 KEY_CTRL_R    = 18;
+public comptime i32 KEY_CTRL_S    = 19;
+public comptime i32 KEY_CTRL_T    = 20;
+public comptime i32 KEY_CTRL_U    = 21;
+public comptime i32 KEY_CTRL_V    = 22;
+public comptime i32 KEY_CTRL_W    = 23;
+public comptime i32 KEY_CTRL_X    = 24;
+public comptime i32 KEY_CTRL_Y    = 25;
+public comptime i32 KEY_CTRL_Z    = 26;
+public comptime i32 KEY_ESC       = 27;
+public comptime i32 KEY_BACKSPACE_WIN = 127;
+
+// Teclas virtuales (rango 1000+; valores arbitrarios fuera del rango ASCII).
+public comptime i32 VK_UP    = 1001;
+public comptime i32 VK_DOWN  = 1002;
+public comptime i32 VK_LEFT  = 1003;
+public comptime i32 VK_RIGHT = 1004;
+public comptime i32 VK_HOME  = 1005;
+public comptime i32 VK_END   = 1006;
+public comptime i32 VK_PGUP  = 1007;
+public comptime i32 VK_PGDN  = 1008;
+public comptime i32 VK_DEL   = 1009;
+public comptime i32 VK_INS   = 1010;
+public comptime i32 VK_F1    = 1101;
+public comptime i32 VK_F2    = 1102;
+public comptime i32 VK_F3    = 1103;
+public comptime i32 VK_F4    = 1104;
+public comptime i32 VK_F5    = 1105;
+public comptime i32 VK_F6    = 1106;
+public comptime i32 VK_F10   = 1110;
+
+// Variantes con modificadores (rango 2000+).
+// Shift: 2000  Ctrl: 3000  Ctrl+Shift: 4000
+public comptime i32 VK_SHIFT_UP    = 2001;
+public comptime i32 VK_SHIFT_DOWN  = 2002;
+public comptime i32 VK_SHIFT_LEFT  = 2003;
+public comptime i32 VK_SHIFT_RIGHT = 2004;
+public comptime i32 VK_SHIFT_HOME  = 2005;
+public comptime i32 VK_SHIFT_END   = 2006;
+
+public comptime i32 VK_CTRL_UP     = 3001;
+public comptime i32 VK_CTRL_DOWN   = 3002;
+public comptime i32 VK_CTRL_LEFT   = 3003;
+public comptime i32 VK_CTRL_RIGHT  = 3004;
+public comptime i32 VK_CTRL_HOME   = 3005;
+public comptime i32 VK_CTRL_END    = 3006;
+public comptime i32 VK_CTRL_PGUP   = 3007;
+public comptime i32 VK_CTRL_PGDN   = 3008;
+
+// =============================================================================
+// Validacion compile-time: las constantes no pueden colisionar entre si.
+// =============================================================================
+static_assert(KEY_ESC != KEY_CTRL_Q,            "KEY_ESC colisiona con CTRL_Q");
+static_assert(KEY_BACKSPACE != KEY_TAB,         "KEY_BACKSPACE colisiona con TAB");
+static_assert(VK_UP > 127,                       "VK_UP debe estar fuera del rango ASCII");
+static_assert(VK_F1 > VK_END,                    "F-keys deben ir despues de las de movimiento");
+static_assert(VK_SHIFT_UP != VK_CTRL_UP,         "Shift y Ctrl arrows no deben colisionar");
+static_assert(VK_CTRL_LEFT != KEY_CTRL_L,        "VK_CTRL_LEFT (3003) no debe pisar KEY_CTRL_L");
+

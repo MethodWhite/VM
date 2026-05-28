@@ -397,8 +397,34 @@ namespace runtime {
             // RET corresponde al CALL del frame OOP head: usar return_pc
             // cacheado, evitar la lectura desde vm_mem.
             ret_addr = frame->return_pc;
+            // BugFix P0-E2: si este frame fue pushed con save_regs (caso
+            // AOP advice chain dispatch), restaurar r1..r12 del snapshot
+            // para que el siguiente paso del chain vea la calling
+            // convention original (r1=this, r2..rN=args).  El RET del
+            // ULTIMO paso del chain restaura tambien (no daña: el caller
+            // del CALLVIRT original ya respaldo sus regs vivos si los
+            // necesitaba via su propio regalloc).
+            if (frame->has_saved_regs) {
+                for (int i = 0; i < 12; ++i) {
+                    vm->registers.regs[i + 1].qword(frame->saved_r1_r12[i]);
+                }
+            }
+            // B5 multi-AROUND: si este frame OWNS el around_chain (es el
+            // outer-most AROUND del callsite), liberar el array heap.
+            if (frame->around_chain_owns && frame->around_chain != nullptr) {
+                delete[] frame->around_chain;
+            }
+            // LR3: si el NEXT step es un AFTER_RETURNING (inject_r0_to_reg!=0),
+            // copiar R0 actual (return value del current frame) al reg destino
+            // del next.  Asi el advice ve el return value como su arg.
+            loader::FrameHeader *next_frame = frame->prev;
+            const uint8_t inject_reg = (next_frame ? next_frame->inject_r0_to_reg : 0);
+            const uint64_t r0_value  = vm->registers.regs[R00].qword();
             vm->frame_stack = frame->prev;
             vm->frame_pool.release(frame);
+            if (inject_reg >= 1 && inject_reg <= 12) {
+                vm->registers.regs[inject_reg].qword(r0_value);
+            }
         } else {
             // RET de callvm puro (sin frame OOP, o anidado dentro de uno):
             // leer ret_addr desde el slot del stack VM.

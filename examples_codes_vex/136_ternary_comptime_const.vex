@@ -3,10 +3,10 @@
 // (1) Ternario `cond ? a : b` -- operador de seleccion de expresion.
 //     Mismo CFG que un if/else con PHI en merge.
 //
-// (2) `comptime const NAME = expr;` -- constante compile-time evaluada
+// (2) `comptime NAME = expr;` -- constante compile-time evaluada
 //     y inline-ada en cada uso (cero overhead, sin storage runtime).
 //     El init puede usar builtins comptime + operadores + OTRAS
-//     comptime const previas.
+//     comptime previas.
 //
 // (3) `static_assert(cond, "msg")` -- verifica invariante en compile-
 //     time.  Si cond es false (o no comptime-evaluable), error de
@@ -14,16 +14,16 @@
 
 struct Token { i32 kind; u64 payload; }
 
-// comptime const con introspeccion.
-comptime const u64 TOKEN_SZ      = sizeof<Token>();          // 16 (4+pad+8)
-comptime const u64 TOKEN_K_OFF   = offsetof<Token>("kind");  // 0
-comptime const u64 TOKEN_P_OFF   = offsetof<Token>("payload"); // 8
+// comptime con introspeccion.
+comptime u64 TOKEN_SZ      = sizeof<Token>();          // 16 (4+pad+8)
+comptime u64 TOKEN_K_OFF   = offsetof<Token>("kind");  // 0
+comptime u64 TOKEN_P_OFF   = offsetof<Token>("payload"); // 8
 
-// comptime const compuestas (usan otras comptime const).
-comptime const u64 BUFFER_CAP    = 256;
-comptime const u64 BUFFER_BYTES  = TOKEN_SZ * BUFFER_CAP;     // 4096
-comptime const i32 MAX_DEPTH     = 32;
-comptime const i32 HALF_DEPTH    = MAX_DEPTH / 2;             // 16
+// comptime compuestas (usan otras comptime).
+comptime u64 BUFFER_CAP    = 256;
+comptime u64 BUFFER_BYTES  = TOKEN_SZ * BUFFER_CAP;     // 4096
+comptime i32 MAX_DEPTH     = 32;
+comptime i32 HALF_DEPTH    = MAX_DEPTH / 2;             // 16
 
 // Static asserts: invariantes verificadas al compilar.  Si alguno
 // fallara, el .velb no se generaria.
@@ -41,13 +41,13 @@ i32 main() {
     i32 level = 7;
     i32 tier = (level >= 10) ? 1 : (level >= 5) ? 2 : 3;   // 2
 
-    // Comptime if con comptime const + builtin.
+    // Comptime if con comptime + builtin.
     i32 r = 0;
     comptime if (BUFFER_BYTES == 4096 && TOKEN_SZ * 256 == BUFFER_BYTES) {
         r = 14;
     }
 
-    // Ternario sobre comptime const + runtime value.
+    // Ternario sobre comptime + runtime value.
     i32 step = (tier == 2) ? (HALF_DEPTH - 2) : MAX_DEPTH;  // 14
 
     return mode_score + r + step;   // 14 + 14 + 14 = 42

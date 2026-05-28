@@ -162,9 +162,8 @@ static gc::GcHandle alloc_flat(ProcessVM *vm,
     s->header.class_ptr  = nullptr;
     s->header.flags      = loader::OBJ_FLAG_GC_OWNED;
     s->header.hash_code  = static_cast<uint32_t>(h);
-    s->header.owner_pid  = 0;
-    s->header.lock_depth = 0;
-    s->header._mon_pad   = 0;
+    // monitor_word empaqueta owner + lock_depth; cero = unlocked.
+    s->header.monitor_word.store(0, std::memory_order_relaxed);
 
     s->encoding = static_cast<uint8_t>(enc);
     s->kind     = static_cast<uint8_t>(loader::StringKind::FLAT);
@@ -218,9 +217,8 @@ static gc::GcHandle alloc_rope(ProcessVM *vm,
     s->header.class_ptr  = nullptr;
     s->header.flags      = loader::OBJ_FLAG_GC_OWNED;
     s->header.hash_code  = static_cast<uint32_t>(h);
-    s->header.owner_pid  = 0;
-    s->header.lock_depth = 0;
-    s->header._mon_pad   = 0;
+    // monitor_word empaqueta owner + lock_depth; cero = unlocked.
+    s->header.monitor_word.store(0, std::memory_order_relaxed);
 
     s->encoding = static_cast<uint8_t>(enc);
     s->kind     = static_cast<uint8_t>(loader::StringKind::ROPE);
@@ -271,9 +269,8 @@ static gc::GcHandle alloc_slice(ProcessVM *vm,
     s->header.class_ptr  = nullptr;
     s->header.flags      = loader::OBJ_FLAG_GC_OWNED;
     s->header.hash_code  = static_cast<uint32_t>(h);
-    s->header.owner_pid  = 0;
-    s->header.lock_depth = 0;
-    s->header._mon_pad   = 0;
+    // monitor_word empaqueta owner + lock_depth; cero = unlocked.
+    s->header.monitor_word.store(0, std::memory_order_relaxed);
 
     s->encoding = static_cast<uint8_t>(enc);
     s->kind     = static_cast<uint8_t>(loader::StringKind::SLICE);

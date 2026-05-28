@@ -77,6 +77,8 @@ namespace vex::ast {
         ClassDecl,
         EnumDecl,        ///< Declaracion de tipo algebraico (enum + variantes con/sin payload).
         ExternFnDecl,    ///< @c extern "lib.dll" fn name(params) -> ret; (FFI declarativo, 0 overhead).
+        ImportDecl,      ///< @c import "path" [as alias] [only A, B];  (Phase M sistema de modulos).
+        NamespaceDecl,   ///< @c namespace foo { decls }  (Phase M.7.c, inline namespace estilo C++).
 
         // ----- Statements -----
         BlockStmt,
@@ -111,6 +113,7 @@ namespace vex::ast {
         UnaryExpr,
         AssignExpr,
         TernaryExpr,   ///< cond ? then : else (A.38)
+        TryExpr,       ///< expr? (P2: early-return para Result<V,E>)
         CallExpr,
         IndexExpr,
         ThisExpr,
@@ -119,6 +122,8 @@ namespace vex::ast {
         RSpawnExpr,   ///< rspawn(node) { body }: spawn cross-node, devuelve Future handle
         LambdaExpr,   ///< (args) => expr  o  (args) => { stmts }: closure inline
         MatchExpr,    ///< ADTs: match scrutinee { case Variant(bindings) => body; ... }
+        SuperCallExpr,        ///< super(args) -- delegacion ctor (R1)
+        SuperMethodCallExpr,  ///< super.method(args) -- callsuper no-virtual (R1)
         InitListExpr, ///< { 1, 2, 3 } o { .x = 1, .y = 2 } como
                       ///< inicializador de array o struct.  Solo valido en
                       ///< var-decl o como init de campo nested.  Lowering
@@ -512,9 +517,17 @@ namespace vex::ast {
         /// propiedad y el lowering emite la llamada en vez de un
         /// getfield directo.  1 = getter (`obj.prop`), 2 = setter (lhs
         /// de un AssignExpr; @ref AssignExpr::is_property_set se marca
-        /// en el padre).  El metodo se llama `get_<field_name>` o
+        /// en el padre).  3 = static field de clase (Counter.count).
+        /// 4 = simbolo de namespace importado (Phase M.7, `lib_a.valor_a`).
+        /// El metodo se llama `get_<field_name>` o
         /// `set_<field_name>` segun el caso.
         uint8_t               property_kind = 0;
+        /// Phase M.7: cuando @c property_kind == 4 este campo guarda
+        /// el indice del namespace en @c TypeChecker::imported_namespaces_
+        /// para que el lowering pueda resolver el mangled_label sin
+        /// depender de la pila de scopes (que ya esta vacia al lower).
+        /// Sentinel: UINT32_MAX = no resuelto.
+        uint32_t              ns_index = 0xFFFFFFFFu;
         FieldAccessExpr() : Expr(NodeKind::FieldAccessExpr) {}
     };
 
@@ -551,6 +564,32 @@ namespace vex::ast {
         std::unique_ptr<Expr> then_expr;
         std::unique_ptr<Expr> else_expr;
         TernaryExpr() : Expr(NodeKind::TernaryExpr) {}
+    };
+
+    /**
+     * @struct TryExpr
+     * @brief Operador @c `?` postfix para Result -- early-return sintactico.
+     *
+     * Sintaxis: @c `expr?` -- donde @c expr es de tipo @c Result<V,E>.
+     *
+     * Equivalente a:
+     * @code
+     *   let __tmp = expr;
+     *   if (isErr(__tmp)) { return __tmp; }
+     *   value(__tmp)
+     * @endcode
+     *
+     * Solo valido dentro de funciones cuyo return type sea @c Result<_, E>
+     * compatible (mismo @c E o convertible).  El type checker valida estas
+     * condiciones; el lowering desugara emitiendo una rama if-error con
+     * RET via SRET copy (mismo patron que @c return X cuando la funcion
+     * retorna Result).
+     *
+     * El tipo de la expresion es @c V (el payload Ok del Result).
+     */
+    struct TryExpr : Expr {
+        std::unique_ptr<Expr> operand;  ///< Expresion de tipo Result<V,E>
+        TryExpr() : Expr(NodeKind::TryExpr) {}
     };
 
     struct AssignExpr : Expr {
@@ -595,6 +634,36 @@ namespace vex::ast {
     };
 
     /**
+     * @struct SuperCallExpr (BugFix R1)
+     * @brief @c super(args) -- delegacion al constructor de la superclase
+     *        dentro del cuerpo de un constructor.
+     *
+     * Solo valida dentro del body de un ctor de clase con super_name no
+     * vacio.  El type checker resuelve al constructor de la super, valida
+     * la aridad y tipos de args.  El lowering emite CALLVIRT a la
+     * vtable_index del super_ctor con this como receptor.
+     */
+    struct SuperCallExpr : Expr {
+        std::vector<std::unique_ptr<Expr>> args;
+        SuperCallExpr() : Expr(NodeKind::SuperCallExpr) {}
+    };
+
+    /**
+     * @struct SuperMethodCallExpr (BugFix R1)
+     * @brief @c super.method(args) -- llamada a metodo de la superclase
+     *        evitando el dispatch virtual.
+     *
+     * Util para overrides que delegan al super.  El lowering emite
+     * @c callsuper (opcode 0xFC) o equivalent que dispatcha a la
+     * vtable_index del SUPER directamente, no del receiver dinamico.
+     */
+    struct SuperMethodCallExpr : Expr {
+        std::string                        method_name;
+        std::vector<std::unique_ptr<Expr>> args;
+        SuperMethodCallExpr() : Expr(NodeKind::SuperMethodCallExpr) {}
+    };
+
+    /**
      * @struct NewExpr
      * @brief Creacion de instancia: @c new ClassName(args).
      *
@@ -611,6 +680,22 @@ namespace vex::ast {
         /// la clase plantilla y reemplaza class_name con el nombre del
         /// tipo concreto generado (ej. "Box_i32").
         std::vector<std::unique_ptr<TypeNode>> type_args;
+        /// bug4: array allocation `new T[N]`.  Si esta seteado, el
+        /// expression aloca un array de N elementos del tipo `class_name`
+        /// en host heap (via malloc).  El resultado es un host_ptr al
+        /// buffer de N * sizeof(T) bytes.  args queda vacio en este caso.
+        std::unique_ptr<Expr> array_size;
+        /// Z.6: marca que esta instancia debe alocarse en el SharedHeap
+        /// (cross-process visible).  Lo setea @c lower_var_decl cuando el
+        /// var-decl padre tiene @c is_shared=true.  El lowering despacha
+        /// a @c __new_<Class>_shared (que emite el opcode @c newobjs en
+        /// lugar de @c newobj).
+        bool                  is_shared = false;
+        /// Bug fix 2026-05-23: indica que @c class_name YA fue mutado a su
+        /// forma mangled (Node_i32 etc).  Sin este flag, re-llamadas a
+        /// @c check_new sobre el mismo NewExpr (e.g. por compound assign
+        /// que re-evalua RHS) concatenarian el sufijo otra vez ("Node_i32_i32").
+        bool                  is_mangled = false;
         NewExpr() : Expr(NodeKind::NewExpr) {}
     };
 
@@ -772,6 +857,12 @@ namespace vex::ast {
         std::string              variant_name;  ///< "Red", "Green", "_" (default), etc.
         std::vector<std::string> bindings;      ///< Nombres locales para los payload fields.
         std::unique_ptr<Stmt>    body;
+        /// Bug fix 2026-05-23: guard opcional `case Pat if expr =>`.  Si
+        /// presente, el lowering evalua la expr DESPUES del tag match;
+        /// solo entra al body si guard es true.  Si false, continua al
+        /// siguiente arm.  La exhaustividad se relaja: la presencia de
+        /// guards permite que el match no sea estaticamente exhaustivo.
+        std::unique_ptr<Expr>    guard;
         SourceLoc                loc;
     };
 
@@ -820,6 +911,13 @@ namespace vex::ast {
         std::vector<std::unique_ptr<Expr>> elements;
         std::vector<std::string>           field_names;
         bool                               is_designated = false;
+        /// Tipo destino anotado por el type checker desde el contexto.
+        /// Para `unique<Punto> p = {.x=10, .y=20}` el desugar marca aqui
+        /// "Punto" para que el lowering sepa que el init list construye
+        /// un struct Punto y emita los STOREs en posiciones correctas.
+        /// Vacio = init list contextual (el type checker resuelve por
+        /// uso en var-decl u otros sitios).
+        std::string                        target_type_name;
         InitListExpr() : Expr(NodeKind::InitListExpr) {}
     };
 
@@ -912,6 +1010,11 @@ namespace vex::ast {
         /// setea @c infer_type=true; el type checker computa el tipo del
         /// @c init y lo aplica al binding sin requerir TypeNode en el AST.
         bool                      infer_type = false;
+        /// Z.6: marca `shared T name = new T()` -- el storage class
+        /// dispatcha al SharedHeap en lugar del gc_heap local.  El handle
+        /// resultante tiene bit 31 (SHARED_HANDLE_BIT) set.  Stdlib clases
+        /// son agnosticas; solo el var-decl decide.
+        bool                      is_shared = false;
         VarDeclStmt() : Stmt(NodeKind::VarDeclStmt) {}
     };
 
@@ -1152,6 +1255,12 @@ namespace vex::ast {
         std::string                              name;
         std::vector<std::unique_ptr<ParamDecl>>  params;
         std::unique_ptr<BlockStmt>               body;
+        /// Phase M6.a L.3: visibilidad cross-module.  @c true (default) =
+        /// publica, exportada al `.vexi` y accesible desde otros modulos.
+        /// @c false = privada al modulo (no se exporta).  El parser setea
+        /// segun keyword `public`/`private` precedente; sin keyword = true
+        /// (default permisivo para compat con codigo existente).
+        bool                                     is_public = true;
         bool                                     is_async = false; ///< @Async: el cuerpo se ejecuta en un proceso hijo, devuelve handle de Future
         /// marca `comptime fn` -- la funcion se interpreta en
         /// compile-time, no genera codigo runtime.  Solo puede llamarse
@@ -1180,6 +1289,11 @@ namespace vex::ast {
         /// marca @Pure una fn impura, el resultado es indefinido --
         /// la memoizacion no detecta el cheating.
         bool                                     is_pure  = false;
+        /// Bug fix 2026-05-23: forward declaration `T fn(args);` sin body.
+        /// El parser lo setea cuando ve `;` post-`)`.  El type checker
+        /// registra la firma sin requerir body; otra FunctionDecl con el
+        /// mismo nombre debe aparecer despues con body, o error.
+        bool                                     is_forward_decl = false;
         FunctionDecl() : Node(NodeKind::FunctionDecl) {}
     };
 
@@ -1226,12 +1340,20 @@ namespace vex::ast {
         std::string               name;
         std::unique_ptr<Expr>     init;
         bool                      is_const = false;
+        /// Phase M6.a L.3: visibilidad cross-module (default true).
+        bool                      is_public = true;
         ///  marca `comptime const`.  El init debe ser comptime-
         /// evaluable; el type checker guarda el valor en
         /// @c TypeChecker::comptime_const_values_ y los usos posteriores
         /// se baja como @c IrOp::CONST inline (cero overhead).  No genera
         /// global runtime storage.
         bool                      is_comptime = false;
+        /// v4: atributos `@hot`/`@cold`/`@align(N)`/`@section("name")`.
+        /// Solo aplicables a comptime const (string/array/struct).
+        bool                      attr_hot   = false;
+        bool                      attr_cold  = false;
+        uint16_t                  attr_align = 0;     ///< 0 = default
+        std::string               attr_section;        ///< vacio = default
         GlobalVarDecl() : Node(NodeKind::GlobalVarDecl) {}
     };
 
@@ -1254,7 +1376,102 @@ namespace vex::ast {
         std::string               name;
         std::unique_ptr<TypeNode> aliased;
         bool                      is_using_form = false;
+        /// Phase M6.a L.3: visibilidad cross-module (default true).
+        bool                      is_public = true;
+        /// Si @c true, el alias es un NEWTYPE: comparte la representacion
+        /// del tipo subyacente pero es nominalmente DISTINTO en el type
+        /// checker.  Sintaxis: @c "typedef u64 ptr new;".  El type checker
+        /// asigna un @c nominal_id unico que distingue este tipo de su
+        /// underlying y de otros newtypes.  Sin conversion implicita;
+        /// requiere cast explicito @c (T)x para cruzar al underlying.
+        bool                      is_newtype = false;
+        /// Si @c true (solo aplica si @c is_newtype), el newtype es
+        /// @c @opaque: ademas de la barrera nominal, el usuario NO puede
+        /// inicializar con literal del underlying ni hacer cast explicito.
+        /// Sintaxis: @c "typedef u64 fd new @opaque;".  Sirve para handles
+        /// donde el codigo cliente no debe ver la representacion.
+        bool                      is_opaque = false;
+        /// Alineacion forzada en bytes via @c "@align(N)" (potencia de 2,
+        /// 1..4096).  0 = sin override (alineacion natural del underlying).
+        uint16_t                  align_override = 0;
+        /// Tipos desde los que se permite construir este newtype via
+        /// cast explicito (@c "explicit from T;" en el bloque).  Una entrada
+        /// con @c is_public=true permite cross-file; sin esa marca el cast
+        /// solo se admite en el mismo fichero donde se declaro el typedef.
+        struct ExplicitConv {
+            std::unique_ptr<TypeNode> type;
+            bool                      is_public = false;
+        };
+        std::vector<ExplicitConv> explicit_from;
+        std::vector<ExplicitConv> explicit_to;
         TypeAliasDecl() : Node(NodeKind::TypeAliasDecl) {}
+    };
+
+    /**
+     * @struct ImportDecl
+     * @brief Declaracion de @c import "path" [as alias] [only A, B];
+     *
+     * Phase M (sistema de modulos).  El @c path es siempre un string
+     * literal por consistencia con @c extern "lib.dll", @c loadmodule(),
+     * @c @Method("lib:fn"), etc.  Se resuelve a un fichero @c .vex en
+     * el filesystem por el module resolver del compilador.
+     *
+     * Sin @c as ni @c only, el modulo se accede via su namespace (el
+     * ultimo segmento del path: @c "editor/buffer" -> @c buffer).  Con
+     * @c as, el namespace se renombra.  Con @c only, los simbolos
+     * listados se inyectan al scope local sin necesidad de prefijo.
+     *
+     * Si @c is_public_reexport es @c true (sintaxis @c "public import"),
+     * los simbolos importados se reexportan a su vez para los modulos
+     * que importen ESTE modulo.  Sin esa marca, los imports son privados
+     * al modulo actual (no se re-exportan transitivamente).
+     */
+    struct ImportDecl : Node {
+        /// Ruta literal tal como aparecio en el source (sin las comillas).
+        /// E.g. @c "editor/buffer" o @c "std/io".
+        std::string                  path;
+        /// Alias opcional para el namespace.  Vacio si no hay @c as.
+        std::string                  alias;
+        /// Lista de simbolos especificos a importar al scope local
+        /// cuando se usa @c "only A, B" o @c "only A as B, C as D".
+        /// Vacio significa "todos los publicos accesibles via namespace".
+        struct OnlySymbol {
+            std::string name;          // nombre original en el modulo
+            std::string rename;        // nombre local (vacio = sin rename)
+        };
+        std::vector<OnlySymbol>      only_symbols;
+        /// Si el import es @c "public import "x";" (re-export).  Sin esa
+        /// marca, los simbolos importados son privados al modulo actual.
+        bool                         is_public_reexport = false;
+
+        ImportDecl() : Node(NodeKind::ImportDecl) {}
+    };
+
+    /**
+     * @struct NamespaceDecl
+     * @brief Declaracion de namespace inline estilo C++:
+     *        @c "namespace foo { ... }"
+     *
+     * Agrupa declaraciones top-level bajo un namespace logico.  Estructura
+     * identica a @c ModuleNode (raiz) en cuanto a contenidos, pero anidable
+     * dentro del fichero.  Permite tener dos clases / structs / enums /
+     * funciones con el mismo nombre en namespaces distintos del mismo
+     * modulo (e.g. @c ui.Button vs @c audio.Button).
+     *
+     * El mangling automatico aplica prefijo @c <ns_name>__ a todas las
+     * declaraciones internas, de modo que en el bytecode emitido los
+     * labels son @c ui__Button vs @c audio__Button.  Anidamiento se
+     * concatena: @c "namespace a { namespace b { class C } }" produce
+     * label @c a__b__C.  Cero overhead runtime: el namespace es
+     * puramente lexical.
+     *
+     * Acceso desde fuera del namespace: sintaxis qualified @c foo.X
+     * (no @c foo::X -- Vex prefiere el punto sobre el scope-op de C++).
+     */
+    struct NamespaceDecl : Node {
+        std::string                          name;       ///< "ui", "audio", etc.
+        std::vector<std::unique_ptr<Node>>   decls;       ///< contenidos top-level
+        NamespaceDecl() : Node(NodeKind::NamespaceDecl) {}
     };
 
     /**
@@ -1288,6 +1505,8 @@ namespace vex::ast {
     struct StructDecl : Node {
         std::string                  name;
         std::vector<StructFieldDecl> fields;
+        /// Phase M6.a L.3: visibilidad cross-module (default true).
+        bool                         is_public = true;
         /// marca `@Introspect` -- el compilador
         /// emite IntrospectInfo POD en static_data y registra el tipo en
         /// el global `__introspect_registry` para que `find_type("Name")`
@@ -1349,6 +1568,12 @@ namespace vex::ast {
         std::vector<EnumVariantDecl> variants;
         /// marca `@Introspect`.  Ver `StructDecl`.
         bool                         is_introspect = false;
+        /// Phase M6.a L.3: visibilidad cross-module (default true).
+        bool                         is_public = true;
+        /// L2.3: parametros de tipo opcionales `enum Maybe<T> { None, Some(T) }`.
+        /// Si no esta vacio, el enum es un template y se monomorphiza on demand
+        /// en cada uso `Maybe<i32>` (mismo modelo que generic classes A.8).
+        std::vector<std::string>     type_params;
         EnumDecl() : Node(NodeKind::EnumDecl) {}
     };
 
@@ -1445,6 +1670,8 @@ namespace vex::ast {
         std::vector<ClassFieldDecl>                       fields;
         std::vector<std::unique_ptr<ClassMethodDecl>>     methods;
         bool                                              is_final = false;
+        /// Phase M6.a L.3: visibilidad cross-module (default true).
+        bool                                              is_public = true;
         /// Parametros de tipo (templates).  `class Box<T>` produce
         /// type_params = ["T"].  Vacio para clases no genericas.  El
         /// type checker no procesa la clase como tal sino que la guarda

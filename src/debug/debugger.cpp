@@ -1871,11 +1871,15 @@ namespace debug {
                                 oh->class_ptr->name.data),
                             oh->class_ptr->name.size);
                     }
+                    // Monitor word empaqueta owner_encoded (48 bits) y lock_depth (16 bits).
+                    // Lo desempacamos via los helpers de loader::ObjectHeader para mantener
+                    // el campo JSON estable aunque el layout interno cambie.
+                    const uint64_t mw = oh->monitor_word.load(std::memory_order_relaxed);
                     d << ",\"class\":\"" << json_escape(cname) << "\""
                       << ",\"flags\":" << oh->flags
                       << ",\"hash_code\":" << oh->hash_code
-                      << ",\"owner_pid\":" << oh->owner_pid
-                      << ",\"lock_depth\":" << oh->lock_depth;
+                      << ",\"owner_pid\":" << loader::monitor_owner(mw)
+                      << ",\"lock_depth\":" << loader::monitor_depth(mw);
                 }
                 // Bytes raw (en hex como array).
                 d << ",\"bytes\":[";

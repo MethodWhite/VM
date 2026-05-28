@@ -1,0 +1,37 @@
+// Z.10 ext: GC mark+sweep STW del SharedHeap.  Verifica:
+//   - sweep colecta shared objects no alcanzables (~rooted) en single-thread.
+//   - sweep funciona con multi-scheduler via STW poll en run_loop.
+//   - mark transitivo (BFS) preserva refs salientes de shared objects vivos.
+class Holder {
+    public i64 v;
+    public Holder() { this.v = 0; }
+}
+i32 main() {
+    // Alocar 6 shared objects.
+    shared Holder a = new Holder();
+    shared Holder b = new Holder();
+    shared Holder c = new Holder();
+    shared Holder d = new Holder();
+    shared Holder e = new Holder();
+    shared Holder f = new Holder();
+    a.v = 10;  b.v = 20;
+    u32 before = shared_heap_live_count();
+
+    // Soltar refs a c, d, e, f (reasignar a a/b).  Solo a y b siguen rooted.
+    c = a;  d = a;  e = b;  f = b;
+
+    // GC sweep: deberia colectar 4 objetos (c, d, e, f originales).
+    shared_gc_collect();
+    u32 after = shared_heap_live_count();
+
+    // Verificar a y b siguen accesibles.
+    if (a.v != 10) return 81;
+    if (b.v != 20) return 82;
+    // before debio ser >= 6 (cada shared new Holder + ClassInfo internals).
+    if (before < 6) return 83;
+    // after debio bajar (algunos collected).  Tolerante: > 0 y < before.
+    if (after >= before) return 84;
+    if (after == 0) return 85;
+
+    return 42;
+}

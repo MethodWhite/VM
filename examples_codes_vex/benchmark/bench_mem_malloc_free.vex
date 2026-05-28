@@ -1,0 +1,33 @@
+// Benchmark: reserva + liberacion de memoria via malloc/free puro (host heap).
+//
+// Mide overhead del path RAW_ALLOC + RAW_FREE: cada iteracion aloca
+// un bloque de 32 bytes en HOST heap (via VirtualAlloc/mmap del proceso),
+// hace un write minimal para evitar dead-code-elimination, y libera.
+//
+// Es el path mas "manual" de memoria en Vex: cero borrow checker, cero
+// GC tracking, cero RAII automatico.  Equivalente conceptual a `malloc`/
+// `free` de C.
+//
+// Para medir el path GC, ver `bench_mem_class.vex`.
+// Para medir el path stack-frame, ver `bench_mem_struct.vex`.
+//
+// Ejecuta: vm --run bench_mem_malloc_free.velb --stats [-m jit]
+// Esperado: MIPS proporcional al cost de malloc/free + el loop counter.
+
+i32 main() {
+    i64 sum = 0;
+    i64 i   = 0;
+    while (i < 1000000) {
+        // RAW_ALLOC de 32 bytes en host heap.
+        i32* p = malloc(32);
+        // Write minimal: 1 STORE para que el optimizer no elimine el alloc.
+        *p = 1;
+        // Acumula el valor para evitar dead-store-elimination tambien.
+        sum = sum + (*p);
+        // RAW_FREE: devuelve el bloque al allocator.
+        free(p);
+        i = i + 1;
+    }
+    // Resultado esperado: sum == 1000000 (1 por iteracion).
+    return sum;
+}

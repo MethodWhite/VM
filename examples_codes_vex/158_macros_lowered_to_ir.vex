@@ -1,0 +1,37 @@
+// validacion de que @Macro bodies se lowerean a IR como
+// IrFunction `__macro_<name>`.  Este test confirma que el pipeline
+// IR -> bytecode soporta codigo simple de macros (foundation para
+// la futura ComptimeVM execution -- ver Phase MC.2+).
+//
+// El test no ejerce la ComptimeVM: solo valida que la compilacion
+// produce un .velb correcto y que los macros simples evaluan a su
+// resultado esperado en compile time.
+
+i32 doblar(i32 x) { return x + x; }
+
+// Macro simple: retorna codigo Vex como string.  El nombre lowereado
+// internamente seria `__macro_macro_doblar` si MC.1 esta activo;
+// MC.2+ ejecutaria este body via la ComptimeVM en lugar del AST eval.
+@Macro
+comptime string macro_doblar(i64 n) {
+    return "doblar(" + to_str(n) + ")";
+}
+
+// Macro con string concat: ejercita STRCAT lowering en IR.
+@Macro
+comptime string macro_suma_str(i64 a, i64 b) {
+    return "(" + to_str(a) + " + " + to_str(b) + ")";
+}
+
+i32 main() {
+    // (1) Macro simple: el codigo emitido es "doblar(21)" -> 42.
+    i32 r1 = macro_doblar(21);
+    if (r1 != 42) return 91;
+
+    // (2) Macro con concat de strings: "(20 + 22)" -> 42.
+    i32 r2 = macro_suma_str(20, 22);
+    if (r2 != 42) return 92;
+
+    // (3) Ambos exitosos -> retornar 42.
+    return r1;
+}

@@ -992,6 +992,37 @@ VESTA_PLUGIN_EXPORT uint64_t vcol_queue_size(uint64_t handle) {
     return q ? q->size : 0;
 }
 
+/**
+ * @brief Elimina la primera ocurrencia de @c value en la queue (busqueda
+ *        lineal O(N) desde head); reorganiza con shift-left.  Devuelve 1
+ *        si se elimino, 0 si no se encontro.  Util para LRU caches donde
+ *        un acceso mueve el elemento al final.
+ */
+VESTA_PLUGIN_EXPORT uint64_t vcol_queue_remove_value(uint64_t handle,
+                                                    uint64_t value) {
+    VestaQueue *q = (VestaQueue *) (uintptr_t) handle;
+    if (!q || q->size == 0) return 0;
+    uint64_t idx = q->head;
+    for (uint64_t i = 0; i < q->size; ++i) {
+        if (q->data[idx] == value) {
+            /* Shift-left: cada slot tras @c idx avanza un puesto en el
+             * ring (manteniendo el orden FIFO de los demas elementos). */
+            uint64_t cur  = idx;
+            uint64_t next = (cur + 1) & q->mask;
+            for (uint64_t j = i + 1; j < q->size; ++j) {
+                q->data[cur] = q->data[next];
+                cur          = next;
+                next         = (next + 1) & q->mask;
+            }
+            q->tail = (q->tail + q->mask) & q->mask;  /* tail-1 mod cap */
+            q->size--;
+            return 1;
+        }
+        idx = (idx + 1) & q->mask;
+    }
+    return 0;
+}
+
 VESTA_PLUGIN_EXPORT void vcol_queue_clear(uint64_t handle) {
     VestaQueue *q = (VestaQueue *) (uintptr_t) handle;
     if (!q) return;

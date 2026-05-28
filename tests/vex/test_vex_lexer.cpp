@@ -14,7 +14,7 @@
  * @file test_vex_lexer.cpp
  * @brief Test automatico del lexer Vex.
  *
- * Cobertura del subset:
+ * Cobertura del subset A.1:
  *   - Identificadores ASCII y todas las palabras reservadas cerradas.
  *   - Literales enteros (decimal, hex, bin, oct) con separadores '_'.
  *   - Literales flotantes con/sin exponente.
@@ -28,8 +28,8 @@
  *       * string sin cerrar
  *       * caracter sin cerrar
  *       * caracter inesperado
- *       * interpolacion rechazada
- *       * triple-quoted rechazado
+ *       * interpolacion rechazada en A.1
+ *       * triple-quoted rechazado en A.1
  *
  * El test devuelve exit code 0 si todas las aserciones pasan; cualquier
  * fallo aborta inmediatamente con detalle del caso fallido.

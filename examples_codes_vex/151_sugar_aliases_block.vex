@@ -12,7 +12,7 @@
 //
 // (3) BLOQUE comptime {} con sugar `name = expr;`:
 //        Cada decl dentro del bloque equivale a
-//        `comptime const auto name = expr;` (inferencia + const implicito).
+//        `comptime auto name = expr;` (inferencia + const implicito).
 //        Reduce ruido en cadenas largas de templates.
 
 i32 doblar(i32 x) { return x * 2; }
@@ -25,9 +25,9 @@ i32 main() {
     //     Comparar este codigo con la version verbose pre-A.43.13:
     //
     //     // ANTES (verbose):
-    //     comptime const string t = "doblar({x})";
-    //     comptime const string r = comptime_replace(t, "{x}", "10");
-    //     comptime const string o = comptime_concat("mas_uno(",
+    //     comptime string t = "doblar({x})";
+    //     comptime string r = comptime_replace(t, "{x}", "10");
+    //     comptime string o = comptime_concat("mas_uno(",
     //                                  comptime_concat(r, ")"));
     //     static_assert(comptime_streq(o, "mas_uno(doblar(10))"), "...");
     //

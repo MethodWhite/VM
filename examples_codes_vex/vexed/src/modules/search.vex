@@ -1,0 +1,30 @@
+// =============================================================================
+// modules/search.vex - busqueda de substring en el buffer
+// =============================================================================
+
+import "modules/buffer";
+
+// Busca `needle` (string) en el buffer empezando desde `from_offset`.
+// Devuelve el offset (byte) de la primera ocurrencia, o -1.
+public i64 find_from(buffer.Buffer b, string needle, i32 from_offset) {
+    u8* nbuf = str_cstr(needle);
+    i32 nlen = (i32) str_bytes(needle);
+    if (nlen == 0) return (i64) from_offset;
+    if (nlen > b.length - from_offset) return -1;
+    i32 last = b.length - nlen + 1;
+    i32 i = from_offset;
+    if (i < 0) i = 0;
+    while (i < last) {
+        i32 j = 0;
+        while (j < nlen && b.data[i + j] == nbuf[j]) {
+            j = j + 1;
+        }
+        if (j == nlen) return (i64) i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+public i64 find(buffer.Buffer b, string needle) {
+    return find_from(b, needle, 0);
+}

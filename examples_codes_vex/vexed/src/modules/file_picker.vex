@@ -1,0 +1,391 @@
+// =============================================================================
+// modules/file_picker.vex - Ctrl-P fuzzy file picker modal
+// =============================================================================
+//
+// Modal centrado en pantalla con:
+//   - Campo de busqueda en la cabecera (query incremental).
+//   - Lista de ficheros (enumerados recursivamente desde cwd hasta depth-2).
+//   - Filtro substring case-insensitive sobre el nombre del fichero.
+//   - Up/Down navega, Enter selecciona, Esc cancela.
+//
+// La enumeracion es shallow (max_depth=2) para mantener latencia baja en
+// proyectos grandes; el sidebar sigue siendo el browser completo.
+//
+// Devuelve el path absoluto del fichero seleccionado (o cadena vacia si
+// el usuario cancela con Esc).
+
+import "modules/file_io";
+import "modules/screen";
+import "modules/keys";
+import "modules/input";
+
+public comptime i32 FP_MAX_ENTRIES = 2048;
+public comptime i32 FP_NAME_MAX    = 260;
+public comptime i32 FP_FINDDATA    = 320;
+public comptime i32 FP_MAX_DEPTH   = 2;
+public comptime i32 FP_QUERY_MAX   = 128;
+
+public class FilePicker {
+    public u8*   names;        // buffer concatenado de path-relativos
+    public i32   names_used;
+    public i32   names_cap;
+    public i32*  offsets;      // offsets[i] = inicio del path en `names`
+    public i32*  lens;
+    public i32   count;
+    public string cwd;          // base path para resolver fullpath
+
+    // Estado de la query.
+    public u8*   query;
+    public i32   query_len;
+    public i32*  filtered;     // indices a `offsets` que matchean
+    public i32   filt_count;
+    public i32   sel;
+    public i32   scroll;
+
+    public FilePicker(string base_cwd) {
+        this.names      = malloc(65536);
+        this.names_used = 0;
+        this.names_cap  = 65536;
+        this.offsets    = malloc(FP_MAX_ENTRIES * 4);
+        this.lens       = malloc(FP_MAX_ENTRIES * 4);
+        this.count      = 0;
+        this.cwd        = base_cwd;
+        this.query      = malloc(FP_QUERY_MAX);
+        this.query_len  = 0;
+        this.query[0]   = 0;
+        this.filtered   = malloc(FP_MAX_ENTRIES * 4);
+        this.filt_count = 0;
+        this.sel        = 0;
+        this.scroll     = 0;
+    }
+
+    // Enumera recursivamente desde `dir` con prefijo de path relativo.
+    // Solo lista ficheros (no dirs).  Skip "." y "..".
+    public void enumerate_dir(u8* dir_path, i32 dir_len, u8* prefix, i32 pre_len, i32 depth) {
+        if (depth > FP_MAX_DEPTH) return;
+        if (this.count >= FP_MAX_ENTRIES) return;
+        // Construir spec = dir_path + "\\*" o "/*".
+        u8* spec = malloc(dir_len + 4);
+        i32 k = 0;
+        while (k < dir_len) { spec[k] = dir_path[k]; k = k + 1; }
+        spec[dir_len]     = 92;    // '\\'
+        spec[dir_len + 1] = 42;    // '*'
+        spec[dir_len + 2] = 0;
+        u8* finddata = malloc(FP_FINDDATA);
+        i64 h = file_io.dir_open(spec, finddata);
+        free(spec);
+        if (h == -1) { free(finddata); return; }
+        i32 cont = 1;
+        while (cont == 1 && this.count < FP_MAX_ENTRIES) {
+            i32 attrib = (i32) finddata[0];
+            i32 is_dir = 0;
+            if ((attrib & 16) != 0) is_dir = 1;
+            u8* name_p = finddata + 40;
+            i32 nlen = 0;
+            while (nlen < FP_NAME_MAX && name_p[nlen] != 0) nlen = nlen + 1;
+            // Skip "." y ".."
+            i32 skip = 0;
+            if (nlen == 1 && name_p[0] == 46) skip = 1;
+            if (nlen == 2 && name_p[0] == 46 && name_p[1] == 46) skip = 1;
+            if (skip == 0) {
+                if (is_dir == 1) {
+                    // Recursar: construir nuevo dir + nuevo prefix.
+                    u8* sub_dir = malloc(dir_len + nlen + 2);
+                    i32 z = 0;
+                    while (z < dir_len) { sub_dir[z] = dir_path[z]; z = z + 1; }
+                    sub_dir[dir_len] = 92;
+                    z = 0;
+                    while (z < nlen) { sub_dir[dir_len + 1 + z] = name_p[z]; z = z + 1; }
+                    sub_dir[dir_len + 1 + nlen] = 0;
+                    u8* sub_pre = malloc(pre_len + nlen + 2);
+                    z = 0;
+                    while (z < pre_len) { sub_pre[z] = prefix[z]; z = z + 1; }
+                    if (pre_len > 0) {
+                        sub_pre[pre_len] = 47;   // '/'
+                        z = 0;
+                        while (z < nlen) { sub_pre[pre_len + 1 + z] = name_p[z]; z = z + 1; }
+                        sub_pre[pre_len + 1 + nlen] = 0;
+                    } else {
+                        z = 0;
+                        while (z < nlen) { sub_pre[z] = name_p[z]; z = z + 1; }
+                        sub_pre[nlen] = 0;
+                    }
+                    i32 new_pre_len = pre_len + nlen;
+                    if (pre_len > 0) new_pre_len = new_pre_len + 1;
+                    this.enumerate_dir(sub_dir, dir_len + 1 + nlen, sub_pre, new_pre_len, depth + 1);
+                    free(sub_dir);
+                    free(sub_pre);
+                } else {
+                    // Fichero: anyadir con prefix/name.
+                    i32 full_len = nlen;
+                    if (pre_len > 0) full_len = pre_len + 1 + nlen;
+                    if (this.names_used + full_len + 1 <= this.names_cap) {
+                        i32 dst = this.names_used;
+                        i32 j = 0;
+                        if (pre_len > 0) {
+                            while (j < pre_len) { this.names[dst + j] = prefix[j]; j = j + 1; }
+                            this.names[dst + pre_len] = 47;   // '/'
+                            j = 0;
+                            while (j < nlen) { this.names[dst + pre_len + 1 + j] = name_p[j]; j = j + 1; }
+                        } else {
+                            while (j < nlen) { this.names[dst + j] = name_p[j]; j = j + 1; }
+                        }
+                        this.names[dst + full_len] = 0;
+                        this.offsets[this.count] = dst;
+                        this.lens[this.count]    = full_len;
+                        this.count               = this.count + 1;
+                        this.names_used          = dst + full_len + 1;
+                    }
+                }
+            }
+            i32 rc = file_io.dir_next(h, finddata);
+            if (rc != 0) cont = 0;
+        }
+        file_io.dir_close(h);
+        free(finddata);
+    }
+
+    // Inicializa la lista de ficheros enumerando desde cwd recursivo.
+    public void populate() {
+        i32 cwd_n = (i32) str_bytes(this.cwd);
+        u8* cwd_c = str_cstr(this.cwd);
+        u8* empty = malloc(1);
+        empty[0] = 0;
+        this.enumerate_dir(cwd_c, cwd_n, empty, 0, 0);
+        free(empty);
+        this.recompute_filter();
+    }
+
+    // Re-compute filtered indices basado en query.  Substring case-insens.
+    public void recompute_filter() {
+        this.filt_count = 0;
+        i32 i = 0;
+        while (i < this.count) {
+            i32 nlen = this.lens[i];
+            u8* nm = this.names + this.offsets[i];
+            i32 matches = 0;
+            if (this.query_len == 0) {
+                matches = 1;
+            } else {
+                // Substring match case-insensitive: probar todas las pos.
+                i32 j = 0;
+                while (j + this.query_len <= nlen) {
+                    i32 k = 0;
+                    i32 ok = 1;
+                    while (k < this.query_len) {
+                        i32 a = (i32) nm[j + k];
+                        i32 b = (i32) this.query[k];
+                        // Lowercase ambos.
+                        if (a >= 65 && a <= 90) a = a + 32;
+                        if (b >= 65 && b <= 90) b = b + 32;
+                        if (a != b) { ok = 0; k = this.query_len; } else { k = k + 1; }
+                    }
+                    if (ok == 1) { matches = 1; j = nlen; } else { j = j + 1; }
+                }
+            }
+            if (matches == 1) {
+                this.filtered[this.filt_count] = i;
+                this.filt_count = this.filt_count + 1;
+            }
+            i = i + 1;
+        }
+        if (this.sel >= this.filt_count) this.sel = this.filt_count - 1;
+        if (this.sel < 0) this.sel = 0;
+        if (this.scroll > this.sel) this.scroll = this.sel;
+    }
+
+    // Construye el path absoluto del item seleccionado (cwd + "\\" + relpath).
+    public string selected_path() {
+        if (this.filt_count == 0 || this.sel < 0 || this.sel >= this.filt_count) return "";
+        i32 idx = this.filtered[this.sel];
+        i32 rn  = this.lens[idx];
+        u8* rp  = this.names + this.offsets[idx];
+        i32 cn  = (i32) str_bytes(this.cwd);
+        u8* cp  = str_cstr(this.cwd);
+        u8* buf = malloc(cn + rn + 2);
+        i32 k = 0;
+        while (k < cn) { buf[k] = cp[k]; k = k + 1; }
+        buf[cn] = 92;   // '\\'
+        k = 0;
+        while (k < rn) {
+            u8 c = rp[k];
+            if (c == 47) c = 92;     // normalizar `/` a `\\` para Windows
+            buf[cn + 1 + k] = c;
+            k = k + 1;
+        }
+        buf[cn + 1 + rn] = 0;
+        string s = str_make(buf, cn + 1 + rn);
+        free(buf);
+        return s;
+    }
+
+    public string selected_name() {
+        if (this.filt_count == 0 || this.sel < 0 || this.sel >= this.filt_count) return "";
+        i32 idx = this.filtered[this.sel];
+        i32 rn  = this.lens[idx];
+        u8* rp  = this.names + this.offsets[idx];
+        // Quedarse solo con basename: encontrar el ultimo '/'
+        i32 cut = rn;
+        while (cut > 0 && rp[cut - 1] != 47) cut = cut - 1;
+        return str_make(rp + cut, rn - cut);
+    }
+
+    // Renderiza el modal centrado.
+    public void render(screen.Screen sc) {
+        i32 box_w = 70;
+        if (box_w > sc.cols - 4) box_w = sc.cols - 4;
+        if (box_w < 40) box_w = 40;
+        i32 box_h = 22;
+        if (box_h > sc.rows - 4) box_h = sc.rows - 4;
+        i32 top = (sc.rows - box_h) / 2 + 1;
+        i32 left = (sc.cols - box_w) / 2 + 1;
+        i32 inner_w = box_w - 2;
+        i32 list_h  = box_h - 4;
+
+        string col_bord = "\x1b[38;2;189;147;249m";   // purple
+        string col_sec  = "\x1b[38;2;139;233;253m";   // cyan
+        string col_kw   = "\x1b[38;2;255;121;198m";   // pink
+        string col_fg   = "\x1b[38;2;248;248;242m";
+
+        // Borde superior.
+        print("\x1b[${top};${left}H");
+        print(col_bord);
+        print("+");
+        string title = " Abrir fichero (Ctrl-P) ";
+        i32 tlen = (i32) str_bytes(title);
+        i32 lpad = (inner_w - tlen) / 2;
+        if (lpad < 0) lpad = 0;
+        i32 z = 0;
+        while (z < lpad) { print("-"); z = z + 1; }
+        print(screen.ATTR_RESET); print(col_sec); print(screen.ATTR_BOLD);
+        print(title); print(screen.ATTR_RESET);
+        print(col_bord);
+        i32 rpad = inner_w - lpad - tlen;
+        z = 0;
+        while (z < rpad) { print("-"); z = z + 1; }
+        print("+");
+        print(screen.ATTR_RESET);
+
+        // Linea de query.
+        i32 row = top + 1;
+        print("\x1b[${row};${left}H");
+        print(col_bord); print("|"); print(screen.ATTR_RESET);
+        print(" "); print(col_kw); print("> "); print(screen.ATTR_RESET);
+        print(col_fg);
+        i32 q = 0;
+        while (q < this.query_len) {
+            print_char((i32) this.query[q]);
+            q = q + 1;
+        }
+        print(screen.ATTR_RESET);
+        // Padding hasta el borde.
+        i32 used = 1 + 1 + 2 + this.query_len;
+        while (used < inner_w + 1) { print(" "); used = used + 1; }
+        print(col_bord); print("|"); print(screen.ATTR_RESET);
+
+        // Separador.
+        row = row + 1;
+        print("\x1b[${row};${left}H");
+        print(col_bord);
+        print("+");
+        z = 0;
+        while (z < inner_w) { print("-"); z = z + 1; }
+        print("+");
+        print(screen.ATTR_RESET);
+
+        // Lista de ficheros visibles.
+        if (this.sel < this.scroll) this.scroll = this.sel;
+        if (this.sel >= this.scroll + list_h) this.scroll = this.sel - list_h + 1;
+        if (this.scroll < 0) this.scroll = 0;
+
+        row = row + 1;
+        i32 r = 0;
+        while (r < list_h) {
+            print("\x1b[${row};${left}H");
+            print(col_bord); print("|"); print(screen.ATTR_RESET);
+            i32 idx = this.scroll + r;
+            if (idx < this.filt_count) {
+                i32 fidx = this.filtered[idx];
+                i32 nlen = this.lens[fidx];
+                u8* nm = this.names + this.offsets[fidx];
+                i32 is_sel = 0;
+                if (idx == this.sel) is_sel = 1;
+                if (is_sel == 1) print(screen.ATTR_INVERT);
+                print(" ");
+                i32 maxn = inner_w - 2;
+                if (nlen > maxn) nlen = maxn;
+                i32 k = 0;
+                while (k < nlen) {
+                    i32 ch = (i32) nm[k];
+                    if (ch >= 32 && ch < 127) print_char(ch);
+                    else                       print(".");
+                    k = k + 1;
+                }
+                if (is_sel == 1) print(screen.ATTR_RESET);
+                // Padding.
+                i32 ru = 1 + nlen;
+                while (ru < inner_w) { print(" "); ru = ru + 1; }
+            } else {
+                z = 0;
+                while (z < inner_w) { print(" "); z = z + 1; }
+            }
+            print(col_bord); print("|"); print(screen.ATTR_RESET);
+            row = row + 1;
+            r = r + 1;
+        }
+
+        // Footer.
+        print("\x1b[${row};${left}H");
+        print(col_bord);
+        print("+");
+        z = 0;
+        while (z < inner_w) { print("-"); z = z + 1; }
+        print("+");
+        print(screen.ATTR_RESET);
+        flush();
+    }
+
+    // Procesa una tecla.  Devuelve:
+    //   0 = continua en el picker
+    //   1 = usuario selecciono (Enter)
+    //   2 = usuario cancelo (Esc)
+    public i32 handle_key(i32 k) {
+        if (k == keys.KEY_ESC) return 2;
+        if (k == keys.KEY_ENTER || k == keys.KEY_LF) return 1;
+        if (k == keys.VK_UP)   {
+            if (this.sel > 0) this.sel = this.sel - 1;
+            return 0;
+        }
+        if (k == keys.VK_DOWN) {
+            if (this.sel < this.filt_count - 1) this.sel = this.sel + 1;
+            return 0;
+        }
+        if (k == keys.VK_PGUP) {
+            this.sel = this.sel - 10;
+            if (this.sel < 0) this.sel = 0;
+            return 0;
+        }
+        if (k == keys.VK_PGDN) {
+            this.sel = this.sel + 10;
+            if (this.sel >= this.filt_count) this.sel = this.filt_count - 1;
+            return 0;
+        }
+        if (k == keys.KEY_BACKSPACE || k == keys.KEY_BACKSPACE_WIN) {
+            if (this.query_len > 0) {
+                this.query_len = this.query_len - 1;
+                this.query[this.query_len] = 0;
+                this.recompute_filter();
+            }
+            return 0;
+        }
+        // Caracteres imprimibles -> agregar a query.
+        if (k >= 32 && k < 127 && this.query_len < FP_QUERY_MAX - 1) {
+            this.query[this.query_len] = (u8) k;
+            this.query_len = this.query_len + 1;
+            this.query[this.query_len] = 0;
+            this.sel = 0;
+            this.recompute_filter();
+        }
+        return 0;
+    }
+}

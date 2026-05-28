@@ -852,6 +852,16 @@ namespace runtime {
     void exec_instr_newobj(ProcessVM *vm, const DecodedInstr &instr);
 
     /**
+     * @brief Ejecuta NEWOBJS (Phase Z): aloca instancia en SharedHeap.
+     *
+     * Variante shared de NEWOBJ.  Aloca en vm.shared_heap, registra el
+     * host_ptr en shared_handle_table, e inicializa ObjectHeader con
+     * hash_code = handle (con SHARED_HANDLE_BIT) para reverse lookup
+     * O(1) desde gchandle.
+     */
+    void exec_instr_newobjs(ProcessVM *vm, const DecodedInstr &instr);
+
+    /**
      * @brief Ejecuta GCRUN: fuerza un ciclo de GC menor.
      *
      * Llama a minor_gc(); si old_used >= threshold tambien ejecuta major_gc().
@@ -886,6 +896,17 @@ namespace runtime {
      * reg1 = registro con el tamano en bytes.  Devuelve GcHandle en R00.
      */
     void exec_instr_gcalloc(ProcessVM *vm, const DecodedInstr &instr);
+
+    // =========================================================================
+    //  Ejecutores: atomics i64 (Phase Z, opcodes 0x00 0xA9 .. 0xAD)
+    // =========================================================================
+    void exec_instr_atomicld(ProcessVM *vm, const DecodedInstr &instr);
+    void exec_instr_atomicst(ProcessVM *vm, const DecodedInstr &instr);
+    void exec_instr_atomicadd(ProcessVM *vm, const DecodedInstr &instr);
+    void exec_instr_atomiccas(ProcessVM *vm, const DecodedInstr &instr);
+    void exec_instr_sharedstat(ProcessVM *vm, const DecodedInstr &instr);
+    void exec_instr_gcpromote(ProcessVM *vm, const DecodedInstr &instr);
+    void exec_instr_gcdemote(ProcessVM *vm, const DecodedInstr &instr);
 
     // =========================================================================
     //  Ejecutores: raw allocator (0x00 0xB0 .. 0xB2)

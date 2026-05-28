@@ -99,6 +99,7 @@
 
 #include "arena/VirtualMemory.h"
 #include "arena/arena_manager.h"
+#include "gc/wait_table.h"  // WaitTable (lock-free per-bucket)
 
 // forward decl para no incluir el header completo (incluiria
 // gc_heap.h indirectamente).  El puntero al owner se usa en major_gc para
@@ -868,11 +869,15 @@ namespace gc {
          * devuelve true.
          * Si lo posee otro proceso, devuelve false (el llamante debe bloquear).
          *
-         * @param h         Handle del objeto cuyo monitor se quiere adquirir.
-         * @param local_pid PID local del proceso solicitante.
+         * Toma @c owner_encoded de 48 bits (scheduler_id<<32 | local_pid).
+         * Globalmente unico: evita la colision local_pid==local_pid entre
+         * schedulers distintos (bug Z.11 ext: lock confundido como reentrante).
+         *
+         * @param h             Handle del objeto cuyo monitor se quiere adquirir.
+         * @param owner_encoded PID encoded global del proceso solicitante.
          * @return true si el monitor fue adquirido o incrementado; false si bloqueado.
          */
-        bool monitor_try_acquire(GcHandle h, uint32_t local_pid);
+        bool monitor_try_acquire(GcHandle h, uint64_t owner_encoded);
 
         /**
          * @brief Libera el monitor del objeto referenciado por @p h.
@@ -880,12 +885,12 @@ namespace gc {
          * Decrementa lock_depth.  Si llega a 0, marca el monitor como libre y
          * extrae un proceso de la cola de espera para despertarlo.
          *
-         * @param h         Handle del objeto cuyo monitor se libera.
-         * @param local_pid PID local del proceso propietario actual.
+         * @param h             Handle del objeto cuyo monitor se libera.
+         * @param owner_encoded PID encoded global del propietario actual.
          * @return PID codificado del siguiente proceso de la cola de espera
          *         (0 si la cola estaba vacia o el monitor sigue bloqueado).
          */
-        uint64_t monitor_release(GcHandle h, uint32_t local_pid);
+        uint64_t monitor_release(GcHandle h, uint64_t owner_encoded);
 
         /**
          * @brief Anade un PID codificado a la cola de espera del monitor de @p h.
@@ -919,6 +924,29 @@ namespace gc {
          * @return Vector con todos los PID codificados (puede estar vacio).
          */
         std::vector<uint64_t> monitor_pop_all_waiters(GcHandle h);
+
+        // -----------------------------------------------------------------
+        // Wait queues con dispatch local-vs-shared (Phase Z).
+        // -----------------------------------------------------------------
+        // Cuando un handle tiene el @c SHARED_HANDLE_BIT, las wait queues
+        // (monitor + condvar) se enrutan a @c vm.shared_wait_table en lugar
+        // de la tabla local @c wait_table_, permitiendo que parent y child
+        // que comparten el mismo objeto se coordinen cross-process.
+
+        /// Encola @p encoded_pid en la wait queue CONDVAR de @p h.  Usada
+        /// por @c monwait para distinguir esperantes que liberan el
+        /// monitor (CONDVAR) de los que esperan reentrar (MONITOR).
+        void condvar_add_waiter(GcHandle h, uint64_t encoded_pid);
+
+        /// Despierta UN proceso de la wait queue CONDVAR de @p h.  Usada
+        /// por @c monnoti.  Devuelve el PID codificado o 0 si vacia.
+        uint64_t condvar_pop_waiter(GcHandle h);
+
+        /// Despierta TODOS los procesos de la wait queue CONDVAR de @p h.
+        /// Usada por @c monnota.  La cola queda vacia tras la llamada.
+        std::vector<uint64_t> condvar_pop_all_waiters(GcHandle h);
+
+        // set_owner_process ya declarada e inlineada arriba.
 
         /**
          * @brief Minor GC: evacua la Nursery copiando supervivientes a OldGen.
@@ -1112,10 +1140,19 @@ namespace gc {
         // --- Tabla de referencias debiles ---
         std::vector<WeakEntry> weak_table_; ///< Referencias debiles indexadas por uint32_t.
 
-        // --- Colas de espera de monitores ---
+        // --- Colas de espera de monitores (LOCAL per-process) ---
         // Clave: GcHandle del objeto con el monitor ocupado.
         // Valor: lista FIFO de PID codificados ((scheduler_id<<32)|local_pid) esperando.
         std::unordered_map<GcHandle, std::vector<uint64_t>> monitor_waiters_;
+
+        // Wait queues lock-free per-bucket para objetos GC LOCALES.
+        // Para objetos shared (handle con SHARED_HANDLE_BIT) se enruta a
+        // @c vm.shared_wait_table via @c wait_table_for().
+        WaitTable wait_table_;
+
+        /// Devuelve la WaitTable apropiada para @p h: la local del heap si
+        /// el handle es local, o la global del VM si es shared.
+        inline WaitTable &wait_table_for(GcHandle h) noexcept;
 
         // --- RememberedSet ---
         std::unordered_set<GcHandle> remembered_set_; ///< Handles OLD con referencias a YOUNG.

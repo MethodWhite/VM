@@ -8,22 +8,28 @@ general; para detalles de cada feature consulta los docs especificos en
 
 ## Indice
 
-1. [Filosofia de diseño](#1-filosofia-de-diseno)
-2. [Comparativa rapida con otros lenguajes](#2-comparativa-rapida-con-otros-lenguajes)
-3. [Tour del lenguaje](#3-tour-del-lenguaje)
-   - [Tipos y variables](#tipos-y-variables)
-   - [Funciones](#funciones)
-   - [Clases y OOP](#clases-y-oop)
-   - [Genericos](#genericos)
-   - [Pattern matching y enums](#pattern-matching-y-enums)
-   - [Optional y Result](#optional-y-result)
-   - [Smart pointers y borrow checker](#smart-pointers-y-borrow-checker)
-   - [Async y concurrencia](#async-y-concurrencia)
-   - [Strings con interpolacion](#strings-con-interpolacion)
-   - [FFI a APIs nativas](#ffi-a-apis-nativas)
-   - [Metaprogramacion](#metaprogramacion)
-4. [El pipeline de compilacion](#4-el-pipeline-de-compilacion)
-5. [Referencia detallada por tema](#5-referencia-detallada-por-tema)
+- [El lenguaje Vex](#el-lenguaje-vex)
+  - [Indice](#indice)
+  - [1. Filosofia de diseño](#1-filosofia-de-diseño)
+  - [2. Comparativa rapida con otros lenguajes](#2-comparativa-rapida-con-otros-lenguajes)
+  - [3. Tour del lenguaje](#3-tour-del-lenguaje)
+    - [Tipos y variables](#tipos-y-variables)
+    - [Funciones](#funciones)
+    - [Clases y OOP](#clases-y-oop)
+    - [Genericos](#genericos)
+    - [Pattern matching y enums](#pattern-matching-y-enums)
+    - [Optional y Result](#optional-y-result)
+    - [Smart pointers y borrow checker](#smart-pointers-y-borrow-checker)
+    - [Async y concurrencia](#async-y-concurrencia)
+    - [Strings con interpolacion](#strings-con-interpolacion)
+    - [FFI a APIs nativas](#ffi-a-apis-nativas)
+    - [Metaprogramacion](#metaprogramacion)
+  - [4. El pipeline de compilacion](#4-el-pipeline-de-compilacion)
+  - [5. Referencia detallada por tema](#5-referencia-detallada-por-tema)
+    - [Sintaxis y semantica](#sintaxis-y-semantica)
+    - [Modelo de programacion](#modelo-de-programacion)
+    - [Memoria y seguridad](#memoria-y-seguridad)
+    - [Concurrencia y FFI](#concurrencia-y-ffi)
 
 ---
 
@@ -371,12 +377,23 @@ i32 main() {
     // spawn en scheduler especifico (multi-thread real)
     spawn on(2) { ... };
     
-    // synchronized para exclusion mutua
+    // synchronized para exclusion mutua intra-proceso
     Counter c = new Counter();
     synchronized (c) {
         c.value = c.value + 1;
     }
-    
+
+    // Memoria compartida cross-process
+    shared Counter g = new Counter();           // aloca en SharedHeap
+    spawn { synchronized(g) { g.value += 1; } };
+    spawn { synchronized(g) { g.value += 1; } };
+    // Con --schedulers N: paralelismo real con exclusion mutua correcta
+
+    // Atomic primitives lock-free
+    i64 ctr = shared_malloc(8);
+    atomic_store_i64(ctr, 0);
+    spawn { for (i32 i=0;i<1000;i++) atomic_add_i64(ctr, 1); };
+
     return 0;
 }
 ```
@@ -384,8 +401,16 @@ i32 main() {
 Modelo actor (mailboxes + procesos ligeros) tipo Erlang. Scheduler cooperativo
 con cuotas de instrucciones; opcional multi-thread real con `--schedulers N`.
 
-Detalles: [doc/VMdoc/Vex/Async.md](./VMdoc/Vex/Async.md) y
-[doc/VMdoc/Vex/Sincronizacion.md](./VMdoc/Vex/Sincronizacion.md).
+**Memoria compartida cross-process** (Phase Z): el modificador `shared` en
+var-decl pone el objeto en el `SharedHeap` global del VM, visible a todos los
+procesos hijos via spawn.  Los monitores funcionan transparente cross-scheduler
+(exclusion mutua correcta) gracias al `monitor_word` con encoded_pid 48-bit
+unico globalmente.  Atomic primitives (`atomic_load/store/cas/add_i64`) para
+casos lock-free sin lock.
+
+Detalles: [doc/VMdoc/Vex/Async.md](./VMdoc/Vex/Async.md),
+[doc/VMdoc/Vex/Sincronizacion.md](./VMdoc/Vex/Sincronizacion.md) y
+[doc/VMdoc/PhaseZ/SharedMemory.md](./VMdoc/PhaseZ/SharedMemory.md).
 
 ### Strings con interpolacion
 

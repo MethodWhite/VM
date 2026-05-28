@@ -1,0 +1,54 @@
+// Bench 2: Monitor contention cross-process.
+// 4 workers concurrentes incrementan un shared Counter bajo synchronized.
+// Mide throughput de monitor CAS lock-free + WaitTable per-bucket.
+//
+// Configuracion:
+//   - 4 workers spawn'd, cada uno 100K increments synchronized.
+//   - Total: 400K ops bajo lock.
+//   - Join via msgsend a parent (msgrecv en main bloqueante, sin busy-wait).
+//
+// Esperado:
+//   - Single-scheduler: workers serializan (cooperativo); ~100K ops/sec.
+//   - Multi-scheduler N: contention real medible.
+class Counter {
+    public i64 value;
+    public Counter() { this.value = 0; }
+    public void add(i64 d) {
+        synchronized(this) {
+            this.value = this.value + d;
+        }
+    }
+}
+
+i32 main() {
+    shared Counter c = new Counter();
+    i64 parent_pid = pid();
+    // 4 workers concurrentes.  Cada uno tras N iter envia 1 mensaje al padre.
+    i64 w1 = spawn {
+        i32 i = 0;
+        while (i < 100000) { c.add(1); i = i + 1; }
+        msgsend(parent_pid, 1);
+    };
+    i64 w2 = spawn {
+        i32 i = 0;
+        while (i < 100000) { c.add(1); i = i + 1; }
+        msgsend(parent_pid, 2);
+    };
+    i64 w3 = spawn {
+        i32 i = 0;
+        while (i < 100000) { c.add(1); i = i + 1; }
+        msgsend(parent_pid, 3);
+    };
+    i64 w4 = spawn {
+        i32 i = 0;
+        while (i < 100000) { c.add(1); i = i + 1; }
+        msgsend(parent_pid, 4);
+    };
+    // Join sin busy-wait: 4 msgrecv bloqueantes.  El scheduler cede CPU
+    // al hijo cuando el padre esta en WAIT_IO en la mailbox.
+    i64 a = msgrecv();
+    i64 b = msgrecv();
+    i64 d = msgrecv();
+    i64 e = msgrecv();
+    return (i32) c.value;  // 400_000
+}

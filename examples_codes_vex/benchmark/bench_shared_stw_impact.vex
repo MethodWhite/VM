@@ -1,0 +1,53 @@
+// Bench 4: STW pause impact en multi-thread.
+// 4 workers CPU-bound (no acceden shared) corren mientras el main hace
+// K rondas de (alloc 500 shared + sweep).  Medimos cuanto se ralentiza
+// el throughput de los workers por el STW.
+//
+// Join via msgsend (no busy-wait); en single-scheduler los workers
+// igualmente se serializan, en multi-sched corren en paralelo.
+class C { public i32 v; public C() { this.v = 0; } }
+class WorkerRet { public i64 done; public WorkerRet() { this.done = 0; } }
+
+i32 main() {
+    i64 parent_pid = pid();
+    // 4 workers CPU-bound.
+    i64 w1 = spawn {
+        i32 i = 0;
+        while (i < 5000000) { i = i + 1; }
+        msgsend(parent_pid, 1);
+    };
+    i64 w2 = spawn {
+        i32 i = 0;
+        while (i < 5000000) { i = i + 1; }
+        msgsend(parent_pid, 2);
+    };
+    i64 w3 = spawn {
+        i32 i = 0;
+        while (i < 5000000) { i = i + 1; }
+        msgsend(parent_pid, 3);
+    };
+    i64 w4 = spawn {
+        i32 i = 0;
+        while (i < 5000000) { i = i + 1; }
+        msgsend(parent_pid, 4);
+    };
+    // Main: 50 rondas de (aloc 500 shared + sweep).
+    i32 K = 50;
+    i32 cycle = 0;
+    while (cycle < K) {
+        i32 i = 0;
+        while (i < 500) {
+            shared C c = new C();
+            c.v = i;
+            i = i + 1;
+        }
+        shared_gc_collect();
+        cycle = cycle + 1;
+    }
+    // Join sin busy-wait.
+    i64 a = msgrecv();
+    i64 b = msgrecv();
+    i64 c2 = msgrecv();
+    i64 d = msgrecv();
+    return 42;
+}

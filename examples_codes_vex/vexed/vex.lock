@@ -1,0 +1,8 @@
+# vex.lock -- generado automaticamente, no editar a mano
+# Builds reproducibles bit-perfect: sha256 + author_fp + caps.
+
+[meta]
+version       = "1"
+generated_at  = "2026-05-26T18:50:03Z"
+resolver      = "mvr-1"
+

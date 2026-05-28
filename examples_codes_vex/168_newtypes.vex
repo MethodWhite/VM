@@ -1,0 +1,78 @@
+// =====================================================================
+// 168_newtypes.vex - typedef T name new + @opaque + introspeccion
+// =====================================================================
+// Motivacion: en codigo de sistemas es trivial mezclar IDs/handles del
+// mismo ancho:  un `u64 user_id` y un `u64 group_id` son indistinguibles
+// para el type checker, lo que abre la puerta a bugs como pasar un
+// group_id donde una API espera un user_id.
+//
+// `typedef T name new` crea un NEWTYPE: comparte la representacion
+// runtime con T (mismos 8 bytes en memoria, mismo coste de copia) pero
+// es NOMINALMENTE distinto.  Sin overhead.  El cast explicito `(T)x`
+// cruza la barrera de forma controlada.
+//
+// `@opaque` cierra el cast: ni siquiera el codigo cliente puede leer
+// los bits subyacentes -- solo las funciones constructoras/consumidoras
+// que conocen el secreto.  Util para handles seguros (session, fd...).
+// =====================================================================
+
+// --- Newtypes ordinarios: distincion nominal con cast permitido ------
+typedef u64 user_id   new;
+typedef u64 group_id  new;
+typedef u32 port_num  new;
+
+// --- Newtype @opaque: bits ocultos para el codigo cliente ------------
+// Para tipos opacos, el cast `(T) raw` esta BLOQUEADO en cualquier
+// contexto -- la unica forma de obtener un secret_token es via funciones
+// que ya lo devuelvan (FFI, builtins, otras factorias).  Aqui solo
+// declaramos el tipo y lo introspectamos; el flujo de obtencion real
+// vendria desde una API externa (e.g. `extern "rand.dll" fn issue() -> secret_token`).
+typedef u64 secret_token new @opaque;
+
+// API de uso real: cada parametro lleva su tipo unico.  Si el usuario
+// confunde el orden de los args (user_id vs group_id), error compile-time.
+u64 grant(user_id u, group_id g) {
+    return (u64) u + (u64) g * 1000;
+}
+
+i32 main() {
+    // Crear envueltos via cast explicito (newtypes no-opaque).
+    user_id  alice    = (user_id)  101;
+    user_id  bob      = (user_id)  202;
+    group_id admins   = (group_id) 7;
+    port_num web_port = (port_num) 8080;
+
+    // OK: tipos coinciden.
+    u64 g1 = grant(alice, admins);  // 101 + 7*1000 = 7101
+
+    // PROHIBIDO (descomentar para ver el error compile-time):
+    //   u64 bad = grant(admins, alice);  // group_id donde se espera user_id
+
+    // PROHIBIDO: aritmetica entre newtypes distintos sin cast.
+    //   u64 mix = alice + admins;  // u64+u64 OK, pero user_id+group_id no
+
+    // OK: cast explicito para extraer bits.
+    u64 raw = (u64) bob;
+    if (raw != 202) return 100;
+    if (g1 != 7101) return 200;
+    if ((u32) web_port != 8080) return 300;
+
+    // Introspeccion compile-time.
+    if (!is_newtype<user_id>())       return 400;
+    if ( is_newtype<u64>())           return 500;
+    if (!is_opaque<secret_token>())   return 600;
+    if ( is_opaque<user_id>())        return 700;
+
+    // underlying_of<T>() devuelve el typename del underlying.
+    string un_user = underlying_of<user_id>();
+    string un_u64  = underlying_of<u64>();
+    if (str_length(un_user) != 3) return 800;   // "u64" -> 3 bytes
+    if (str_length(un_u64)  != 3) return 900;
+
+    // Verificacion rapida: dos newtypes con el MISMO underlying son
+    // tipos DIFERENTES (porque tienen nominal_id distinto).
+    if (is_same<user_id, group_id>())  return 1000;
+    if (!is_same<user_id, user_id>())  return 1100;
+
+    return 42;
+}

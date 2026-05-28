@@ -150,6 +150,7 @@ namespace vex {
         KW_NONNULL,
         KW_TYPEDEF,
         KW_USING,
+        KW_NAMESPACE,   ///< Phase M.7.c: namespace foo { ... } inline.
         KW_STRUCT,
         KW_CLASS,
         KW_INTERFACE,

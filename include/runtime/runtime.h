@@ -40,8 +40,12 @@
 
 #include "runtime/pid.h"
 #include "loader/oop_types.h"  // FutureObject + FutureState para shared_futures
+#include "gc/shared_heap.h"           // SharedHeap (memoria compartida cross-process)
+#include "gc/shared_handle_table.h"   // SharedHandleTable (handles compartidos)
+#include "gc/wait_table.h"            // WaitTable (monitors cross-process)
 #include <mutex>                // mutex para shared_futures concurrent access
 #include <condition_variable>   // condition_variable para done_cv (rev3)
+#include <atomic>               // atomics para coordinacion STW del shared GC
 
 /** @brief Version actual del formato de bytecode .velb soportado por esta VM. */
 #define VERSION_VM 0
@@ -126,6 +130,31 @@ namespace runtime {
         // objetos GC normales).  Mejora futura: free list + reciclaje.
         std::vector<loader::FutureObject> shared_futures;
         std::mutex                        shared_futures_mtx;
+
+        // ---------------------------------------------------------------------
+        // memoria compartida cross-process.
+        // ---------------------------------------------------------------------
+        // SharedHeap (slab allocator lock-free) + SharedHandleTable (Treiber
+        // stack ABA-safe) + WaitTable (lock-free per-bucket) habilitan que
+        // procesos del mismo VM compartan objetos via @c shared T = new T().
+        //
+        // Coordinacion STW del shared GC: cuando @c shared_gc_collect()
+        // arranca, setea @c shared_gc_active=true y espera que TODOS los
+        // schedulers respondan en su safepoint poll incrementando
+        // @c shared_gc_acks.  Tras el sweep, limpia @c shared_gc_active=false
+        // y notifica @c shared_gc_cv para liberar a los schedulers parados.
+        gc::SharedHeap          shared_heap;
+        gc::SharedHandleTable   shared_handle_table;
+        gc::WaitTable           shared_wait_table;
+        std::atomic<bool>       shared_gc_active{false};
+        std::atomic<uint32_t>   shared_gc_acks{0};
+        std::mutex              shared_gc_mtx;
+        std::condition_variable shared_gc_cv;
+
+        /// Ejecuta una recoleccion mayor del @c shared_heap con STW
+        /// coordinado entre todos los schedulers.  Retorna el numero de
+        /// objetos shared barridos (estimacion via slot count).
+        uint32_t shared_gc_collect();
 
         // ---------------------------------------------------------------------
         // Argumentos de linea de comandos del programa Vex (argv).

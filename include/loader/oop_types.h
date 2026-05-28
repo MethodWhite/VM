@@ -20,6 +20,7 @@
 #ifndef OOP_TYPES_H
 #define OOP_TYPES_H
 
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 
@@ -147,6 +148,10 @@ namespace loader {
     static constexpr uint8_t ADVICE_BEFORE = 0;
     static constexpr uint8_t ADVICE_AFTER  = 1;
     static constexpr uint8_t ADVICE_AROUND = 2;
+    /// Bug fix 2026-05-23: @AfterReturning recibe el valor de retorno
+    /// del target como primer argumento.  El runtime invoca el advice tras
+    /// el target con r1 = R0_post_target (el valor de retorno preservado).
+    static constexpr uint8_t ADVICE_AFTER_RETURNING = 3;
 
     typedef struct AdviceEntry {
         uint8_t      kind;          ///< ADVICE_BEFORE / ADVICE_AFTER / ADVICE_AROUND
@@ -357,22 +362,119 @@ namespace loader {
     //    [ObjectHeader (24B)] <- inicio del payload; aqui apunta GcHeap::deref()
     //    [campos del objeto]
     //
-    //  Cambio de ABI respecto a v1:
-    //    Se anaden owner_pid (4B), lock_depth (2B) y _mon_pad (2B) para
-    //    soportar monitores (instrucciones monenter/monexit/monwait/monnoti/monnota).
-    //    owner_pid almacena el local_pid del proceso propietario del monitor
-    //    (0 = monitor libre).  lock_depth permite locks reentrantes.
+    //  Cambio de ABI v3.1 (Phase Z.11 ext - 2026-05-23):
+    //    El owner del monitor es ahora el @c encoded_pid (48 bits) que
+    //    combina @c scheduler_id (16 bits) + @c local_pid (32 bits).  El
+    //    local_pid NO es unico cross-scheduler -- en --schedulers N>1, dos
+    //    workers en distintos schedulers pueden tener el mismo local_pid,
+    //    causando que el check de reentrancia (`owner == self_pid`) sea
+    //    espuriamente true -> data loss en synchronized cross-scheduler.
+    //
+    //      monitor_word (64 bits):
+    //        bits 0-47  : owner_encoded (encoded_pid del propietario;
+    //                                    0 = monitor libre).  Cubre
+    //                                    65535 schedulers * 4G procs.
+    //        bits 48-63 : lock_depth  (uint16, contador reentrante;
+    //                                  0 = libre, N = N adquisiciones).
+    //                                  16 bits suficiente: ningun caso
+    //                                  realista justifica > 65535 niveles.
+    //
+    //    Esto habilita las operaciones monenter/monexit/monwait LOCK-FREE
+    //    via CAS atomico sobre el word completo.  ABI-compatible en tamano
+    //    y alineacion (sigue siendo 24 bytes total).  Para JIT y AOT, el
+    //    offset del monitor_word es siempre 16.
+    //
+    //    Portabilidad a C: traducir @c std::atomic<uint64_t> a @c _Atomic
+    //    @c uint64_t (C11).  Mismo ABI binario.
     // -------------------------------------------------------------------------
+
+    /** @brief Mascara para los 48 bits bajos del encoded_pid. */
+    static constexpr uint64_t MONITOR_OWNER_MASK = 0x0000FFFFFFFFFFFFULL;
+
+    /**
+     * @brief Empaca @p owner_encoded y @p depth en un @c monitor_word de 64 bits.
+     *
+     * @p owner_encoded debe caber en 48 bits (encoded_pid = sched<<32|local).
+     * @p depth debe caber en 16 bits (max 65535 reentrancias).
+     *
+     * Inline + constexpr: el compilador lo resuelve en compile time para
+     * literales (caso comun: @c monitor_make(self_pid, 1) en monenter).
+     */
+    static constexpr inline uint64_t monitor_make(uint64_t owner_encoded, uint32_t depth) noexcept {
+        return (owner_encoded & MONITOR_OWNER_MASK)
+             | (static_cast<uint64_t>(depth & 0xFFFFu) << 48);
+    }
+
+    /** @brief Extrae el @c owner_encoded del @c monitor_word (bits 0-47). */
+    static constexpr inline uint64_t monitor_owner(uint64_t word) noexcept {
+        return word & MONITOR_OWNER_MASK;
+    }
+
+    /** @brief Extrae el @c lock_depth del @c monitor_word (bits 48-63). */
+    static constexpr inline uint32_t monitor_depth(uint64_t word) noexcept {
+        return static_cast<uint32_t>((word >> 48) & 0xFFFFu);
+    }
+
     struct alignas(8) ObjectHeader {
-        ClassInfo *class_ptr;  ///< 8 bytes - puntero a los metadatos de la clase
-        uint32_t   flags;      ///< 4 bytes - OBJ_FLAG_*
-        uint32_t   hash_code;  ///< 4 bytes - identidad del objeto (lazy)
-        uint32_t   owner_pid;  ///< 4 bytes - local_pid del propietario del monitor (0=libre)
-        uint16_t   lock_depth; ///< 2 bytes - contador de locks reentrantes
-        uint16_t   _mon_pad;   ///< 2 bytes - relleno de alineacion
+        ClassInfo *class_ptr;                ///< 8 bytes - puntero a los metadatos de la clase
+        uint32_t   flags;                    ///< 4 bytes - OBJ_FLAG_*
+        uint32_t   hash_code;                ///< 4 bytes - identidad del objeto (lazy)
+        std::atomic<uint64_t> monitor_word;  ///< 8 bytes - monitor empacado (owner_pid:32 + lock_depth:32)
+
+        // Default ctor: campos triviales quedan indeterminados (igual que v2);
+        // el atomic monitor_word se zero-construye explicitamente para no
+        // dejar bits sucios que puedan parecer "monitor locked" en runtime.
+        ObjectHeader() noexcept
+            : class_ptr(nullptr), flags(0), hash_code(0), monitor_word(0) {}
+
+        // Copy / move: std::atomic NO es copy/movable por defecto, pero los
+        // contenedores que envuelven ObjectHeader (e.g. FutureObject en un
+        // vector<>) necesitan ambos.  Implementamos load/store atomic para
+        // preservar la semantica.  Es seguro porque la copia/move ocurre
+        // en contextos no-concurrentes (push_back que realoca, return de
+        // helpers locales).
+        ObjectHeader(const ObjectHeader &o) noexcept
+            : class_ptr(o.class_ptr),
+              flags(o.flags),
+              hash_code(o.hash_code),
+              monitor_word(o.monitor_word.load(std::memory_order_relaxed)) {}
+
+        ObjectHeader &operator=(const ObjectHeader &o) noexcept {
+            if (this != &o) {
+                class_ptr = o.class_ptr;
+                flags     = o.flags;
+                hash_code = o.hash_code;
+                monitor_word.store(
+                    o.monitor_word.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+            }
+            return *this;
+        }
+
+        ObjectHeader(ObjectHeader &&o) noexcept
+            : class_ptr(o.class_ptr),
+              flags(o.flags),
+              hash_code(o.hash_code),
+              monitor_word(o.monitor_word.load(std::memory_order_relaxed)) {}
+
+        ObjectHeader &operator=(ObjectHeader &&o) noexcept {
+            if (this != &o) {
+                class_ptr = o.class_ptr;
+                flags     = o.flags;
+                hash_code = o.hash_code;
+                monitor_word.store(
+                    o.monitor_word.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+            }
+            return *this;
+        }
     };
     static_assert(sizeof(ObjectHeader) == 24,
                   "ObjectHeader debe medir exactamente 24 bytes");
+    static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t),
+                  "std::atomic<uint64_t> debe ser size 8 (lock-free en x86-64/AArch64)");
+    static_assert(alignof(std::atomic<uint64_t>) == alignof(uint64_t),
+                  "std::atomic<uint64_t> debe alinearse como uint64_t");
 
     // -------------------------------------------------------------------------
     //  FrameHeader - frame en la cadena de llamadas (para throw/catch)
@@ -388,6 +490,37 @@ namespace loader {
         /// que `proceed()` funcione como una llamada implicita al wrapped
         /// method, con la misma calling convention que el receptor original.
         MethodInfo  *proceed_target;
+        /// B5 (multi-AROUND nesting): cadena restante de AROUND wrappers
+        /// despues de `proceed_target`.  Cuando este frame es un AROUND
+        /// que invoca proceed(), el sistema:
+        ///   1. Crea un nuevo frame con method = proceed_target.
+        ///   2. Si around_chain_len > 0: el nuevo frame recibe
+        ///      proceed_target = around_chain[0], around_chain =
+        ///      around_chain+1, around_chain_len -= 1.
+        ///   3. Si around_chain_len == 0: el nuevo frame es M original,
+        ///      sin proceed_target (proceed() en M es invalido).
+        /// El array es compartido entre todos los frames de la cadena
+        /// AROUND; se libera cuando el frame top-level del AROUND chain
+        /// se destruye.  Punteros sin ownership: NO usar delete[].
+        MethodInfo  **around_chain;   ///< cadena de AROUND restantes (o nullptr)
+        uint32_t      around_chain_len; ///< entries restantes en around_chain
+        uint8_t       around_chain_owns; ///< 1 si este frame liberar around_chain en RET
+        uint8_t       has_saved_regs;    ///< 1 si saved_r1..r12 son validos (advice chain)
+        uint8_t       _around_pad[2];    ///< alignment a 8 bytes
+        /// Snapshot de R1..R12 al INICIO del advice chain dispatch.  Los
+        /// advices BEFORE/AFTER pueden corromper estos regs (e.g.
+        /// `Logger.calls = ...` emite `getstatic r1, ...` que destruye r1).
+        /// Entre cada paso del chain, RET restaura desde estos slots para
+        /// preservar la calling convention original (r1=this, r2..rN=args).
+        /// Solo se rellenan cuando @c has_saved_regs == 1.
+        uint64_t      saved_r1_r12[12];
+        /// Bug fix 2026-05-23 (LR3): si != 0, este frame es un advice
+        /// AFTER_RETURNING.  Cuando el frame previo (target) hace RET y
+        /// salta a este advice, exec_instr_ret copia R0 (return value del
+        /// target) al reg indicado (1..12).  La copia se hace tras el
+        /// restore saved_r1_r12 del frame ANTERIOR.
+        uint8_t      inject_r0_to_reg;
+        uint8_t      _ir_pad[7];
     } FrameHeader;
 
     // -------------------------------------------------------------------------

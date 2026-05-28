@@ -29,11 +29,14 @@
 #include "cli/vsh.h"
 #include "ir/ir_emitter.h"
 #include "jit/auto_jit.h"
+#include "pkg/cli.h"
 #include "runtime/proceso_runtime.h"
 #include "cli/runtime_api_commands.h"
 #include "util/assembler_multiprocess.h"
 #include "vex/compiler.h"
 #include "vex/comptime_vm.h"   /* Phase MC.4 probe del ComptimeRuntime */
+#include "vex/project_cache.h" /* Phase M5.B project-level cache */
+#include "vex/velb_signature.h" /* Phase M.L28: firmas digitales */
 #include "util/sqlite_singleton.h"
 #include "util/fs_utils.h"
 #include "runtime/manager_runtime.h"
@@ -177,6 +180,21 @@ int main(int argc, char *argv[]) {
     asm_multi_process::run_and_capture("chcp 65001");
 #endif
 
+    // ------------------------------------------------------------------
+    // Subcomando especial: @c vm pkg <subcmd> ...
+    // Despachamos ANTES del parser cxxopts porque el package manager
+    // tiene su propio sistema de flags y subcomandos.
+    // ------------------------------------------------------------------
+    if (argc >= 2 && std::string(argv[1]) == "pkg") {
+        // Pasamos argv shifted: argv[0]="vm", argv[1]="pkg",
+        // queremos que pkg::cli reciba argv[1]=primer subcomando.
+        // Construimos un argc/argv nuevo skipeando el "pkg" literal.
+        std::vector<char *> sub;
+        sub.push_back(argv[0]);
+        for (int i = 2; i < argc; ++i) sub.push_back(argv[i]);
+        return pkg::cli::run(static_cast<int>(sub.size()), sub.data());
+    }
+
     /* registrar el hook auto-JIT en el runtime.
      * El runtime (vesta_rt) tiene un function pointer nulo por defecto;
      * el main aqui lo apunta al JIT trigger.  Si el env var
@@ -256,6 +274,13 @@ int main(int argc, char *argv[]) {
             ("vex-emit-ir",       "Emitir el SSA IR del .vex (pre y post optimizacion) en <output>.ir; util para debug del frontend")
             ("vex-base",          "VA base address para el modulo (hex, e.g. 0x10000000). Usado para plugins cargados via loadmodule, evita solapamiento con el caller (default 0x0).",
                 cxxopts::value<std::string>()->default_value("0x0"))
+            // Phase M.sandbox: restringe las capabilities del modulo
+            // principal al subset listado.  Default vacio = ALL granted
+            // (zero overhead, backward compat).  Sintaxis: 'fs:read,net,
+            // ffi:call=kernel32.dll;user32.dll' etc.  Ver include/loader/
+            // sandbox.h para tabla completa de caps + sintaxis.
+            ("vex-caps",          "Phase M.sandbox: restringe caps del modulo principal. Sintaxis: 'fs:read,net,ffi:call=kernel32.dll;user32.dll'. Vacio = ALL granted (default). 'none' = sandbox total.",
+                cxxopts::value<std::string>()->default_value(""))
             // Diagramas para debug y traceo del pipeline Vex.  Soportan dos
             // formatos seleccionables via --diagram-format:
             //   mermaid (default): escribe .mmd con bloque ```mermaid```;
@@ -314,6 +339,11 @@ int main(int argc, char *argv[]) {
 #endif
             ("keep-labels", "Mantener los nombres de label en el .velb (por defecto se eliminan: el loader no los usa y reducen ~9% el tamano)")
             ("emit-map", "Generar archivo .velb-map con info de simbolos y secciones (debug). Off por defecto: cuesta ~60% del tiempo del linker")
+            // Phase M.L28: firmas digitales del .velb.
+            ("sign-velb",   "Firmar un .velb con clave privada PEM. Uso: --sign-velb input.velb --sign-key priv.pem -o output.signed.velb", cxxopts::value<std::string>())
+            ("sign-key",    "Path al PEM con la clave privada para --sign-velb",                            cxxopts::value<std::string>())
+            ("verify-velb", "Verificar la firma digital de un .velb. Uso: --verify-velb file.velb --verify-key pub.pem", cxxopts::value<std::string>())
+            ("verify-key",  "Path al PEM con la clave publica para --verify-velb",                           cxxopts::value<std::string>())
             ;
 
 
@@ -405,6 +435,67 @@ int main(int argc, char *argv[]) {
         vesta::scout() << "Keystone supported architectures:\n";
         for (auto &a: archs.keystone) vesta::scout() << "  " << a << "\n";
         return 0;
+    }
+
+    // Phase M.L28: firmas digitales del .velb (independientes del flujo
+    // de compile / run / etc.).  Ambos comandos retornan al usuario al
+    // terminar; no continuan al resto del flow.
+    if (result.count("sign-velb")) {
+        const std::string in_path = result["sign-velb"].as<std::string>();
+        if (!result.count("sign-key")) {
+            std::cerr << "error: --sign-velb requiere --sign-key <priv.pem>\n";
+            return EXIT_FAILURE;
+        }
+        const std::string key_path = result["sign-key"].as<std::string>();
+        const std::string out_path = result.count("output")
+            ? result["output"].as<std::string>()
+            : (in_path + ".signed");
+        std::ifstream f(in_path, std::ios::binary | std::ios::ate);
+        if (!f) { std::cerr << "error: no se puede abrir " << in_path << "\n"; return EXIT_FAILURE; }
+        const std::streamsize sz = f.tellg();
+        f.seekg(0, std::ios::beg);
+        std::vector<uint8_t> bytes(static_cast<size_t>(sz < 0 ? 0 : sz));
+        if (sz > 0) f.read(reinterpret_cast<char *>(bytes.data()), sz);
+        f.close();
+        std::vector<uint8_t> signed_bytes;
+        std::string err;
+        if (!vex::velb_sign(bytes, key_path, vex::VsigAlgo::RSA_SHA256,
+                              signed_bytes, err)) {
+            std::cerr << "error: " << err << "\n";
+            return EXIT_FAILURE;
+        }
+        std::ofstream of(out_path, std::ios::binary);
+        if (!of) { std::cerr << "error: no se puede escribir " << out_path << "\n"; return EXIT_FAILURE; }
+        of.write(reinterpret_cast<const char *>(signed_bytes.data()),
+                  static_cast<std::streamsize>(signed_bytes.size()));
+        std::cerr << "[sign] " << in_path << " (" << bytes.size()
+                   << " B) -> " << out_path << " (" << signed_bytes.size()
+                   << " B, +" << (signed_bytes.size() - bytes.size())
+                   << " B footer VSIG)\n";
+        return EXIT_SUCCESS;
+    }
+
+    if (result.count("verify-velb")) {
+        const std::string in_path = result["verify-velb"].as<std::string>();
+        if (!result.count("verify-key")) {
+            std::cerr << "error: --verify-velb requiere --verify-key <pub.pem>\n";
+            return EXIT_FAILURE;
+        }
+        const std::string key_path = result["verify-key"].as<std::string>();
+        std::ifstream f(in_path, std::ios::binary | std::ios::ate);
+        if (!f) { std::cerr << "error: no se puede abrir " << in_path << "\n"; return EXIT_FAILURE; }
+        const std::streamsize sz = f.tellg();
+        f.seekg(0, std::ios::beg);
+        std::vector<uint8_t> bytes(static_cast<size_t>(sz < 0 ? 0 : sz));
+        if (sz > 0) f.read(reinterpret_cast<char *>(bytes.data()), sz);
+        f.close();
+        auto vr = vex::velb_verify_signature(bytes, key_path);
+        if (vr.ok) {
+            std::cerr << "[verify] " << in_path << ": firma VALIDA\n";
+            return EXIT_SUCCESS;
+        }
+        std::cerr << "[verify] " << in_path << ": " << vr.error << "\n";
+        return EXIT_FAILURE;
     }
 
 #ifdef VESTA_HAS_PREPROCESSOR
@@ -1326,8 +1417,80 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        // Phase M5.B: PROJECT CACHE LOOKUP.  Si el source tiene imports,
+        // intentar cache hit a nivel @c .velb final.  Si todos los hashes
+        // de root + deps recursivos coinciden con los cacheados, copiar
+        // el @c .velb cacheado al output y SALTAR todo el compile +
+        // link.  Desactivable via @c VEX_NO_PROJECT_CACHE=1.
+        const bool project_cache_enabled = [](){
+            const char *v = std::getenv("VEX_NO_PROJECT_CACHE");
+            return !(v && v[0] == '1');
+        }();
+        const bool project_cache_verbose = [](){
+            const char *v = std::getenv("VEX_VERBOSE_PROJECT_CACHE");
+            return v && v[0] == '1';
+        }();
+        const bool has_imports = vex::vex_source_has_imports(vex_source);
+
+        vex::ProjectCacheKey pck;
+        pck.opt_level       = copts.opt_level;
+        pck.emit_debug      = copts.emit_debug;
+        pck.vex_base        = 0;  // no usado por compile_vex_project; queda 0
+        pck.instrument_mode = copts.instrument_mode;
+        pck.port_target     = copts.port_target;
+        const uint32_t opts_hash = vex::project_cache_opts_hash(pck);
+
+        // Path canonico del root para el cache key.
+        std::string canonical_root;
+        try {
+            canonical_root = std::filesystem::weakly_canonical(vex_path).string();
+        } catch (...) { canonical_root = vex_path; }
+        const std::string pc_dir   = vex::default_project_cache_dir();
+        const std::string pc_path  = vex::project_cache_path(canonical_root, pc_dir);
+
+        if (project_cache_enabled && has_imports) {
+            uint32_t cached_opts_hash = 0;
+            std::vector<vex::ProjectCacheDep> cached_deps;
+            std::vector<uint8_t>              cached_velb;
+            if (vex::project_cache_load(pc_path, cached_opts_hash,
+                                          cached_deps, cached_velb)
+                && cached_opts_hash == opts_hash
+                && !cached_deps.empty()
+                && !cached_velb.empty()
+                && vex::project_cache_validate(cached_deps)) {
+                // HIT: escribir el .velb cacheado al output y salir.
+                const std::string out_velb = out_prefix + ".velb";
+                std::ofstream f(out_velb, std::ios::binary);
+                if (f) {
+                    f.write(reinterpret_cast<const char *>(cached_velb.data()),
+                            static_cast<std::streamsize>(cached_velb.size()));
+                    if (f.good()) {
+                        if (project_cache_verbose) {
+                            std::cerr << "[vex-project-cache] hit: "
+                                       << pc_path << " -> " << out_velb
+                                       << " (" << cached_velb.size()
+                                       << " bytes)\n";
+                        }
+                        return EXIT_SUCCESS;
+                    }
+                }
+                // Si fallo escribir, caemos al compile normal (no es fatal).
+                if (project_cache_verbose) {
+                    std::cerr << "[vex-project-cache] hit pero write fallo, recompile\n";
+                }
+            } else if (project_cache_verbose) {
+                std::cerr << "[vex-project-cache] miss: " << pc_path << "\n";
+            }
+        }
+
+        // Phase M.2.e: si el source tiene `import`, dispatch al
+        // compilador multi-modulo.  Este construye el dep graph,
+        // compila cada dep en topo order, inyecta .vexi, y mergea
+        // todas las funciones en un solo .vel.
         vex::CompileResult cr =
-            vex::compile_vex_source(vex_source, vex_path, copts);
+            has_imports
+                ? vex::compile_vex_project(vex_path, copts)
+                : vex::compile_vex_source(vex_source, vex_path, copts);
 
         /* Phase MC.16+: diagnostico de macros que el lowering rechazo
          * por usar builtins comptime-only no aliasables (comptime_compile,
@@ -1514,8 +1677,12 @@ int main(int argc, char *argv[]) {
 #else
                 setenv("VESTA_MC_PREBUILT", cache_path.c_str(), 1);
 #endif
+                // Phase M.2.e: same dispatch en el path two-phase del macro
+                // cache.  Si el source tiene imports, usar compile_vex_project.
                 vex::CompileResult cr2 =
-                    vex::compile_vex_source(vex_source, vex_path, copts);
+                    vex::vex_source_has_imports(vex_source)
+                        ? vex::compile_vex_project(vex_path, copts)
+                        : vex::compile_vex_source(vex_source, vex_path, copts);
 #if defined(_WIN32)
                 _putenv_s("VESTA_MC_PREBUILT", "");
 #else
@@ -1712,6 +1879,55 @@ int main(int argc, char *argv[]) {
             /*keep_labels=*/(result.count("keep-labels") > 0),
             /*ir_section_bytes=*/&cr.ir_section_bytes,
             /*emit_map=*/(result.count("emit-map") > 0));
+
+        // Phase M5.B: persistir el .velb final al project cache si
+        // (a) el compile usa imports (compile_vex_project tiene
+        // dep_paths populated), (b) el link fue exitoso, y (c) el cache
+        // esta enabled.
+        if (rc == EXIT_SUCCESS
+         && project_cache_enabled
+         && has_imports
+         && !cr.dep_paths.empty()) {
+            const std::string velb_path = out_prefix + ".velb";
+            std::ifstream vf(velb_path, std::ios::binary | std::ios::ate);
+            if (vf.is_open()) {
+                const std::streamsize sz = vf.tellg();
+                vf.seekg(0, std::ios::beg);
+                std::vector<uint8_t> velb_bytes(
+                    static_cast<size_t>(sz < 0 ? 0 : sz));
+                if (sz > 0) {
+                    vf.read(reinterpret_cast<char *>(velb_bytes.data()), sz);
+                }
+                vf.close();
+                if (!velb_bytes.empty()) {
+                    std::vector<vex::ProjectCacheDep> deps;
+                    deps.reserve(cr.dep_paths.size());
+                    for (const auto &p : cr.dep_paths) {
+                        std::ifstream df(p, std::ios::binary | std::ios::ate);
+                        if (!df.is_open()) continue;
+                        const std::streamsize dsz = df.tellg();
+                        df.seekg(0, std::ios::beg);
+                        std::vector<uint8_t> dbytes(
+                            static_cast<size_t>(dsz < 0 ? 0 : dsz));
+                        if (dsz > 0) {
+                            df.read(reinterpret_cast<char *>(dbytes.data()), dsz);
+                        }
+                        vex::ProjectCacheDep d;
+                        d.path        = p;
+                        d.source_hash = vex::fnv1a64_bytes(
+                            dbytes.data(), dbytes.size());
+                        deps.push_back(std::move(d));
+                    }
+                    const bool saved = vex::project_cache_save(
+                        pc_path, opts_hash, deps, velb_bytes);
+                    if (project_cache_verbose) {
+                        std::cerr << "[vex-project-cache] " << (saved ? "saved" : "save_failed")
+                                   << ": " << pc_path << " (" << velb_bytes.size()
+                                   << " bytes, " << deps.size() << " deps)\n";
+                    }
+                }
+            }
+        }
 
         /* Phase MC.4: probe del ComptimeRuntime (activable via env var
          * VESTA_COMPTIME_PROBE=1).  Tras producir el .velb, lo carga
@@ -1913,6 +2129,17 @@ int main(int argc, char *argv[]) {
             if (!proc) {
                 std::cerr << "Error: no se pudo cargar el ejecutable\n";
                 return EXIT_FAILURE;
+            }
+            // Phase M.sandbox: aplicar @c --vex-caps al modulo cargado.
+            // El primer Executable del pool es el que acabamos de cargar.
+            if (result.count("vex-caps") && !mgr.loader.executables.empty()) {
+                const std::string caps_str = result["vex-caps"].as<std::string>();
+                if (!caps_str.empty()) {
+                    auto &exe = *mgr.loader.executables.front();
+                    exe.caps = ::loader::parse_caps(caps_str);
+                    std::cerr << "[sandbox] modulo principal con caps: "
+                              << ::loader::caps_to_string(exe.caps) << "\n";
+                }
             }
             const long long ns_load = t_load.ns();
 

@@ -329,6 +329,30 @@ namespace vex {
      */
     bool comptime_is_primitive(const Type &t);
 
+    /**
+     * @brief @c true si @c t es un newtype (typedef T name new).
+     *
+     * Devuelve true para @c "typedef u64 port new;" -> @c port.  Cualquier
+     * tipo cuyo @c nominal_id sea distinto de 0.
+     */
+    bool comptime_is_newtype(const Type &t);
+
+    /**
+     * @brief @c true si @c t es un newtype @c @opaque.
+     *
+     * Implica @c comptime_is_newtype(t) == true.
+     */
+    bool comptime_is_opaque(const Type &t);
+
+    /**
+     * @brief Devuelve el nombre canonico del underlying de un newtype.
+     *
+     * Si @c t no es un newtype, devuelve el typename habitual (sin
+     * indirection).  Si es un newtype, recupera el typename del tipo
+     * subyacente (e.g. @c "u64" para @c "typedef u64 port new").
+     */
+    std::string comptime_underlying_name(const TypeChecker &tc, const Type &t);
+
 } // namespace vex
 
 #endif // VEX_COMPTIME_INTROSPECT_H

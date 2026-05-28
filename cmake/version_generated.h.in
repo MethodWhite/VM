@@ -1,0 +1,34 @@
+// Auto-generado por CMake (configure_file).  NO editar manualmente.
+//
+// La fuente de verdad de los numeros de version vive en el
+// `project(VMProject VERSION X.Y.Z ...)` de @c CMakeLists.txt .
+// Cualquier cambio aqui se sobreescribe en el siguiente
+// `cmake --build`.
+//
+// Consumido por:
+//   - @c src/vex/parser.cpp (@Target con compiler:/vm: semver)
+//   - @c include/vesta_rt/public.h (futura API de introspeccion)
+//
+// Mapeo a otros lenguajes (Phase B port):
+//   - C/C++:  @c #define VEX_COMPILER_VERSION_MAJOR ...
+//   - Rust:   @c const VEX_COMPILER_VERSION_MAJOR: u32 = ...;
+//   - Go:     @c const VEX_COMPILER_VERSION_MAJOR = ...
+
+#ifndef VEX_VERSION_GENERATED_H
+#define VEX_VERSION_GENERATED_H
+
+#define VEX_COMPILER_VERSION_MAJOR @VEX_COMPILER_VERSION_MAJOR@
+#define VEX_COMPILER_VERSION_MINOR @VEX_COMPILER_VERSION_MINOR@
+#define VEX_COMPILER_VERSION_PATCH @VEX_COMPILER_VERSION_PATCH@
+
+#define VEX_VM_VERSION_MAJOR @VEX_VM_VERSION_MAJOR@
+#define VEX_VM_VERSION_MINOR @VEX_VM_VERSION_MINOR@
+#define VEX_VM_VERSION_PATCH @VEX_VM_VERSION_PATCH@
+
+// String literals para uso directo en tags y diagnosticos.
+#define VEX_COMPILER_VERSION_STRING \
+    "@VEX_COMPILER_VERSION_MAJOR@.@VEX_COMPILER_VERSION_MINOR@.@VEX_COMPILER_VERSION_PATCH@"
+#define VEX_VM_VERSION_STRING \
+    "@VEX_VM_VERSION_MAJOR@.@VEX_VM_VERSION_MINOR@.@VEX_VM_VERSION_PATCH@"
+
+#endif // VEX_VERSION_GENERATED_H

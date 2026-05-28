@@ -41,6 +41,7 @@ Phase E  -->  Stackmaps + safepoints + GC integration        [PARCIAL: D.2 Fase 
 Phase F  -->  AOT: object emitter (COFF/ELF) + linker propio [PENDIENTE]
 Phase G  -->  Native exception unwinding + debug info        [PENDIENTE]
 Phase H  -->  ELF backend + Linux/macOS native               [PENDIENTE]
+Phase Z  -->  Memoria compartida cross-process (Erlang-style) [COMPLETO]
 ```
 
 Tiempo estimado total para llegar al ejecutable nativo standalone: ~18 meses
@@ -325,6 +326,43 @@ Ver [CONTRIBUTING.md](./CONTRIBUTING.md) para el proceso completo.
 
 ---
 
+## Phase Z: Memoria compartida cross-process (COMPLETA, 2026-05-23)
+
+Phase Z se desarrollo en paralelo a Phases A-D para resolver la limitacion
+arquitectural historica de t13: cada `ProcessVM` tenia su propio `gc::GcHeap`
+privado, impidiendo `synchronized`/`notify`/`wait` cross-process.
+
+**Status final**: COMPLETA (Z.1-Z.11 + Z.10 ext + Z.11 ext).
+
+**Componentes principales** (~3580 LOC nuevos):
+
+- `SharedHeap`: slab allocator lock-free con 12 size-classes y growth dinamico
+  hasta ~1.5 GB total.
+- `SharedHandleTable`: registry lock-free de hasta 4.19M handles con tagged-ABA.
+- `WaitTable`: 4096 buckets con spinlock + backoff PAUSE/YIELD; split
+  MONITOR/CONDVAR.
+- `ObjectHeader.monitor_word` (ABI v3.1): atomic uint64 con encoded_pid 48-bit
+  + lock_depth 16-bit -> exclusion mutua correcta cross-scheduler.
+- Modificador `shared` en var-decl + builtins `share()`/`unshare()`/`is_shared()`.
+- 8 opcodes nuevos (0xA6-0xAD): `newobjs`/`gcpromote`/`gcdemote` + atomic
+  primitives + `sharedstat`.
+- GC mark+sweep STW del SharedHeap coordinado multi-scheduler.
+
+**Verificacion** (snapshot 2026-05-23):
+
+- Vex e2e: **237/237 OK, 0 fallidos**.
+- Tests Z unitarios: **8141 PASS**.
+- `bench_shared_contention --schedulers 4`: R0 = 400000 exacto.
+- t13 (Java-style synchronized + wait/notify cross-process): R0 = 42.
+
+**Doc relacionada**:
+
+- [doc/VMdoc/PhaseZ/SharedMemory.md](./VMdoc/PhaseZ/SharedMemory.md) - modelo completo.
+- [doc/VMdoc/SetInstruccionesVM/PHASEZ_SHARED.md](./VMdoc/SetInstruccionesVM/PHASEZ_SHARED.md) - opcodes 0xA6-0xAD.
+- [doc/VMdoc/SetInstruccionesVM/MONITOR.md](./VMdoc/SetInstruccionesVM/MONITOR.md) - ABI v3.1 del monitor_word.
+
+---
+
 Documentos relacionados:
 
 - [doc/ARCHITECTURE.md](./ARCHITECTURE.md) - arquitectura interna actual
@@ -332,3 +370,4 @@ Documentos relacionados:
 - [doc/LANGUAGE.md](./LANGUAGE.md) - lo que Vex soporta hoy
 - [doc/VMdoc/IR/SSA.md](./VMdoc/IR/SSA.md) - representacion intermedia + pasadas de optimizacion
 - [doc/VMdoc/SetInstruccionesVM/](./VMdoc/SetInstruccionesVM/) - referencia del bytecode
+- [doc/VMdoc/PhaseZ/SharedMemory.md](./VMdoc/PhaseZ/SharedMemory.md) - memoria compartida cross-process

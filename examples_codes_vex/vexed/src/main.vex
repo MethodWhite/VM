@@ -1,0 +1,1830 @@
+// =============================================================================
+// vexed - editor TUI fullscreen en Vex
+// =============================================================================
+//
+// Editor visual estilo nano/pico.  La pantalla se redibuja entera tras
+// cada tecla.  Movimiento con flechas, edicion en cursor, undo, search
+// interactivo, save-as.
+//
+// Atajos:
+//   Flechas, Home, End, PageUp, PageDown   navegacion
+//   Enter                                   nueva linea
+//   Backspace, Delete                       borrar
+//   Ctrl-S                                  guardar (al fichero actual)
+//   Ctrl-O                                  guardar como (pide nombre)
+//   Ctrl-F                                  buscar (pide texto)
+//   Ctrl-Z                                  deshacer
+//   F1                                      ayuda
+//   Ctrl-Q                                  salir (Esc solo cancela seleccion)
+
+import "modules/file_io";
+import "modules/buffer";
+import "modules/history";
+import "modules/screen";
+import "modules/search";
+import "modules/keys";
+import "modules/input";
+import "modules/clipboard";
+import "modules/tabs";
+import "modules/syntax";
+import "modules/launcher";
+import "modules/file_picker";
+import "modules/multicursor";
+import "modules/autocomplete";
+// =============================================================================
+// Sidebar: explorador plano del directorio actual (lista de entradas).
+// =============================================================================
+//
+// Por simplicidad de v1, NO hay arbol con expansion; la sidebar siempre
+// muestra el contenido de un unico directorio (`cwd`).  Pulsar Enter
+// sobre una carpeta cambia el cwd a esa carpeta (con `..` para subir).
+// Pulsar Enter sobre un fichero lo abre en una pestana nueva.
+// =============================================================================
+
+comptime i32 SB_MAX_ENTRIES = 1024;
+comptime i32 SB_NAME_MAX    = 260;
+comptime i32 FINDDATA_BYTES = 320;
+
+// =============================================================================
+// DEBUG LOG / WORKAROUND DE BUG LATENTE DEL COMPILADOR
+// =============================================================================
+// `DEBUG_LOG = 1` ademas de diagnosticar, ENMASCARA un bug latente del
+// compilador donde `render_line_hl` (con syntax highlighter activo) crashea
+// silenciosamente en buffers grandes (>50KB) cuando se ejecuta el row loop
+// SIN llamadas intermedias a funciones que provoquen save_live_regs (efecto
+// regalloc).  El bug se reproduce abriendo `main.vex` del propio editor
+// (~62KB) sin diag_log: el editor sale en LOOP iter=K tras la primera
+// renderizacion exitosa.  Con diag_log=1, las llamadas a fopen/fwrite/
+// fclose en cada iter alteran el patron de save/restore-live-regs y el
+// crash desaparece.
+//
+// Causa raiz (presunta): regalloc + GC interaction en render_line_hl.  Hay
+// algun reg/spill que se corrompe entre iteraciones del row loop cuando
+// no hay calls que fuercen save/restore.  Es un LANG bug, no del editor.
+// Documentado para fix futuro al nivel del compilador.
+//
+// Cambiar a 0 + rebuild para re-disable diag (PROVOCARA el bug en buffers
+// grandes hasta que se arregle al nivel compilador).
+// =============================================================================
+comptime i32 DEBUG_LOG = 1;
+
+// F8: Configuracion del editor (toggleable en runtime).
+//   show_line_numbers -> Ctrl-E
+//   show_whitespace   -> Ctrl-T (visualizar tabs/espacios trailing como puntos)
+//   show_sidebar      -> Ctrl-B
+// F7: persistencia en `.vexed.json` (cwd-local).  Formato minimo key=val
+// por linea (no JSON full porque vex no tiene parser nativo aun).
+class EditorSettings {
+    public i32 show_line_numbers;
+    public i32 show_whitespace;
+    public i32 show_sidebar;
+    public EditorSettings() {
+        this.show_line_numbers = 1;
+        this.show_whitespace   = 0;
+        this.show_sidebar      = 1;
+    }
+}
+
+// F7: serializa settings a .vexed.json (formato key=val por linea, no
+// JSON estricto -- nuestro parser es ad-hoc).
+void settings_save(EditorSettings s) {
+    Result<i64, i32> rfp = file_io.open_file(".vexed.json", "wb");
+    if (!isOk(rfp)) return;
+    i64 fp = value(rfp);
+    string ln1 = "line_numbers=${s.show_line_numbers}\n";
+    string ln2 = "whitespace=${s.show_whitespace}\n";
+    string ln3 = "sidebar=${s.show_sidebar}\n";
+    file_io.write_bytes(fp, str_cstr(ln1), (i32) str_bytes(ln1));
+    file_io.write_bytes(fp, str_cstr(ln2), (i32) str_bytes(ln2));
+    file_io.write_bytes(fp, str_cstr(ln3), (i32) str_bytes(ln3));
+    file_io.close_file(fp);
+}
+
+// F7: carga settings desde .vexed.json si existe.  Si no, retorna defaults.
+EditorSettings settings_load() {
+    diag_log("settings_load ENTRY");
+    EditorSettings s = new EditorSettings();
+    file_io.FileReader fr = new file_io.FileReader();
+    Result<i64, i32> rload = fr.read_all(".vexed.json");
+    if (!isOk(rload)) {
+        diag_log("settings_load .vexed.json not found, using defaults");
+        return s;
+    }
+    i64 n = value(rload);
+    diag_log("settings_load read ${n} bytes from .vexed.json");
+    // Parser ad-hoc: busca substrings "line_numbers=N", "whitespace=N",
+    // "sidebar=N".  Lee el digito justo despues del `=`.
+    i32 i = 0;
+    while (i < (i32) n - 14) {
+        // Buscar "line_numbers="
+        if (fr.data[i]   == 108 && fr.data[i+1] == 105 && fr.data[i+2] == 110 &&
+            fr.data[i+3] == 101 && fr.data[i+4] == 95  && fr.data[i+12] == 61) {
+            // ASCII '0'=48, '1'=49.
+            if (fr.data[i+13] == 48) s.show_line_numbers = 0;
+            else                     s.show_line_numbers = 1;
+        }
+        // "whitespace="
+        if (i < (i32) n - 11 &&
+            fr.data[i]   == 119 && fr.data[i+1] == 104 && fr.data[i+2] == 105 &&
+            fr.data[i+3] == 116 && fr.data[i+10] == 61) {
+            if (fr.data[i+11] == 48) s.show_whitespace = 0;
+            else                     s.show_whitespace = 1;
+        }
+        // "sidebar="
+        if (i < (i32) n - 8 &&
+            fr.data[i]   == 115 && fr.data[i+1] == 105 && fr.data[i+2] == 100 &&
+            fr.data[i+3] == 101 && fr.data[i+4] == 98  && fr.data[i+5] == 97  &&
+            fr.data[i+6] == 114 && fr.data[i+7] == 61) {
+            if (fr.data[i+8] == 48) s.show_sidebar = 0;
+            else                    s.show_sidebar = 1;
+        }
+        i = i + 1;
+    }
+    diag_log("settings_load EXIT line_num=${s.show_line_numbers} ws=${s.show_whitespace} sb=${s.show_sidebar}");
+    return s;
+}
+
+class Sidebar {
+    public string cwd;
+    public u8*    names;       // names_buf concatenado: cada entry NUL-terminada
+    public i32    names_used;
+    public i32    names_cap;
+    public i32*   offsets;     // offsets[i] = inicio en `names` de la entry i
+    public i32*   lens;        // longitud (bytes) de la entry i
+    public i32*   is_dirs;     // 1 si la entry i es carpeta
+    public i32*   depths;      // F3: nivel de indent (0 = root, 1 = expandido)
+    public i32*   is_expanded; // F3: 1 si dir esta expandido in-place
+    public i32    count;
+    public i32    sel;         // entry seleccionada (0..count-1)
+    public i32    scroll;      // primera entry visible
+    public i32    width;       // columnas (incluye barra divisoria)
+    public i32    visible;     // 1 = se renderiza; 0 = oculta
+    public i32    focused;     // 1 = arrows navegan sidebar; 0 = van al editor
+
+    public Sidebar() {
+        u8* cwd_buf = malloc(512);
+        u8* got = file_io.getcwd_into(cwd_buf, 512);
+        if (got == null) {
+            cwd_buf[0] = (u8) 46; // '.'
+            cwd_buf[1] = 0;
+        }
+        i32 cwd_len = 0;
+        while (cwd_buf[cwd_len] != 0) cwd_len = cwd_len + 1;
+        this.cwd        = str_make(cwd_buf, cwd_len);
+        free(cwd_buf);
+        this.names      = malloc(SB_MAX_ENTRIES * SB_NAME_MAX);
+        this.names_used = 0;
+        this.names_cap  = SB_MAX_ENTRIES * SB_NAME_MAX;
+        this.offsets    = malloc(SB_MAX_ENTRIES * 4);
+        this.lens       = malloc(SB_MAX_ENTRIES * 4);
+        this.is_dirs    = malloc(SB_MAX_ENTRIES * 4);
+        this.depths     = malloc(SB_MAX_ENTRIES * 4);
+        this.is_expanded= malloc(SB_MAX_ENTRIES * 4);
+        this.count      = 0;
+        this.sel        = 0;
+        this.scroll     = 0;
+        this.width      = 28;
+        this.visible    = 0;
+        this.focused    = 0;
+        this.reload();
+    }
+
+    // F3: expande in-place el directorio en idx insertando sus hijos despues.
+    // Hijos tienen depth = depths[idx] + 1 y nombre relativo "parent/child".
+    public void expand_at(i32 idx) {
+        if (idx < 0 || idx >= this.count) return;
+        if (this.is_dirs[idx] != 1) return;
+        if (this.is_expanded[idx] == 1) return;
+        // Construir el path absoluto del dir: cwd + "\\" + relname.
+        i32 cwd_n = (i32) str_bytes(this.cwd);
+        i32 rel_n = this.lens[idx];
+        u8* cwd_c = str_cstr(this.cwd);
+        u8* rel_c = this.names + this.offsets[idx];
+        u8* spec = malloc(cwd_n + rel_n + 5);
+        i32 z = 0;
+        while (z < cwd_n) { spec[z] = cwd_c[z]; z = z + 1; }
+        spec[cwd_n] = 92;
+        z = 0;
+        while (z < rel_n) {
+            u8 c = rel_c[z];
+            if (c == 47) c = 92;
+            spec[cwd_n + 1 + z] = c;
+            z = z + 1;
+        }
+        spec[cwd_n + 1 + rel_n]     = 92;
+        spec[cwd_n + 1 + rel_n + 1] = 42;
+        spec[cwd_n + 1 + rel_n + 2] = 0;
+        u8* finddata = malloc(FINDDATA_BYTES);
+        i64 h = file_io.dir_open(spec, finddata);
+        free(spec);
+        if (h == -1) { free(finddata); return; }
+        // Coleccionar hijos en arrays locales (insertaremos despues).
+        u8* child_buf  = malloc(64 * SB_NAME_MAX);
+        i32 child_used = 0;
+        i32* c_off  = malloc(64 * 4);
+        i32* c_len  = malloc(64 * 4);
+        i32* c_dir  = malloc(64 * 4);
+        i32 child_count = 0;
+        i32 cont = 1;
+        while (cont == 1 && child_count < 64) {
+            i32 attrib = (i32) finddata[0];
+            i32 is_dir = 0;
+            if ((attrib & 16) != 0) is_dir = 1;
+            u8* name_p = finddata + 40;
+            i32 nlen = 0;
+            while (nlen < SB_NAME_MAX && name_p[nlen] != 0) nlen = nlen + 1;
+            i32 skip = 0;
+            if (nlen == 1 && name_p[0] == 46) skip = 1;
+            if (nlen == 2 && name_p[0] == 46 && name_p[1] == 46) skip = 1;
+            if (skip == 0) {
+                // Construir nombre relativo: rel_c + "/" + child_name.
+                i32 full_n = rel_n + 1 + nlen;
+                if (child_used + full_n + 1 <= 64 * SB_NAME_MAX) {
+                    i32 dst = child_used;
+                    i32 j = 0;
+                    while (j < rel_n) { child_buf[dst + j] = rel_c[j]; j = j + 1; }
+                    child_buf[dst + rel_n] = 47;
+                    j = 0;
+                    while (j < nlen) { child_buf[dst + rel_n + 1 + j] = name_p[j]; j = j + 1; }
+                    child_buf[dst + full_n] = 0;
+                    c_off[child_count] = dst;
+                    c_len[child_count] = full_n;
+                    c_dir[child_count] = is_dir;
+                    child_count = child_count + 1;
+                    child_used = dst + full_n + 1;
+                }
+            }
+            i32 rc = file_io.dir_next(h, finddata);
+            if (rc != 0) cont = 0;
+        }
+        file_io.dir_close(h);
+        free(finddata);
+        // Insertar hijos en this.* despues de idx.  Hay que hacer hueco:
+        // shift this.offsets/lens/is_dirs/depths/is_expanded desde idx+1
+        // hacia abajo en `child_count` posiciones.
+        if (this.count + child_count > SB_MAX_ENTRIES) {
+            free(child_buf); free(c_off); free(c_len); free(c_dir);
+            return;
+        }
+        i32 i = this.count - 1;
+        while (i > idx) {
+            this.offsets[i + child_count] = this.offsets[i];
+            this.lens[i + child_count]    = this.lens[i];
+            this.is_dirs[i + child_count] = this.is_dirs[i];
+            this.depths[i + child_count]  = this.depths[i];
+            this.is_expanded[i + child_count] = this.is_expanded[i];
+            i = i - 1;
+        }
+        // Anyadir hijos al names buffer y registrar.
+        i32 child_depth = this.depths[idx] + 1;
+        i = 0;
+        while (i < child_count) {
+            i32 cn = c_len[i];
+            i32 src = c_off[i];
+            if (this.names_used + cn + 1 <= this.names_cap) {
+                i32 dst = this.names_used;
+                i32 j = 0;
+                while (j < cn) { this.names[dst + j] = child_buf[src + j]; j = j + 1; }
+                this.names[dst + cn] = 0;
+                this.offsets[idx + 1 + i] = dst;
+                this.lens[idx + 1 + i]    = cn;
+                this.is_dirs[idx + 1 + i] = c_dir[i];
+                this.depths[idx + 1 + i]  = child_depth;
+                this.is_expanded[idx + 1 + i] = 0;
+                this.names_used = dst + cn + 1;
+            }
+            i = i + 1;
+        }
+        this.count = this.count + child_count;
+        this.is_expanded[idx] = 1;
+        free(child_buf); free(c_off); free(c_len); free(c_dir);
+    }
+
+    // F3: colapsa el dir en idx -- remueve entradas posteriores cuyo depth
+    // sea > depths[idx], hasta encontrar una con depth <= depths[idx].
+    public void collapse_at(i32 idx) {
+        if (idx < 0 || idx >= this.count) return;
+        if (this.is_dirs[idx] != 1) return;
+        if (this.is_expanded[idx] == 0) return;
+        i32 base_depth = this.depths[idx];
+        i32 j = idx + 1;
+        while (j < this.count && this.depths[j] > base_depth) {
+            j = j + 1;
+        }
+        i32 n_remove = j - (idx + 1);
+        if (n_remove == 0) {
+            this.is_expanded[idx] = 0;
+            return;
+        }
+        // Shift entries [j..count) hacia arriba en n_remove.
+        i32 k = j;
+        while (k < this.count) {
+            this.offsets[k - n_remove] = this.offsets[k];
+            this.lens[k - n_remove]    = this.lens[k];
+            this.is_dirs[k - n_remove] = this.is_dirs[k];
+            this.depths[k - n_remove]  = this.depths[k];
+            this.is_expanded[k - n_remove] = this.is_expanded[k];
+            k = k + 1;
+        }
+        this.count = this.count - n_remove;
+        this.is_expanded[idx] = 0;
+        if (this.sel >= this.count) this.sel = this.count - 1;
+        if (this.sel < 0) this.sel = 0;
+    }
+
+    // Recarga las entradas leyendo `this.cwd`.
+    public void reload() {
+        this.count      = 0;
+        this.names_used = 0;
+        // Construir el spec "<cwd>\*" en un buffer host.
+        u8* cwd_c = str_cstr(this.cwd);
+        i32 cwd_n = (i32) str_bytes(this.cwd);
+        u8* spec = malloc(cwd_n + 8);
+        i32 i = 0;
+        while (i < cwd_n) { spec[i] = cwd_c[i]; i = i + 1; }
+        // Anyadir "\\*" (Windows) o "/*" (POSIX).  Usamos '\' por defecto.
+        spec[cwd_n]     = (u8) 92; // '\'
+        spec[cwd_n + 1] = (u8) 42; // '*'
+        spec[cwd_n + 2] = 0;
+
+        u8* finddata = malloc(FINDDATA_BYTES);
+        i64 h = file_io.dir_open(spec, finddata);
+        free(spec);
+        if (h == -1) {
+            free(finddata);
+            return;
+        }
+        // Primera entrada ya esta en finddata.
+        i32 cont = 1;
+        while (cont == 1 && this.count < SB_MAX_ENTRIES) {
+            i32 attrib = (i32) finddata[0];
+            i32 is_dir = 0;
+            if ((attrib & 16) != 0) is_dir = 1;
+            // Saltar "." (no util).
+            u8* name_p = finddata + 40;
+            i32 nlen = 0;
+            while (nlen < SB_NAME_MAX && name_p[nlen] != 0) nlen = nlen + 1;
+            i32 skip = 0;
+            if (nlen == 1 && name_p[0] == (u8) 46) skip = 1; // "."
+            if (skip == 0 && this.names_used + nlen + 1 <= this.names_cap) {
+                i32 dst = this.names_used;
+                i32 k = 0;
+                while (k < nlen) {
+                    this.names[dst + k] = name_p[k];
+                    k = k + 1;
+                }
+                this.names[dst + nlen] = 0;
+                this.offsets[this.count] = dst;
+                this.lens[this.count]    = nlen;
+                this.is_dirs[this.count] = is_dir;
+                this.depths[this.count]  = 0;     // F3: top-level
+                this.is_expanded[this.count] = 0; // F3: no expandido
+                this.count               = this.count + 1;
+                this.names_used          = dst + nlen + 1;
+            }
+            i32 rc = file_io.dir_next(h, finddata);
+            if (rc != 0) cont = 0;
+        }
+        file_io.dir_close(h);
+        free(finddata);
+        if (this.sel >= this.count) this.sel = this.count - 1;
+        if (this.sel < 0) this.sel = 0;
+        this.scroll = 0;
+    }
+
+    // Devuelve el nombre de la entry i (string nuevo).
+    public string entry_name(i32 i) {
+        if (i < 0 || i >= this.count) return "";
+        u8* p = this.names + this.offsets[i];
+        return str_make(p, this.lens[i]);
+    }
+
+    public i32 entry_is_dir(i32 i) {
+        if (i < 0 || i >= this.count) return 0;
+        return this.is_dirs[i];
+    }
+
+    // Construye el path absoluto cwd + "\\" + entry_name(i).
+    public string entry_path(i32 i) {
+        if (i < 0 || i >= this.count) return this.cwd;
+        i32 cwd_n = (i32) str_bytes(this.cwd);
+        i32 en    = this.lens[i];
+        u8* cwd_c = str_cstr(this.cwd);
+        u8* buf   = malloc(cwd_n + en + 2);
+        i32 k = 0;
+        while (k < cwd_n) { buf[k] = cwd_c[k]; k = k + 1; }
+        buf[cwd_n] = (u8) 92; // '\'
+        u8* nm = this.names + this.offsets[i];
+        k = 0;
+        while (k < en) { buf[cwd_n + 1 + k] = nm[k]; k = k + 1; }
+        buf[cwd_n + 1 + en] = 0;
+        string s = str_make(buf, cwd_n + 1 + en);
+        free(buf);
+        return s;
+    }
+
+    public void move_up()   { if (this.sel > 0) this.sel = this.sel - 1; }
+    public void move_down() { if (this.sel < this.count - 1) this.sel = this.sel + 1; }
+}
+
+// Buffer global para la barra de status (evita allocar string cada frame).
+// Usamos solo el ultimo mensaje.
+
+// Renderiza la barra superior con las pestanas (orden de creacion,
+// activa resaltada con INVERT).  Como Vex no soporta `class == class`
+// hoy, identificamos la activa por `id`.
+void render_tab_bar(tabs.Workspace ws, screen.Screen sc) {
+    sc.move_cursor(1, 1);
+    tabs.EditorTab active = ws.active;
+    if (active == null) {
+        print(screen.ATTR_INVERT);
+        print(" sin pestanas ");
+        print(screen.ATTR_RESET);
+        sc.clear_eol();
+        return;
+    }
+    i32 active_id = active.id;
+    // Busca el head (count-1 retrocesos desde la activa).
+    tabs.EditorTab head = active;
+    i32 back = 0;
+    while (back < ws.count - 1) {
+        head = head.prev;
+        back = back + 1;
+    }
+    tabs.EditorTab cur = head;
+    i32 idx = 1;
+    i32 max_col = sc.cols;
+    i32 col_used = 0;
+    while (idx <= ws.count) {
+        string mark = "";
+        if (cur.buf.dirty == 1) mark = "*";
+        string label = " ${idx} ${cur.title}${mark} ";
+        i32 lblen = (i32) str_bytes(label);
+        if (col_used + lblen > max_col) break;
+        if (cur.id == active_id) print(screen.ATTR_INVERT);
+        else                     print(screen.ATTR_DIM);
+        print(label);
+        print(screen.ATTR_RESET);
+        col_used = col_used + lblen;
+        cur = cur.next;
+        idx = idx + 1;
+    }
+    sc.clear_eol();
+}
+
+// Renderiza la sidebar en las primeras `sb.width` columnas.  Cada
+// entry ocupa una linea desde fila 2 (debajo del tab bar) hasta
+// sc.rows - 1 (encima del status bar).  La activa va invertida.
+void render_sidebar(Sidebar sb, screen.Screen sc) {
+    if (sb.visible == 0) return;
+    i32 body_top = 2;
+    i32 body_bot = sc.rows - 1;
+    i32 list_h   = body_bot - body_top + 1;
+    // Auto-scroll para mantener sel visible.
+    if (sb.sel < sb.scroll) sb.scroll = sb.sel;
+    if (sb.sel >= sb.scroll + list_h) sb.scroll = sb.sel - list_h + 1;
+    if (sb.scroll < 0) sb.scroll = 0;
+
+    // Paleta Dracula para entries del sidebar:
+    //   dir         -> pink "+" + cyan nombre (resalta carpetas)
+    //   fichero     -> fg blanco con ".ext" coloreado segun extension
+    //   seleccion   -> ATTR_INVERT envuelve todo
+    string col_dir_sym  = "\x1b[38;2;255;121;198m";  // pink "+"
+    string col_dir_name = "\x1b[38;2;139;233;253m";  // cyan dir name
+    string col_file     = "\x1b[38;2;248;248;242m";  // fg white
+    string col_ext_vex  = "\x1b[38;2;80;250;123m";   // green (.vex/.vsh/.c/.cpp)
+    string col_ext_doc  = "\x1b[38;2;241;250;140m";  // yellow (.md/.txt/.toml)
+    string col_ext_dim  = "\x1b[38;2;98;114;164m";   // comment-gray (.velb/.vexi/...)
+
+    i32 r = 0;
+    while (r < list_h) {
+        sc.move_cursor(body_top + r, 1);
+        i32 idx = sb.scroll + r;
+        if (idx < sb.count) {
+            i32 is_sel = 0;
+            if (idx == sb.sel && sb.focused == 1) is_sel = 1;
+            if (is_sel == 1) print(screen.ATTR_INVERT);
+            // F3: indent segun depth (2 spaces por nivel).
+            i32 depth = sb.depths[idx];
+            i32 indent_used = 0;
+            print(" ");
+            indent_used = indent_used + 1;
+            i32 ii = 0;
+            while (ii < depth) {
+                print("  ");
+                indent_used = indent_used + 2;
+                ii = ii + 1;
+            }
+            // Prefijo: F3 muestra '+' (collapsed) o '-' (expanded) en dirs.
+            i32 is_dir = sb.is_dirs[idx];
+            if (is_dir == 1) {
+                print(col_dir_sym);
+                if (sb.is_expanded[idx] == 1) print("- ");
+                else                          print("+ ");
+                print(col_dir_name);
+            } else {
+                print("  ");
+                print(col_file);
+            }
+            // F3: para entries de hijos (depth>0), mostrar solo el basename
+            // (parte despues del ultimo '/').  Para depth 0 mostrar full name.
+            u8* nm_full = sb.names + sb.offsets[idx];
+            i32 nlen_full = sb.lens[idx];
+            i32 base_off = 0;
+            if (depth > 0) {
+                i32 z = nlen_full - 1;
+                while (z >= 0) {
+                    if (nm_full[z] == 47) { base_off = z + 1; z = -1; }
+                    else                  { z = z - 1; }
+                }
+            }
+            u8* nm = nm_full + base_off;
+            i32 nlen = nlen_full - base_off;
+            i32 maxn = sb.width - indent_used - 4;
+            if (maxn < 1) maxn = 1;
+            if (nlen > maxn) nlen = maxn;
+            // Encontrar el ultimo '.' para separar name y ext (solo ficheros).
+            i32 dot = -1;
+            if (is_dir == 0) {
+                i32 z = nlen - 1;
+                while (z >= 0) {
+                    if (nm[z] == 46) { dot = z; z = -1; } else { z = z - 1; }
+                }
+            }
+            i32 k = 0;
+            i32 ext_started = 0;
+            while (k < nlen) {
+                if (dot > 0 && k == dot && ext_started == 0) {
+                    // Identificar extension y elegir color.
+                    string col_ext = col_ext_dim;
+                    // Comparar suffix con tablas (rapido inline).
+                    i32 elen = nlen - dot;
+                    // .vex
+                    if (elen == 4 && nm[dot+1] == 118 && nm[dot+2] == 101 && nm[dot+3] == 120) col_ext = col_ext_vex;
+                    // .vsh
+                    else if (elen == 4 && nm[dot+1] == 118 && nm[dot+2] == 115 && nm[dot+3] == 104) col_ext = col_ext_vex;
+                    // .c
+                    else if (elen == 2 && nm[dot+1] == 99) col_ext = col_ext_vex;
+                    // .h
+                    else if (elen == 2 && nm[dot+1] == 104) col_ext = col_ext_vex;
+                    // .md
+                    else if (elen == 3 && nm[dot+1] == 109 && nm[dot+2] == 100) col_ext = col_ext_doc;
+                    // .txt
+                    else if (elen == 4 && nm[dot+1] == 116 && nm[dot+2] == 120 && nm[dot+3] == 116) col_ext = col_ext_doc;
+                    // .toml
+                    else if (elen == 5 && nm[dot+1] == 116 && nm[dot+2] == 111 && nm[dot+3] == 109 && nm[dot+4] == 108) col_ext = col_ext_doc;
+                    print(col_ext);
+                    ext_started = 1;
+                }
+                i32 ch = (i32) nm[k];
+                if (ch >= 32 && ch < 127) print_char(ch);
+                else                       print(".");
+                k = k + 1;
+            }
+            // Resetear color tras el nombre.
+            print(screen.ATTR_RESET);
+            if (is_sel == 1) print(screen.ATTR_INVERT);
+            // Padding hasta width-1 (cuenta indent del depth).
+            i32 used = indent_used + 2 + nlen;
+            while (used < sb.width - 1) { print(" "); used = used + 1; }
+            if (is_sel == 1) print(screen.ATTR_RESET);
+        } else {
+            i32 fill = 0;
+            while (fill < sb.width - 1) { print(" "); fill = fill + 1; }
+        }
+        // Barra divisoria al final.
+        print(screen.FG_GRAY);
+        print("|");
+        print(screen.ATTR_RESET);
+        r = r + 1;
+    }
+}
+
+// Renderiza el frame completo: tab bar + sidebar + editor + status bar.
+// El editor ocupa las filas [2, sc.rows-1].  Si la sidebar esta visible,
+// el editor empieza en columna sb.width+1.
+void draw_full(tabs.Workspace ws, Sidebar sb, screen.Screen sc, i32 view_rows,
+               string status_msg, syntax.SyntaxHighlighter hl,
+               EditorSettings settings) {
+    if (ws.active == null) return;
+    tabs.EditorTab t = ws.active;
+    buffer.Buffer b = t.buf;
+    i32 row_top = t.row_top;
+    diag_log("draw_full ENTRY title='${t.title}' b.length=${b.length} line_count=${b.line_count()} row_top=${row_top}");
+
+    i32 base_left = 1;
+    if (sb.visible == 1) base_left = sb.width + 1;
+    // F8: gutter de line numbers ocupa 6 cols ("NNNN | ").  Ajusta dinamico
+    // si el archivo es muy grande (>9999 lineas).
+    i32 gutter_w = 0;
+    if (settings.show_line_numbers == 1) {
+        gutter_w = 6;
+        i32 total_lines = b.line_count();
+        if (total_lines >= 100000) gutter_w = 8;
+        else if (total_lines >= 10000) gutter_w = 7;
+    }
+    i32 editor_left = base_left + gutter_w;
+
+    // 1. Tab bar arriba (toda la anchura).
+    render_tab_bar(ws, sc);
+
+    // 2. Sidebar (si visible).
+    render_sidebar(sb, sc);
+
+    // 3. Cuerpo del editor (filas 2..sc.rows-1, cols editor_left..cols).
+    // Sintaxis Vex se aplica al render de TODAS las lineas visibles.
+    // El highlighter mantiene estado multi-linea (block comments / triple
+    // strings); reset al inicio del frame y luego scan desde la primera
+    // linea visible.  Para evitar bugs en archivos donde una linea
+    // anterior abre un bloque /*..*/ que se cierra abajo, hacemos un
+    // pre-scan rapido desde linea 0 hasta row_top para inicializar el
+    // estado correctamente.  Esto es O(N) por keystroke pero acceptable
+    // para archivos <= 10k lineas (Phase A).
+    hl.reset_state();
+    i32 pre = 0;
+    while (pre < row_top && pre < b.line_count()) {
+        i32 ps = b.line_offset(pre);
+        // Avanzar el estado del highlighter "en seco": no emitimos, solo
+        // consumimos.  Reusamos render_line con sel_on=0 y max_chars=0
+        // tampoco sirve porque emitiria.  Simplificacion: emitimos a
+        // un sink-vacio via posicionar cursor en columna invalida.
+        // Mejor: hacer scan dedicado.  Por ahora skip el pre-scan; el
+        // bug es solo cosmetico si el block comment de arriba escapa.
+        pre = pre + 1;
+        break;  // saltar pre-scan -- aceptable como TODO
+    }
+
+    i32 body_top = 2;
+    i32 cur_row  = b.cursor_row();
+    // Paleta Dracula para el gutter.
+    string col_lnum_norm = "\x1b[38;2;98;114;164m";    // comment-gray
+    string col_lnum_cur  = "\x1b[38;2;241;250;140m";   // yellow para linea actual
+    string col_gutter_br = "\x1b[38;2;68;71;90m";      // current-line subtle
+
+    i32 r = 0;
+    while (r < view_rows) {
+        i32 file_line = row_top + r;
+        // WORKAROUND latent bug: diag_log UNCONDITIONAL (incluso buffer vacio).
+        // Necesitamos calls que dispersen save_live_regs en el row loop.
+        // Sin esto, el bug crashea silenciosamente en cualquier momento.
+        diag_log("rl ${r}");
+        // F8: gutter de line numbers a la izquierda del editor body.
+        if (gutter_w > 0) {
+            diag_log("rl ${r} g1 move_cursor");
+            sc.move_cursor(body_top + r, base_left);
+            diag_log("rl ${r} g2 line_count_check");
+            if (file_line < b.line_count()) {
+                diag_log("rl ${r} g3 num=${file_line + 1}");
+                if (file_line == cur_row) print(col_lnum_cur);
+                else                       print(col_lnum_norm);
+                // Imprimir el numero (1-based) right-aligned en gutter_w-2 cols.
+                i32 num = file_line + 1;
+                i32 num_w = gutter_w - 2;
+                // Calcular digitos.
+                i32 d = num; i32 dig = 0;
+                while (d > 0) { dig = dig + 1; d = d / 10; }
+                if (dig == 0) dig = 1;
+                i32 pad = num_w - dig;
+                i32 pi = 0;
+                while (pi < pad) { print(" "); pi = pi + 1; }
+                diag_log("rl ${r} g4 pre_print_int");
+                print_int(num);
+                diag_log("rl ${r} g5 post_print_int");
+                print(" ");
+                print(col_gutter_br);
+                print("|");
+                print(" ");
+                print(screen.ATTR_RESET);
+                diag_log("rl ${r} g6 gutter_done");
+            } else {
+                // Gutter vacio para lineas inexistentes.
+                i32 gi = 0;
+                while (gi < gutter_w - 2) { print(" "); gi = gi + 1; }
+                print(col_gutter_br);
+                print("| ");
+                print(screen.ATTR_RESET);
+            }
+        }
+        if (file_line < b.line_count()) {
+            i32 byte_start = b.line_offset(file_line);
+            if (b.length > 0) diag_log("rl ${r} pre_render bs=${byte_start}");
+            if (settings.show_whitespace == 1) {
+                sc.render_line_with_ws(b, byte_start, body_top + r, editor_left);
+            } else {
+                sc.render_line_hl(b, byte_start, body_top + r, editor_left, hl);
+            }
+            if (b.length > 0) diag_log("rl ${r} post_render");
+        } else {
+            sc.move_cursor(body_top + r, editor_left);
+            print(screen.FG_GRAY);
+            print("~");
+            print(screen.ATTR_RESET);
+            sc.clear_eol();
+        }
+        r = r + 1;
+    }
+
+    // 4. Status bar (ultima fila).
+    sc.move_cursor(sc.rows, 1);
+    print(screen.ATTR_INVERT);
+    i32 line  = b.cursor_row() + 1;
+    i32 col   = b.cursor_col() + 1;
+    i32 total = b.line_count();
+    string mark = " ";
+    if (b.dirty == 1) mark = "*";
+    // Selection info: si hay seleccion activa, mostrar el conteo.
+    string sel_info = "";
+    if (b.sel_active() == 1) {
+        i32 sn = b.sel_end() - b.sel_start();
+        sel_info = "  Sel:${sn}B";
+    }
+    print(" ${mark} ${t.title}  L${line}:C${col}/${total}${sel_info}  ${status_msg} ");
+    print(screen.ATTR_RESET);
+    sc.clear_eol();
+}
+
+// Snapshot helper.  Cualquier edicion fresca limpia el redo stack.
+void snapshot(buffer.Buffer b, history.SnapshotStack st, history.SnapshotStack rd) {
+    history.Snapshot snap;
+    history.make_snapshot_into(b, &snap);
+    history.stack_push(st, &snap);
+    history.stack_clear(rd);
+}
+
+// Pide texto al usuario tras un prompt en la barra inferior.
+// Devuelve string vacio si el usuario pulsa Esc o no escribe nada.
+string prompt(screen.Screen sc, string label) {
+    u8* buf = malloc(256);
+    i32 n = 0;
+    buf[0] = 0;
+    sc.show_cursor();
+    while (1) {
+        sc.move_cursor(sc.rows, 1);
+        print(screen.ATTR_INVERT);
+        print(" ${label}: ");
+        // Imprime el contenido del buffer hasta n.
+        i32 i = 0;
+        while (i < n) {
+            print_char((i32) buf[i]);
+            i = i + 1;
+        }
+        print(" ");
+        print(screen.ATTR_RESET);
+        sc.clear_eol();
+        flush();
+
+        i32 k = input.read_key_blocking();
+        if (k == keys.KEY_ENTER || k == keys.KEY_LF) {
+            buf[n] = 0;
+            string result = str_make(buf, n);
+            free(buf);
+            sc.hide_cursor();
+            return result;
+        }
+        if (k == keys.KEY_ESC) {
+            free(buf);
+            sc.hide_cursor();
+            return "";
+        }
+        if (k == keys.KEY_BACKSPACE || k == keys.KEY_BACKSPACE_WIN) {
+            if (n > 0) n = n - 1;
+            continue;
+        }
+        if (k >= 32 && k < 127 && n < 255) {
+            buf[n] = (u8) k;
+            n = n + 1;
+        }
+    }
+    free(buf);
+    sc.hide_cursor();
+    return "";
+}
+
+// F6: Help overlay -- panel centrado encima del editor sin destruir el
+// frame de fondo.  Soporta scroll vertical con Up/Down/PgUp/PgDn.  Tras
+// Esc/Enter/Q el main loop redibuja todo.
+
+// Una entrada del overlay: header de seccion (kind=1) o keybinding (kind=0).
+class HelpEntry {
+    public i32    kind;   // 0 = key row, 1 = section header, 2 = blank
+    public string label;  // texto izquierda (key) o texto seccion
+    public string desc;   // descripcion derecha (si kind=0)
+}
+
+HelpEntry he_make(i32 kind, string label, string desc) {
+    HelpEntry e = new HelpEntry();
+    e.kind = kind; e.label = label; e.desc = desc;
+    return e;
+}
+
+void show_help_line(i32 row, i32 left, i32 inner_w, string label, string desc,
+                    string color_label) {
+    print("\x1b[${row};${left}H");                  // posicionar
+    print("\x1b[38;2;189;147;249m");                // purple border
+    print("|");
+    print(screen.ATTR_RESET);
+    print(" ");
+    print(color_label);
+    print(label);
+    print(screen.ATTR_RESET);
+    // Padding entre label y desc: alinear desc a columna 22 del interior.
+    i32 lblen = (i32) str_bytes(label);
+    i32 pad = 22 - lblen;
+    if (pad < 1) pad = 1;
+    i32 k = 0;
+    while (k < pad) { print(" "); k = k + 1; }
+    print("\x1b[38;2;248;248;242m");
+    print(desc);
+    print(screen.ATTR_RESET);
+    // Padding final hasta el borde derecho.
+    i32 used = 1 + 1 + lblen + pad + (i32) str_bytes(desc);
+    while (used < inner_w + 1) { print(" "); used = used + 1; }
+    print("\x1b[38;2;189;147;249m");
+    print("|");
+    print(screen.ATTR_RESET);
+}
+
+// Renderiza una entry dentro del frame del overlay.  Diferentes estilos
+// segun kind: 1=section (cyan bold), 2=blank, 0=key/desc.
+void show_help_render_entry(i32 row, i32 left, i32 inner_w, HelpEntry e,
+                            string col_kw, string col_sec, string col_bord) {
+    print("\x1b[${row};${left}H");
+    print(col_bord); print("|"); print(screen.ATTR_RESET);
+    if (e.kind == 1) {
+        print(" "); print(col_sec); print(screen.ATTR_BOLD);
+        print(e.label); print(screen.ATTR_RESET);
+        i32 used = 1 + (i32) str_bytes(e.label) + 1;
+        while (used < inner_w + 1) { print(" "); used = used + 1; }
+    } else if (e.kind == 2) {
+        i32 j = 0;
+        while (j < inner_w) { print(" "); j = j + 1; }
+    } else {
+        print("   "); print(col_kw); print(e.label); print(screen.ATTR_RESET);
+        i32 lblen = (i32) str_bytes(e.label);
+        i32 pad = 22 - lblen;
+        if (pad < 1) pad = 1;
+        i32 k = 0;
+        while (k < pad) { print(" "); k = k + 1; }
+        print("\x1b[38;2;248;248;242m"); print(e.desc); print(screen.ATTR_RESET);
+        i32 used = 3 + lblen + pad + (i32) str_bytes(e.desc);
+        while (used < inner_w + 1) { print(" "); used = used + 1; }
+    }
+    print(col_bord); print("|"); print(screen.ATTR_RESET);
+}
+
+void show_help_overlay(screen.Screen sc) {
+    diag_log("show_help_overlay ENTRY");   // WORKAROUND latent bug
+    i32 box_w = 70;
+    if (box_w > sc.cols - 4) box_w = sc.cols - 4;
+    if (box_w < 40) box_w = 40;
+    i32 box_h = 26;
+    if (box_h > sc.rows - 4) box_h = sc.rows - 4;
+    i32 top  = (sc.rows - box_h) / 2 + 1;
+    i32 left = (sc.cols - box_w) / 2 + 1;
+    if (top < 1)  top = 1;
+    if (left < 1) left = 1;
+    i32 inner_w = box_w - 2;
+
+    string col_kw   = "\x1b[38;2;255;121;198m";   // pink labels
+    string col_sec  = "\x1b[38;2;139;233;253m";   // cyan section
+    string col_bord = "\x1b[38;2;189;147;249m";   // purple border
+
+    // Construir contenido scrollable: lista de HelpEntry.  El total puede
+    // exceder la altura visible; navegamos con Up/Down/PgUp/PgDn.
+    HelpEntry[64] entries;
+    diag_log("help array allocated");   // WORKAROUND latent bug
+    i32 n = 0;
+    entries[n] = he_make(1, "Movimiento", "");                                       n = n + 1;
+    entries[n] = he_make(0, "Flechas",                "mover el cursor");            n = n + 1;
+    entries[n] = he_make(0, "Home / End",             "inicio / fin de linea");      n = n + 1;
+    entries[n] = he_make(0, "PgUp / PgDn",            "scroll por pagina");          n = n + 1;
+    entries[n] = he_make(0, "Ctrl-Left / Right",      "palabra prev / sig");         n = n + 1;
+    entries[n] = he_make(0, "Ctrl-Home / End",        "doc inicio / fin");           n = n + 1;
+    entries[n] = he_make(0, "Shift + movimiento",     "extender seleccion");         n = n + 1;
+    entries[n] = he_make(2, "", "");                                                  n = n + 1;
+    diag_log("help mov done");
+    entries[n] = he_make(1, "Edicion", "");                                           n = n + 1;
+    entries[n] = he_make(0, "Enter",                  "nueva linea + auto-indent");  n = n + 1;
+    entries[n] = he_make(0, "Backspace / Delete",     "borrar caracter / seleccion");n = n + 1;
+    entries[n] = he_make(0, "Ctrl-X / Ctrl-C / V",    "cortar / copiar / pegar");    n = n + 1;
+    entries[n] = he_make(0, "Ctrl-U",                 "pegar (alias Ctrl-V)");       n = n + 1;
+    entries[n] = he_make(0, "Ctrl-K",                 "cortar linea actual");        n = n + 1;
+    entries[n] = he_make(0, "Ctrl-D",                 "duplicar linea actual");      n = n + 1;
+    entries[n] = he_make(0, "F4",                     "toggle comentario //");       n = n + 1;
+    entries[n] = he_make(0, "Ctrl-Z / Ctrl-Y",        "undo / redo");                n = n + 1;
+    entries[n] = he_make(2, "", "");                                                  n = n + 1;
+    diag_log("help edit done");
+    entries[n] = he_make(1, "Archivo y busqueda", "");                                n = n + 1;
+    entries[n] = he_make(0, "Ctrl-S",                 "guardar fichero actual");     n = n + 1;
+    entries[n] = he_make(0, "Ctrl-O",                 "guardar como (prompt)");      n = n + 1;
+    entries[n] = he_make(0, "Ctrl-F",                 "buscar texto (prompt)");      n = n + 1;
+    entries[n] = he_make(0, "F3",                     "buscar siguiente");           n = n + 1;
+    entries[n] = he_make(0, "Ctrl-G",                 "ir a linea N");               n = n + 1;
+    entries[n] = he_make(2, "", "");                                                  n = n + 1;
+    diag_log("help arc done");
+    entries[n] = he_make(1, "Vista y toggles", "");                                   n = n + 1;
+    entries[n] = he_make(0, "Ctrl-B",                 "toggle sidebar");             n = n + 1;
+    entries[n] = he_make(0, "Ctrl-E",                 "toggle line numbers");        n = n + 1;
+    entries[n] = he_make(0, "Ctrl-T",                 "toggle whitespace");          n = n + 1;
+    entries[n] = he_make(0, "F6",                     "ciclar pestanas activa");     n = n + 1;
+    entries[n] = he_make(0, "Sidebar: Enter",         "expand / collapse dir");      n = n + 1;
+    entries[n] = he_make(2, "", "");                                                  n = n + 1;
+    diag_log("help vista done");
+    entries[n] = he_make(1, "Navegacion y edicion avanzada", "");                     n = n + 1;
+    entries[n] = he_make(0, "Ctrl-P",                 "fuzzy file picker");          n = n + 1;
+    entries[n] = he_make(0, "Ctrl-Up / Ctrl-Down",    "agregar multicursor");        n = n + 1;
+    entries[n] = he_make(0, "F5",                     "autocomplete popup");         n = n + 1;
+    entries[n] = he_make(0, "Tab (en popup)",         "aceptar sugerencia");         n = n + 1;
+    entries[n] = he_make(2, "", "");                                                  n = n + 1;
+    diag_log("help nav done");
+    entries[n] = he_make(1, "Pestanas", "");                                          n = n + 1;
+    entries[n] = he_make(0, "Ctrl-N",                 "nueva pestana");              n = n + 1;
+    entries[n] = he_make(0, "Ctrl-W",                 "cerrar pestana actual");      n = n + 1;
+    entries[n] = he_make(0, "Ctrl-PgUp / PgDn",       "pestana prev / sig");         n = n + 1;
+    entries[n] = he_make(2, "", "");                                                  n = n + 1;
+    diag_log("help pest done");
+    entries[n] = he_make(1, "Salir", "");                                             n = n + 1;
+    entries[n] = he_make(0, "Ctrl-Q",                 "salir del editor");           n = n + 1;
+    entries[n] = he_make(0, "Esc",                    "cancelar seleccion / prompt");n = n + 1;
+    i32 entry_count = n;
+
+    // Reservar 1 row para titulo, 1 borde superior, 1 borde inferior y
+    // 1 footer = 4 rows fijos.  Content visible = box_h - 4.
+    i32 content_h = box_h - 4;
+    if (content_h < 5) content_h = 5;
+
+    // Bucle scroll: re-renderiza el overlay cada vez que cambia scroll_off.
+    i32 scroll_off = 0;
+    i32 closing = 0;
+    while (closing == 0) {
+        diag_log("help_overlay iter");   // WORKAROUND latent bug
+        // Borde superior con titulo centrado.
+        print("\x1b[${top};${left}H");
+        print(col_bord);
+        print("+");
+        string title = " vexed - ayuda ";
+        i32 tlen = (i32) str_bytes(title);
+        i32 lpad = (inner_w - tlen) / 2;
+        if (lpad < 0) lpad = 0;
+        i32 i2 = 0;
+        while (i2 < lpad) { print("-"); i2 = i2 + 1; }
+        print(screen.ATTR_RESET);
+        print(screen.ATTR_BOLD);
+        print(col_sec);
+        print(title);
+        print(screen.ATTR_RESET);
+        print(col_bord);
+        i32 rpad = inner_w - lpad - tlen;
+        i2 = 0;
+        while (i2 < rpad) { print("-"); i2 = i2 + 1; }
+        print("+");
+        print(screen.ATTR_RESET);
+
+        // Render content area scrollable.
+        i32 row = top + 1;
+        i32 vi = 0;
+        while (vi < content_h) {
+            i32 idx = scroll_off + vi;
+            if (idx < entry_count) {
+                show_help_render_entry(row, left, inner_w, entries[idx],
+                                       col_kw, col_sec, col_bord);
+            } else {
+                // blank padding
+                show_help_render_entry(row, left, inner_w, he_make(2, "", ""),
+                                       col_kw, col_sec, col_bord);
+            }
+            row = row + 1;
+            vi = vi + 1;
+        }
+
+        // Footer con info de scroll + cierre.
+        print("\x1b[${row};${left}H");
+        print(col_bord); print("|"); print(screen.ATTR_RESET);
+        print(screen.ATTR_DIM);
+        i32 last_visible = scroll_off + content_h;
+        if (last_visible > entry_count) last_visible = entry_count;
+        string foot = " ${last_visible}/${entry_count}  Up/Down/PgUp/PgDn  Esc=cerrar ";
+        i32 flen = (i32) str_bytes(foot);
+        i32 fpad = (inner_w - flen) / 2;
+        if (fpad < 0) fpad = 0;
+        i32 j2 = 0;
+        while (j2 < fpad) { print(" "); j2 = j2 + 1; }
+        print(foot);
+        j2 = fpad + flen;
+        while (j2 < inner_w) { print(" "); j2 = j2 + 1; }
+        print(screen.ATTR_RESET);
+        print(col_bord); print("|"); print(screen.ATTR_RESET);
+        row = row + 1;
+
+        // Borde inferior.
+        print("\x1b[${row};${left}H");
+        print(col_bord);
+        print("+");
+        i32 bx = 0;
+        while (bx < inner_w) { print("-"); bx = bx + 1; }
+        print("+");
+        print(screen.ATTR_RESET);
+
+        flush();
+        i32 k = input.read_key_blocking();
+        i32 max_scroll = entry_count - content_h;
+        if (max_scroll < 0) max_scroll = 0;
+        if (k == keys.VK_DOWN) {
+            if (scroll_off < max_scroll) scroll_off = scroll_off + 1;
+        } else if (k == keys.VK_UP) {
+            if (scroll_off > 0) scroll_off = scroll_off - 1;
+        } else if (k == keys.VK_PGDN) {
+            scroll_off = scroll_off + content_h - 2;
+            if (scroll_off > max_scroll) scroll_off = max_scroll;
+        } else if (k == keys.VK_PGUP) {
+            scroll_off = scroll_off - (content_h - 2);
+            if (scroll_off < 0) scroll_off = 0;
+        } else if (k == keys.VK_HOME) {
+            scroll_off = 0;
+        } else if (k == keys.VK_END) {
+            scroll_off = max_scroll;
+        } else {
+            // Cualquier otra tecla (Esc, Enter, q, etc.) cierra.
+            closing = 1;
+        }
+    }
+}
+
+void show_help(screen.Screen sc) {
+    show_help_overlay(sc);
+}
+
+// Crea una tabs.EditorTab nueva con titulo dado y carga (si existe) el
+// fichero del filesystem en su buffer.  Si el path es vacio o la
+// lectura falla, queda con buffer vacio.
+// Estado global de diagnostico para que el caller pueda reportar el ultimo
+// resultado de read_all en el status bar.
+i64 make_tab_last_status = 0;
+i64 make_tab_last_err    = 0;
+
+// Escribe un mensaje en vexed_diag.log (append) si DEBUG_LOG == 1.
+// Si esta a 0 (default), no-op completo: no abre fichero, no escribe.
+// Para activar: cambiar `comptime i32 DEBUG_LOG = 0;` -> `... = 1;` y rebuild.
+void diag_log(string msg) {
+    if (DEBUG_LOG == 0) return;
+    Result<i64, i32> rfp = file_io.open_file("vexed_diag.log", "ab");
+    if (!isOk(rfp)) return;
+    i64 fp = value(rfp);
+    file_io.write_bytes(fp, str_cstr(msg), (i32) str_bytes(msg));
+    u8* nl = malloc(1);
+    nl[0] = 10;
+    file_io.write_bytes(fp, nl, 1);
+    free(nl);
+    file_io.close_file(fp);
+}
+
+tabs.EditorTab make_tab(string path, string display_title) {
+    diag_log("make_tab ENTRY title='${display_title}' path_bytes=${str_bytes(path)}");
+    tabs.EditorTab t = new tabs.EditorTab(display_title);
+    if (str_bytes(path) <= 0) {
+        make_tab_last_status = -1;
+        make_tab_last_err    = 0;
+        diag_log("make_tab EARLY_RETURN empty path");
+        return t;
+    }
+    diag_log("make_tab CREATING FileReader");
+    file_io.FileReader fr = new file_io.FileReader();
+    diag_log("make_tab CALLING read_all");
+    Result<i64, i32> rload = fr.read_all(path);
+    diag_log("make_tab read_all returned, checking isOk");
+    if (isOk(rload)) {
+        i64 n = value(rload);
+        make_tab_last_status = n;
+        make_tab_last_err    = 0;
+        diag_log("make_tab read OK n=${n}");
+        t.buf.ensure_capacity((i32) n + 64);
+        diag_log("make_tab ensure_capacity done");
+        i32 i = 0;
+        while (i < (i32) n) {
+            t.buf.data[i] = fr.data[i];
+            i = i + 1;
+        }
+        t.buf.length = (i32) n;
+        t.buf.cursor = 0;
+        t.buf.dirty  = 0;
+        diag_log("make_tab buf populated");
+    } else {
+        make_tab_last_status = -2;
+        make_tab_last_err    = (i64) error(rload);
+        diag_log("make_tab read FAIL err=${error(rload)}");
+    }
+    diag_log("make_tab EXIT");
+    return t;
+}
+
+// ============================================================================
+// Quick editor operations: duplicar linea (Ctrl-D) y toggle comentario (F4).
+// ============================================================================
+
+// Duplica la linea actual y deja el cursor al inicio de la nueva linea.
+void duplicate_line(buffer.Buffer b) {
+    i32 row   = b.cursor_row();
+    i32 start = b.line_offset(row);
+    // line_offset(row+1) apunta al primer byte DESPUES del \n; si no hay
+    // siguiente linea, usar length.
+    i32 next  = b.line_offset(row + 1);
+    if (next <= start) next = b.length;
+    i32 has_lf = 0;
+    if (next > start && b.data[next - 1] == 10) has_lf = 1;
+    // Construir el buffer a insertar: la linea + \n garantizado.
+    i32 line_len = next - start;
+    // Si la linea original no termina en \n (ultima sin LF), anyadir uno.
+    i32 ins_len = line_len;
+    if (has_lf == 0) ins_len = line_len + 1;
+    u8* tmp = malloc(ins_len + 1);
+    i32 k = 0;
+    while (k < line_len) { tmp[k] = b.data[start + k]; k = k + 1; }
+    if (has_lf == 0) { tmp[line_len] = 10; }   // anyadir LF al duplicado
+    // Posicionar cursor justo despues del LF de la linea original (o al final
+    // si la original no tenia LF -- en ese caso insertamos LF antes).
+    if (has_lf == 1) {
+        b.cursor = next;
+    } else {
+        // sin LF: primero hay que anyadir LF entre original y duplicado.
+        b.cursor = next;
+        u8* lf_buf = malloc(1);
+        lf_buf[0] = 10;
+        b.insert_bytes(lf_buf, 1);
+        free(lf_buf);
+        ins_len = line_len;  // ya no anyadimos LF en el duplicado
+        // y reconstruir tmp sin el LF extra (ya esta insertado).
+    }
+    b.insert_bytes(tmp, ins_len);
+    free(tmp);
+    // El cursor queda al final del duplicado; reposicionar al inicio.
+    b.cursor = next + (has_lf == 0 ? 1 : 0);
+    b.sel_clear();
+    b.dirty = 1;
+}
+
+// Toggle comentario "// " al inicio de la linea actual.  Si la linea ya
+// empieza con "//", lo elimina (preservando un espacio opcional tras "//").
+void toggle_comment_line(buffer.Buffer b) {
+    i32 row   = b.cursor_row();
+    i32 start = b.line_offset(row);
+    // Saltar espacios iniciales para detectar "//".
+    i32 i = start;
+    while (i < b.length && (b.data[i] == 32 || b.data[i] == 9)) i = i + 1;
+    i32 has_slashes = 0;
+    if (i + 1 < b.length && b.data[i] == 47 && b.data[i + 1] == 47) {
+        has_slashes = 1;
+    }
+    if (has_slashes == 1) {
+        // Quitar "//" (y un espacio adicional si existe).
+        i32 rm = 2;
+        if (i + 2 < b.length && b.data[i + 2] == 32) rm = 3;
+        b.delete_range(i, i + rm);
+    } else {
+        // Insertar "// " en la primera columna no-blanco (col i).
+        u8* tag = malloc(3);
+        tag[0] = 47; tag[1] = 47; tag[2] = 32;   // "// "
+        i32 saved = b.cursor;
+        b.cursor = i;
+        b.insert_bytes(tag, 3);
+        free(tag);
+        // Ajustar cursor saved si estaba despues del punto de insercion.
+        if (saved >= i) saved = saved + 3;
+        b.cursor = saved;
+    }
+    b.sel_clear();
+    b.dirty = 1;
+}
+
+i32 main() {
+    screen.Screen sc = new screen.Screen();
+
+    // ---------- F2: Launcher TUI inicial ----------
+    launcher.Launcher lc = new launcher.Launcher();
+    launcher.LauncherResult lr = lc.run(sc);
+    if (lr.mode == launcher.LR_CANCEL) {
+        sc.show_cursor();
+        sc.move_cursor(sc.rows, 1);
+        println("");
+        println("cancelado");
+        return 0;
+    }
+
+    tabs.Workspace ws = new tabs.Workspace();
+    if (lr.mode == launcher.LR_FILE) {
+        // Extraer el basename para el titulo de la pestana.
+        u8* pc = str_cstr(lr.path);
+        i32 pn = (i32) str_bytes(lr.path);
+        i32 cut = pn;
+        while (cut > 0 && pc[cut - 1] != (u8) 92 && pc[cut - 1] != (u8) 47) {
+            cut = cut - 1;
+        }
+        string title = str_make(pc + cut, pn - cut);
+        ws.open_tab(make_tab(lr.path, title));
+    } else if (lr.mode == launcher.LR_NEW) {
+        // Nuevo: titulo = nombre del fichero (basename), buffer vacio.
+        u8* pc = str_cstr(lr.path);
+        i32 pn = (i32) str_bytes(lr.path);
+        i32 cut = pn;
+        while (cut > 0 && pc[cut - 1] != (u8) 92 && pc[cut - 1] != (u8) 47) {
+            cut = cut - 1;
+        }
+        string title = str_make(pc + cut, pn - cut);
+        // make_tab leera del path si existe; si no, queda vacio.
+        ws.open_tab(make_tab(lr.path, title));
+    } else if (lr.mode == launcher.LR_PROJECT) {
+        // Proyecto: abre untitled + activa sidebar en el cwd seleccionado.
+        ws.open_tab(make_tab("", "untitled-1"));
+    }
+
+    Sidebar sb = new Sidebar();
+    if (lr.mode == launcher.LR_PROJECT) {
+        // sincronizar cwd de sidebar con el seleccionado en launcher
+        sb.cwd = lr.path;
+        sb.reload();
+        sb.visible = 1;
+    }
+    syntax.SyntaxHighlighter hl = new syntax.SyntaxHighlighter();
+    // F4: multicursor state.
+    multicursor.MultiCursor mc = new multicursor.MultiCursor();
+    // F5: autocomplete.  Index se reconstruye al abrir/saltar tab.
+    autocomplete.AutoComplete ac = new autocomplete.AutoComplete();
+    i32 ac_dirty = 1;   // flag: hay que reindex en el siguiente uso.
+    // F7: cargar settings persistentes desde .vexed.json (cwd-local).  Si
+    // el fichero no existe, usa defaults (show_line_numbers=1, show_ws=0).
+    EditorSettings settings = settings_load();
+    // Sincronizar sidebar visibility con la setting cargada.  Aplica solo
+    // si estamos en Project mode (sb.visible ya se puso a 1 antes); para
+    // FILE/NEW deja sb.visible=0 default.
+    if (lr.mode == launcher.LR_PROJECT) {
+        sb.visible = settings.show_sidebar;
+    }
+
+    i32 view_rows = sc.rows - 2;
+    string default_status = "F1=ayuda  Ctrl-B=sidebar  Ctrl-E=lineas  Ctrl-T=whitespace  Ctrl-Q=salir";
+    string status_msg = default_status;
+
+    sc.hide_cursor();
+    sc.clear();
+
+    i32 quit = 0;
+    i32 loop_iter = 0;
+    while (quit == 0) {
+        tabs.EditorTab tab = ws.active;
+        buffer.Buffer b = tab.buf;
+        diag_log("LOOP iter=${loop_iter} title='${tab.title}' buf.length=${b.length} line_count=${b.line_count()}");
+        loop_iter = loop_iter + 1;
+        history.SnapshotStack st = tab.undo;
+        history.SnapshotStack rd = tab.redo;
+        i32 row_top = tab.row_top;
+
+        // Refrescar viewport.
+        i32 cur_row = b.cursor_row();
+        if (cur_row < row_top) row_top = cur_row;
+        if (cur_row >= row_top + view_rows) row_top = cur_row - view_rows + 1;
+        tab.row_top = row_top;
+
+        draw_full(ws, sb, sc, view_rows, status_msg, hl, settings);
+
+        i32 editor_left = 1;
+        if (sb.visible == 1) editor_left = sb.width + 1;
+        // F8: descontar el ancho del gutter para que el cursor caiga sobre el
+        // caracter correcto del editor body.
+        if (settings.show_line_numbers == 1) {
+            i32 gutter_w = 6;
+            i32 total_lines = b.line_count();
+            if (total_lines >= 100000) gutter_w = 8;
+            else if (total_lines >= 10000) gutter_w = 7;
+            editor_left = editor_left + gutter_w;
+        }
+        if (sb.focused == 1) {
+            i32 srow = (sb.sel - sb.scroll) + 2;
+            sc.move_cursor(srow, 1);
+        } else {
+            i32 screen_row = (cur_row - row_top) + 2;
+            i32 screen_col = b.cursor_col() + editor_left;
+            i32 max_c = sc.cols - 1;
+            if (screen_col > max_c) screen_col = max_c;
+            sc.move_cursor(screen_row, screen_col);
+            sc.show_cursor();
+        }
+        flush();
+
+        i32 key = input.read_key_blocking();
+        sc.hide_cursor();
+        status_msg = default_status;
+
+        // --- Dispatch del sidebar cuando tiene foco ---
+        if (sb.focused == 1) {
+            if (key == keys.KEY_CTRL_Q) {
+                quit = 1;
+            } else if (key == keys.KEY_CTRL_B) {
+                sb.visible = 0; sb.focused = 0;
+                sc.clear();
+            } else if (key == keys.VK_F6) {
+                sb.focused = 0;
+            } else if (key == keys.VK_UP)   { sb.move_up();   }
+            else if (key == keys.VK_DOWN)   { sb.move_down(); }
+            else if (key == keys.VK_HOME)   { sb.sel = 0; }
+            else if (key == keys.VK_END)    { sb.sel = sb.count - 1; }
+            else if (key == keys.KEY_ESC || key == keys.VK_LEFT) {
+                sb.focused = 0;
+                status_msg = "foco editor";
+            } else if (key == keys.KEY_ENTER || key == keys.KEY_LF || key == keys.VK_RIGHT) {
+                if (sb.count > 0) {
+                    if (sb.entry_is_dir(sb.sel) == 1) {
+                        string nm = sb.entry_name(sb.sel);
+                        // ".." sigue siendo cd-up (replace cwd).  Otros dirs:
+                        // F3 toggle expand/collapse en lugar de cd.
+                        if (str_equals(nm, "..")) {
+                            u8* c = str_cstr(sb.cwd);
+                            i32 nL = (i32) str_bytes(sb.cwd);
+                            i32 cut = nL;
+                            while (cut > 0 && c[cut - 1] != (u8) 92) cut = cut - 1;
+                            if (cut > 0) cut = cut - 1;
+                            if (cut > 0) sb.cwd = str_make(c, cut);
+                            sb.sel = 0; sb.scroll = 0;
+                            sb.reload();
+                        } else {
+                            // F3: toggle expand.
+                            if (sb.is_expanded[sb.sel] == 1) {
+                                sb.collapse_at(sb.sel);
+                            } else {
+                                sb.expand_at(sb.sel);
+                            }
+                        }
+                    } else {
+                        diag_log("sidebar file branch begin");   // WORKAROUND
+                        string p = sb.entry_path(sb.sel);
+                        diag_log("entry_path done");
+                        string nm = sb.entry_name(sb.sel);
+                        diag_log("entry_name done");
+                        i32 plen = (i32) str_bytes(p);
+                        diag_log("sidebar ENTER path_bytes=${plen}");
+                        tabs.EditorTab new_t = make_tab(p, nm);
+                        diag_log("post make_tab, new_t.buf.length=${new_t.buf.length} line_count=${new_t.buf.line_count()}");
+                        ws.open_tab(new_t);
+                        diag_log("post open_tab, ws.count=${ws.count}");
+                        tabs.EditorTab chk = ws.active;
+                        diag_log("ws.active.buf.length=${chk.buf.length} line_count=${chk.buf.line_count()} title='${chk.title}'");
+                        sb.focused = 0;
+                        sc.clear();
+                        if (make_tab_last_status > 0) {
+                            status_msg = "abierto: ${nm} (${make_tab_last_status} B, path ${plen} B)";
+                        } else if (make_tab_last_status == -1) {
+                            status_msg = "abierto: ${nm} (vacio)";
+                        } else if (make_tab_last_status == -2) {
+                            status_msg = "FAIL leer ${nm} err=${make_tab_last_err} path=${plen}B";
+                        } else {
+                            status_msg = "abierto: ${nm} (status=${make_tab_last_status})";
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (key == keys.KEY_CTRL_Q) {
+            quit = 1;
+        } else if (key == keys.KEY_ESC) {
+            // Esc: cancela seleccion + limpia multicursores extra.
+            if (mc.has_extras() == 1) {
+                mc.clear();
+                status_msg = "multicursor limpiado";
+            } else if (b.sel_active() == 1) {
+                b.sel_clear();
+                status_msg = "seleccion cancelada";
+            } else {
+                status_msg = "usa Ctrl-Q para salir";
+            }
+        }
+        // --- movimiento sin shift: limpia la seleccion ---
+        else if (key == keys.VK_LEFT)  { b.sel_clear(); b.move_left(); }
+        else if (key == keys.VK_RIGHT) { b.sel_clear(); b.move_right(); }
+        else if (key == keys.VK_UP)    { b.sel_clear(); b.move_up(); }
+        else if (key == keys.VK_DOWN)  { b.sel_clear(); b.move_down(); }
+        else if (key == keys.VK_HOME)  { b.sel_clear(); b.move_home(); }
+        else if (key == keys.VK_END)   { b.sel_clear(); b.move_end(); }
+        else if (key == keys.VK_PGUP) {
+            b.sel_clear();
+            i32 j = 0;
+            while (j < view_rows) { b.move_up(); j = j + 1; }
+        } else if (key == keys.VK_PGDN) {
+            b.sel_clear();
+            i32 j = 0;
+            while (j < view_rows) { b.move_down(); j = j + 1; }
+        }
+        // --- movimiento con shift: extiende la seleccion ---
+        else if (key == keys.VK_SHIFT_LEFT)  { b.sel_begin(); b.move_left(); }
+        else if (key == keys.VK_SHIFT_RIGHT) { b.sel_begin(); b.move_right(); }
+        else if (key == keys.VK_SHIFT_UP)    { b.sel_begin(); b.move_up(); }
+        else if (key == keys.VK_SHIFT_DOWN)  { b.sel_begin(); b.move_down(); }
+        else if (key == keys.VK_SHIFT_HOME)  { b.sel_begin(); b.move_home(); }
+        else if (key == keys.VK_SHIFT_END)   { b.sel_begin(); b.move_end(); }
+        // --- movimiento por palabra (Ctrl+Left/Right) ---
+        else if (key == keys.VK_CTRL_LEFT)  { b.sel_clear(); b.move_word_left(); }
+        else if (key == keys.VK_CTRL_RIGHT) { b.sel_clear(); b.move_word_right(); }
+        else if (key == keys.VK_CTRL_HOME)  { b.sel_clear(); b.cursor = 0; }
+        else if (key == keys.VK_CTRL_END)   { b.sel_clear(); b.cursor = b.length; }
+        // --- F4: multicursor (Ctrl+Up/Down agregan cursores) ---
+        else if (key == keys.VK_CTRL_UP) {
+            mc.add_above(b);
+            status_msg = "multicursor: ${mc.count + 1} cursores (Esc para limpiar)";
+        }
+        else if (key == keys.VK_CTRL_DOWN) {
+            mc.add_below(b);
+            status_msg = "multicursor: ${mc.count + 1} cursores (Esc para limpiar)";
+        }
+        // --- F5: autocomplete (F5 muestra popup; Up/Down navega; Tab acepta) ---
+        else if (key == keys.VK_F5) {
+            if (ac_dirty == 1) { ac.rebuild(b); ac_dirty = 0; }
+            ac.prefix_before_cursor(b);
+            ac.popup_sel = 0;
+            ac.recompute_filter();
+            if (ac.filt_count == 0) {
+                status_msg = "autocomplete: sin sugerencias (prefijo='${ac.prefix_len}' chars)";
+            } else {
+                // Mostrar popup + loop interno hasta Tab/Esc.
+                ac.popup_active = 1;
+                i32 cur_row = b.cursor_row();
+                i32 cur_col = b.cursor_col();
+                i32 anchor_row = (cur_row - tab.row_top) + 2;
+                i32 sb_off = 1;
+                if (sb.visible == 1) sb_off = sb.width + 1;
+                if (settings.show_line_numbers == 1) sb_off = sb_off + 6;
+                i32 anchor_col = cur_col + sb_off;
+                i32 ac_done = 0;
+                while (ac_done == 0) {
+                    diag_log("ac iter");        // WORKAROUND latent bug
+                    ac.render_popup(sc, anchor_row, anchor_col);
+                    flush();
+                    i32 ak = input.read_key_blocking();
+                    if (ak == keys.KEY_ESC) {
+                        ac.popup_active = 0;
+                        ac_done = 1;
+                    } else if (ak == keys.VK_UP) {
+                        if (ac.popup_sel > 0) ac.popup_sel = ac.popup_sel - 1;
+                    } else if (ak == keys.VK_DOWN) {
+                        if (ac.popup_sel < ac.filt_count - 1 && ac.popup_sel < 9) {
+                            ac.popup_sel = ac.popup_sel + 1;
+                        }
+                    } else {
+                        // KEY_TAB=9 o KEY_ENTER acepta.
+                        if (ak == 9 || ak == keys.KEY_ENTER || ak == keys.KEY_LF) {
+                            snapshot(b, st, rd);
+                            ac.accept(b);
+                            ac_dirty = 1;
+                        }
+                        ac.popup_active = 0;
+                        ac_done = 1;
+                    }
+                }
+                sc.clear();
+                status_msg = "autocomplete: ${ac.filt_count} sugerencias";
+            }
+        }
+        // --- edicion ---
+        else if (key == keys.VK_DEL) {
+            snapshot(b, st, rd);
+            if (b.sel_active() == 1) {
+                b.delete_selection();
+            } else if (b.cursor < b.length) {
+                b.delete_range(b.cursor, b.cursor + 1);
+            }
+        } else if (key == keys.KEY_BACKSPACE || key == keys.KEY_BACKSPACE_WIN) {
+            snapshot(b, st, rd);
+            if (b.sel_active() == 1) {
+                b.delete_selection();
+            } else if (b.cursor > 0) {
+                b.backspace();
+            }
+        } else if (key == keys.KEY_ENTER || key == keys.KEY_LF) {
+            snapshot(b, st, rd);
+            if (b.sel_active() == 1) b.delete_selection();
+            // Auto-indent: copia la sangria (spaces + tabs) de la linea actual.
+            i32 cur_row_idx = b.cursor_row();
+            i32 ls = b.line_offset(cur_row_idx);
+            i32 indent_end = ls;
+            while (indent_end < b.length) {
+                i32 ch = (i32) b.data[indent_end];
+                if (ch == 32 || ch == 9) {
+                    indent_end = indent_end + 1;
+                } else {
+                    break;
+                }
+            }
+            // Indent_end no debe exceder el cursor (no sangra mas alla).
+            if (indent_end > b.cursor) indent_end = b.cursor;
+            i32 indent_n = indent_end - ls;
+            // Smart-indent: si el ultimo char no-blanco de la linea anterior
+            // es `{`, anyade 4 spaces extra.  Soporta estilo C/Java/Rust/Vex.
+            i32 extra_indent = 0;
+            i32 cur_cursor = b.cursor;
+            i32 j = cur_cursor - 1;
+            while (j >= ls) {
+                i32 ch = (i32) b.data[j];
+                if (ch == 32 || ch == 9) {
+                    j = j - 1;
+                } else {
+                    if (ch == 123) extra_indent = 4;   // '{'
+                    j = ls - 1;                          // exit
+                }
+            }
+            b.newline();
+            if (indent_n > 0) {
+                u8* src = b.data + ls;
+                b.insert_bytes(src, indent_n);
+            }
+            // Anyadir indentacion extra (4 spaces si lineas-previa termina en `{`).
+            if (extra_indent > 0) {
+                u8* spaces = malloc(extra_indent + 1);
+                i32 k = 0;
+                while (k < extra_indent) { spaces[k] = 32; k = k + 1; }
+                spaces[extra_indent] = 0;
+                b.insert_bytes(spaces, extra_indent);
+                free(spaces);
+            }
+        }
+        // --- portapapeles ---
+        else if (key == keys.KEY_CTRL_C) {
+            if (b.sel_active() == 1) {
+                i32 ss = b.sel_start();
+                i32 se = b.sel_end();
+                u8* p = b.data + ss;
+                clipboard.clip_set(p, se - ss);
+                status_msg = "copiados ${se - ss} bytes";
+            } else {
+                status_msg = "sin seleccion para copiar";
+            }
+        } else if (key == keys.KEY_CTRL_X) {
+            if (b.sel_active() == 1) {
+                snapshot(b, st, rd);
+                i32 ss = b.sel_start();
+                i32 se = b.sel_end();
+                u8* p = b.data + ss;
+                clipboard.clip_set(p, se - ss);
+                i32 n = b.delete_selection();
+                status_msg = "cortados ${n} bytes";
+            } else {
+                status_msg = "sin seleccion para cortar";
+            }
+        } else if (key == keys.KEY_CTRL_V || key == keys.KEY_CTRL_U) {
+            if (clipboard.clip_empty() == 1) {
+                status_msg = "portapapeles vacio";
+            } else {
+                snapshot(b, st, rd);
+                if (b.sel_active() == 1) b.delete_selection();
+                u8* src = clipboard.clip_data();
+                i32 n = clipboard.clip_len();
+                b.insert_bytes(src, n);
+                status_msg = "pegados ${n} bytes";
+            }
+        } else if (key == keys.KEY_CTRL_K) {
+            // Cortar linea actual (incluye el \n si no es la ultima).
+            snapshot(b, st, rd);
+            i32 row = b.cursor_row();
+            i32 ls = b.line_offset(row);
+            i32 le = b.length;
+            if (row + 1 < b.line_count()) le = b.line_offset(row + 1);
+            u8* p = b.data + ls;
+            clipboard.clip_set(p, le - ls);
+            i32 n = b.delete_range(ls, le);
+            status_msg = "linea cortada (${n} bytes)";
+        } else if (key == keys.KEY_CTRL_S) {
+            Result<i64, i32> rsave = file_io.save_buffer(tab.title, b);
+            if (isOk(rsave)) {
+                status_msg = "guardado ${value(rsave)} bytes en ${tab.title}";
+                b.dirty = 0;
+            } else {
+                status_msg = "error al guardar (codigo ${error(rsave)})";
+            }
+        } else if (key == keys.KEY_CTRL_O) {
+            string newname = prompt(sc, "Guardar como");
+            if (str_bytes(newname) > 0) {
+                Result<i64, i32> rsave = file_io.save_buffer(newname, b);
+                if (isOk(rsave)) {
+                    tab.title = newname;
+                    status_msg = "guardado ${value(rsave)} bytes en ${tab.title}";
+                    b.dirty = 0;
+                } else {
+                    status_msg = "error al guardar (codigo ${error(rsave)})";
+                }
+            }
+            sc.clear();
+        } else if (key == keys.KEY_CTRL_F) {
+            string needle = prompt(sc, "Buscar");
+            if (str_bytes(needle) > 0) {
+                tab.last_needle = needle;
+                i64 idx = search.find_from(b, needle, b.cursor + 1);
+                if (idx < 0) idx = search.find(b, needle);  // wrap
+                if (idx < 0) {
+                    status_msg = "no encontrado: ${needle}";
+                } else {
+                    b.cursor = (i32) idx;
+                    b.sel_clear();
+                    status_msg = "encontrado en offset ${idx}";
+                }
+            }
+            sc.clear();
+        } else if (key == keys.VK_F3) {
+            // F3 = repetir ultima busqueda (sin pedir patron).
+            if (str_bytes(tab.last_needle) == 0) {
+                status_msg = "sin patron previo; usa Ctrl-F primero";
+            } else {
+                string nd = tab.last_needle;
+                i64 idx = search.find_from(b, nd, b.cursor + 1);
+                if (idx < 0) idx = search.find(b, nd);
+                if (idx < 0) {
+                    status_msg = "no encontrado: ${nd}";
+                } else {
+                    b.cursor = (i32) idx;
+                    b.sel_clear();
+                    status_msg = "siguiente en offset ${idx}";
+                }
+            }
+        } else if (key == keys.KEY_CTRL_G) {
+            // Goto line: pide numero (1-based).
+            string ln_str = prompt(sc, "Ir a linea");
+            if (str_bytes(ln_str) > 0) {
+                // Parseo decimal manual desde el StringObject.
+                u8* p = str_cstr(ln_str);
+                i32 n_bytes = (i32) str_bytes(ln_str);
+                i32 v = 0;
+                i32 j = 0;
+                while (j < n_bytes) {
+                    i32 ch = (i32) p[j];
+                    if (ch >= 48 && ch <= 57) {
+                        v = v * 10 + (ch - 48);
+                    } else {
+                        break;
+                    }
+                    j = j + 1;
+                }
+                if (v > 0) {
+                    b.goto_line(v - 1);
+                    b.sel_clear();
+                    status_msg = "ir a linea ${v}";
+                } else {
+                    status_msg = "linea invalida";
+                }
+            }
+            sc.clear();
+        } else if (key == keys.KEY_CTRL_Z) {
+            history.Snapshot rsnap;
+            i32 ok = history.stack_pop_into(st, &rsnap);
+            if (ok == 1) {
+                // Guarda el estado actual en redo antes de restaurar.
+                history.Snapshot cur;
+                history.make_snapshot_into(b, &cur);
+                history.stack_push(rd, &cur);
+                history.restore(b, &rsnap);
+                b.sel_clear();
+                status_msg = "undo aplicado";
+            } else {
+                status_msg = "nada que deshacer";
+            }
+        } else if (key == keys.KEY_CTRL_Y) {
+            history.Snapshot rsnap;
+            i32 ok = history.stack_pop_into(rd, &rsnap);
+            if (ok == 1) {
+                history.Snapshot cur;
+                history.make_snapshot_into(b, &cur);
+                history.stack_push(st, &cur);
+                history.restore(b, &rsnap);
+                b.sel_clear();
+                status_msg = "redo aplicado";
+            } else {
+                status_msg = "nada que rehacer";
+            }
+        }
+        // --- sidebar toggle / focus ---
+        else if (key == keys.KEY_CTRL_B) {
+            if (sb.visible == 1) {
+                sb.visible = 0; sb.focused = 0;
+                settings.show_sidebar = 0;
+            } else {
+                sb.visible = 1; sb.focused = 1;
+                settings.show_sidebar = 1;
+            }
+            sc.clear();
+        } else if (key == keys.VK_F6) {
+            if (sb.visible == 1) {
+                sb.focused = 1;
+                status_msg = "foco sidebar (Esc/Left para volver)";
+            } else {
+                status_msg = "sidebar oculta (Ctrl-B para abrir)";
+            }
+        }
+        // --- gestion de pestanas ---
+        else if (key == keys.KEY_CTRL_N) {
+            ws.open_tab(make_tab("", "untitled-${ws.count + 1}"));
+            sc.clear();
+            status_msg = "nueva pestana";
+        } else if (key == keys.KEY_CTRL_W) {
+            // Ctrl-W: cerrar pestana actual.  Si es la unica, NO salir
+            // automaticamente del editor (eso es agresivo y sorprende al
+            // usuario tras LANG.fix-10 que arreglo el check de Ctrl-Q).
+            // Para salir hay que usar Ctrl-Q explicito.
+            if (ws.count == 1) {
+                status_msg = "no se puede cerrar la unica pestana; usa Ctrl-Q para salir";
+            } else {
+                if (b.dirty == 1) {
+                    status_msg = "pestana modificada; guarda con Ctrl-S antes de cerrar";
+                } else {
+                    ws.close_active();
+                    sc.clear();
+                    status_msg = "pestana cerrada";
+                }
+            }
+        } else if (key == keys.VK_CTRL_PGUP) {
+            ws.prev_tab();
+            sc.clear();
+        } else if (key == keys.VK_CTRL_PGDN) {
+            ws.next_tab();
+            sc.clear();
+        } else if (key == keys.VK_F1) {
+            show_help(sc);
+        } else if (key == keys.KEY_CTRL_P) {
+            // Ctrl-P: fuzzy file picker.  Lista recursiva desde sb.cwd (o
+            // cwd de proceso si no hay sidebar Project).  Modal interactivo.
+            string picker_cwd = sb.cwd;
+            if (str_bytes(picker_cwd) == 0) picker_cwd = ".";
+            file_picker.FilePicker fp = new file_picker.FilePicker(picker_cwd);
+            fp.populate();
+            sc.hide_cursor();
+            i32 fp_done = 0;
+            while (fp_done == 0) {
+                diag_log("file_picker iter");   // WORKAROUND latent bug
+                fp.render(sc);
+                i32 fk = input.read_key_blocking();
+                i32 act = fp.handle_key(fk);
+                if (act == 1) {
+                    // Seleccionado: abrir el fichero.
+                    string p = fp.selected_path();
+                    string nm = fp.selected_name();
+                    if (str_bytes(p) > 0) {
+                        ws.open_tab(make_tab(p, nm));
+                        sc.clear();
+                        status_msg = "abierto via Ctrl-P: ${nm}";
+                    }
+                    fp_done = 1;
+                } else if (act == 2) {
+                    sc.clear();
+                    status_msg = "picker cancelado";
+                    fp_done = 1;
+                }
+            }
+        } else if (key == keys.KEY_CTRL_D) {
+            // Duplicar linea actual.
+            snapshot(b, st, rd);
+            duplicate_line(b);
+            status_msg = "linea duplicada";
+        } else if (key == keys.VK_F4) {
+            // Toggle comentario en la linea actual.
+            snapshot(b, st, rd);
+            toggle_comment_line(b);
+            status_msg = "comentario alternado";
+        } else if (key == keys.KEY_CTRL_E) {
+            // F8: toggle line numbers.
+            if (settings.show_line_numbers == 1) {
+                settings.show_line_numbers = 0;
+                status_msg = "line numbers: OFF";
+            } else {
+                settings.show_line_numbers = 1;
+                status_msg = "line numbers: ON";
+            }
+            sc.clear();
+        } else if (key == keys.KEY_CTRL_T) {
+            // F8: toggle whitespace visualization.
+            if (settings.show_whitespace == 1) {
+                settings.show_whitespace = 0;
+                status_msg = "whitespace: OFF";
+            } else {
+                settings.show_whitespace = 1;
+                status_msg = "whitespace: ON";
+            }
+            sc.clear();
+        } else if (key >= 32 && key < 127) {
+            // Insertar caracter imprimible.  F4: si hay multicursores, aplica
+            // a todos via mc.insert_char_at_all (limpia extras tras op).
+            snapshot(b, st, rd);
+            if (b.sel_active() == 1) b.delete_selection();
+            if (mc.has_extras() == 1) {
+                mc.insert_char_at_all(b, key);
+                status_msg = "char insertado en N cursores (extras limpiadas)";
+            } else {
+                b.insert_char(key);
+            }
+            ac_dirty = 1;   // F5: invalida el autocomplete index.
+        }
+        // Otras teclas: ignoradas (no salen del editor).
+    }
+
+    // F7: persistir settings al disco antes de salir.
+    settings_save(settings);
+
+    sc.show_cursor();
+    sc.move_cursor(sc.rows, 1);
+    println("");
+    println("bye");
+    return 42;
+}

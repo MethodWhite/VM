@@ -1158,6 +1158,32 @@ void emit_instr_three_reg(
     code_final.emit8(static_cast<uint8_t>((idx3 << 4)));                  // b3
 }
 
+// Emite 4 regs empacados en FIXED_4 (4 nibbles, 2 bytes).  Layout:
+//   b2 = (r0 << 4) | r1
+//   b3 = (r2 << 4) | r3
+// Util para @c atomiccas (dst, addr, exp, des).
+void emit_instr_four_reg(
+    const vm::Instruction *instruction_parser,
+    ByteWriter &           code_final,
+    const InstrInfo *      /*now_instr*/,
+    Assembler *            /*assembly_ctx*/
+) {
+    auto r1 = dynamic_cast<vm::RegisterOperand *>(instruction_parser->operands[0].get());
+    auto r2 = dynamic_cast<vm::RegisterOperand *>(instruction_parser->operands[1].get());
+    auto r3 = dynamic_cast<vm::RegisterOperand *>(instruction_parser->operands[2].get());
+    auto r4 = dynamic_cast<vm::RegisterOperand *>(instruction_parser->operands[3].get());
+    if (r1 == nullptr || r2 == nullptr || r3 == nullptr || r4 == nullptr)
+        throw std::runtime_error(instruction_parser->opcode + ": requires four register operands");
+
+    uint8_t idx1 = encode_reg_general(r1->name.c_str());
+    uint8_t idx2 = encode_reg_general(r2->name.c_str());
+    uint8_t idx3 = encode_reg_general(r3->name.c_str());
+    uint8_t idx4 = encode_reg_general(r4->name.c_str());
+
+    code_final.emit8(static_cast<uint8_t>((idx1 << 4) | (idx2 & 0x0F))); // b2
+    code_final.emit8(static_cast<uint8_t>((idx3 << 4) | (idx4 & 0x0F))); // b3
+}
+
 // =========================================================================
 // Cursor read/write (readcur / writecur) emission
 // =========================================================================

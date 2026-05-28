@@ -4,3 +4,6 @@
 out
 *.mmd
 *.c
+*.log
+*.vexi
+*.vexir

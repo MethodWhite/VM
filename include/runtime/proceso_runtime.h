@@ -451,6 +451,17 @@ namespace runtime {
          */
         std::atomic<bool> wake_pending { false };
 
+        /**
+         * @brief B4.3: flag de "notify recibido" para que MONWAIT no
+         * re-bloquee tras un wake.
+         *
+         * Set por @c monnoti / @c monnota en el proceso popeado de la cola
+         * CONDVAR.  Consumido por @c monwait al re-ejecutar tras wake:
+         * si esta set, lo limpia y AVANZA el PC (sin re-bloquear).
+         * Lock-free (atomic exchange).
+         */
+        std::atomic<bool> condvar_notified { false };
+
         // --- Cache de instrucciones descodificadas (icache) ---
         DecodedInstr icache[ICACHE_SIZE] = {}; ///< Tabla de instrucciones descodificadas indexada por icache_index(PC)
 
@@ -637,6 +648,11 @@ namespace runtime {
         std::jmp_buf av_recovery_jmpbuf;
         bool         av_recovery_active = false;
         uint64_t     pending_av_addr    = 0; ///< direccion bruta del AV (informativa)
+        /// Tipo de excepcion host que disparo el recovery:
+        ///   0 = AV (segfault, default), 1 = DIVIDE_BY_ZERO, 2 = INT_OVERFLOW.
+        /// El scheduler lo consulta tras el @c longjmp para emitir el
+        /// @c FatalError adecuado.
+        uint32_t     pending_av_kind   = 0;
 
         StringInternPool *str_intern_pool = nullptr; ///< Pool de strings internados (creado bajo demanda)
 

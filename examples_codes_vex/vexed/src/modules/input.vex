@@ -1,0 +1,180 @@
+// =============================================================================
+// modules/input.vex - lectura raw de teclado.
+// Windows: via kernel32.ReadConsoleInputA (evita el bug LANG.fix-6 que
+// triggea msvcrt._getch con bytes scancode reales).  ReadConsoleInputA
+// retorna eventos completos con wVirtualKeyCode directo, sin secuencias
+// dual-byte ni escape sequences, eliminando el patron problematico.
+// =============================================================================
+
+import "modules/keys";
+
+i64 g_kernel32     = 0;
+i64 g_get_std      = 0;
+i64 g_read_input   = 0;
+i64 g_stdin_h      = 0;
+i64 g_irec_buf     = 0;  // u8* buffer para INPUT_RECORD (20 bytes)
+i64 g_nread_buf    = 0;  // u8* buffer para nread DWORD (4 bytes)
+i32 g_init         = 0;
+
+void ensure_loaded() {
+    if (g_init != 0) return;
+    g_kernel32     = ffi_open("kernel32.dll");
+    g_get_std      = ffi_sym(g_kernel32, "GetStdHandle");
+    g_read_input   = ffi_sym(g_kernel32, "ReadConsoleInputA");
+    // STD_INPUT_HANDLE = -10 (DWORD) = 0xFFFFFFF6.  Pasamos como i64
+    // con sign-extend; el FFI marshalling toma los bits bajos.
+    i64 std_input  = -10;
+    g_stdin_h      = ffi_call(g_get_std, std_input);
+    // Reservar buffers en host memory.  INPUT_RECORD son 20 bytes en x64.
+    u8* irec       = malloc(32);
+    u8* nread      = malloc(8);
+    g_irec_buf     = (i64) irec;
+    g_nread_buf    = (i64) nread;
+    g_init         = 1;
+}
+
+// Lee WORD (2 bytes) little-endian desde u8* buf en offset dado.
+i32 read_u16_le(u8* buf, i32 off) {
+    i32 lo = (i32) buf[off];
+    i32 hi = (i32) buf[off + 1];
+    return (hi << 8) | lo;
+}
+
+// Lee DWORD (4 bytes) little-endian desde u8* buf en offset dado.
+i32 read_u32_le(u8* buf, i32 off) {
+    i32 b0 = (i32) buf[off];
+    i32 b1 = (i32) buf[off + 1];
+    i32 b2 = (i32) buf[off + 2];
+    i32 b3 = (i32) buf[off + 3];
+    return (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+}
+
+// Mapea Windows wVirtualKeyCode + dwControlKeyState a keys.VK_* del editor.
+//
+// Windows VK_* codes:
+//   VK_PRIOR (PgUp) = 0x21    VK_NEXT (PgDn)  = 0x22
+//   VK_END   = 0x23           VK_HOME         = 0x24
+//   VK_LEFT  = 0x25           VK_UP           = 0x26
+//   VK_RIGHT = 0x27           VK_DOWN         = 0x28
+//   VK_INSERT = 0x2D          VK_DELETE       = 0x2E
+//   VK_F1..F10 = 0x70..0x79
+//
+// dwControlKeyState bits:
+//   RIGHT_ALT_PRESSED  = 0x01    LEFT_ALT_PRESSED  = 0x02
+//   RIGHT_CTRL_PRESSED = 0x04    LEFT_CTRL_PRESSED = 0x08
+//   SHIFT_PRESSED      = 0x10
+i32 map_win_vk(i32 vk, i32 cks) {
+    i32 is_ctrl  = 0;
+    i32 is_shift = 0;
+    if ((cks & 12) != 0) is_ctrl  = 1;   // 0x0C = LEFT_CTRL | RIGHT_CTRL
+    if ((cks & 16) != 0) is_shift = 1;   // 0x10 = SHIFT
+
+    // Arrows
+    if (vk == 37) {  // VK_LEFT
+        if (is_ctrl == 1)  return keys.VK_CTRL_LEFT;
+        if (is_shift == 1) return keys.VK_SHIFT_LEFT;
+        return keys.VK_LEFT;
+    }
+    if (vk == 38) {  // VK_UP
+        if (is_ctrl == 1)  return keys.VK_CTRL_UP;
+        if (is_shift == 1) return keys.VK_SHIFT_UP;
+        return keys.VK_UP;
+    }
+    if (vk == 39) {  // VK_RIGHT
+        if (is_ctrl == 1)  return keys.VK_CTRL_RIGHT;
+        if (is_shift == 1) return keys.VK_SHIFT_RIGHT;
+        return keys.VK_RIGHT;
+    }
+    if (vk == 40) {  // VK_DOWN
+        if (is_ctrl == 1)  return keys.VK_CTRL_DOWN;
+        if (is_shift == 1) return keys.VK_SHIFT_DOWN;
+        return keys.VK_DOWN;
+    }
+
+    // Navegacion
+    if (vk == 36) {  // VK_HOME
+        if (is_ctrl == 1)  return keys.VK_CTRL_HOME;
+        if (is_shift == 1) return keys.VK_SHIFT_HOME;
+        return keys.VK_HOME;
+    }
+    if (vk == 35) {  // VK_END
+        if (is_ctrl == 1)  return keys.VK_CTRL_END;
+        if (is_shift == 1) return keys.VK_SHIFT_END;
+        return keys.VK_END;
+    }
+    if (vk == 33) {  // VK_PRIOR (PgUp)
+        if (is_ctrl == 1) return keys.VK_CTRL_PGUP;
+        return keys.VK_PGUP;
+    }
+    if (vk == 34) {  // VK_NEXT (PgDn)
+        if (is_ctrl == 1) return keys.VK_CTRL_PGDN;
+        return keys.VK_PGDN;
+    }
+
+    // Insert / Delete
+    if (vk == 45) return keys.VK_INS;
+    if (vk == 46) return keys.VK_DEL;
+
+    // F-keys
+    if (vk == 112) return keys.VK_F1;
+    if (vk == 113) return keys.VK_F2;
+    if (vk == 114) return keys.VK_F3;
+    if (vk == 115) return keys.VK_F4;
+    if (vk == 116) return keys.VK_F5;
+    if (vk == 117) return keys.VK_F6;
+    if (vk == 121) return keys.VK_F10;
+
+    return keys.KEY_NONE;
+}
+
+// Lee UN evento del console input y retorna la tecla mapeada.  Si el
+// evento no es KEY_EVENT down con tecla mapeable, descarta y reintenta.
+public i32 read_key_blocking() {
+    ensure_loaded();
+    u8* irec  = (u8*) g_irec_buf;
+    i64 nread = g_nread_buf;
+
+    while (1) {
+        // ReadConsoleInputA(hConsoleInput, lpBuffer, nLength=1, lpNumberOfEventsRead)
+        i64 ok = ffi_call(g_read_input, g_stdin_h, g_irec_buf, 1, nread);
+        if (ok == 0) return keys.KEY_NONE;  // error de I/O
+
+        // INPUT_RECORD layout:
+        //   off 0  : WORD  EventType
+        //   off 2  : (padding to 4-byte align)
+        //   off 4  : BOOL  KeyEvent.bKeyDown          (4 bytes)
+        //   off 8  : WORD  KeyEvent.wRepeatCount      (2 bytes)
+        //   off 10 : WORD  KeyEvent.wVirtualKeyCode   (2 bytes)
+        //   off 12 : WORD  KeyEvent.wVirtualScanCode  (2 bytes)
+        //   off 14 : WORD  KeyEvent.uChar (Unicode)   (2 bytes; ASCII en byte bajo)
+        //   off 16 : DWORD KeyEvent.dwControlKeyState (4 bytes)
+        i32 event_type = read_u16_le(irec, 0);
+        if (event_type != 1) continue;   // 1 = KEY_EVENT; ignorar MOUSE/FOCUS/etc
+
+        // bKeyDown: BOOL (4 bytes, !=0 si pressed).  Solo procesamos KEY DOWN.
+        i32 key_down = read_u32_le(irec, 4);
+        if (key_down == 0) continue;
+
+        i32 vk    = read_u16_le(irec, 10);
+        i32 ascii = (i32) irec[14];           // uChar.AsciiChar en byte bajo
+        i32 cks   = read_u32_le(irec, 16);
+
+        // 1. Tecla especial (flecha/F1/Home/End/etc.) -- prioridad maxima.
+        i32 mapped = map_win_vk(vk, cks);
+        if (mapped != keys.KEY_NONE) return mapped;
+
+        // 2. ASCII (incluyendo control chars como Ctrl+Q = 0x11, Tab=9, Enter=13).
+        //    Skipear los key-events sin caracter (modificadores puros, etc.).
+        if (ascii != 0) return ascii;
+
+        // Sino, ignorar y leer siguiente evento.
+    }
+    return keys.KEY_NONE;
+}
+
+// Compat shim: el codigo viejo podria llamar poll_key.  Con ReadConsoleInputA
+// el patron es bloqueante directo; retornamos KEY_NONE para sigificar
+// "no hay tecla disponible sin bloquear" (no se usa en el editor actual).
+public i32 poll_key() {
+    return keys.KEY_NONE;
+}

@@ -1,0 +1,58 @@
+enum JsonValue {
+    JNull,
+    JBool(bool),
+    JNumber(f64),
+    JString(string),
+    JArray(JsonArray),
+    JObject(JsonObject)
+}
+
+class JsonArray {
+    public JsonValue[] items;
+    public i32 count;
+    public i32 capacity;
+
+    public JsonArray() {
+        this.capacity = 8;
+        this.items = new JsonValue[8];
+        this.count = 0;
+    }
+
+    public void push(JsonValue v) {
+        if (this.count == this.capacity) {
+            JsonValue[] nuevo = new JsonValue[this.capacity * 2];
+            for (i32 i = 0; i < this.count; i++) nuevo[i] = this.items[i];
+            this.items = nuevo;
+            this.capacity *= 2;
+        }
+        this.items[this.count] = v;
+        this.count++;
+    }
+}
+
+class JsonObject {
+    public string[] keys;
+    public JsonValue[] values;
+    public i32 count;
+
+    public JsonObject() {
+        this.keys = new string[16];
+        this.values = new JsonValue[16];
+        this.count = 0;
+    }
+
+    public void put(string k, JsonValue v) {
+        this.keys[this.count] = k;
+        this.values[this.count] = v;
+        this.count++;
+    }
+}
+
+i32 main() {
+    JsonArray arr = new JsonArray();
+    arr.push(JsonValue.JNumber(3.14));
+    arr.push(JsonValue.JString("hola"));
+    arr.push(JsonValue.JBool(true));
+    return arr.count;
+}
+

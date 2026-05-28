@@ -411,6 +411,15 @@ namespace runtime {
     void decode_instr_three_reg(ProcessVM *vm, DecodedInstr &instr);
 
     /**
+     * @brief Descodifica 4 regs empacados en FIXED_4 (4 nibbles, 2 bytes):
+     *   byte2 (rip+2) = (r0 << 4) | r1
+     *   byte3 (rip+3) = (r2 << 4) | r3
+     * Almacena en mem_data: reg_base=r0, reg_index=r1, reg_final=r2, scale=r3.
+     * Util para @c atomiccas (dst, addr, exp, des).
+     */
+    void decode_instr_four_reg(ProcessVM *vm, DecodedInstr &instr);
+
+    /**
      * @brief Descodifica una instruccion de acceso a static field (getstatic /
      *        setstatic, FIXED_8).
      *

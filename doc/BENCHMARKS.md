@@ -12,6 +12,7 @@ Performance del intérprete y JIT C1, metodología, y comparativas con otras VMs
   - [2. Hardware y metodologia](#2-hardware-y-metodologia)
   - [3. Benchmarks sinteticos del intérprete](#3-benchmarks-sinteticos-del-intérprete)
     - [Benchmarks core (12 incluidos)](#benchmarks-core-12-incluidos)
+    - [Benchmarks memoria compartida cross-process](#benchmarks-memoria-compartida-cross-process)
   - [4. Speedup acumulado del sprint 2026-05-17](#4-speedup-acumulado-del-sprint-2026-05-17)
   - [5. JIT C1 baseline](#5-jit-c1-baseline)
   - [6. Pipeline de optimizacion](#6-pipeline-de-optimizacion)
@@ -113,6 +114,42 @@ Ubicacion: [`examples_codes_vex/benchmark/`](../examples_codes_vex/benchmark/).
 - ALU-heavy: **~350-360 MIPS** (limite del dispatch loop + decode).
 - LOAD-heavy: **~290-330 MIPS** (memory deps + zero-extend cost).
 - Recursion-heavy: **~200-220 MIPS** (CALL/RET overhead via frame pool).
+
+---
+
+### Benchmarks memoria compartida cross-process
+
+Suite dedicada para validar throughput del `SharedHeap` + monitores cross-scheduler
++ STW GC.  Implementadas como ficheros `bench_shared_*.vex` en
+`examples_codes_vex/benchmark/`.
+
+Ejecucion via `bash tests/vex/bench_shared_runner.sh cmake-build-windows`
+(corre cada bench en 4 modos: VM single, VM 4-sched, JIT thr=1, JIT 4-sched).
+
+| Bench                           | Que mide                                              | Iters total | VM single  | VM 4-sched | JIT 4-sched |
+| :------------------------------ | :---------------------------------------------------- | :---------: | ---------: | ---------: | ----------: |
+| `bench_shared_alloc`            | Throughput SharedHeap vs gc_heap local (1M+1M iter)  | 2M          | 1035 ms / 40 MIPS  | 1038 ms / 40 MIPS  | 1034 ms / 40 MIPS  |
+| `bench_shared_contention`       | 4 workers concurrent monenter+RMW sobre shared (Counter.add) | 400K | 256 ms / 49 MIPS   | 261 ms     | **64 ms / 177 MIPS** |
+| `bench_shared_gc`               | GC mark+sweep latency (100 cy x 1K shared + sweep)   | 100K shared | 64 ms / 35 MIPS    | 64 ms      | 68 ms       |
+| `bench_shared_stw_impact`       | STW pause impact (4 CPU-bound workers + 50 GC cycles)| 20M+50      | 429 ms / 327 MIPS  | **121 ms / 1161 MIPS** | 122 ms |
+
+**Verificacion de correctness**:
+
+- `bench_shared_alloc` -> R0 = 0x1e8480 = 2000000 (1M + 1M iter, suma exacta).
+- `bench_shared_contention` -> **R0 = 0x61a80 = 400000 exacto** en 3/3 runs
+  (post-Z.11 ext; antes perdia ~1.7% por bug de local_pid no-unico cross-sched).
+- `bench_shared_gc` -> R0 = 42 (sweep colecta huerfanos correctamente).
+- `bench_shared_stw_impact` -> R0 = 42 (workers terminan cuanto el STW corre 50x).
+
+**Patrones observables**:
+
+- `SharedHeap` alloc throughput: ~2-3x mas lento que gc_heap local (1 CAS extra
+  + register en SharedHandleTable).  Aceptable y predecible.
+- `synchronized` cross-scheduler: 4-sched es **~4x mas rapido** que single-sched
+  para CPU-bound workers no-contendentes (`bench_shared_stw_impact`: 327 -> 1161 MIPS).
+- JIT 4-sched de contention: **~4x mejor** que VM 4-sched gracias a `lock cmpxchg`
+  host inline.
+- GC sweep tiene latencia despreciable (~50-200 us por sweep para 1K objetos).
 
 ---
 

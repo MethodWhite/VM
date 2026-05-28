@@ -1,0 +1,34 @@
+// Refactor del bug3 original.  El borrow checker rechaza `lend(local_plain)`
+// en compile-time porque viola la promesa zero-cost (el slot vive en VM
+// stack, no en host heap; no se puede pasar cross-funcion sin overhead).
+// La solucion idiomatica: declarar el owner como unique<T>.
+
+i32 leer_y_doblar(borrow<i32> r) {
+    return read_borrow(r) * 2;
+}
+
+void incrementar(borrow_mut<i32> m, i32 delta) {
+    i32 actual = read_borrow(m);
+    write_borrow(m, actual + delta);
+}
+
+i32 main() {
+    unique<i32> valor = unique_box(10);
+
+    // borrow shared multiple OK (R2)
+    borrow<i32> r1 = lend(valor);
+    borrow<i32> r2 = lend(valor);
+    i32 a = leer_y_doblar(r1);  // 20
+    i32 b = leer_y_doblar(r2);  // 20
+
+    // r1, r2 ya no se usan -> NLL los libera aqui (F1)
+
+    // Ahora podemos pedir borrow_mut
+    borrow_mut<i32> m = lend_mut(valor);
+    incrementar(m, 5);
+
+    // Tras NLL libera el mut, podemos leer valor de nuevo
+    i32 v = read_borrow(lend(valor));
+    println("final: ${v}");  // 15
+    return 0;
+}

@@ -1,0 +1,45 @@
+// P2: Operador `?` postfix para Result<V,E> -- early-return sintactico.
+//
+// Sintaxis: `expr?` donde expr es Result<V,E>.
+// Equivalente a:
+//   let __tmp = expr;
+//   if (isErr(__tmp)) { return __tmp; }
+//   value(__tmp)
+//
+// Cierra ~5 lineas de boilerplate cada vez que se quiere propagar errores
+// de un Result a otro.  Solo valido dentro de funciones que devuelven
+// Result<_, E> con el mismo tipo de error.
+
+Result<i64, i64> parse_pos(i64 n) {
+    if (n < 0) {
+        return Err(99);
+    }
+    return Ok(n + 1);
+}
+
+// Funcion que usa `?` para propagar errores.  Si parse_pos devuelve Err,
+// el `?` hace early-return con el mismo error envolvente.
+Result<i64, i64> sum_two_pos(i64 a, i64 b) {
+    i64 va = parse_pos(a)?;   // si parse_pos(a) es Err, retorna ese Err
+    i64 vb = parse_pos(b)?;   // idem para b
+    return Ok(va + vb);
+}
+
+i32 main() {
+    // (1) Caso happy path: ambos positivos.
+    Result<i64, i64> r1 = sum_two_pos(20, 21);
+    if (!isOk(r1)) return 91;
+    if (value(r1) != 43) return 92;     // (20+1) + (21+1) = 43
+
+    // (2) Caso error primer arg: parse_pos(-5) devuelve Err(99).
+    Result<i64, i64> r2 = sum_two_pos(-5, 10);
+    if (isOk(r2)) return 93;
+    if (error(r2) != 99) return 94;
+
+    // (3) Caso error segundo arg: parse_pos(-1).
+    Result<i64, i64> r3 = sum_two_pos(7, -1);
+    if (isOk(r3)) return 95;
+    if (error(r3) != 99) return 96;
+
+    return 42;
+}

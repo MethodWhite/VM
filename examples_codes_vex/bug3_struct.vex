@@ -1,0 +1,34 @@
+// Test: struct host-managed con borrow checker.
+
+struct Punto {
+    i32 x;
+    i32 y;
+}
+
+i32 sumar(borrow<Punto> p) {
+    Punto v = read_borrow(p);
+    return v.x + v.y;
+}
+
+void escalar(borrow_mut<Punto> p, i32 k) {
+    Punto v = read_borrow(p);
+    v.x = v.x * k;
+    v.y = v.y * k;
+    write_borrow(p, v);
+}
+
+i32 main() {
+    Punto inicial = {.x = 10, .y = 20};
+    unique<Punto> punto = unique_box(inicial);
+
+    borrow<Punto> r = lend(punto);
+    i32 s1 = sumar(r);              // 30
+
+    borrow_mut<Punto> m = lend_mut(punto);
+    escalar(m, 3);                  // (30, 60)
+
+    Punto final_v = read_borrow(lend(punto));
+    println("x=${final_v.x} y=${final_v.y} sum=${s1}");
+
+    return final_v.x + final_v.y;   // 30 + 60 = 90
+}

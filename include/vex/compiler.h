@@ -205,6 +205,19 @@ namespace vex {
          * @c VESTA_MC_VERBOSE para diagnostico.
          */
         std::vector<std::pair<std::string, std::string>> macro_skip_reasons;
+
+        /**
+         * @brief Phase M5.B: rutas canonicas (absolutas + normalizadas) de
+         * TODOS los modulos que participaron en el compile (root + deps
+         * recursivos).  El main.cpp las usa para persistir el project
+         * cache: tras un compile exitoso guarda
+         * @c (paths, source_hashes, .velb final) para que el siguiente
+         * compile pueda hacer cache hit instantaneo si nada cambio.
+         *
+         * Vacio si la compilacion fue single-file (sin imports) o si
+         * @c compile_vex_source en lugar de @c compile_vex_project se uso.
+         */
+        std::vector<std::string> dep_paths;
     };
 
     /**
@@ -230,6 +243,39 @@ namespace vex {
     CompileResult compile_vex_source(const std::string &source,
                                      const std::string &filename,
                                      const CompileOptions &opts = {});
+
+    /**
+     * @brief Compila un proyecto multi-modulo (Phase M.2.e).
+     *
+     * Resuelve los @c import del fichero raiz via @c ModuleGraph,
+     * compila cada modulo en orden topologico (deps primero), inyecta
+     * los .vexi entre dependientes, y emite un unico @c .vel con todas
+     * las funciones mergeadas.
+     *
+     * Restricciones MVP:
+     *   - Solo @c "only A, B" imports inyectan simbolos (alias y namespace
+     *     son features posteriores).
+     *   - Sin mangling automatico: el usuario es responsable de que los
+     *     nombres de funciones no colisionen entre modulos.
+     *   - Sin link separado: todos los modulos se mergean en un solo .vel.
+     *
+     * @param root_path Path absoluto o relativo del @c .vex raiz.
+     * @param opts      Opciones de compilacion.
+     * @return CompileResult con el @c .vel mergeado + diagnostics.
+     */
+    CompileResult compile_vex_project(const std::string &root_path,
+                                        const CompileOptions &opts = {});
+
+    /**
+     * @brief Detecta si el source @c .vex contiene @c import declaraciones
+     * top-level.  Heuristica permisiva (string-scanner que respeta
+     * comentarios y strings).  Usado por @c main.cpp para decidir si
+     * dispatchar a @c compile_vex_project en lugar de @c compile_vex_source.
+     *
+     * @param source Texto Vex.
+     * @return @c true si encuentra al menos un @c import top-level.
+     */
+    bool vex_source_has_imports(const std::string &source);
 
 } // namespace vex
 

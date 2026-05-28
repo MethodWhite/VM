@@ -1,0 +1,90 @@
+// =====================================================================
+// 169_newtype_advanced.vex - @align(N) + explicit from/to + module-privacy
+// =====================================================================
+// Sigue al 168_newtypes.vex.  Cubre las extensiones del sistema de
+// tipos nominales:
+//
+//   1. @align(N): forzar alineacion mas estricta que la natural.
+//      Util para SIMD (16/32/64), DMA, GPU descriptors, protocolos
+//      binarios con padding fijo.
+//
+//   2. explicit from/to T { ... }: declarar que conversiones del cast
+//      explicit son legales.  Sin el bloque, los newtypes no-opacos
+//      aceptan cast libre con su underlying (default permisivo).  Con
+//      el bloque, SOLO se permiten las conversiones listadas.
+//
+//   3. Module-privacy: por defecto las conversiones declaradas son
+//      privadas al fichero donde se declaro el typedef.  El modificador
+//      `public` las hace accesibles cross-file.  Como este ejemplo
+//      esta en un solo fichero, todas las conversiones declaradas
+//      (con o sin `public`) son legales aqui.
+// =====================================================================
+
+// --- (1) @align(N) sobre newtypes -----------------------------------
+typedef u8 simd_byte new @align(16);   // bytes con alineacion SIMD
+typedef u8 cache_line_byte new @align(64); // alineacion de cache line
+
+// Struct mixto: el u32 con align natural 4 ocupa offset 0..4; el
+// simd_byte fuerza padding hasta 16 antes de colocarse.
+struct AlignedPacket {
+    u32        magic;
+    simd_byte  payload;
+}
+
+// --- (2) explicit from/to T { ... } sobre newtype no-opaco ----------
+typedef u64 file_id new {
+    // Solo permitimos construir desde u32 (no desde u64, no desde i64).
+    // Esto restringe el ABI publico del newtype.
+    explicit from u32;
+    // Y permitimos extraer a u64 para serializar.
+    public explicit to u64;
+};
+
+// --- (3) @opaque con conversiones declaradas + module-privacy -------
+typedef u64 session_handle new @opaque {
+    // 'public explicit from u64' permite construir cross-file
+    // (cualquier .vex podria hacer `(session_handle) raw_id`).
+    public explicit from u64;
+    // 'explicit to u64' (sin public) permite el cast SOLO en este
+    // fichero.  Otros ficheros no pueden extraer los bits.
+    explicit to u64;
+};
+
+i32 main() {
+    // --- alineacion -------------------------------------------------
+    // El compilador verifica los offsets en compile time.
+    if (offsetof<AlignedPacket>("magic")   != 0)  return 100;
+    if (offsetof<AlignedPacket>("payload") != 16) return 200;
+    if (sizeof<AlignedPacket>() % 16 != 0)        return 300;
+
+    // --- explicit from/to T sobre file_id (no-opaco) ---------------
+    // OK: u32 -> file_id (declarado en explicit from u32).
+    u32     base = 42;
+    file_id fid  = (file_id) base;
+    // OK: file_id -> u64 (declarado en public explicit to u64).
+    u64     out  = (u64) fid;
+    if (out != 42) return 400;
+
+    // PROHIBIDO si descomentas (no esta en 'explicit from'):
+    //   file_id bad = (file_id) (u64) 9;   // u64 no en from-list
+
+    // --- @opaque + conversiones declaradas -------------------------
+    // OK: u64 -> session_handle declarado public.  El literal entero
+    // se castea explicito a u64 primero porque el tipo natural de
+    // `0xDEADBEEF` es i64 (no esta en la lista de from-types).
+    u64 raw_id = (u64) 0xDEADBEEF;
+    session_handle sh = (session_handle) raw_id;
+    // OK: session_handle -> u64 permitido en mismo fichero (sin public).
+    u64 raw = (u64) sh;
+    if (raw != 0xDEADBEEF) return 500;
+
+    // Introspeccion: confirmar que sigue siendo newtype + opaque.
+    if (!is_newtype<session_handle>()) return 600;
+    if (!is_opaque<session_handle>())  return 700;
+    if (!is_newtype<file_id>())        return 800;
+    if ( is_opaque<file_id>())         return 900;
+
+    // is_same chequea identidad nominal, no underlying.
+    if (is_same<file_id, session_handle>()) return 1000;
+    return 42;
+}

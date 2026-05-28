@@ -1,0 +1,68 @@
+// Phase Z (1-10) integrado: shared memory cross-process Erlang/Java style.
+// Cubre: shared modifier, share/unshare/is_shared, synchronized+wait+notify
+// cross-process, atomic primitives, shared_malloc, introspect.
+class Counter {
+    public i64 value;
+    public bool ready;
+    public Counter() { this.value = 0; this.ready = false; }
+    public i64 add(i64 d) {
+        synchronized(this) {
+            this.value = this.value + d;
+            return this.value;
+        }
+    }
+}
+
+i32 main() {
+    // ===== 1) shared modifier + synchronized cross-process =====
+    shared Counter c = new Counter();
+    i64 child = spawn {
+        synchronized(c) {
+            c.value = 100;
+            c.ready = true;
+            notify(c);
+        }
+    };
+    synchronized(c) {
+        while (!c.ready) wait(c);
+    }
+    // c.value should be 100.
+    if (c.value != 100) return 1;
+
+    // ===== 2) is_shared / share / unshare =====
+    Counter local = new Counter();
+    if (is_shared(local)) return 2;     // local NO es shared
+    if (!is_shared(c)) return 3;        // c SI es shared
+    Counter copy = unshare(c);          // deep-copy a local
+    if (is_shared(copy)) return 4;      // copy debe ser local
+    if (copy.value != 100) return 5;    // copy preservo el valor
+
+    // ===== 3) share() promueve local a shared =====
+    Counter to_share = new Counter();
+    to_share.value = 200;
+    Counter promoted = share(to_share);
+    if (!is_shared(promoted)) return 6; // promoted ahora es shared
+    if (promoted.value != 200) return 7;
+
+    // ===== 4) Atomic primitives sobre shared_malloc =====
+    i64* atomic_cell = shared_malloc(8);
+    atomic_store_i64(atomic_cell, 42);
+    i64 v = atomic_load_i64(atomic_cell);
+    if (v != 42) return 8;
+    i64 old = atomic_add_i64(atomic_cell, 8);
+    if (old != 42) return 9;
+    i64 v2 = atomic_load_i64(atomic_cell);
+    if (v2 != 50) return 10;
+    i64 cas_old = atomic_cas_i64(atomic_cell, 50, 999);
+    if (cas_old != 50) return 11;
+    i64 v3 = atomic_load_i64(atomic_cell);
+    if (v3 != 999) return 12;
+    shared_free(atomic_cell);
+
+    // ===== 5) Introspect del SharedHeap =====
+    u32 cnt = shared_heap_live_count();   // 2 objetos shared: c, promoted (+ Counter handles internos)
+    if (cnt < 2) return 13;
+
+    // Todo correcto -> 42.
+    return 42;
+}

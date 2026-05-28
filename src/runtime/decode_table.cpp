@@ -3129,59 +3129,64 @@ namespace runtime {
         },
 
         /* 0xA6 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+            // NEWOBJS reg_cls -> aloca en SharedHeap (Phase Z.6).  Registra
+            // el host_ptr en shared_handle_table y guarda el shared handle
+            // en ObjectHeader.hash_code para reverse lookup O(1).
+            "newobjs", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_newobjs, decode_instr_two_op_reg
         },
 
         /* 0xA7 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+            // GCPROMOTE r_dst, r_src - deep-copy de local a SharedHeap.
+            "gcpromote", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_gcpromote, decode_instr_two_op_reg
         },
 
         /* 0xA8 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+            // GCDEMOTE r_dst, r_src - deep-copy de SharedHeap a local.
+            "gcdemote", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_gcdemote, decode_instr_two_op_reg
         },
 
         /* 0xA9 */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+            // ATOMICLD reg_dst, reg_addr - r_dst = atomic_load_i64(*r_addr).
+            "atomicld", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_atomicld, decode_instr_two_op_reg
         },
 
         /* 0xAA */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+            // ATOMICST reg_addr, reg_val - atomic_store_i64(*r_addr, r_val).
+            "atomicst", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_atomicst, decode_instr_two_op_reg
         },
 
         /* 0xAB */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+            // ATOMICCAS reg_dst, reg_addr, reg_exp, reg_des - 4 regs FIXED_4.
+            // r_dst = compare_exchange_i64(*r_addr, r_exp, r_des) - valor previo.
+            "atomiccas", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_atomiccas, decode_instr_four_reg
         },
 
         /* 0xAC */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+            // ATOMICADD reg_dst, reg_addr, reg_delta - 3 regs FIXED_4.
+            // r_dst = atomic_fetch_add_i64(*r_addr, r_delta) - valor previo.
+            "atomicadd", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_atomicadd, decode_instr_three_reg
         },
 
         /* 0xAD */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+            // SHAREDSTAT reg_dst, reg_op - introspeccion SharedHeap.
+            // op=0 bytes, op=1 alloc_count, op=2 gc_collect.
+            "sharedstat", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_sharedstat, decode_instr_two_op_reg
         },
 
         /* 0xAE */{

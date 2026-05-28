@@ -306,6 +306,35 @@ namespace vex {
         /// aridad y tipos en compile time.
         std::vector<Type> fn_params;
 
+        /// Newtype nominal ID (typedef T name new).  0 = no es newtype
+        /// (alias transparente clasico).  Cualquier valor > 0 identifica
+        /// univocamente al newtype: dos Type con kinds/representacion
+        /// identicos pero distinto @c nominal_id son tipos DIFERENTES.
+        /// El ID se asigna en el type checker (counter global) cuando
+        /// se procesa la TypeAliasDecl con marca @c is_newtype.
+        /// Conservacion: cualquier copia de un Type preserva el ID;
+        /// la representacion subyacente (kind, pointee, etc.) se mantiene
+        /// para que el lowering y el ABI nativo no cambien.
+        uint32_t nominal_id = 0;
+
+        /// @c true si el newtype es @c @opaque: el usuario NO puede leer
+        /// los bits subyacentes (no hay cast implicito ni inicializacion
+        /// por literal).  Solo se puede construir/consumir via funciones
+        /// que lo manejen explicitamente.  Sin efecto si @c nominal_id == 0.
+        bool is_opaque = false;
+
+        /// Nombre humano-legible del newtype (para mensajes de error e
+        /// introspeccion).  Vacio si no es newtype.
+        std::string nominal_name;
+
+        /// Alineacion forzada en bytes (sintaxis @c "@align(N)").  0 = sin
+        /// override (usar alineacion natural del kind).  Debe ser potencia
+        /// de 2 en [1, 4096].  Aplica cuando el tipo se usa como campo de
+        /// struct o como ALLOCA: el frontend padea hasta cumplir el
+        /// requirement.  Util para SIMD (16/32/64), DMA, GPU descriptors,
+        /// protocolos de wire format con padding fijo.
+        uint16_t align_override = 0;
+
         Type() = default;
         explicit Type(PrimitiveKind k) : kind(k) {}
         Type(PrimitiveKind k, std::string sn) : kind(k), struct_name(std::move(sn)) {}
@@ -344,6 +373,14 @@ namespace vex {
          * @brief Compara dos tipos por igualdad estructural (sigue la cadena de punteros).
          */
         bool operator==(const Type &o) const noexcept {
+            // Newtypes con distinto nominal_id son tipos DIFERENTES aunque
+            // la representacion subyacente coincida.  nominal_id == 0
+            // significa "no es newtype" -> caen al check estructural.
+            if (nominal_id != o.nominal_id) return false;
+            // align_override forma parte de la identidad del tipo: dos
+            // newtypes con misma representacion pero @align(N) distinto
+            // son tipos distintos (al menos para evitar mezcla accidental).
+            if (align_override != o.align_override) return false;
             if (kind != o.kind || struct_name != o.struct_name) return false;
             // Para PTR/ARRAY la naturaleza host vs virtual ES parte de la
             // identidad de tipo: `T*` y `VirtualPtr<T>` son tipos distintos.
@@ -664,6 +701,12 @@ namespace vex {
      * @return std::string nuevo con la representacion textual.
      */
     inline std::string type_to_string(const Type &t) {
+        // Newtype: mostrar el nombre nominal (e.g. "fd" en vez de "u64").
+        // Asi los mensajes de error son legibles ("incompatible con fd"
+        // en lugar de "incompatible con u64").
+        if (t.nominal_id != 0 && !t.nominal_name.empty()) {
+            return t.nominal_name;
+        }
         if (t.kind == PrimitiveKind::PTR) {
             // T* (host por defecto) vs VirtualPtr<T> (direccion VM).
             if (t.is_virtual) {
@@ -829,6 +872,15 @@ namespace vex {
      */
     inline bool types_assignable(const Type &target, const Type &value) noexcept {
         if (target == value) return true;
+        // Newtype barrier: si target O value es un newtype (nominal_id > 0)
+        // y NO son el mismo newtype (operator== ya lo cubrio), el tipo
+        // es nominalmente distinto y requiere cast explicito `(T)x`.
+        // Sin este check, `typedef u64 port new; port p = 100;` permitiria
+        // la coercion numerica u64 -> port silenciosamente, perdiendo la
+        // garantia del newtype.  Salvo: newtype -> u64 (extraer bits) y
+        // u64 -> newtype (envolver) requieren cast explicito (manejado en
+        // lower_cast_expr + check_call).
+        if (target.nominal_id != 0 || value.nominal_id != 0) return false;
         if (is_numeric(target.kind) && is_numeric(value.kind)) return true;
         if (target.kind == PrimitiveKind::PTR && value.kind == PrimitiveKind::PTR) {
             // Tratamos un PTR sin pointee como @c void* (caso de builtins

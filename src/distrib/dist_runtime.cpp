@@ -389,9 +389,8 @@ uint32_t DistRuntime::rspawn(runtime::ProcessVM *proc,
     fut->header.class_ptr  = nullptr; // sin clase OOP (future raw)
     fut->header.flags      = loader::OBJ_FLAG_GC_OWNED;
     fut->header.hash_code  = 0;
-    fut->header.owner_pid  = 0;
-    fut->header.lock_depth = 0;
-    fut->header._mon_pad   = 0;
+    // owner_pid / lock_depth ahora viven empacados en monitor_word; cero = unlocked.
+    fut->header.monitor_word.store(0, std::memory_order_relaxed);
     fut->state      = loader::FutureState::PENDING;
     std::memset(fut->_pad, 0, sizeof(fut->_pad));
     fut->result     = 0;
@@ -463,9 +462,8 @@ uint32_t DistRuntime::rspawn_velb(runtime::ProcessVM *proc,
     fut->header.class_ptr  = nullptr;
     fut->header.flags      = loader::OBJ_FLAG_GC_OWNED;
     fut->header.hash_code  = 0;
-    fut->header.owner_pid  = 0;
-    fut->header.lock_depth = 0;
-    fut->header._mon_pad   = 0;
+    // monitor_word empaqueta owner + lock_depth; cero = unlocked.
+    fut->header.monitor_word.store(0, std::memory_order_relaxed);
     fut->state      = loader::FutureState::PENDING;
     std::memset(fut->_pad, 0, sizeof(fut->_pad));
     fut->result     = 0;

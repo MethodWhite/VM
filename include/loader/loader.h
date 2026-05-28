@@ -40,6 +40,7 @@
 
 #include "runtime/vm_address_space.h"
 #include "loader/oop_types.h"
+#include "loader/sandbox.h"     // loader::Caps + parse_caps + caps_to_string
 #include "debug/debug_info.h"
 #include "ir/ssa_ir.h"
 
@@ -301,6 +302,17 @@ namespace loader {
          */
         //Sqlite::json metadata;
 
+        /**
+         * @brief Capabilities concedidas a este modulo + whitelists granulares.
+         *
+         * Default ALL granted + sin whitelists -> @c caps.unrestricted() == true ->
+         * cero overhead (los chequeos colapsan a un branch predicho).
+         *
+         * Configurable por modulo via CLI @c --vex-caps (modulo principal) o
+         * por @c loadmodule(path, caps_str) (modulo dinamico).
+         */
+        loader::Caps caps{};
+
         // Opciones del linker
         // Assembly::Bytecode::Linker::LinkerOptions options; ///< Opciones usadas para generar este ejecutable
     } Executable;
@@ -383,8 +395,14 @@ namespace loader {
          * spawn se llama una sola vez por hijo.
          *
          * @param dest Proceso destino que recibira la copia del codigo.
+         * @param parent Proceso padre del que copiar el estado actual de
+         *               @c vm_mem (no el bytecode crudo). Si es @c nullptr,
+         *               copia desde @c exe->bytecode original. Para spawn
+         *               se debe pasar el padre para heredar el state de
+         *               @c __module_init (cache slots de @c ClassInfo*, etc.).
          */
-        void copy_executables_to(runtime::ProcessVM &dest);
+        void copy_executables_to(runtime::ProcessVM &dest,
+                                  runtime::ProcessVM *parent = nullptr);
 
         /**
          * Permite obtener una cadena de la seccion strings, en base a su offset

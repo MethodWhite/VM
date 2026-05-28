@@ -137,14 +137,18 @@ void vrt_gc_write_barrier(vrt_proc *proc, vrt_handle old_handle) {
 int32_t vrt_monitor_enter(vrt_proc *proc, vrt_handle obj) {
     if (!proc || obj == VRT_NULL_HANDLE) return 0;
     runtime::ProcessVM *p   = as_proc(proc);
-    const uint32_t      pid = static_cast<uint32_t>(p->pid.local_pid);
+    // Phase Z.11 ext: usamos el PID encoded (sched<<32|local) de 48 bits para
+    // evitar la colision local_pid cross-scheduler.
+    const uint64_t      pid = (static_cast<uint64_t>(p->pid.scheduler_id) << 32)
+                              | static_cast<uint64_t>(p->pid.local_pid);
     return p->gc_heap.monitor_try_acquire(obj, pid) ? 1 : 0;
 }
 
 void vrt_monitor_exit(vrt_proc *proc, vrt_handle obj) {
     if (!proc || obj == VRT_NULL_HANDLE) return;
     runtime::ProcessVM *p   = as_proc(proc);
-    const uint32_t      pid = static_cast<uint32_t>(p->pid.local_pid);
+    const uint64_t      pid = (static_cast<uint64_t>(p->pid.scheduler_id) << 32)
+                              | static_cast<uint64_t>(p->pid.local_pid);
     (void)p->gc_heap.monitor_release(obj, pid);
     /* TODO Phase E (D.2): si monitor_release devuelve un waiter,
      * llamar vm.make_ready(next).  Por ahora el bytecode handler

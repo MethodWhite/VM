@@ -2055,4 +2055,33 @@ namespace vex {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Helpers de introspeccion sobre newtypes (typedef T name new).
+    // -------------------------------------------------------------------------
+    // Un newtype es un alias nominal: dos Type con la misma representacion
+    // pero distinto @c nominal_id son tipos DIFERENTES.  El campo se setea
+    // en el TypeChecker al procesar la TypeAliasDecl con @c is_newtype.
+    // @opaque es un sub-flag que prohibe al usuario observar el underlying.
+
+    bool comptime_is_newtype(const Type &t) {
+        return t.nominal_id != 0;
+    }
+
+    bool comptime_is_opaque(const Type &t) {
+        return t.nominal_id != 0 && t.is_opaque;
+    }
+
+    std::string comptime_underlying_name(const TypeChecker &tc, const Type &t) {
+        // Para un newtype, el typename canonico ya esconde el nominal_id.
+        // El "underlying" es el mismo tipo con @c nominal_id=0, lo que se
+        // consigue creando una copia sin la marca nominal.  Para no-newtype
+        // devolvemos el name habitual sin indireccion.
+        if (t.nominal_id == 0) return comptime_type_name(tc, t);
+        Type u = t;
+        u.nominal_id = 0;
+        u.is_opaque  = false;
+        u.nominal_name.clear();
+        return comptime_type_name(tc, u);
+    }
+
 } // namespace vex

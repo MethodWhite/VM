@@ -804,6 +804,21 @@ namespace runtime {
         instr.data_instruction.mem_data.reg_final = (b3 >> 4) & 0x0F; // r_len
     }
 
+    // Descodificador de 4 regs empacados en FIXED_4: 4 nibbles en 2 bytes.
+    //   byte2 (rip+2) = (r0 << 4) | r1
+    //   byte3 (rip+3) = (r2 << 4) | r3
+    // Util para atomiccas: r0=dst, r1=addr, r2=expected, r3=desired.
+    void decode_instr_four_reg(ProcessVM *vm, DecodedInstr &instr) {
+        instr.flags_info.size_instr = 4;
+        uint64_t base = vm->registers.rip.raw() + 2;
+        uint8_t  b2   = vm->vm_mem[base];
+        uint8_t  b3   = vm->vm_mem[base + 1];
+        instr.data_instruction.mem_data.reg_base  = (b2 >> 4) & 0x0F; // r0
+        instr.data_instruction.mem_data.reg_index = b2 & 0x0F;         // r1
+        instr.data_instruction.mem_data.reg_final = (b3 >> 4) & 0x0F; // r2
+        instr.data_instruction.mem_data.scale     = b3 & 0x0F;         // r3
+    }
+
     /**
      * @brief Descodificador de @c getstatic / @c setstatic (FIXED_8).
      *

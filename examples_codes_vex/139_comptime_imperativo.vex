@@ -52,10 +52,10 @@ comptime i64 prod(i64 n) {
 }
 
 // Constantes computadas en compile-time.
-comptime const i64 S100  = sum_iter(100);      // 5050
-comptime const i64 D100  = find_div(100, 7);   // 105 (105 = 15*7)
-comptime const i64 ODD9  = sum_odd(9);          // 1+3+5+7+9 = 25
-comptime const i64 P6    = prod(6);             // 720
+comptime i64 S100  = sum_iter(100);      // 5050
+comptime i64 D100  = find_div(100, 7);   // 105 (105 = 15*7)
+comptime i64 ODD9  = sum_odd(9);          // 1+3+5+7+9 = 25
+comptime i64 P6    = prod(6);             // 720
 
 static_assert(S100 == 5050,  "sum_iter(100)");
 static_assert(D100 == 105,   "find_div(100, 7)");

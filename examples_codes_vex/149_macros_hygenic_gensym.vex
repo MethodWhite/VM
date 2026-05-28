@@ -1,8 +1,8 @@
 // macros hygenic + sugar comptime + gensym.
 //
-// (1) SUGAR: `comptime X = expr;` equivale a `comptime const auto X = expr;`.
+// (1) SUGAR: `comptime X = expr;` equivale a `comptime auto X = expr;`.
 //     Reduce ruido tipico en metaprogramacion donde antes habia que
-//     repetir `comptime const string code = ...; comptime const i64 r = ...`.
+//     repetir `comptime string code = ...; comptime i64 r = ...`.
 //
 // (2) GENSYM: `gensym(prefix)` devuelve un identifier fresco unico por
 //     llamada.  Permite generar nombres no-colisionables con el scope

@@ -353,6 +353,21 @@ namespace Assembly::Bytecode {
          */
         {"mvtake",     {{0x00, 0x72, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
 
+        /* --- Phase Z: memoria compartida cross-process (0xA6-0xAD) ---
+         *  Stubs registrados para que el assembler acepte estos mnemonicos
+         *  emitidos por el lowering Phase Z.  El runtime ejecuta versiones
+         *  simplificadas (no thread-safe cross-process aun) hasta que el
+         *  mark/sweep del SharedHeap aterrice.
+         */
+        {"newobjs",    {{0x00, 0xA6, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_one_reg}}},
+        {"gcpromote",  {{0x00, 0xA7, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
+        {"gcdemote",   {{0x00, 0xA8, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
+        {"atomicld",   {{0x00, 0xA9, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
+        {"atomicst",   {{0x00, 0xAA, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
+        {"atomiccas",  {{0x00, 0xAB, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_four_reg}}},
+        {"atomicadd",  {{0x00, 0xAC, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_three_reg}}},
+        {"sharedstat", {{0x00, 0xAD, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
+
         /* --- Super-instrucciones ALU 3-operandos (0x73-0x7B) ---
          *  Combinan `mov rd, rs1; OP rd, rs2` en una sola instruccion VM.
          *  Reduce dispatch + decode para el patron mas frecuente del 2-address

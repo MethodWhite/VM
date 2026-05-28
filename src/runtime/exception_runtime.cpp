@@ -142,6 +142,43 @@ namespace runtime {
                 fields,
                 /*methods=*/{},
                 /*flags=*/0);
+
+            // BugFix R4: registrar las clases excepcion estandar comunes
+            // con solo un field `message` (string ptr).  El lowering del
+            // frontend Vex detecta `new <ExceptionClass>(msg)` y emite la
+            // secuencia inline (newobj + store message) sin requerir
+            // constructor explicito en bytecode.  El `catch (X e)` accede
+            // a `e.message` via getfield offset 24 (justo despues del
+            // ObjectHeader).
+            const char *std_exc_names[] = {
+                "RuntimeException",
+                "ArithmeticException",
+                "IllegalArgumentException",
+                "IndexOutOfBoundsException",
+                "NullPointerException",
+                "IOException",
+                "ClassCastException",
+                "UnsupportedOperationException",
+            };
+            std::vector<loader::FieldDecl> exc_fields;
+            {
+                loader::FieldDecl f{};
+                f.name = "message";
+                f.kind = loader::FIELD_PRIMITIVE;
+                f.size_bytes = 8;
+                f.access = loader::FIELD_PUBLIC;
+                exc_fields.push_back(f);
+            }
+            for (const char *n : std_exc_names) {
+                if (!reg.find_class(n)) {
+                    (void)reg.define_class(n,
+                        /*super=*/nullptr,
+                        /*interfaces=*/{},
+                        exc_fields,
+                        /*methods=*/{},
+                        /*flags=*/0);
+                }
+            }
         });
     }
 
@@ -183,9 +220,41 @@ namespace runtime {
         loader::FrameHeader *fr = vm->frame_stack;
         const uint64_t cur_pc = vm->registers.rip.raw();
 
-        // Helper: append "(file.vex:line)" o "(pc=0xADDR)".
+        // Helper: append "(file.vex:line)" usando primero DebugInfo del
+        // .velb cargado (precision pc_offset -> line); fallback a
+        // MethodDebug (start_line del metodo).  Item 4: ahora el stack
+        // trace muestra la linea EXACTA de la instruccion fallida en
+        // lugar de la linea del inicio del metodo.
         auto append_dbg = [&](loader::MethodInfo *m, uint64_t pc,
                               const char *pc_label) {
+            // Buscar DebugInfo precise via los Executables cargados.
+            // Accedemos via scheduler.vm_reference.loader_public (la VM
+            // propietaria es el owner del Loader publico).
+            for (const auto &exe_ptr : vm->scheduler.vm_reference.loader_public.executables) {
+                if (!exe_ptr || !exe_ptr->debug_info) continue;
+                // pc absoluto -> bytecode_offset relativo al inicio del
+                // code section del executable.  Asumimos un solo executable
+                // (caso comun); para multi-velb el primero que matchee.
+                auto info = exe_ptr->debug_info->lookup_line(
+                    static_cast<uint32_t>(pc));
+                if (info.found && info.line > 0) {
+                    append_str(" (");
+                    if (info.file && info.file[0] != '\0') {
+                        append_str(info.file);
+                    } else if (m) {
+                        const MethodDebug *md = lookup_method_debug(m);
+                        if (md) append(md->source_file.data(), md->source_file.size());
+                        else append_str("?");
+                    } else {
+                        append_str("?");
+                    }
+                    append_str(":");
+                    append_dec((uint64_t)info.line);
+                    append_str(")");
+                    return;
+                }
+            }
+            // Fallback: MethodDebug con start_line.
             const MethodDebug *md = m ? lookup_method_debug(m) : nullptr;
             if (md && !md->source_file.empty()) {
                 append_str(" (");
@@ -457,9 +526,17 @@ namespace runtime {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         const DWORD code = info->ExceptionRecord->ExceptionCode;
-        // Solo manejamos AV.  Otras excepciones (div0 hardware, illegal
-        // instr, debug breakpoints, etc.) siguen su curso normal.
-        if (code != EXCEPTION_ACCESS_VIOLATION) {
+        // Manejamos AV y divisiones por cero (Bug fix 2026-05-23).
+        // Otras excepciones (illegal instr, debug breakpoints, etc.) siguen
+        // su curso normal.
+        uint32_t kind_local = 0;  // 0=AV
+        if (code == EXCEPTION_ACCESS_VIOLATION) {
+            kind_local = 0;
+        } else if (code == EXCEPTION_INT_DIVIDE_BY_ZERO) {
+            kind_local = 1;
+        } else if (code == EXCEPTION_INT_OVERFLOW) {
+            kind_local = 2;
+        } else {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         ProcessVM *proc = t_executing_proc;
@@ -468,9 +545,11 @@ namespace runtime {
             // setjmp: la VM crashea como antes (comportamiento legado).
             return EXCEPTION_CONTINUE_SEARCH;
         }
+        proc->pending_av_kind = kind_local;
         // Capturar la direccion del fault (segundo elemento de
-        // ExceptionInformation: 0=read/write flag, 1=virtual addr).
-        if (info->ExceptionRecord->NumberParameters >= 2) {
+        // ExceptionInformation: 0=read/write flag, 1=virtual addr) -- solo
+        // para AV; para div0 / overflow no aplica.
+        if (kind_local == 0 && info->ExceptionRecord->NumberParameters >= 2) {
             proc->pending_av_addr =
                 (uint64_t)info->ExceptionRecord->ExceptionInformation[1];
         } else {
@@ -501,19 +580,25 @@ namespace runtime {
         });
     }
 #else
-    // POSIX: handler de SIGSEGV.  El handler usa siglongjmp directamente
+    // POSIX: handler de SIGSEGV / SIGFPE.  El handler usa siglongjmp directamente
     // ya que en POSIX longjmp desde un signal handler es bien definido
     // si se usa sigsetjmp con savesigs=1.
-    static void posix_sigsegv_handler(int /*sig*/, siginfo_t *info, void *ctx) {
+    static void posix_signal_handler(int sig, siginfo_t *info, void *ctx) {
         (void)ctx;
         ProcessVM *proc = t_executing_proc;
         if (proc == nullptr || !proc->av_recovery_active) {
-            // Restaurar handler default y dejar que el OS mate el proceso.
-            std::signal(SIGSEGV, SIG_DFL);
-            std::raise(SIGSEGV);
+            std::signal(sig, SIG_DFL);
+            std::raise(sig);
             return;
         }
-        proc->pending_av_addr = info ? (uint64_t)(uintptr_t)info->si_addr : 0;
+        // Bug fix 2026-05-23: capturar tambien SIGFPE (div/0).
+        if (sig == SIGFPE) {
+            proc->pending_av_kind = 1;  // DIVIDE_BY_ZERO (o overflow)
+            proc->pending_av_addr = 0;
+        } else {
+            proc->pending_av_kind = 0;  // AV
+            proc->pending_av_addr = info ? (uint64_t)(uintptr_t)info->si_addr : 0;
+        }
         std::longjmp(proc->av_recovery_jmpbuf, 1);
     }
 
@@ -521,10 +606,11 @@ namespace runtime {
         std::call_once(g_av_handler_init_flag, []() {
             struct sigaction sa{};
             sa.sa_flags     = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
-            sa.sa_sigaction = &posix_sigsegv_handler;
+            sa.sa_sigaction = &posix_signal_handler;
             sigemptyset(&sa.sa_mask);
             (void)sigaction(SIGSEGV, &sa, nullptr);
             (void)sigaction(SIGBUS,  &sa, nullptr);
+            (void)sigaction(SIGFPE,  &sa, nullptr);
         });
     }
 #endif

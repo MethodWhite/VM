@@ -1,0 +1,24 @@
+// Test: class Vex con borrow checker.  Las clases ya viven en GC heap
+// (host_ptr automatico), asi que se aceptan directamente como owners.
+
+class Punto {
+    public i32 x;
+    public i32 y;
+    public Punto(i32 px, i32 py) {
+        this.x = px;
+        this.y = py;
+    }
+    public i32 suma() { return this.x + this.y; }
+}
+
+i32 leer_suma(borrow<Punto> p) {
+    Punto obj = read_borrow(p);
+    return obj.suma();
+}
+
+i32 main() {
+    unique<Punto> punto = unique_box(new Punto(10, 20));
+
+    borrow<Punto> r = lend(punto);
+    return leer_suma(r);   // 30
+}

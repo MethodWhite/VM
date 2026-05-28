@@ -588,6 +588,38 @@ VESTA_PLUGIN_EXPORT uint64_t vio_char_to_vmbuf(uint64_t proc_ptr,
     return (uint64_t) k;
 }
 
+/* BugFix R7: stringify de f64 (bits IEEE 754) a buffer VM.
+ * Para uso en interpolacion ${f64_var} en contexto STRING.
+ * Format: hasta 6 digitos significativos (similar a %g).
+ */
+VESTA_PLUGIN_EXPORT uint64_t vio_float_to_vmbuf(uint64_t proc_ptr,
+                                                 uint64_t vm_addr,
+                                                 uint64_t bits) {
+    double d;
+    memcpy(&d, &bits, sizeof(d));
+    char   tmp[64];
+    int    n = snprintf(tmp, sizeof(tmp), "%g", d);
+    if (n < 0) n = 0;
+    if ((size_t) n >= sizeof(tmp)) n = (int) sizeof(tmp) - 1;
+    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, (size_t) n);
+    return (uint64_t) n;
+}
+
+/* BugFix R7: stringify de GcHandle a buffer VM ("<gc:N>").
+ * Para uso en interpolacion ${class_var} en contexto STRING.
+ */
+VESTA_PLUGIN_EXPORT uint64_t vio_gchandle_to_vmbuf(uint64_t proc_ptr,
+                                                    uint64_t vm_addr,
+                                                    uint64_t handle) {
+    char   tmp[32];
+    int    n = snprintf(tmp, sizeof(tmp), "<gc:%llu>",
+                        (unsigned long long) handle);
+    if (n < 0) n = 0;
+    if ((size_t) n >= sizeof(tmp)) n = (int) sizeof(tmp) - 1;
+    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, (size_t) n);
+    return (uint64_t) n;
+}
+
 /* -------------------------------------------------------------------------
  * counter monotonico para `gensym()` builtin de Vex.
  *
@@ -951,6 +983,95 @@ static size_t vio_encode_utf8(uint64_t cp, char *buf) {
  * usamos desde vio_print_fmt para emitir el padding. */
 VESTA_PLUGIN_EXPORT uint64_t vio_print_pad(uint64_t fill_cp, uint64_t width);
 
+/* Item 18: wcwidth basico para alineacion en columnas terminal.
+ *
+ * Devuelve el ancho VISUAL de un codepoint Unicode:
+ *   - 0 para caracteres de control (0x00-0x1F, 0x7F-0x9F) y zero-width
+ *     marks (combining marks, U+200B ZERO WIDTH SPACE, etc.).
+ *   - 2 para caracteres "wide" del estandar EastAsianWidth.txt
+ *     (CJK, Hangul, Yi, Fullwidth ASCII, mayoria de emojis).
+ *   - 1 para el resto (ASCII printable, Latin extended, etc.).
+ *
+ * Implementacion compacta: tabla por rangos en lugar de la tabla completa
+ * de Unicode (~2 KB en lugar de ~120 KB).  Suficientemente precisa para
+ * el 95% de uso real (terminales y print alineado).
+ */
+static int vex_wcwidth_cp(uint32_t cp) {
+    /* Control characters: 0 columnas. */
+    if (cp < 0x20 || (cp >= 0x7F && cp < 0xA0)) return 0;
+    /* Zero-width: combining marks, zero-width space/joiner, BOM. */
+    if ((cp >= 0x0300 && cp <= 0x036F) || /* combining diacritical */
+        (cp >= 0x200B && cp <= 0x200F) || /* zero-width spaces */
+        (cp >= 0x202A && cp <= 0x202E) || /* bidi controls */
+        (cp == 0xFEFF))                   /* BOM */
+        return 0;
+    /* Wide ranges (East Asian + emoji). */
+    if ((cp >= 0x1100 && cp <= 0x115F) || /* Hangul Jamo init */
+        (cp >= 0x2329 && cp <= 0x232A) || /* angle brackets */
+        (cp >= 0x2E80 && cp <= 0x303E) || /* CJK radicals etc */
+        (cp >= 0x3041 && cp <= 0x33FF) || /* Hiragana/Kata/CJK symbols */
+        (cp >= 0x3400 && cp <= 0x4DBF) || /* CJK ExtA */
+        (cp >= 0x4E00 && cp <= 0x9FFF) || /* CJK Unified */
+        (cp >= 0xA000 && cp <= 0xA4CF) || /* Yi */
+        (cp >= 0xAC00 && cp <= 0xD7A3) || /* Hangul syllables */
+        (cp >= 0xF900 && cp <= 0xFAFF) || /* CJK Compat */
+        (cp >= 0xFE30 && cp <= 0xFE4F) || /* CJK Compat Forms */
+        (cp >= 0xFF00 && cp <= 0xFF60) || /* Fullwidth Latin */
+        (cp >= 0xFFE0 && cp <= 0xFFE6) || /* Fullwidth signs */
+        (cp >= 0x1F300 && cp <= 0x1F64F) || /* Misc Symbols & Pictographs + emoji */
+        (cp >= 0x1F680 && cp <= 0x1F6FF) || /* Transport & Map */
+        (cp >= 0x1F900 && cp <= 0x1F9FF) || /* Supplemental Symbols */
+        (cp >= 0x20000 && cp <= 0x2FFFD) || /* CJK Ext B-F */
+        (cp >= 0x30000 && cp <= 0x3FFFD))   /* CJK Ext G */
+        return 2;
+    return 1;
+}
+
+/* Decodifica un codepoint UTF-8 a partir de p; devuelve numero de bytes
+ * consumidos (1..4) y escribe el codepoint en *out_cp.  Devuelve 0 si
+ * la secuencia es invalida (entonces *out_cp = 0xFFFD replacement). */
+static size_t vex_utf8_decode(const char *p, size_t n, uint32_t *out_cp) {
+    if (n == 0) { *out_cp = 0; return 0; }
+    unsigned char c = (unsigned char)p[0];
+    if (c < 0x80) { *out_cp = c; return 1; }
+    if ((c & 0xE0) == 0xC0 && n >= 2) {
+        *out_cp = ((uint32_t)(c & 0x1F) << 6)
+                | ((uint32_t)(p[1] & 0x3F));
+        return 2;
+    }
+    if ((c & 0xF0) == 0xE0 && n >= 3) {
+        *out_cp = ((uint32_t)(c & 0x0F) << 12)
+                | ((uint32_t)(p[1] & 0x3F) << 6)
+                | ((uint32_t)(p[2] & 0x3F));
+        return 3;
+    }
+    if ((c & 0xF8) == 0xF0 && n >= 4) {
+        *out_cp = ((uint32_t)(c & 0x07) << 18)
+                | ((uint32_t)(p[1] & 0x3F) << 12)
+                | ((uint32_t)(p[2] & 0x3F) << 6)
+                | ((uint32_t)(p[3] & 0x3F));
+        return 4;
+    }
+    *out_cp = 0xFFFD;
+    return 1;
+}
+
+/* Suma el ancho visual (columnas terminal) de los bytes UTF-8 en p[0..n]. */
+static size_t vex_utf8_cols(const char *p, size_t n) {
+    size_t cols = 0;
+    size_t i = 0;
+    while (i < n) {
+        uint32_t cp;
+        size_t adv = vex_utf8_decode(p + i, n - i, &cp);
+        if (adv == 0) break;
+        int w = vex_wcwidth_cp(cp);
+        if (w < 0) w = 1;
+        cols += (size_t)w;
+        i += adv;
+    }
+    return cols;
+}
+
 /**
  * @brief Imprime un valor con formato y alineacion.
  *
@@ -1049,11 +1170,11 @@ VESTA_PLUGIN_EXPORT uint64_t vio_print_fmt(uint64_t value, uint64_t kind,
             break;
     }
 fmt_done: ; /* statement vacio para que la label valga en C estricto */
-    /* Calcular padding y emitir.  width se interpreta en BYTES emitidos
-     * (no en columnas terminal): para texto puramente ASCII coincide con
-     * el ancho visible; para multi-byte UTF-8 puede diferir y queda como
-     * limitacion conocida del formato simple. */
-    uint64_t pad = (tmp_n < width) ? (width - tmp_n) : 0u;
+    /* Item 18: calcular padding usando COLUMNAS terminal (no bytes).
+     * Para ASCII puro cols == bytes; para multi-byte UTF-8 (CJK, emoji)
+     * cada codepoint puede ocupar 2 columnas o 0 (control). */
+    size_t cols = vex_utf8_cols(tmp, tmp_n);
+    uint64_t pad = (cols < width) ? (width - cols) : 0u;
     if (align == 2u && pad > 0u) {
         /* RIGHT-align: padding antes. */
         vio_print_pad(fill_cp, pad);
@@ -1089,10 +1210,17 @@ VESTA_PLUGIN_EXPORT uint64_t vio_print_pad(uint64_t fill_cp, uint64_t width) {
     } else {
         return 0;
     }
+    /* Item 18: width se interpreta en COLUMNAS terminal.  Determinar
+     * cuantos cols ocupa una copia del fill, luego repetir hasta cubrir
+     * width cols.  Defensa: si fill tiene 0 cols (control), tratarlo
+     * como 1 col para evitar loop infinito. */
+    int fill_cols = vex_wcwidth_cp((uint32_t)fill_cp);
+    if (fill_cols < 1) fill_cols = 1;
+    uint64_t copies = (width + (uint64_t)fill_cols - 1u) / (uint64_t)fill_cols;
     /* Emitir en chunks para no abusar del buffer en width grandes. */
     char chunk[256];
     size_t chunk_used = 0;
-    for (uint64_t i = 0; i < width; ++i) {
+    for (uint64_t i = 0; i < copies; ++i) {
         if (chunk_used + enc_n > sizeof(chunk)) {
             vio_buffer_append(chunk, chunk_used);
             chunk_used = 0;

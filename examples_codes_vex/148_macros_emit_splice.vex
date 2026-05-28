@@ -34,22 +34,22 @@ i32 main() {
     // (3) Construir el codigo a partir de un literal compile-time.
     // Tan flexible como un macro real: el string puede venir de
     // typename<T>, comptime_to_str, etc.
-    comptime const string code = comptime_concat("doblar(",
+    comptime string code = comptime_concat("doblar(",
                                     comptime_concat(comptime_to_str(7), ")"));
     i32 derivado = comptime_emit_expr(code);   // doblar(7) = 14
     if (derivado != 14) return 93;
 
     // (4) Composicion: codigo del macro #1 envuelto en otra llamada.
-    comptime const string inner = "doblar(8)";
-    comptime const string outer = comptime_concat("mas_uno(",
+    comptime string inner = "doblar(8)";
+    comptime string outer = comptime_concat("mas_uno(",
                                      comptime_concat(inner, ")"));
     i32 anidado = comptime_emit_expr(outer);   // mas_uno(doblar(8)) = 17
     if (anidado != 17) return 94;
 
     // (5) Mix de runtime y compile-time: el codigo usa `n` runtime
     // PERO incluye una constante derivada por el macro al compile.
-    comptime const string lit_5 = comptime_to_str(5);
-    comptime const string code5 = comptime_concat("n + ", lit_5);
+    comptime string lit_5 = comptime_to_str(5);
+    comptime string code5 = comptime_concat("n + ", lit_5);
     i32 mix = comptime_emit_expr(code5);  // n + 5 = 25
     if (mix != 25) return 95;
 

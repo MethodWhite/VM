@@ -15,7 +15,7 @@
  * @brief Test unitario del ClassRegistry: define clases, busca campos /
  *        metodos por nombre, valida AOP y caches de lookup.
  *
- * Cubre el flujo basico de meta-programacio sin tocar el resto
+ * Cubre el flujo basico de meta-programacion de A.4 sin tocar el resto
  * de la VM.  Compila con el framework estandar de tests del proyecto
  * (cualquier .cpp dentro de tests/ se vuelve un ejecutable separado).
  *

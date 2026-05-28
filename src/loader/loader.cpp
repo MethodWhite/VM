@@ -1229,11 +1229,19 @@ namespace loader {
         return false;
     }
 
-    void Loader::copy_executables_to(runtime::ProcessVM &dest) {
+    void Loader::copy_executables_to(runtime::ProcessVM &dest,
+                                      runtime::ProcessVM *parent) {
         // Replica la copia que hace load_executable() pero apuntando al
         // vm_mem del proceso destino.  Itera todos los executables cargados
-        // (puede ser >1 si se usa loadmodule) y todas sus secciones,
-        // copiando el bytecode al rango de VAs original.
+        // (puede ser >1 si se usa loadmodule) y todas sus secciones.
+        //
+        // Bug fix Z.3 (2026-05-23): si @c parent != nullptr, copiamos el
+        // estado ACTUAL del @c vm_mem del padre (que ya contiene los stores
+        // de @c __module_init: cache slots con @c ClassInfo*, etc.) en
+        // lugar del bytecode original (que tiene esos slots a cero).  Sin
+        // este fix, @c findclass cacheado en el child devolvia 0 y
+        // @c newobj fallaba silenciosamente (host_ptr a header sin
+        // class_ptr -> SEGFAULT al primer field access).
         for (const auto &exe_ptr : executables) {
             const Executable *exe = exe_ptr.get();
             if (!exe) continue;
@@ -1242,12 +1250,32 @@ namespace loader {
                 const uint64_t vm_addr = sec->memory.address_init;
                 const uint64_t offset  = sec->file_offset;
                 if (offset >= exe->bytecode.size()) continue;
-                const uint8_t *src    = exe->bytecode.data() + offset;
                 const size_t   avail  = exe->bytecode.size() - offset;
                 const size_t sec_size = sec->size_real
                                       ? std::min<size_t>(sec->size_real, avail)
                                       : avail;
-                dest.vm_mem.vm_to_host_memcpy(vm_addr, src, sec_size);
+                if (parent) {
+                    // Copia desde el vm_mem actual del padre, qword a qword
+                    // (preserva cualquier modificacion runtime: cache slots
+                    // de __module_init, datos globales modificados, etc.).
+                    // Limitamos a chunks de 8 bytes alineados; el resto se
+                    // cubre con el fallback del bytecode original.
+                    constexpr size_t CHUNK = 8;
+                    size_t i = 0;
+                    for (; i + CHUNK <= sec_size; i += CHUNK) {
+                        uint64_t v = parent->vm_mem.read_u64(vm_addr + i);
+                        dest.vm_mem.write_u64(vm_addr + i, v);
+                    }
+                    // Bytes residuales (< 8): copiar uno por uno.
+                    for (; i < sec_size; ++i) {
+                        uint8_t b = parent->vm_mem.read_u8(vm_addr + i);
+                        dest.vm_mem.write_u8(vm_addr + i, b);
+                    }
+                } else {
+                    // Fallback: copia desde el bytecode crudo (caso load_module).
+                    const uint8_t *src = exe->bytecode.data() + offset;
+                    dest.vm_mem.vm_to_host_memcpy(vm_addr, src, sec_size);
+                }
             }
         }
     }

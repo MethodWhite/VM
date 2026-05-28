@@ -980,22 +980,61 @@ namespace port {
     void CBackend::emit_static_data(EmitContext &ctx, const ir::IrModule &mod) {
         if (mod.static_data.empty()) return;
         if (opts_.emit_comments) {
-            ctx.out << "/* Literales estaticos del modulo (interned por el frontend Vex) */\n";
+            ctx.out << "/* Literales estaticos del modulo (interned por el frontend Vex).\n"
+                       " * Layout pool unificado (M.staticdata-pool):\n"
+                       " *   - __vex_static_pool[]: todos los bytes contiguos.\n"
+                       " *   - __str_<i>: macro que retorna ptr al inicio de la entry i.\n"
+                       " * Beneficios cache-locality + un solo simbolo expuesto al linker.\n"
+                       " */\n";
         }
-        for (size_t i = 0; i < mod.static_data.size(); ++i) {
-            const auto &bytes = mod.static_data[i];
-            // VEX_UNUSED silencia warning para literales no referenciados
-            // por el codigo emitido (clases con __module_init omitido).
-            ctx.out << "static VEX_UNUSED const unsigned char __str_" << i
-                    << "[" << bytes.size() + 1 << "] = { ";
-            // Emit byte-by-byte para preservar nuls intermedios y ser estricto
-            // con strict-aliasing/UB.  Sufijo nul para STRRAW + FFI seguro.
-            for (size_t b = 0; b < bytes.size(); ++b) {
-                if (b) ctx.out << ", ";
-                ctx.out << static_cast<unsigned>(bytes[b]);
+        const size_t N = mod.static_data.size();
+        // 1) Pool unico con TODOS los bytes contiguos, alineado a 8.  Si
+        //    alguna entry tiene meta.alignment > 8, el pool no garantiza
+        //    el alineamiento absoluto del array C (el linker C puede
+        //    relocarlo); pero el offset relativo entre entries es estable.
+        //    Para alineamientos mayores (AVX2/AVX-512), usar atributos C
+        //    `_Alignas` o `__attribute__((aligned(N)))` en el array.
+        uint16_t max_align = 8;
+        for (size_t i = 0; i < N; ++i) {
+            const uint16_t a = mod.static_data.meta_at(i).alignment;
+            if (a > max_align) max_align = a;
+        }
+        ctx.out << "static VEX_UNUSED";
+        if (max_align > 1) {
+            // Atributo C estandar (C11) para alineamiento garantizado.
+            ctx.out << " _Alignas(" << max_align << ")";
+        }
+        ctx.out << " const unsigned char __vex_static_pool[] = {";
+        // 2) Emit pool byte por byte, respetando alineamiento de cada entry
+        //    via padding NUL intermedio.  Indices [offset] dentro del pool.
+        size_t cursor = 0;
+        std::vector<size_t> entry_offsets(N);
+        for (size_t i = 0; i < N; ++i) {
+            auto [bp, bn] = mod.static_data.bytes_at(i);
+            const uint16_t a = mod.static_data.meta_at(i).alignment;
+            const uint16_t needed = (a > 0) ? a : 1;
+            // Padding hasta multiplo de needed.
+            while (cursor % needed != 0) {
+                ctx.out << (cursor ? ", " : "") << "0";
+                cursor++;
             }
-            if (!bytes.empty()) ctx.out << ", ";
-            ctx.out << "0 };\n";
+            entry_offsets[i] = cursor;
+            for (size_t b = 0; b < bn; ++b) {
+                ctx.out << ((cursor || b) ? ", " : "") << static_cast<unsigned>(bp[b]);
+                cursor++;
+            }
+            // Sufijo NUL: separa entries Y permite uso como cstr para FFI.
+            ctx.out << ", 0";
+            cursor++;
+        }
+        ctx.out << " };\n\n";
+        // 3) Macros legibles por entry.  El consumer existente del C
+        //    backend referencia `__str_<i>` como puntero a unsigned char.
+        //    Generamos un alias macro -> &__vex_static_pool[offset] con
+        //    coste cero en runtime (resuelto en compile time del C).
+        for (size_t i = 0; i < N; ++i) {
+            ctx.out << "#define __str_" << i
+                    << " (&__vex_static_pool[" << entry_offsets[i] << "])\n";
         }
         ctx.out << "\n";
     }

@@ -407,6 +407,23 @@ bool ir_pass_load_narrow(IrFunction &fn);
  */
 bool ir_pass_schedule(IrFunction &fn);
 
+/**
+ * @brief Registra un helper @c __new_<X> como "puro" (sin side effects
+ *        que requieran preservar la llamada cuando el resultado no se usa).
+ *
+ * El frontend lo invoca cuando detecta un constructor trivial (sin
+ * @c callvirt al ctor user-defined).  El optimizador puede eliminar
+ * la llamada al @c __new_<X> si el handle resultante no se usa.
+ *
+ * Implementacion ligera: un set global de strings consultado por DCE.
+ */
+void register_pure_new_helper(const std::string &fn_name);
+
+/**
+ * @brief Consulta si un helper @c __new_<X> ha sido marcado como puro.
+ */
+bool is_pure_new_helper(const std::string &fn_name);
+
 } // namespace ir
 
 #endif // IR_OPTIMIZER_H

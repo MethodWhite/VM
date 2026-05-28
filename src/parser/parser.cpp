@@ -460,6 +460,21 @@ namespace vm {
         /* --- Move-and-take (primitivo de smart pointers unique<T> / shared<T>) --- */
         {"mvtake",    {"mvtake",    OpArity::TWO}},
 
+        /* --- Phase Z: memoria compartida cross-process ---
+         *  Todos arity TWO (reg, reg).  El lowering los emite cuando un
+         *  objeto tiene SHARED_HANDLE_BIT puesto.  Stubs registrados aqui
+         *  para que el .vel emitido parsee; runtime los ejecuta como mov
+         *  hasta que el mark/sweep cross-process este integrado.
+         */
+        {"newobjs",    {"newobjs",    OpArity::ONE}},
+        {"gcpromote",  {"gcpromote",  OpArity::TWO}},
+        {"gcdemote",   {"gcdemote",   OpArity::TWO}},
+        {"atomicld",   {"atomicld",   OpArity::TWO}},   // dst, addr
+        {"atomicst",   {"atomicst",   OpArity::TWO}},   // addr, val
+        {"atomiccas",  {"atomiccas",  OpArity::FOUR}},  // dst, addr, exp, des
+        {"atomicadd",  {"atomicadd",  OpArity::THREE}}, // dst, addr, delta
+        {"sharedstat", {"sharedstat", OpArity::TWO}},
+
         /* --- descarga dinamica de modulos (builtin unloadmodule) --- */
         {"unloadmod", {"unloadmod", OpArity::TWO}},
 

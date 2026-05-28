@@ -21,9 +21,9 @@ static_assert(comptime_streq(method_name<Calc>(2), "doble"), "m2 = doble");
 static_assert(comptime_streq(method_name<Calc>(3), "mark"), "m3 = mark");
 
 // (2) method_return_type devuelve Type.
-comptime const Type RGet  = method_return_type<Calc>(1);
-comptime const Type RDob  = method_return_type<Calc>(2);
-comptime const Type RMark = method_return_type<Calc>(3);
+comptime Type RGet  = method_return_type<Calc>(1);
+comptime Type RDob  = method_return_type<Calc>(2);
+comptime Type RMark = method_return_type<Calc>(3);
 static_assert(sizeof<RGet>() == 4,                       "get -> i32");
 static_assert(sizeof<RDob>() == 8,                       "doble -> i64");
 static_assert(comptime_streq(typename<RMark>(), "string"), "mark -> string");

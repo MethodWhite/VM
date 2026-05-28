@@ -1,0 +1,48 @@
+// Regresion test para bug2.vex: el destructor de la clase contenida en
+// un `unique<T>` no se invocaba al cleanup automatico al salir del scope.
+//
+// Bug previo: `unique_box(new Recurso(1))` hacia una doble indireccion
+// (slot[+0] = malloc'd ptr; *malloc_ptr = Recurso host_ptr).  El cleanup
+// hacia callvirt sobre el malloc'd ptr (basura) en vez de sobre el
+// Recurso real, por lo que `~Recurso()` nunca se llamaba.
+//
+// Fix: cuando el payload de unique_box ya es PTR (e.g. resultado de
+// `new T()`), saltar la doble indireccion via RAW_ALLOC y guardar el
+// host_ptr DIRECTAMENTE en slot[+0].  El cleanup hace CALLVIRT(dtor) +
+// skip RAW_FREE (el GC libera el inner object cuando ningun root lo
+// referencia).
+//
+// Verificacion: contador estatico cuenta invocaciones de dtor; al salir
+// de `usar()` el contador debe ser 2 (uno por cada Recurso).
+
+class Counter {
+    public static i32 ctor_count;
+    public static i32 dtor_count;
+}
+
+class Recurso {
+    public i32 id;
+    public Recurso(i32 i) {
+        this.id = i;
+        Counter.ctor_count = Counter.ctor_count + 1;
+    }
+    public ~Recurso() {
+        Counter.dtor_count = Counter.dtor_count + 1;
+    }
+}
+
+void usar() {
+    unique<Recurso> r1 = unique_box(new Recurso(1));
+    unique<Recurso> r2 = unique_box(new Recurso(2));
+    // r1, r2 destruidos LIFO al exit del scope
+}
+
+i32 main() {
+    Counter.ctor_count = 0;
+    Counter.dtor_count = 0;
+    usar();
+    // Verificar que ambos ctors corrieron y ambos dtors corrieron.
+    if (Counter.ctor_count != 2) return 91;
+    if (Counter.dtor_count != 2) return 92;
+    return 42;
+}

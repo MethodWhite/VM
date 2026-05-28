@@ -9,7 +9,7 @@
  * @file tests/jit/test_stackmap.cpp
  * @brief Tests del sistema de stackmaps + JitRegistry + scan_jit_frames.
  *
- * Cubre:
+ * Cubre Fase 1 D.2-integration:
  *   1. Encoder rellena @c pc_offset correctamente para cada SAFEPOINT.
  *   2. Selector emite stackmaps con los slots GC correctos.
  *   3. JitRegistry register/lookup/unregister con binary search.

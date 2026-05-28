@@ -56,13 +56,11 @@ static_assert(offsetof(loader::ObjectHeader, hash_code)
               == VESTA_OBJ_HDR_HASH_CODE_OFFSET,
               "ABI drift: offsetof(ObjectHeader, hash_code)");
 
-static_assert(offsetof(loader::ObjectHeader, owner_pid)
+// owner_pid + lock_depth viven empacados en @c monitor_word (8 bytes) en offset 16.
+// El layout es: bits 0-47 owner_encoded, bits 48-63 lock_depth.
+static_assert(offsetof(loader::ObjectHeader, monitor_word)
               == VESTA_OBJ_HDR_OWNER_PID_OFFSET,
-              "ABI drift: offsetof(ObjectHeader, owner_pid)");
-
-static_assert(offsetof(loader::ObjectHeader, lock_depth)
-              == VESTA_OBJ_HDR_LOCK_DEPTH_OFFSET,
-              "ABI drift: offsetof(ObjectHeader, lock_depth)");
+              "ABI drift: offsetof(ObjectHeader, monitor_word)");
 
 static_assert(alignof(loader::ObjectHeader) == 8,
               "ABI drift: alignof(ObjectHeader) != 8");

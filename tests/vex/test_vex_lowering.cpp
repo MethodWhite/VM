@@ -21,7 +21,8 @@
  *   - if/else genera CFG con 4 bloques (entry, then, else, merge) y
  *     terminadores correctos.
  *   - Llamada recursiva genera instruccion CALL con func_name correcto.
-
+ *   - Caracteristicas no soportadas en A.1 (loops, asignacion) generan
+ *     error explicito en el lowering.
  */
 
 #include "ir/ssa_ir.h"

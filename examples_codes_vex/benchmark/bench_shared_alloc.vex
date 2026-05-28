@@ -1,0 +1,50 @@
+// Bench 1: Allocation throughput - shared vs local.
+// Mide overhead de SharedHeap (alloc + register en SharedHandleTable)
+// vs gc_heap local per-process, sin GC periodico (SharedHeap crece
+// dinamicamente hasta SHARED_MAX_CHUNKS_PER_SLAB).
+//
+// Configuracion:
+//   - 1M iter LOCAL (gc_heap local; minor GC automatico cuando el nursery
+//     se llena).
+//   - 1M iter SHARED (SharedHeap crece dinamicamente bajo demanda).
+//
+// Esperado: shared ~2-3x mas lento que local (1 CAS extra + register
+// slot en SharedHandleTable).
+class Counter {
+    public i32 v;
+    public Counter() { this.v = 0; }
+}
+
+i32 helper_local() {
+    Counter c = new Counter();
+    c.v = 1;
+    return c.v;
+}
+
+i32 helper_shared() {
+    shared Counter c = new Counter();
+    c.v = 1;
+    return c.v;
+}
+
+i32 main() {
+    i32 acc = 0;
+    i32 N = 1000000;
+    // FASE 1: 1M iter LOCAL.
+    i32 i = 0;
+    while (i < N) {
+        acc = acc + helper_local();
+        i = i + 1;
+    }
+    // FASE 2: 1M iter SHARED.  El SharedHeap crece dinamicamente
+    // alocando hasta 256 chunks por size-class.  Tras 1M shared allocs
+    // sin liberacion explicita, se invoca shared_gc_collect una sola
+    // vez al final para reciclar todos los slots sin roots.
+    i = 0;
+    while (i < N) {
+        acc = acc + helper_shared();
+        i = i + 1;
+    }
+    shared_gc_collect();  // sweep final
+    return acc;  // 2_000_000
+}

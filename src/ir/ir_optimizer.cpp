@@ -46,6 +46,12 @@ static bool is_side_effecting(IrOp op) {
         case IrOp::THROW:   case IrOp::TRYENTER: case IrOp::TRYLEAVE:
         case IrOp::LANDINGPAD:
         // async / distribucion
+        // BugFix audit B-future: FUTURE aloca una NUEVA entry en
+        // vm.shared_futures cada vez.  Sin marcarlo side-effecting,
+        // CSE deduplica multiples `future` ops creyendo que producen
+        // el mismo valor, lo que rompe @Async chain (todos los awaits
+        // se quedan esperando el MISMO future fulfilled una sola vez).
+        case IrOp::FUTURE:
         case IrOp::AWAIT:   case IrOp::FULFILL:  case IrOp::REJECT:
         case IrOp::MSGSEND: case IrOp::MSGRECV:  case IrOp::RSPAWN:
         // monitores
@@ -73,9 +79,27 @@ static bool is_side_effecting(IrOp op) {
         case IrOp::STRFINALIZE:
         // scheduler / proceso
         case IrOp::SPAWN:   case IrOp::RESUME:   case IrOp::YIELD:
-        case IrOp::SWAPCTX: case IrOp::SPAWN_ARGS:
+        case IrOp::SWAPCTX: case IrOp::SPAWN_ARGS: case IrOp::SPAWN_ON:
+        case IrOp::HLT:     case IrOp::PANIC:
         // asignacion
         case IrOp::ALLOCA:
+        // recuperados fase B: lecturas/escrituras que consultan estado
+        // global del runtime y NO pueden reordenarse contra los STOREs
+        // que arman sus structs de parametros.  Tratarlos como llamadas.
+        case IrOp::MVTAKE_IR:
+        case IrOp::GC_ALLOCP:
+        case IrOp::GC_PROMOTE: case IrOp::GC_DEMOTE:
+        case IrOp::GC_HANDLE_FOR_PTR:
+        case IrOp::ATOMIC_LD_I64: case IrOp::ATOMIC_ST_I64:
+        case IrOp::ATOMIC_CAS_I64: case IrOp::ATOMIC_ADD_I64:
+        case IrOp::GETSTATIC: case IrOp::SETSTATIC:
+        case IrOp::FINDCLASS: case IrOp::DEFCLASS:
+        case IrOp::DEFFIELD:  case IrOp::DEFMETHOD:  case IrOp::ADDADVICE:
+        case IrOp::FINDMETHOD: case IrOp::FINDFIELD:
+        case IrOp::CALLSUPER:  case IrOp::PROCEED:
+        case IrOp::FULFILL_HLT:
+        case IrOp::STRGETBYTES:
+        case IrOp::GETPID:  case IrOp::GETARGC: case IrOp::GETARG:
         // ensamblador incrustado (nunca eliminar; semantica opaca)
         case IrOp::RAW_ASM:
             return true;
@@ -1574,16 +1598,21 @@ bool ir_pass_cse(IrFunction &fn) {
                 continue;
             }
 
-            // Construir clave canonica: "op:type:imm:op0:op1:..."
+            // Construir clave canonica: "op:type:imm:func_name:op0:op1:..."
             //
             // Bug fix: imm es semanticamente significativo para STR_LIT_ADDR
             // (indice del string), GETFIELD (offset del campo), ALLOCA (size),
             // y posiblemente otros.  Incluirlo en la clave evita dedupe falso
             // (e.g., dos str_lit_addr con strings distintos parecian iguales).
+            //
+            // Bug fix fase B: @c func_name es CRITICO para LABEL_ADDR y los
+            // CALL-like ops (CALL, CALLN, etc).  Sin esto, dos LABEL_ADDR con
+            // labels distintos se deduplican incorrectamente (handler_pc del
+            // tryenter se mezcla con el name_addr del findclass, p.ej.).
             std::ostringstream key;
             key << static_cast<int>(ins.op) << ":"
                 << static_cast<int>(ins.type) << ":"
-                << ins.imm;
+                << ins.imm << ":" << ins.func_name;
             for (IrValueId op : ins.operands) {
                 // Resolver sustituciones previas en los operandos
                 IrValueId canonical = op;
@@ -2757,16 +2786,34 @@ static bool is_sched_barrier(IrOp op) {
     switch (op) {
         case IrOp::CALL: case IrOp::CALLN: case IrOp::CALLVIRT:
         case IrOp::CALLIND: case IrOp::CALLM: case IrOp::CALLCLOSURE:
-        case IrOp::TAILCALL:
+        case IrOp::TAILCALL: case IrOp::CALLSUPER:
         case IrOp::RAW_ASM:
-        case IrOp::NEWOBJ: case IrOp::GC_ALLOC:
+        case IrOp::NEWOBJ: case IrOp::GC_ALLOC: case IrOp::GC_ALLOCP:
         case IrOp::RAW_ALLOC: case IrOp::RAW_FREE:
         case IrOp::THROW: case IrOp::TRYENTER: case IrOp::TRYLEAVE:
         case IrOp::SETFIELD: case IrOp::ARRAY_STORE:
         case IrOp::MEMCPY:
         case IrOp::STRFINALIZE: case IrOp::GCWB_IR:
         case IrOp::FUTURE: case IrOp::AWAIT: case IrOp::FULFILL: case IrOp::REJECT:
+        case IrOp::FULFILL_HLT:
         case IrOp::MSGSEND: case IrOp::MSGRECV:
+        // Recuperados fase B: instrucciones que LEEN structs de params
+        // construidos por STOREs previos.  Sin barrera, el scheduler puede
+        // moverlas antes de los STOREs y leer basura.  Cubre tambien las
+        // operaciones GC/atomic/static que mutan estado global.
+        case IrOp::MVTAKE_IR:
+        case IrOp::GC_PROMOTE: case IrOp::GC_DEMOTE:
+        case IrOp::GC_HANDLE_FOR_PTR:
+        case IrOp::ATOMIC_LD_I64: case IrOp::ATOMIC_ST_I64:
+        case IrOp::ATOMIC_CAS_I64: case IrOp::ATOMIC_ADD_I64:
+        case IrOp::GETSTATIC: case IrOp::SETSTATIC:
+        case IrOp::FINDCLASS: case IrOp::DEFCLASS:
+        case IrOp::DEFFIELD:  case IrOp::DEFMETHOD:  case IrOp::ADDADVICE:
+        case IrOp::FINDMETHOD: case IrOp::FINDFIELD:
+        case IrOp::PROCEED:
+        case IrOp::SPAWN_ON: case IrOp::HLT: case IrOp::PANIC:
+        case IrOp::GETPID:  case IrOp::GETARGC: case IrOp::GETARG:
+        case IrOp::STRGETBYTES:
             return true;
         default:
             return false;
@@ -3089,6 +3136,20 @@ void ir_optimize(IrModule &mod, OptLevel level) {
             ir_pass_schedule(fn);
         }
     }
+}
+
+// Set global de helpers @c __new_<X> marcados como puros por el frontend.
+// El frontend lo invoca cuando detecta un ctor trivial (sin @c callvirt al
+// ctor user-defined); el DCE puede eliminar la llamada si el handle no se
+// usa.  Coste: lookup O(1) amortizado en una sola posicion del pipeline.
+static std::unordered_set<std::string> g_pure_new_helpers;
+
+void register_pure_new_helper(const std::string &fn_name) {
+    g_pure_new_helpers.insert(fn_name);
+}
+
+bool is_pure_new_helper(const std::string &fn_name) {
+    return g_pure_new_helpers.count(fn_name) != 0;
 }
 
 } // namespace ir

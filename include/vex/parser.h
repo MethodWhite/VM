@@ -47,6 +47,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "vex/ast.h"
@@ -72,6 +73,16 @@ namespace vex {
          * @param diags Sumidero de errores.  Debe sobrevivir al parser.
          */
         Parser(Lexer &lex, Diagnostics &diags);
+
+        /**
+         * @brief Phase M.L8: registra un alias de tipo conocido (typedef
+         * importado de otro modulo via @c .vexi) ANTES de parsear.  El
+         * @c looks_like_cast lo usa para reconocer @c (Name)expr como un
+         * cast.  Idempotente: insertar el mismo nombre dos veces es no-op.
+         */
+        void add_known_alias(const std::string &name) {
+            declared_aliases_.insert(name);
+        }
 
         /**
          * @brief Parsea el programa completo desde el cursor actual del lexer.
@@ -188,6 +199,11 @@ namespace vex {
         std::unique_ptr<ast::ParamDecl>     parse_param();
         std::unique_ptr<ast::TypeAliasDecl> parse_typedef_decl();
         std::unique_ptr<ast::TypeAliasDecl> parse_using_decl();
+        /// @brief Parsea @c import "path" [as alias] [only A, B];
+        /// @param is_public_reexport @c true si vino precedido de @c public.
+        std::unique_ptr<ast::ImportDecl>    parse_import_decl(bool is_public_reexport);
+        /// @brief Parsea @c "namespace foo { decls }" (Phase M.7.c).
+        std::unique_ptr<ast::NamespaceDecl> parse_namespace_decl();
         std::unique_ptr<ast::StructDecl>    parse_struct_decl();
         /// `typedef struct {...} Name;` o
         /// `typedef enum {...} Name;`.  Devuelve StructDecl o EnumDecl.
@@ -326,6 +342,42 @@ namespace vex {
         /// llamada en el archivo (single-pass parser). Forward refs requieren
         /// un pre-scanner (Phase B futura).
         std::unordered_map<std::string, std::vector<int>> macro_expr_params_;
+
+        /// Set de identifiers declarados como typedef / using en el archivo
+        /// (alias de tipos).  Poblado por @c parse_typedef_decl /
+        /// @c parse_using_decl.  Consultado por @c looks_like_cast para
+        /// permitir `(MyTypedef) x` cuando el identifier es un alias
+        /// conocido (cierre de Item 19 de pendientes).  Limitacion
+        /// single-pass: el typedef debe declararse ANTES del uso (igual
+        /// que cualquier forward decl en C/Vex).
+        std::unordered_set<std::string> declared_aliases_;
+
+        /// Phase M.L24: flag indicando si la ultima invocacion de
+        /// @c parse_top_level_decl skipeo la decl por @c @Target no
+        /// matcheado.  @c parse_program lo consulta para evitar
+        /// llamar a @c synchronize() (que descartaria tokens validos
+        /// de la siguiente decl).
+        bool last_decl_was_target_skip_ = false;
+
+        /// Phase M6.a L.3: visibilidad pendiente capturada en
+        /// @c parse_top_level_decl.  Los sub-parsers que produzcan un
+        /// nodo top-level llaman @c apply_pending_visibility_ al final
+        /// antes de devolver el nodo.  Valores: 0 = sin keyword (mantener
+        /// el default del nodo), 1 = @c public explicito, 2 = @c private
+        /// explicito.  El destructor @c VisGuard en
+        /// @c parse_top_level_decl resetea a 0 al salir.
+        uint8_t                         pending_visibility_ = 0;
+
+    public:
+        /// Helper que aplica @c pending_visibility_ al nodo si el nodo
+        /// es de un kind con campo @c is_public.  Llamado al final de
+        /// cada @c parse_<xxx>_decl que pueda aparecer en top-level.
+        /// No-op si @c pending_visibility_ == 0.
+        void apply_pending_visibility(ast::Node *n) noexcept;
+
+        /// Phase M.L24: descarta una decl top-level cuya @Target no matcheo.
+        /// Consume tokens hasta el final natural de la decl ({ ... } o ;).
+        void skip_target_skipped_decl();
     };
 
 } // namespace vex

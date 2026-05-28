@@ -1,6 +1,6 @@
 // metaprogramacion completa al nivel de Nim.
 //
-// (1) `comptime const NAME = expr;` local (dentro de funciones)
+// (1) `comptime NAME = expr;` local (dentro de funciones)
 // (2) `comptime { ... }` bloque scope para constantes / asserts compile-time
 // (3) `comptime for (i in lo..hi) { body }` loop unrolled, i const por iter
 // (4) Operadores string compile-time: comptime_concat / comptime_streq / comptime_strlen
@@ -25,16 +25,16 @@ comptime i64 pow_int(i64 base, i64 e) {
     return base * pow_int(base, e - 1);
 }
 
-// --- (1) comptime const global con builtins comptime.
-comptime const string TYPE_NAME = typename<Vec3>();
-comptime const u64    TYPE_SZ   = sizeof<Vec3>();
-comptime const u64    F10       = fact(10);          // 3628800
-comptime const u64    F15       = fib(15);           // 610
+// --- (1) comptime global con builtins comptime.
+comptime string TYPE_NAME = typename<Vec3>();
+comptime u64    TYPE_SZ   = sizeof<Vec3>();
+comptime u64    F10       = fact(10);          // 3628800
+comptime u64    F15       = fib(15);           // 610
 
 // --- (4) Operadores string.
-comptime const string PREFIX = "vec_";
-comptime const string COMBINED = comptime_concat(PREFIX, TYPE_NAME);   // "vec_Vec3"
-comptime const u64 COMBINED_LEN = comptime_strlen(COMBINED);            // 8
+comptime string PREFIX = "vec_";
+comptime string COMBINED = comptime_concat(PREFIX, TYPE_NAME);   // "vec_Vec3"
+comptime u64 COMBINED_LEN = comptime_strlen(COMBINED);            // 8
 
 // --- static_assert sobre todos los anteriores.
 static_assert(F10 == 3628800,          "fact(10)");
@@ -46,13 +46,13 @@ static_assert(COMBINED_LEN == 8,                       "strlen");
 static_assert(TYPE_SZ == 24,                           "sizeof Vec3");
 
 i32 main() {
-    // --- (1) comptime const local con builtins + fns recursivas.
-    comptime const i64 LOCAL_F6  = fact(6);     // 720
-    comptime const i64 SQ_5      = pow_int(5, 2); // 25
+    // --- (1) comptime local con builtins + fns recursivas.
+    comptime i64 LOCAL_F6  = fact(6);     // 720
+    comptime i64 SQ_5      = pow_int(5, 2); // 25
 
     // --- (2) Bloque comptime con vars locales scoped y static_assert.
     comptime {
-        comptime const i64 DOUBLE = LOCAL_F6 * 2;     // 1440
+        comptime i64 DOUBLE = LOCAL_F6 * 2;     // 1440
         static_assert(DOUBLE == 1440,                 "DOUBLE wrong");
         static_assert(SQ_5 == 25,                     "SQ_5 wrong");
     }
@@ -64,10 +64,10 @@ i32 main() {
     }
     // sum_facts = 1+2+6+24+120 = 153
 
-    // comptime for + comptime const dentro del body (cada iter es scope nuevo).
+    // comptime for + comptime dentro del body (cada iter es scope nuevo).
     i64 product = 1;
     comptime for (j in 2..=5) {
-        comptime const i64 SQ = j * j;     // j const en cada iter
+        comptime i64 SQ = j * j;     // j const en cada iter
         product = product + SQ;             // 4+9+16+25 = 54
     }
 

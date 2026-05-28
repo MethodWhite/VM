@@ -1,0 +1,554 @@
+// =============================================================================
+// modules/launcher.vex - Launcher TUI inicial (F2)
+// =============================================================================
+//
+// Selector inicial al abrir vexed.  Replica vnano.vsh seccion 10:
+//   - Lista del directorio actual con dirs primero, ficheros despues
+//   - Up/Down navega, Enter abre fichero o entra a dir
+//   - Right entra dir, Left sube al padre
+//   - 'p' abre el cwd como proyecto
+//   - 'n' pide nombre y crea fichero nuevo
+//   - '/' activa busqueda incremental por substring
+//   - 'q' o Esc cancela
+//
+// Devuelve LauncherResult con mode = {0 cancel, 1 file, 2 project, 3 new}.
+
+import "modules/file_io";
+import "modules/keys";
+import "modules/input";
+import "modules/screen";
+
+comptime i32 LC_MAX_ENTRIES = 1024;
+comptime i32 LC_NAME_MAX    = 260;
+comptime i32 LC_FINDDATA    = 320;
+
+public comptime i32 LR_CANCEL  = 0;
+public comptime i32 LR_FILE    = 1;
+public comptime i32 LR_PROJECT = 2;
+public comptime i32 LR_NEW     = 3;
+
+public class LauncherResult {
+    public i32    mode;
+    public string path;
+
+    public LauncherResult() {
+        this.mode = LR_CANCEL;
+        this.path = "";
+    }
+}
+
+public class Launcher {
+    public string cwd;
+    public u8*    names;       // pool concatenado de nombres NUL-terminados
+    public i32    names_used;
+    public i32    names_cap;
+    public i32*   offsets;     // offsets[i] dentro de names
+    public i32*   lens;        // lens[i] bytes (sin NUL)
+    public i32*   is_dirs;     // 1 = directorio
+    public i32*   visible_idx; // mapeo entry_filtrada -> idx en pool (para search)
+    public i32    count;       // entries totales en pool
+    public i32    visible_count; // entries tras filtro de busqueda
+    public i32    sel;
+    public i32    scroll;
+    public string search_query;
+    public i32    search_active;
+
+    public Launcher() {
+        u8* cwd_buf = malloc(512);
+        u8* got = file_io.getcwd_into(cwd_buf, 512);
+        if (got == null) {
+            cwd_buf[0] = (u8) 46;
+            cwd_buf[1] = 0;
+        }
+        i32 cwd_len = 0;
+        while (cwd_buf[cwd_len] != 0) cwd_len = cwd_len + 1;
+        this.cwd        = str_make(cwd_buf, cwd_len);
+        free(cwd_buf);
+        this.names      = malloc(LC_MAX_ENTRIES * LC_NAME_MAX);
+        this.names_used = 0;
+        this.names_cap  = LC_MAX_ENTRIES * LC_NAME_MAX;
+        this.offsets    = malloc(LC_MAX_ENTRIES * 4);
+        this.lens       = malloc(LC_MAX_ENTRIES * 4);
+        this.is_dirs    = malloc(LC_MAX_ENTRIES * 4);
+        this.visible_idx = malloc(LC_MAX_ENTRIES * 4);
+        this.count      = 0;
+        this.visible_count = 0;
+        this.sel        = 0;
+        this.scroll     = 0;
+        this.search_query = "";
+        this.search_active = 0;
+        this.reload();
+    }
+
+    // Recarga el listado del cwd actual.  Anyade ".." al inicio si hay
+    // directorio padre.  Dirs antes que ficheros (orden de listdir
+    // nativo; Windows ya devuelve dirs primero la mayoria de veces).
+    public void reload() {
+        this.count      = 0;
+        this.names_used = 0;
+        this.sel        = 0;
+        this.scroll     = 0;
+
+        // 1. anyadir ".." si tiene sentido (cwd no es raiz).
+        i32 cwd_n = (i32) str_bytes(this.cwd);
+        if (cwd_n > 3) {
+            if (this.names_used + 3 <= this.names_cap) {
+                i32 dst = this.names_used;
+                this.names[dst]     = (u8) 46;
+                this.names[dst + 1] = (u8) 46;
+                this.names[dst + 2] = 0;
+                this.offsets[this.count] = dst;
+                this.lens[this.count]    = 2;
+                this.is_dirs[this.count] = 1;
+                this.count               = this.count + 1;
+                this.names_used          = dst + 3;
+            }
+        }
+        u8* cwd_c = str_cstr(this.cwd);
+        u8* spec = malloc(cwd_n + 8);
+        i32 i = 0;
+        while (i < cwd_n) { spec[i] = cwd_c[i]; i = i + 1; }
+        spec[cwd_n]     = (u8) 92; // '\'
+        spec[cwd_n + 1] = (u8) 42; // '*'
+        spec[cwd_n + 2] = 0;
+        u8* finddata = malloc(LC_FINDDATA);
+        i64 h = file_io.dir_open(spec, finddata);
+        free(spec);
+        if (h == -1) {
+            free(finddata);
+            this.apply_filter();
+            return;
+        }
+        // Inlined entry processing (mismo patron que Sidebar.reload).
+        // Refactor: usar ifs anidados explicitos en lugar de && multi-clausula
+        // para esquivar el bug latente LANG.fix-9 (3-way && + asignacion
+        // condicional dentro de funcion grande con muchos locales no escribe
+        // el resultado al slot del var-decl).  Cero overhead vs version &&.
+        i32 cont = 1;
+        while (cont == 1 && this.count < LC_MAX_ENTRIES) {
+            i32 attrib = (i32) finddata[0];
+            i32 is_dir = 0;
+            if ((attrib & 16) != 0) is_dir = 1;
+            u8* name_p = finddata + 40;
+            i32 nlen = 0;
+            while (nlen < LC_NAME_MAX && name_p[nlen] != 0) nlen = nlen + 1;
+            i32 skip = 0;
+            if (nlen == 1 && name_p[0] == (u8) 46) skip = 1; // "."
+            if (nlen == 2 && name_p[0] == (u8) 46 && name_p[1] == (u8) 46) skip = 1; // ".."
+            if (skip == 0 && this.names_used + nlen + 1 <= this.names_cap) {
+                i32 dst = this.names_used;
+                i32 k = 0;
+                while (k < nlen) {
+                    this.names[dst + k] = name_p[k];
+                    k = k + 1;
+                }
+                this.names[dst + nlen] = 0;
+                this.offsets[this.count] = dst;
+                this.lens[this.count]    = nlen;
+                this.is_dirs[this.count] = is_dir;
+                this.count               = this.count + 1;
+                this.names_used          = dst + nlen + 1;
+            }
+            i32 rc = file_io.dir_next(h, finddata);
+            if (rc != 0) cont = 0;
+        }
+        file_io.dir_close(h);
+        free(finddata);
+        this.apply_filter();
+    }
+
+    // Anyade una entry al pool.  Si name_p es null y nlen==-1, escribe
+    // ".." literal (entry sintetica del padre).
+    public void add_entry_bytes(u8* name_p, i32 nlen, i32 is_dir) {
+        i32 actual_len = nlen;
+        if (nlen == -1) actual_len = 2;
+        if (this.names_used + actual_len + 1 > this.names_cap) return;
+        i32 dst = this.names_used;
+        if (nlen == -1) {
+            this.names[dst]     = (u8) 46;
+            this.names[dst + 1] = (u8) 46;
+        } else {
+            i32 k = 0;
+            while (k < nlen) {
+                this.names[dst + k] = name_p[k];
+                k = k + 1;
+            }
+        }
+        this.names[dst + actual_len] = 0;
+        this.offsets[this.count] = dst;
+        this.lens[this.count]    = actual_len;
+        this.is_dirs[this.count] = is_dir;
+        this.count               = this.count + 1;
+        this.names_used          = dst + actual_len + 1;
+    }
+
+    // Repuebla visible_idx segun search_query.  Si query vacia, todas.
+    public void apply_filter() {
+        this.visible_count = 0;
+        i32 qn = (i32) str_bytes(this.search_query);
+        if (qn == 0) {
+            i32 i = 0;
+            while (i < this.count) {
+                this.visible_idx[this.visible_count] = i;
+                this.visible_count = this.visible_count + 1;
+                i = i + 1;
+            }
+        } else {
+            u8* qc = str_cstr(this.search_query);
+            i32 i = 0;
+            while (i < this.count) {
+                u8* nm = this.names + this.offsets[i];
+                i32 nlen = this.lens[i];
+                if (this.contains_ci(nm, nlen, qc, qn) == 1) {
+                    this.visible_idx[this.visible_count] = i;
+                    this.visible_count = this.visible_count + 1;
+                }
+                i = i + 1;
+            }
+        }
+        if (this.sel >= this.visible_count) this.sel = this.visible_count - 1;
+        if (this.sel < 0) this.sel = 0;
+    }
+
+    // Substring case-insensitive sobre bytes ASCII.
+    public i32 contains_ci(u8* hay, i32 hn, u8* needle, i32 nn) {
+        if (nn == 0) return 1;
+        if (nn > hn) return 0;
+        i32 i = 0;
+        while (i <= hn - nn) {
+            i32 j = 0;
+            while (j < nn) {
+                i32 a = (i32) hay[i + j];
+                i32 b = (i32) needle[j];
+                if (a >= 65 && a <= 90) a = a + 32;
+                if (b >= 65 && b <= 90) b = b + 32;
+                if (a != b) break;
+                j = j + 1;
+            }
+            if (j == nn) return 1;
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    public string entry_name(i32 vi) {
+        if (vi < 0 || vi >= this.visible_count) return "";
+        i32 idx = this.visible_idx[vi];
+        u8* p = this.names + this.offsets[idx];
+        return str_make(p, this.lens[idx]);
+    }
+
+    public i32 entry_is_dir(i32 vi) {
+        if (vi < 0 || vi >= this.visible_count) return 0;
+        return this.is_dirs[this.visible_idx[vi]];
+    }
+
+    // Construye path absoluto cwd + sep + name(sel).
+    public string entry_path(i32 vi) {
+        if (vi < 0 || vi >= this.visible_count) return this.cwd;
+        i32 idx = this.visible_idx[vi];
+        i32 cwd_n = (i32) str_bytes(this.cwd);
+        i32 en    = this.lens[idx];
+        u8* cwd_c = str_cstr(this.cwd);
+        u8* buf   = malloc(cwd_n + en + 2);
+        i32 k = 0;
+        while (k < cwd_n) { buf[k] = cwd_c[k]; k = k + 1; }
+        buf[cwd_n] = (u8) 92;
+        u8* nm = this.names + this.offsets[idx];
+        k = 0;
+        while (k < en) { buf[cwd_n + 1 + k] = nm[k]; k = k + 1; }
+        buf[cwd_n + 1 + en] = 0;
+        string s = str_make(buf, cwd_n + 1 + en);
+        free(buf);
+        return s;
+    }
+
+    // Sube al directorio padre (corta tras el ultimo '\').
+    public void go_parent() {
+        u8* c = str_cstr(this.cwd);
+        i32 nL = (i32) str_bytes(this.cwd);
+        i32 cut = nL;
+        while (cut > 0 && c[cut - 1] != (u8) 92) cut = cut - 1;
+        if (cut > 0) cut = cut - 1;
+        if (cut > 2) {
+            this.cwd = str_make(c, cut);
+            this.search_query = "";
+            this.search_active = 0;
+            this.reload();
+        }
+    }
+
+    public void render(screen.Screen sc) {
+        sc.clear();
+        sc.move_cursor(1, 1);
+        // Titulo en barra invertida.
+        print(screen.ATTR_INVERT);
+        print(screen.ATTR_BOLD);
+        print(" vexed - Selector ");
+        i32 pad = sc.cols - 18;
+        i32 p = 0;
+        while (p < pad) { print(" "); p = p + 1; }
+        print(screen.ATTR_RESET);
+
+        sc.move_cursor(2, 1);
+        print(screen.FG_CYAN);
+        print("Carpeta: ");
+        print(this.cwd);
+        print(screen.ATTR_RESET);
+        sc.clear_eol();
+
+        // lista en filas 4..rows-3
+        i32 body_top = 4;
+        i32 body_bot = sc.rows - 3;
+        i32 list_h   = body_bot - body_top + 1;
+        if (list_h < 5) list_h = 5;
+        if (this.sel < this.scroll) this.scroll = this.sel;
+        if (this.sel >= this.scroll + list_h) this.scroll = this.sel - list_h + 1;
+        if (this.scroll < 0) this.scroll = 0;
+
+        i32 r = 0;
+        while (r < list_h) {
+            sc.move_cursor(body_top + r, 1);
+            i32 idx = this.scroll + r;
+            if (idx < this.visible_count) {
+                i32 is_sel = 0;
+                if (idx == this.sel) is_sel = 1;
+                this.draw_entry(idx, is_sel, sc.cols);
+            }
+            sc.clear_eol();
+            r = r + 1;
+        }
+
+        // Linea de busqueda
+        sc.move_cursor(sc.rows - 2, 1);
+        if (this.search_active == 1 || str_bytes(this.search_query) > 0) {
+            print(screen.FG_YELLOW);
+            print("Buscar: ");
+            print(this.search_query);
+            if (this.search_active == 1) print("_");
+            print(screen.ATTR_RESET);
+        }
+        sc.clear_eol();
+
+        // Hint
+        sc.move_cursor(sc.rows, 1);
+        print(screen.FG_GRAY);
+        print(" Enter=abrir  Right=entrar  Left=padre  p=proyecto  n=nuevo  /=buscar  q=salir ");
+        print(screen.ATTR_RESET);
+        sc.clear_eol();
+    }
+
+    public void draw_entry(i32 vi, i32 selected, i32 cols) {
+        i32 idx = this.visible_idx[vi];
+        i32 is_dir = this.is_dirs[idx];
+        string prefix = "    ";
+        if (is_dir == 1) prefix = "  > ";
+
+        u8* nm = this.names + this.offsets[idx];
+        i32 nlen = this.lens[idx];
+
+        if (selected == 1) {
+            print(screen.ATTR_INVERT);
+            print(screen.ATTR_BOLD);
+        } else if (is_dir == 1) {
+            print(screen.FG_BLUE);
+        } else {
+            print(screen.FG_GREEN);
+        }
+        print(prefix);
+        i32 k = 0;
+        i32 max_chars = cols - 6;
+        while (k < nlen && k < max_chars) {
+            i32 ch = (i32) nm[k];
+            if (ch >= 32 && ch < 127) print_char(ch);
+            else                       print(".");
+            k = k + 1;
+        }
+        if (is_dir == 1 && nlen + 1 < max_chars) print("/");
+        print(screen.ATTR_RESET);
+    }
+
+    // Pide nombre de fichero nuevo en barra inferior.  Vacio = cancel.
+    public string prompt_new_name(screen.Screen sc) {
+        sc.move_cursor(sc.rows - 1, 1);
+        print(screen.ATTR_INVERT);
+        print(" Nuevo fichero: ");
+        print(screen.ATTR_RESET);
+        sc.clear_eol();
+        sc.move_cursor(sc.rows - 1, 17);
+        sc.show_cursor();
+        flush();
+
+        u8* buf = malloc(256);
+        i32 n = 0;
+        while (1) {
+            i32 k = input.read_key_blocking();
+            if (k == keys.KEY_ENTER || k == keys.KEY_LF) {
+                buf[n] = 0;
+                string s = str_make(buf, n);
+                free(buf);
+                sc.hide_cursor();
+                return s;
+            }
+            if (k == keys.KEY_ESC) {
+                free(buf);
+                sc.hide_cursor();
+                return "";
+            }
+            if (k == keys.KEY_BACKSPACE || k == keys.KEY_BACKSPACE_WIN) {
+                if (n > 0) {
+                    n = n - 1;
+                    sc.move_cursor(sc.rows - 1, 17 + n);
+                    print(" ");
+                    sc.move_cursor(sc.rows - 1, 17 + n);
+                    flush();
+                }
+                continue;
+            }
+            if (k >= 32 && k < 127 && n < 250) {
+                buf[n] = (u8) k;
+                n = n + 1;
+                sc.move_cursor(sc.rows - 1, 17 + n - 1);
+                print_char(k);
+                flush();
+            }
+        }
+        free(buf);
+        sc.hide_cursor();
+        return "";
+    }
+
+    // Bucle principal del launcher.  Devuelve resultado.
+    public LauncherResult run(screen.Screen sc) {
+        sc.hide_cursor();
+        LauncherResult res = new LauncherResult();
+
+        i32 done = 0;
+        while (done == 0) {
+            this.render(sc);
+            flush();
+            i32 k = input.read_key_blocking();
+
+            // Modo busqueda activo: captura teclas en search_query.
+            if (this.search_active == 1) {
+                if (k == keys.KEY_ESC) {
+                    this.search_active = 0;
+                    this.search_query = "";
+                    this.apply_filter();
+                    continue;
+                }
+                if (k == keys.KEY_ENTER || k == keys.KEY_LF) {
+                    this.search_active = 0;
+                    continue;
+                }
+                if (k == keys.KEY_BACKSPACE || k == keys.KEY_BACKSPACE_WIN) {
+                    i32 qn = (i32) str_bytes(this.search_query);
+                    if (qn > 0) {
+                        u8* qc = str_cstr(this.search_query);
+                        this.search_query = str_make(qc, qn - 1);
+                        this.apply_filter();
+                    }
+                    continue;
+                }
+                if (k >= 32 && k < 127) {
+                    i32 qn = (i32) str_bytes(this.search_query);
+                    u8* qc = str_cstr(this.search_query);
+                    u8* nq = malloc(qn + 2);
+                    i32 i = 0;
+                    while (i < qn) { nq[i] = qc[i]; i = i + 1; }
+                    nq[qn] = (u8) k;
+                    nq[qn + 1] = 0;
+                    this.search_query = str_make(nq, qn + 1);
+                    free(nq);
+                    this.apply_filter();
+                }
+                continue;
+            }
+
+            // Navegacion normal.
+            if (k == keys.KEY_ESC || k == 113) {
+                done = 1;
+                res.mode = LR_CANCEL;
+            } else if (k == keys.VK_UP) {
+                if (this.sel > 0) this.sel = this.sel - 1;
+            } else if (k == keys.VK_DOWN) {
+                if (this.sel < this.visible_count - 1) this.sel = this.sel + 1;
+            } else if (k == keys.VK_PGUP) {
+                this.sel = this.sel - 10;
+                if (this.sel < 0) this.sel = 0;
+            } else if (k == keys.VK_PGDN) {
+                this.sel = this.sel + 10;
+                if (this.sel >= this.visible_count) this.sel = this.visible_count - 1;
+            } else if (k == keys.VK_HOME) {
+                this.sel = 0;
+            } else if (k == keys.VK_END) {
+                this.sel = this.visible_count - 1;
+            } else if (k == keys.VK_LEFT) {
+                this.go_parent();
+            } else if (k == keys.VK_RIGHT) {
+                if (this.visible_count > 0 && this.entry_is_dir(this.sel) == 1) {
+                    string nm = this.entry_name(this.sel);
+                    if (str_equals(nm, "..")) {
+                        this.go_parent();
+                    } else {
+                        this.cwd = this.entry_path(this.sel);
+                        this.search_query = "";
+                        this.search_active = 0;
+                        this.reload();
+                    }
+                }
+            } else if (k == keys.KEY_ENTER || k == keys.KEY_LF) {
+                if (this.visible_count > 0) {
+                    if (this.entry_is_dir(this.sel) == 1) {
+                        string nm = this.entry_name(this.sel);
+                        if (str_equals(nm, "..")) {
+                            this.go_parent();
+                        } else {
+                            this.cwd = this.entry_path(this.sel);
+                            this.search_query = "";
+                            this.search_active = 0;
+                            this.reload();
+                        }
+                    } else {
+                        done = 1;
+                        res.mode = LR_FILE;
+                        res.path = this.entry_path(this.sel);
+                    }
+                }
+            } else if (k == 112) {
+                // 'p' = abrir proyecto (cwd)
+                done = 1;
+                res.mode = LR_PROJECT;
+                res.path = this.cwd;
+            } else if (k == 110) {
+                // 'n' = nuevo fichero
+                string nm = this.prompt_new_name(sc);
+                if (str_bytes(nm) > 0) {
+                    // construir cwd + '\' + nm
+                    i32 cn = (i32) str_bytes(this.cwd);
+                    i32 nn = (i32) str_bytes(nm);
+                    u8* cc = str_cstr(this.cwd);
+                    u8* nc = str_cstr(nm);
+                    u8* buf = malloc(cn + nn + 2);
+                    i32 i = 0;
+                    while (i < cn) { buf[i] = cc[i]; i = i + 1; }
+                    buf[cn] = (u8) 92;
+                    i = 0;
+                    while (i < nn) { buf[cn + 1 + i] = nc[i]; i = i + 1; }
+                    buf[cn + 1 + nn] = 0;
+                    res.path = str_make(buf, cn + 1 + nn);
+                    free(buf);
+                    res.mode = LR_NEW;
+                    done = 1;
+                }
+            } else if (k == 47) {
+                // '/' = activar busqueda
+                this.search_active = 1;
+            }
+        }
+
+        sc.clear();
+        sc.show_cursor();
+        return res;
+    }
+}

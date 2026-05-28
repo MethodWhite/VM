@@ -616,6 +616,15 @@ namespace Assembly::Bytecode {
         Assembler *            assembly_ctx
     );
 
+    /// Emite 4 registros empacados en FIXED_4 (4 nibbles, 2 bytes).
+    /// Layout: b2 = (r0<<4)|r1, b3 = (r2<<4)|r3.  Util para @c atomiccas.
+    void emit_instr_four_reg(
+        const vm::Instruction *instruction_parser,
+        ByteWriter &           code_final,
+        const InstrInfo *      now_instr,
+        Assembler *            assembly_ctx
+    );
+
     /**
      * @brief Emite instrucciones de lectura/escritura a memoria real via cursor.
      *

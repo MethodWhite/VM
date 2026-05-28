@@ -251,6 +251,9 @@ namespace runtime {
         const uint8_t  r_src   = instr.data_instruction.reg_data.reg2;            // src reg con host_ptr
         const auto     ptr_val = static_cast<uintptr_t>(vm->registers.regs[r_src].qword());
         const auto    *payload = reinterpret_cast<const uint8_t *>(ptr_val);
+        // handle_for_ptr es O(1): mira ptr_to_handle_ local + lee
+        // ObjectHeader.hash_code (lleva SHARED_HANDLE_BIT | shared_idx
+        // para objetos del SharedHeap, escrito por newobjs/gcpromote).
         gc::GcHandle   h       = vm->gc_heap.handle_for_ptr(payload);
         vm->registers.regs[r_dst].qword(static_cast<uint64_t>(h));                // GC_NULL_HANDLE si no encontrado
     }
@@ -320,6 +323,59 @@ namespace runtime {
         }
 
         vm->registers.regs[R00].qword(static_cast<uint64_t>(h)); // devolver el handle en R00
+    }
+
+    // B4.3: NEWOBJS r_cls -> aloca en SharedHeap (Phase Z.6).
+    //
+    // Variante shared del NEWOBJ: instead of vm->gc_heap, aloca via
+    // vm_reference.shared_heap (cross-process).  Registra el host_ptr
+    // en shared_handle_table y escribe el handle (con SHARED_HANDLE_BIT)
+    // en ObjectHeader.hash_code para que el reverse lookup de gchandle
+    // sea O(1) (single atomic load del header).  Cero overhead extra
+    // vs el path local: el coste es 1 alloc + 1 register + 1 init.
+    void exec_instr_newobjs(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t r_cls = instr.data_instruction.reg_data.reg1;
+        auto *cls = reinterpret_cast<loader::ClassInfo *>(
+            vm->registers.regs[r_cls].qword());
+        if (cls == nullptr) {
+            vm->registers.regs[R00].qword(static_cast<uint64_t>(gc::GC_NULL_HANDLE));
+            return;
+        }
+
+        auto &vmr = vm->scheduler.vm_reference;
+        const uint32_t sz = cls->instance_size;
+        uint8_t *payload  = vmr.shared_heap.alloc(static_cast<size_t>(sz));
+        if (!payload) {
+            // OOM en SharedHeap -- devolver handle invalido.
+            vm->registers.regs[R00].qword(
+                static_cast<uint64_t>(gc::GC_NULL_HANDLE));
+            return;
+        }
+
+        // Registrar en SharedHandleTable (lock-free CAS).  El handle
+        // devuelto YA lleva SHARED_HANDLE_BIT (bit 31).
+        const uint32_t sh = vmr.shared_handle_table.register_object(payload, sz);
+        if (sh == 0) {
+            // tabla llena -- liberar payload y devolver invalido.
+            vmr.shared_heap.free(payload);
+            vm->registers.regs[R00].qword(
+                static_cast<uint64_t>(gc::GC_NULL_HANDLE));
+            return;
+        }
+
+        // Inicializar ObjectHeader.  Placement-new construye el atomic
+        // monitor_word a 0 (libre).  hash_code = handle (con bit 31)
+        // permite que handle_for_ptr (en gc_heap) lo recupere O(1) con
+        // un single load del header -- lock-free total.
+        auto *hdr      = new (payload) loader::ObjectHeader();
+        hdr->class_ptr = cls;
+        hdr->flags     = loader::OBJ_FLAG_GC_OWNED;
+        hdr->hash_code = sh;  // SHARED_HANDLE_BIT | shared_idx
+
+        // newobjs convention: devolver el HANDLE (con SHARED_HANDLE_BIT).
+        // El frontend lowering hace gcderef post-newobjs para obtener
+        // el host_ptr.  Simetrico a newobj que devuelve el local handle.
+        vm->registers.regs[R00].qword(static_cast<uint64_t>(sh));
     }
 
     /**
@@ -455,6 +511,205 @@ namespace runtime {
 
         uint64_t new_ptr = vm->raw_alloc.realloc(ptr, static_cast<size_t>(size)); // redimensionar
         vm->registers.regs[R00].qword(new_ptr); // devolver el nuevo puntero en R00
+    }
+
+    // =========================================================================
+    //  Phase Z - gcpromote / gcdemote: deep-copy local <-> SharedHeap.
+    // =========================================================================
+    //
+    // El host_ptr en el registro apunta al payload (ObjectHeader + fields).
+    // El @c GcHeader precede al payload por 8 bytes y lleva el tamano total
+    // del slot.  Para identificar si un objeto es shared, marcamos
+    // @c ObjectHeader::hash_code con el bit 31 (@c SHARED_HANDLE_BIT).
+    //
+    // Promote (local -> shared):
+    //   1. Lee tamano del GcHeader del src
+    //   2. Aloca slot en @c vm.shared_heap.alloc(size)
+    //   3. Copia bytes desde src.payload al nuevo slot
+    //   4. Registra en @c shared_handle_table.register_object(new_ptr, size)
+    //   5. Setea bit 31 en hash_code del nuevo header
+    //   6. r_dst = new_host_ptr
+    //
+    // Demote (shared -> local):
+    //   1. Aloca slot en @c gc_heap del proceso actual
+    //   2. Copia bytes
+    //   3. Limpia bit 31 en hash_code
+    //   4. r_dst = new_host_ptr
+
+    void exec_instr_gcpromote(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t  rdst = instr.data_instruction.reg_data.reg1;
+        const uint8_t  rsrc = instr.data_instruction.reg_data.reg2;
+        const uint64_t src  = vm->registers.regs[rsrc].qword();
+        if (src == 0) {
+            vm->registers.regs[rdst].qword(0);
+            return;
+        }
+        // Si ya es shared (bit 31 en hash_code), idempotente.
+        auto *src_hdr = reinterpret_cast<loader::ObjectHeader *>(src);
+        if (src_hdr->hash_code & 0x80000000u) {
+            vm->registers.regs[rdst].qword(src);
+            return;
+        }
+        // El GcHeader precede al payload por 8 bytes (no usado aqui --
+        // estimacion conservadora del tamano via class_ptr si esta presente).
+        // Para v1 usamos un tamano fijo de ObjectHeader + N campos heuristico.
+        // Mejora futura: leer GcHeader.size para tamano exacto.
+        // Tamano conservador: ObjectHeader (24) + class->total_field_size si
+        // class_ptr no es null, sino 64 bytes como default.
+        size_t total_size = 64;
+        if (src_hdr->class_ptr) {
+            total_size = src_hdr->class_ptr->instance_size;
+        }
+        if (total_size < sizeof(loader::ObjectHeader))
+            total_size = sizeof(loader::ObjectHeader);
+
+        auto &shared = vm->scheduler.vm_reference.shared_heap;
+        uint8_t *new_ptr = shared.alloc(total_size);
+        if (!new_ptr) {
+            // OOM en SharedHeap: devolver src sin promote (degradado).
+            vm->registers.regs[rdst].qword(src);
+            return;
+        }
+        std::memcpy(new_ptr, reinterpret_cast<void *>(src), total_size);
+        // Marcar el nuevo header como shared (bit 31 en hash_code).
+        auto *new_hdr = reinterpret_cast<loader::ObjectHeader *>(new_ptr);
+        new_hdr->hash_code |= 0x80000000u;
+        // Registrar en SharedHandleTable.
+        vm->scheduler.vm_reference.shared_handle_table.register_object(
+            new_ptr, static_cast<uint32_t>(total_size));
+        vm->registers.regs[rdst].qword(reinterpret_cast<uint64_t>(new_ptr));
+    }
+
+    void exec_instr_gcdemote(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t  rdst = instr.data_instruction.reg_data.reg1;
+        const uint8_t  rsrc = instr.data_instruction.reg_data.reg2;
+        const uint64_t src  = vm->registers.regs[rsrc].qword();
+        if (src == 0) {
+            vm->registers.regs[rdst].qword(0);
+            return;
+        }
+        auto *src_hdr = reinterpret_cast<loader::ObjectHeader *>(src);
+        // Si no es shared, idempotente.
+        if (!(src_hdr->hash_code & 0x80000000u)) {
+            vm->registers.regs[rdst].qword(src);
+            return;
+        }
+        size_t total_size = 64;
+        if (src_hdr->class_ptr) {
+            total_size = src_hdr->class_ptr->instance_size;
+        }
+        if (total_size < sizeof(loader::ObjectHeader))
+            total_size = sizeof(loader::ObjectHeader);
+        // Alocar en gc_heap local.  Usamos alloc_pinned para que el sweep
+        // local no lo mueva (igual semantica que strings).
+        gc::GcHandle h = vm->gc_heap.alloc_pinned(total_size);
+        if (h == gc::GC_NULL_HANDLE) {
+            vm->registers.regs[rdst].qword(src);
+            return;
+        }
+        uint8_t *new_ptr = vm->gc_heap.deref(h);
+        std::memcpy(new_ptr, reinterpret_cast<void *>(src), total_size);
+        // Limpiar bit shared.
+        auto *new_hdr = reinterpret_cast<loader::ObjectHeader *>(new_ptr);
+        new_hdr->hash_code &= 0x7FFFFFFFu;
+        vm->registers.regs[rdst].qword(reinterpret_cast<uint64_t>(new_ptr));
+    }
+
+    // =========================================================================
+    //  Phase Z - Atomics i64 reales sobre host memory.
+    // =========================================================================
+    //
+    // Implementacion sobre memoria HOST (raw pointers).  Los registros llevan
+    // direcciones host (uint64_t reinterpret_cast'eadas).  Usamos los
+    // intrinsics @c __atomic_* de GCC/Clang con memory_order seq_cst para
+    // simplicidad y correctness; un orden mas relajado por op se anadira
+    // cuando el frontend exponga el parametro de ordering.
+
+    // ATOMICLD r_dst, r_addr : r_dst = atomic_load_i64(*(int64_t*)r_addr).
+    void exec_instr_atomicld(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t  rdst  = instr.data_instruction.reg_data.reg1;
+        const uint8_t  raddr = instr.data_instruction.reg_data.reg2;
+        const uint64_t addr  = vm->registers.regs[raddr].qword();
+        if (addr == 0) {
+            vm->registers.regs[rdst].qword(0);
+            return;
+        }
+        int64_t val = __atomic_load_n(reinterpret_cast<int64_t *>(addr),
+                                       __ATOMIC_SEQ_CST);
+        vm->registers.regs[rdst].qword(static_cast<uint64_t>(val));
+    }
+
+    // ATOMICST r_addr, r_val : atomic_store_i64(*r_addr, r_val).
+    void exec_instr_atomicst(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t  raddr = instr.data_instruction.reg_data.reg1;
+        const uint8_t  rval  = instr.data_instruction.reg_data.reg2;
+        const uint64_t addr  = vm->registers.regs[raddr].qword();
+        if (addr == 0) return;
+        const int64_t  val   = static_cast<int64_t>(vm->registers.regs[rval].qword());
+        __atomic_store_n(reinterpret_cast<int64_t *>(addr), val,
+                         __ATOMIC_SEQ_CST);
+    }
+
+    // ATOMICADD r_dst, r_addr, r_delta : r_dst = atomic_fetch_add_i64.
+    void exec_instr_atomicadd(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t  rdst   = instr.data_instruction.mem_data.reg_base;
+        const uint8_t  raddr  = instr.data_instruction.mem_data.reg_index;
+        const uint8_t  rdelta = instr.data_instruction.mem_data.reg_final;
+        const uint64_t addr   = vm->registers.regs[raddr].qword();
+        if (addr == 0) {
+            vm->registers.regs[rdst].qword(0);
+            return;
+        }
+        const int64_t  delta  = static_cast<int64_t>(vm->registers.regs[rdelta].qword());
+        int64_t old = __atomic_fetch_add(reinterpret_cast<int64_t *>(addr),
+                                          delta, __ATOMIC_SEQ_CST);
+        vm->registers.regs[rdst].qword(static_cast<uint64_t>(old));
+    }
+
+    // ATOMICCAS r_dst, r_addr, r_exp, r_des :
+    //   compare_exchange_strong(*addr, &exp, des).  Devuelve el valor que
+    //   estaba en *addr ANTES de la operacion (sea hit o miss del CAS).
+    //   Si quieres saber si el CAS tuvo exito, comparar r_dst con r_exp.
+    void exec_instr_atomiccas(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t  rdst  = instr.data_instruction.mem_data.reg_base;
+        const uint8_t  raddr = instr.data_instruction.mem_data.reg_index;
+        const uint8_t  rexp  = instr.data_instruction.mem_data.reg_final;
+        const uint8_t  rdes  = instr.data_instruction.mem_data.scale;
+        const uint64_t addr  = vm->registers.regs[raddr].qword();
+        if (addr == 0) {
+            vm->registers.regs[rdst].qword(0);
+            return;
+        }
+        int64_t expected = static_cast<int64_t>(vm->registers.regs[rexp].qword());
+        const int64_t desired = static_cast<int64_t>(vm->registers.regs[rdes].qword());
+        __atomic_compare_exchange_n(reinterpret_cast<int64_t *>(addr),
+                                     &expected, desired,
+                                     /*weak=*/false,
+                                     __ATOMIC_SEQ_CST,
+                                     __ATOMIC_SEQ_CST);
+        vm->registers.regs[rdst].qword(static_cast<uint64_t>(expected));
+    }
+
+    // SHAREDSTAT r_dst, r_op : introspeccion del SharedHeap.
+    //   r_op == 0 -> r_dst = live_count (SharedHandleTable)
+    //   r_op == 1 -> r_dst = total_allocated_bytes
+    //   r_op == 2 -> r_dst = shared_gc_collect (slots barridos)
+    //
+    // Codigos alineados con la convencion del lowering Vex
+    // (shared_heap_live_count/bytes/gc_collect en lower_call).
+    void exec_instr_sharedstat(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t rdst = instr.data_instruction.reg_data.reg1;
+        const uint8_t rop  = instr.data_instruction.reg_data.reg2;
+        const uint64_t op  = vm->registers.regs[rop].qword();
+        auto &vmr  = vm->scheduler.vm_reference;
+        uint64_t result = 0;
+        switch (op) {
+            case 0: result = static_cast<uint64_t>(vmr.shared_handle_table.live_count()); break;
+            case 1: result = vmr.shared_heap.total_allocated_bytes(); break;
+            case 2: result = vmr.shared_gc_collect(); break;
+            default: result = 0; break;
+        }
+        vm->registers.regs[rdst].qword(result);
     }
 
 } // namespace runtime

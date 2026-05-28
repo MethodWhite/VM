@@ -1,0 +1,50 @@
+// Regresion test para bug Shape (bugs1.vex): enum variants con payload
+// f64 se truncaban a int por lowering incorrecto.
+//
+// Bug previo: el constructor del enum llamaba `cast_if_needed(F64, I64)`
+// que selecciona FTOI (float-to-int VALUE conversion), perdiendo la
+// fraccion.  La destructuracion LOAD i64 directo, y luego se interpretaba
+// como f64 -> resultado garbage (~0 para valores pequenos).
+//
+// Fix: constructor usa BITCAST F64->I64 (preserva bits IEEE en el slot).
+// Destructuracion usa BITCAST I64->F64 al hacer bind para que las ops
+// posteriores sean FMUL/FCMP en lugar de IMUL/ICMP.
+
+enum Shape {
+    Circle(f64),
+    Rectangle(f64, f64),
+    Triangle(f64, f64, f64)
+}
+
+f64 area(Shape s) {
+    match s {
+        case Circle(r) => return 3.14159 * r * r;
+        case Rectangle(w, h) => return w * h;
+        case Triangle(a, b, c) => {
+            f64 sp = (a + b + c) / 2.0;
+            f64 area2 = sp * (sp - a) * (sp - b) * (sp - c);
+            return sqrt(area2);
+        }
+    }
+}
+
+i32 main() {
+    Shape s1 = Shape.Circle(5.0);
+    Shape s2 = Shape.Rectangle(3.0, 4.0);
+    Shape s3 = Shape.Triangle(3.0, 4.0, 5.0);
+
+    // (1) Circle(5.0) -> pi * 25 ~= 78.54.
+    //     Tolerancia +-0.01 para permitir pi=3.14159 vs 3.14159265.
+    f64 a1 = area(s1);
+    if (a1 < 78.5 || a1 > 78.6) return 91;
+
+    // (2) Rectangle(3, 4) -> 12.0 exacto.
+    f64 a2 = area(s2);
+    if (a2 < 11.9 || a2 > 12.1) return 92;
+
+    // (3) Triangle(3,4,5) -> 6.0 exacto (formula de Heron).
+    f64 a3 = area(s3);
+    if (a3 < 5.9 || a3 > 6.1) return 93;
+
+    return 42;
+}

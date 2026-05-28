@@ -23,9 +23,17 @@ add_library(vex_lib STATIC
     lowering.cpp
     borrow_checker.cpp
     compiler.cpp
+    compiler_project.cpp
     mermaid_diagrams.cpp
     graphviz_diagrams.cpp
     comptime_introspect.cpp
+    # Sistema de modulos.
+    module_resolver.cpp
+    module_interop.cpp
+    namespace_flatten.cpp
+    vexi_format.cpp
+    project_cache.cpp
+    velb_signature.cpp
     # comptime_vm.cpp vive en src/runtime/ (depende del runtime VM).
     # Transpiler IR -> codigo fuente (C inicial; Java/JS/etc futuro).
     # Vive aqui porque compiler.cpp lo invoca como ultimo paso opcional.
@@ -43,6 +51,18 @@ target_include_directories(vex_lib PUBLIC
 
 # C++17 minimo (consistente con el resto del proyecto).
 target_compile_features(vex_lib PUBLIC cxx_std_17)
+
+# velb_signature.cpp usa OpenSSL EVP_DigestSign / EVP_DigestVerify.
+if (WIN32)
+    target_include_directories(vex_lib PRIVATE
+        ${CMAKE_SOURCE_DIR}/libs/Windows/OpenSSL-Win64/include)
+    target_link_directories(vex_lib PRIVATE
+        ${CMAKE_SOURCE_DIR}/libs/Windows/OpenSSL-Win64/lib/VC/x64/MT)
+    target_link_libraries(vex_lib PRIVATE libcrypto)
+else()
+    find_package(OpenSSL REQUIRED)
+    target_link_libraries(vex_lib PRIVATE OpenSSL::Crypto)
+endif()
 
 # Avisos estrictos en builds nuestros para mantener la regla de "no warnings".
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

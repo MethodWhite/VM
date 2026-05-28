@@ -17,7 +17,7 @@
  *   5. El resultado coincide con la semantica esperada del IR.
  *
  * Este es el primer test end-to-end del pipeline JIT completo y valida
- * que las cuatro piezas funcionan
+ * que las cuatro piezas (D.1.a + D.1.b + D.1.c + D.0) funcionan
  * coordinadamente.
  */
 

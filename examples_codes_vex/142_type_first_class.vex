@@ -1,6 +1,6 @@
 // Type-as-first-class-value -- `Type` es un tipo primer-clase en
 // compile-time.  `comptime_type<T>()` empaca un Type como ComptimeValue;
-// se guarda en un `comptime const Type X` y se usa luego en cualquier
+// se guarda en un `comptime Type X` y se usa luego en cualquier
 // posicion de tipo (sizeof<X>, alignof<X>, typename<X>, field_count<X>,
 // field_name<X>(i), etc.).  Cero runtime: el Type vive solo en compile-time.
 //
@@ -12,15 +12,15 @@ struct Vec3 { f32 x; f32 y; f32 z; }
 struct Vec4 { f32 x; f32 y; f32 z; f32 w; }
 
 // (1) Type-as-value: T es alias compile-time para Vec3.
-comptime const Type T = comptime_type<Vec3>();
+comptime Type T = comptime_type<Vec3>();
 static_assert(sizeof<T>() == 12,                    "sizeof(T) == sizeof(Vec3)");
 static_assert(alignof<T>() == 4,                    "alignof(T) == 4");
 static_assert(comptime_streq(typename<T>(), "Vec3"), "typename(T) == \"Vec3\"");
 static_assert(comptime_streq(typename<Vec3>(), typename<T>()), "Vec3 == T");
 
 // (2) Type-as-value sobre primitivos.
-comptime const Type IntT  = comptime_type<i32>();
-comptime const Type LongT = comptime_type<i64>();
+comptime Type IntT  = comptime_type<i32>();
+comptime Type LongT = comptime_type<i64>();
 static_assert(sizeof<IntT>()  == 4, "IntT = i32");
 static_assert(sizeof<LongT>() == 8, "LongT = i64");
 
@@ -36,17 +36,17 @@ comptime Type pick_vec(i64 dim) {
     return comptime_type<Vec3>();
 }
 
-comptime const Type V4 = pick_vec(4);
+comptime Type V4 = pick_vec(4);
 static_assert(sizeof<V4>() == 16,                    "Vec4 size");
 static_assert(comptime_streq(typename<V4>(), "Vec4"), "Vec4 name");
 static_assert(field_count<V4>() == 4,                 "Vec4 fields");
 static_assert(comptime_streq(field_name<V4>(3), "w"), "Vec4.fld3 = w");
 
-comptime const Type V2 = pick_vec(2);
+comptime Type V2 = pick_vec(2);
 static_assert(sizeof<V2>() == 8,                     "Vec2 size");
 static_assert(comptime_streq(typename<V2>(), "Vec2"), "Vec2 name");
 
-comptime const Type VDef = pick_vec(99);
+comptime Type VDef = pick_vec(99);
 static_assert(comptime_streq(typename<VDef>(), "Vec3"), "fallback Vec3");
 
 i32 main() { return 42; }

@@ -23,6 +23,7 @@
 #include "runtime/manager_runtime.h"
 #include "runtime/exception_runtime.h"
 #include "distrib/dist_runtime.h"
+#include <chrono>  // std::chrono::milliseconds para wait_for del shared_gc_cv
 
 namespace runtime {
 
@@ -296,6 +297,105 @@ namespace runtime {
 
         scheduler_futures.clear(); // limpiar por si quedaron entradas residuales
         start(); // volver a lanzar los schedulers en el pool
+    }
+
+    // -------------------------------------------------------------------------
+    // Recoleccion mayor del SharedHeap con STW coordinado.
+    // -------------------------------------------------------------------------
+    // El GC del SharedHeap requiere STW (stop-the-world) porque los handles
+    // compartidos pueden ser referenciados desde stacks/registros de cualquier
+    // proceso del VM.  Coordinacion:
+    //  1. main thread setea @c shared_gc_active=true (libera los polls).
+    //  2. cada scheduler, en su safepoint poll del run_loop, ve el flag y
+    //     llama @c shared_gc_acks.fetch_add(1) + duerme en @c shared_gc_cv.
+    //  3. main thread espera a que @c shared_gc_acks == num_schedulers.
+    //  4. ejecuta el mark/sweep del @c shared_heap.
+    //  5. setea @c shared_gc_active=false + notifica el cv.
+    //  6. los schedulers despiertan y siguen el run_loop normal.
+    uint32_t VM::shared_gc_collect() {
+        // B3.3: mark + sweep STW del SharedHeap.
+        //
+        // Protocolo:
+        //   1. Coordinacion STW: setea shared_gc_active=true + espera a
+        //      que TODOS los schedulers ack en sus safe points.
+        //   2. clear_marks(): zero del bitmap.
+        //   3. Mark: scan stack + GP regs de cada ProcessVM buscando
+        //      shared handles (value con bit 31 set y valido en
+        //      shared_handle_table).  Marca el handle.
+        //   4. Mark transitivo: BFS via fields del objeto (interpretando
+        //      class_ptr para encontrar offsets GC).  Versionr v1:
+        //      no transitivo - solo roots directos.  Suficiente para
+        //      objetos shared simples sin referencias entre si.
+        //   5. Sweep: para cada slot vivo no-marcado, free + unregister.
+        //   6. Release STW.
+
+        // Coordinacion STW (multi-scheduler).  Single-sched no la necesita.
+        const uint32_t target_acks = static_cast<uint32_t>(schedulers.size());
+        if (num_schedulers > 1) {
+            shared_gc_acks.store(0, std::memory_order_release);
+            shared_gc_active.store(true, std::memory_order_release);
+            std::unique_lock<std::mutex> lk(shared_gc_mtx);
+            shared_gc_cv.wait_for(lk, std::chrono::milliseconds(5000),
+                [&]{ return shared_gc_acks.load(std::memory_order_acquire) >= target_acks; });
+        }
+
+        // Mark + sweep.
+        shared_handle_table.clear_marks();
+
+        // Mark phase: scan stack + regs de cada ProcessVM activo.  Para
+        // cada qword, si es un GcHandle con bit 31 (shared) y resuelve a
+        // un host_ptr valido en shared_handle_table, marcamos el slot.
+        auto try_mark = [&](uint64_t v) {
+            // Filter: rapido descarte de no-handles.
+            if (v == 0) return;
+            // Caso 1: el valor ES un handle directo.
+            if ((v & 0xFFFFFFFF00000000ULL) == 0 || v <= 0xFFFFFFFFULL) {
+                uint32_t h = static_cast<uint32_t>(v);
+                if (h & gc::SHARED_HANDLE_BIT) {
+                    if (shared_handle_table.lookup(h) != nullptr) {
+                        shared_handle_table.mark(h);
+                        return;
+                    }
+                }
+            }
+            // Caso 2: el valor es un host_ptr al payload (registrado).
+            // O(N) lineal: aceptable como fallback.  Mejor: agregar
+            // ptr_to_handle map en SharedHandleTable.  Para v1, skip.
+        };
+
+        for (auto &sched : schedulers) {
+            if (!sched) continue;
+            for (auto &p : sched->processes) {
+                if (!p) continue;
+                // GP regs R0..R15.
+                for (int i = 0; i < 16; ++i) {
+                    try_mark(p->registers.regs[i].raw());
+                }
+                // Stack scan [rsp, stack_high).  Bounded.
+                uint64_t rsp = p->registers.stack_pointer.raw();
+                uint64_t shi = p->stack_high;
+                if (shi > rsp && (shi - rsp) < (16ull * 1024 * 1024)) {
+                    for (uint64_t addr = rsp; addr + 8 <= shi; addr += 8) {
+                        try_mark(p->vm_mem.read_u64(addr));
+                    }
+                }
+            }
+        }
+
+        // Sweep phase: barrer slots no marcados.  El callback recibe
+        // (host_ptr, size_bytes) para que SharedHeap libere el slot.
+        uint32_t swept = shared_handle_table.sweep_unmarked(
+            [this](uint8_t *p, uint32_t /*sz*/) {
+                shared_heap.free(p);
+            });
+
+        // Release STW.
+        if (num_schedulers > 1) {
+            std::lock_guard<std::mutex> lk(shared_gc_mtx);
+            shared_gc_active.store(false, std::memory_order_release);
+            shared_gc_cv.notify_all();
+        }
+        return swept;
     }
 
 } // namespace runtime

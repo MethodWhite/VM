@@ -1,0 +1,730 @@
+// =============================================================================
+// modules/syntax.vex - Highlighter de sintaxis Vex con paleta Dracula.
+// =============================================================================
+// Modelo igual que vnano.vsh seccion 6: tokeniza linea por linea con estado
+// (in_comment, in_docstr) y emite con escape ANSI.  Adaptado al lenguaje Vex:
+// keywords/tipos/builtins distintos de VSH.
+//
+// Uso:
+//   syntax.SyntaxHighlighter hl = new syntax.SyntaxHighlighter();
+//   hl.render_line(b, byte_start, screen_row, screen_col, max_col,
+//                  sel_on, ss, se);
+//
+// Estado:
+//   - `in_block_cmt` persiste entre lineas para `/* ... */` multilinea.
+//   - `in_triple_str` persiste entre lineas para `""" ... """` multilinea.
+//   Se manejan via fields de la clase porque render_line se invoca linea
+//   por linea desde draw_full y necesita continuidad.
+// =============================================================================
+
+import "modules/buffer";
+
+// Codigos ANSI 16 colors (universal -- funciona en cualquier terminal VT100+).
+// Paleta Dracula en truecolor (24-bit RGB) -- restaurada tras Win10+ con VT.
+public comptime string SX_RESET    = "\x1b[0m";
+public comptime string SX_KW       = "\x1b[38;2;255;121;198m";  // Dracula pink   (keyword)
+public comptime string SX_TYPE     = "\x1b[38;2;139;233;253m";  // Dracula cyan   (type)
+public comptime string SX_BUILTIN  = "\x1b[38;2;80;250;123m";   // Dracula green  (builtin)
+public comptime string SX_FUNC     = "\x1b[38;2;80;250;123m";   // Dracula green  (func call)
+public comptime string SX_STR      = "\x1b[38;2;241;250;140m";  // Dracula yellow (string)
+public comptime string SX_DOCSTR   = "\x1b[38;2;241;250;140m";  // Dracula yellow (docstring)
+public comptime string SX_CMT      = "\x1b[38;2;98;114;164m";   // Dracula comment gray
+public comptime string SX_NUM      = "\x1b[38;2;189;147;249m";  // Dracula purple (number)
+public comptime string SX_OP       = "\x1b[38;2;255;121;198m";  // Dracula pink   (operator)
+public comptime string SX_ID       = "\x1b[38;2;248;248;242m";  // Dracula fg     (identifier)
+public comptime string SX_ANNOT    = "\x1b[38;2;255;184;108m";  // Dracula orange (@annot)
+
+// Listas de keywords Vex (orden alfabetico, busqueda lineal O(N)).
+//
+// IMPORTANTE: estas listas viven como funciones que se invocan por cada
+// identificador encontrado.  Para un editor con N <= 5000 lineas y ~100
+// identificadores por linea, son ~500k lookups por render.  Con ~80
+// keywords cada uno se compara en promedio 40 veces -> 20M strcmp por
+// render.  Aceptable para Phase A; mejorar a HashMap perfecto si se
+// observa lag.
+
+// Devuelve 1 si la palabra es keyword del lenguaje.
+i32 is_keyword(u8* word, i32 wlen) {
+    // Match exacto, byte por byte.  Implementado con cadena de if/else
+    // sobre la primera letra para reducir comparaciones.
+    if (wlen < 2 || wlen > 12) return 0;
+    u8 c0 = word[0];
+
+    if (c0 == (u8)'i') {
+        if (wlen == 2 && word[1] == (u8)'f') return 1;       // if
+        if (wlen == 6 && word[1] == (u8)'m' && word[2] == (u8)'p'
+            && word[3] == (u8)'o' && word[4] == (u8)'r' && word[5] == (u8)'t') return 1; // import
+        if (wlen == 9 && word[1] == (u8)'n' && word[2] == (u8)'t'
+            && word[3] == (u8)'e' && word[4] == (u8)'r' && word[5] == (u8)'f'
+            && word[6] == (u8)'a' && word[7] == (u8)'c' && word[8] == (u8)'e') return 1; // interface
+        if (wlen == 6 && word[1] == (u8)'n' && word[2] == (u8)'l'
+            && word[3] == (u8)'i' && word[4] == (u8)'n' && word[5] == (u8)'e') return 1; // inline
+    }
+    if (c0 == (u8)'e') {
+        if (wlen == 4 && word[1] == (u8)'l' && word[2] == (u8)'s' && word[3] == (u8)'e') return 1; // else
+        if (wlen == 4 && word[1] == (u8)'n' && word[2] == (u8)'u' && word[3] == (u8)'m') return 1; // enum
+        if (wlen == 6 && word[1] == (u8)'x' && word[2] == (u8)'t'
+            && word[3] == (u8)'e' && word[4] == (u8)'r' && word[5] == (u8)'n') return 1; // extern
+    }
+    if (c0 == (u8)'w') {
+        if (wlen == 5 && word[1] == (u8)'h' && word[2] == (u8)'i'
+            && word[3] == (u8)'l' && word[4] == (u8)'e') return 1; // while
+    }
+    if (c0 == (u8)'f') {
+        if (wlen == 3 && word[1] == (u8)'o' && word[2] == (u8)'r') return 1; // for
+        if (wlen == 2 && word[1] == (u8)'n') return 1;       // fn
+        if (wlen == 5 && word[1] == (u8)'i' && word[2] == (u8)'n'
+            && word[3] == (u8)'a' && word[4] == (u8)'l') return 1; // final
+        if (wlen == 5 && word[1] == (u8)'a' && word[2] == (u8)'l'
+            && word[3] == (u8)'s' && word[4] == (u8)'e') return 1; // false
+        if (wlen == 7 && word[1] == (u8)'i' && word[2] == (u8)'n'
+            && word[3] == (u8)'a' && word[4] == (u8)'l' && word[5] == (u8)'l'
+            && word[6] == (u8)'y') return 1; // finally
+    }
+    if (c0 == (u8)'d') {
+        if (wlen == 2 && word[1] == (u8)'o') return 1;       // do
+    }
+    if (c0 == (u8)'b') {
+        if (wlen == 5 && word[1] == (u8)'r' && word[2] == (u8)'e'
+            && word[3] == (u8)'a' && word[4] == (u8)'k') return 1; // break
+        if (wlen == 6 && word[1] == (u8)'o' && word[2] == (u8)'r'
+            && word[3] == (u8)'r' && word[4] == (u8)'o' && word[5] == (u8)'w') return 1; // borrow
+        if (wlen == 10 && word[1] == (u8)'o' && word[2] == (u8)'r'
+            && word[3] == (u8)'r' && word[4] == (u8)'o' && word[5] == (u8)'w'
+            && word[6] == (u8)'_' && word[7] == (u8)'m' && word[8] == (u8)'u'
+            && word[9] == (u8)'t') return 1; // borrow_mut
+    }
+    if (c0 == (u8)'c') {
+        if (wlen == 5 && word[1] == (u8)'l' && word[2] == (u8)'a'
+            && word[3] == (u8)'s' && word[4] == (u8)'s') return 1; // class
+        if (wlen == 4 && word[1] == (u8)'a' && word[2] == (u8)'s' && word[3] == (u8)'e') return 1; // case
+        if (wlen == 5 && word[1] == (u8)'a' && word[2] == (u8)'t'
+            && word[3] == (u8)'c' && word[4] == (u8)'h') return 1; // catch
+        if (wlen == 8 && word[1] == (u8)'o' && word[2] == (u8)'n'
+            && word[3] == (u8)'t' && word[4] == (u8)'i' && word[5] == (u8)'n'
+            && word[6] == (u8)'u' && word[7] == (u8)'e') return 1; // continue
+        if (wlen == 5 && word[1] == (u8)'o' && word[2] == (u8)'n'
+            && word[3] == (u8)'s' && word[4] == (u8)'t') return 1; // const
+        if (wlen == 8 && word[1] == (u8)'o' && word[2] == (u8)'m'
+            && word[3] == (u8)'p' && word[4] == (u8)'t' && word[5] == (u8)'i'
+            && word[6] == (u8)'m' && word[7] == (u8)'e') return 1; // comptime
+    }
+    if (c0 == (u8)'s') {
+        if (wlen == 6 && word[1] == (u8)'t' && word[2] == (u8)'r'
+            && word[3] == (u8)'u' && word[4] == (u8)'c' && word[5] == (u8)'t') return 1; // struct
+        if (wlen == 6 && word[1] == (u8)'t' && word[2] == (u8)'a'
+            && word[3] == (u8)'t' && word[4] == (u8)'i' && word[5] == (u8)'c') return 1; // static
+        if (wlen == 5 && word[1] == (u8)'p' && word[2] == (u8)'a'
+            && word[3] == (u8)'w' && word[4] == (u8)'n') return 1; // spawn
+        if (wlen == 5 && word[1] == (u8)'u' && word[2] == (u8)'p'
+            && word[3] == (u8)'e' && word[4] == (u8)'r') return 1; // super
+        if (wlen == 6 && word[1] == (u8)'h' && word[2] == (u8)'a'
+            && word[3] == (u8)'r' && word[4] == (u8)'e' && word[5] == (u8)'d') return 1; // shared
+        if (wlen == 12 && word[1] == (u8)'y' && word[2] == (u8)'n'
+            && word[3] == (u8)'c' && word[4] == (u8)'h' && word[5] == (u8)'r'
+            && word[6] == (u8)'o' && word[7] == (u8)'n' && word[8] == (u8)'i'
+            && word[9] == (u8)'z' && word[10] == (u8)'e' && word[11] == (u8)'d') return 1; // synchronized
+    }
+    if (c0 == (u8)'r') {
+        if (wlen == 6 && word[1] == (u8)'e' && word[2] == (u8)'t'
+            && word[3] == (u8)'u' && word[4] == (u8)'r' && word[5] == (u8)'n') return 1; // return
+        if (wlen == 6 && word[1] == (u8)'s' && word[2] == (u8)'p'
+            && word[3] == (u8)'a' && word[4] == (u8)'w' && word[5] == (u8)'n') return 1; // rspawn
+    }
+    if (c0 == (u8)'p') {
+        if (wlen == 6 && word[1] == (u8)'u' && word[2] == (u8)'b'
+            && word[3] == (u8)'l' && word[4] == (u8)'i' && word[5] == (u8)'c') return 1; // public
+        if (wlen == 7 && word[1] == (u8)'r' && word[2] == (u8)'i'
+            && word[3] == (u8)'v' && word[4] == (u8)'a' && word[5] == (u8)'t'
+            && word[6] == (u8)'e') return 1; // private
+        if (wlen == 9 && word[1] == (u8)'r' && word[2] == (u8)'o'
+            && word[3] == (u8)'t' && word[4] == (u8)'e' && word[5] == (u8)'c'
+            && word[6] == (u8)'t' && word[7] == (u8)'e' && word[8] == (u8)'d') return 1; // protected
+    }
+    if (c0 == (u8)'m') {
+        if (wlen == 5 && word[1] == (u8)'a' && word[2] == (u8)'t'
+            && word[3] == (u8)'c' && word[4] == (u8)'h') return 1; // match
+        if (wlen == 7 && word[1] == (u8)'o' && word[2] == (u8)'n'
+            && word[3] == (u8)'i' && word[4] == (u8)'t' && word[5] == (u8)'o'
+            && word[6] == (u8)'r') return 1; // monitor
+    }
+    if (c0 == (u8)'n') {
+        if (wlen == 3 && word[1] == (u8)'e' && word[2] == (u8)'w') return 1; // new
+        if (wlen == 4 && word[1] == (u8)'u' && word[2] == (u8)'l' && word[3] == (u8)'l') return 1; // null
+        if (wlen == 7 && word[1] == (u8)'o' && word[2] == (u8)'n'
+            && word[3] == (u8)'n' && word[4] == (u8)'u' && word[5] == (u8)'l'
+            && word[6] == (u8)'l') return 1; // nonnull
+    }
+    if (c0 == (u8)'t') {
+        if (wlen == 3 && word[1] == (u8)'r' && word[2] == (u8)'y') return 1; // try
+        if (wlen == 4 && word[1] == (u8)'r' && word[2] == (u8)'u' && word[3] == (u8)'e') return 1; // true
+        if (wlen == 4 && word[1] == (u8)'h' && word[2] == (u8)'i' && word[3] == (u8)'s') return 1; // this
+        if (wlen == 5 && word[1] == (u8)'h' && word[2] == (u8)'r'
+            && word[3] == (u8)'o' && word[4] == (u8)'w') return 1; // throw
+        if (wlen == 7 && word[1] == (u8)'y' && word[2] == (u8)'p'
+            && word[3] == (u8)'e' && word[4] == (u8)'d' && word[5] == (u8)'e'
+            && word[6] == (u8)'f') return 1; // typedef
+    }
+    if (c0 == (u8)'u') {
+        if (wlen == 5 && word[1] == (u8)'s' && word[2] == (u8)'i'
+            && word[3] == (u8)'n' && word[4] == (u8)'g') return 1; // using
+        if (wlen == 6 && word[1] == (u8)'n' && word[2] == (u8)'i'
+            && word[3] == (u8)'q' && word[4] == (u8)'u' && word[5] == (u8)'e') return 1; // unique
+    }
+    if (c0 == (u8)'a') {
+        if (wlen == 2 && word[1] == (u8)'s') return 1;       // as
+        if (wlen == 5 && word[1] == (u8)'w' && word[2] == (u8)'a'
+            && word[3] == (u8)'i' && word[4] == (u8)'t') return 1; // await
+    }
+    if (c0 == (u8)'h') {
+        if (wlen == 4 && word[1] == (u8)'e' && word[2] == (u8)'r' && word[3] == (u8)'e') return 1; // here
+    }
+    if (c0 == (u8)'o') {
+        if (wlen == 2 && word[1] == (u8)'n') return 1;       // on
+        if (wlen == 4 && word[1] == (u8)'n' && word[2] == (u8)'l' && word[3] == (u8)'y') return 1; // only
+    }
+    if (c0 == (u8)'l') {
+        if (wlen == 4 && word[1] == (u8)'e' && word[2] == (u8)'n' && word[3] == (u8)'d') return 1; // lend
+        if (wlen == 8 && word[1] == (u8)'e' && word[2] == (u8)'n'
+            && word[3] == (u8)'d' && word[4] == (u8)'_' && word[5] == (u8)'m'
+            && word[6] == (u8)'u' && word[7] == (u8)'t') return 1; // lend_mut
+    }
+    if (c0 == (u8)'g') {
+        if (wlen == 3 && word[1] == (u8)'e' && word[2] == (u8)'t') return 1; // get
+        if (wlen == 4 && word[1] == (u8)'o' && word[2] == (u8)'t' && word[3] == (u8)'o') return 1; // goto
+    }
+    if (c0 == (u8)'v') {
+        if (wlen == 3 && word[1] == (u8)'a' && word[2] == (u8)'r') return 1; // var
+    }
+    return 0;
+}
+
+// Devuelve 1 si la palabra es un tipo primitivo.
+i32 is_type(u8* word, i32 wlen) {
+    if (wlen < 2 || wlen > 11) return 0;
+    u8 c0 = word[0];
+
+    if (c0 == (u8)'i') {
+        if (wlen == 2 && word[1] == (u8)'8') return 1;       // i8
+        if (wlen == 3 && word[1] == (u8)'1' && word[2] == (u8)'6') return 1; // i16
+        if (wlen == 3 && word[1] == (u8)'3' && word[2] == (u8)'2') return 1; // i32
+        if (wlen == 3 && word[1] == (u8)'6' && word[2] == (u8)'4') return 1; // i64
+    }
+    if (c0 == (u8)'u') {
+        if (wlen == 2 && word[1] == (u8)'8') return 1;       // u8
+        if (wlen == 3 && word[1] == (u8)'1' && word[2] == (u8)'6') return 1; // u16
+        if (wlen == 3 && word[1] == (u8)'3' && word[2] == (u8)'2') return 1; // u32
+        if (wlen == 3 && word[1] == (u8)'6' && word[2] == (u8)'4') return 1; // u64
+    }
+    if (c0 == (u8)'f') {
+        if (wlen == 3 && word[1] == (u8)'3' && word[2] == (u8)'2') return 1; // f32
+        if (wlen == 3 && word[1] == (u8)'6' && word[2] == (u8)'4') return 1; // f64
+    }
+    if (c0 == (u8)'b') {
+        if (wlen == 4 && word[1] == (u8)'o' && word[2] == (u8)'o' && word[3] == (u8)'l') return 1; // bool
+    }
+    if (c0 == (u8)'c') {
+        if (wlen == 4 && word[1] == (u8)'h' && word[2] == (u8)'a' && word[3] == (u8)'r') return 1; // char
+    }
+    if (c0 == (u8)'s') {
+        if (wlen == 6 && word[1] == (u8)'t' && word[2] == (u8)'r'
+            && word[3] == (u8)'i' && word[4] == (u8)'n' && word[5] == (u8)'g') return 1; // string
+    }
+    if (c0 == (u8)'v') {
+        if (wlen == 4 && word[1] == (u8)'o' && word[2] == (u8)'i' && word[3] == (u8)'d') return 1; // void
+    }
+    return 0;
+}
+
+// Devuelve 1 si la palabra es un builtin del lenguaje (subset comun).
+i32 is_builtin(u8* word, i32 wlen) {
+    if (wlen < 3 || wlen > 16) return 0;
+    u8 c0 = word[0];
+
+    if (c0 == (u8)'p') {
+        if (wlen == 5 && word[1] == (u8)'r' && word[2] == (u8)'i'
+            && word[3] == (u8)'n' && word[4] == (u8)'t') return 1; // print
+        if (wlen == 7 && word[1] == (u8)'r' && word[2] == (u8)'i'
+            && word[3] == (u8)'n' && word[4] == (u8)'t' && word[5] == (u8)'l'
+            && word[6] == (u8)'n') return 1; // println
+        if (wlen == 9 && word[1] == (u8)'r' && word[2] == (u8)'i'
+            && word[3] == (u8)'n' && word[4] == (u8)'t' && word[5] == (u8)'_'
+            && word[6] == (u8)'i' && word[7] == (u8)'n' && word[8] == (u8)'t') return 1; // print_int
+        if (wlen == 3 && word[1] == (u8)'i' && word[2] == (u8)'d') return 1; // pid
+    }
+    if (c0 == (u8)'m') {
+        if (wlen == 6 && word[1] == (u8)'a' && word[2] == (u8)'l'
+            && word[3] == (u8)'l' && word[4] == (u8)'o' && word[5] == (u8)'c') return 1; // malloc
+        if (wlen == 7 && word[1] == (u8)'s' && word[2] == (u8)'g'
+            && word[3] == (u8)'s' && word[4] == (u8)'e' && word[5] == (u8)'n'
+            && word[6] == (u8)'d') return 1; // msgsend
+        if (wlen == 7 && word[1] == (u8)'s' && word[2] == (u8)'g'
+            && word[3] == (u8)'r' && word[4] == (u8)'e' && word[5] == (u8)'c'
+            && word[6] == (u8)'v') return 1; // msgrecv
+    }
+    if (c0 == (u8)'f') {
+        if (wlen == 4 && word[1] == (u8)'r' && word[2] == (u8)'e' && word[3] == (u8)'e') return 1; // free
+        if (wlen == 5 && word[1] == (u8)'l' && word[2] == (u8)'u'
+            && word[3] == (u8)'s' && word[4] == (u8)'h') return 1; // flush
+        if (wlen == 8 && word[1] == (u8)'f' && word[2] == (u8)'i'
+            && word[3] == (u8)'_' && word[4] == (u8)'o' && word[5] == (u8)'p'
+            && word[6] == (u8)'e' && word[7] == (u8)'n') return 1; // ffi_open
+        if (wlen == 7 && word[1] == (u8)'f' && word[2] == (u8)'i'
+            && word[3] == (u8)'_' && word[4] == (u8)'s' && word[5] == (u8)'y'
+            && word[6] == (u8)'m') return 1; // ffi_sym
+        if (wlen == 8 && word[1] == (u8)'f' && word[2] == (u8)'i'
+            && word[3] == (u8)'_' && word[4] == (u8)'c' && word[5] == (u8)'a'
+            && word[6] == (u8)'l' && word[7] == (u8)'l') return 1; // ffi_call
+        if (wlen == 6 && word[1] == (u8)'o' && word[2] == (u8)'p'
+            && word[3] == (u8)'e' && word[4] == (u8)'n') return 1; // fopen
+        if (wlen == 7 && word[1] == (u8)'c' && word[2] == (u8)'l'
+            && word[3] == (u8)'o' && word[4] == (u8)'s' && word[5] == (u8)'e') return 1; // fclose
+        if (wlen == 6 && word[1] == (u8)'w' && word[2] == (u8)'r'
+            && word[3] == (u8)'i' && word[4] == (u8)'t' && word[5] == (u8)'e') return 1; // fwrite
+    }
+    if (c0 == (u8)'s') {
+        if (wlen == 6 && word[1] == (u8)'i' && word[2] == (u8)'z'
+            && word[3] == (u8)'e' && word[4] == (u8)'o' && word[5] == (u8)'f') return 1; // sizeof
+        if (wlen == 4 && word[1] == (u8)'o' && word[2] == (u8)'m' && word[3] == (u8)'e') return 1; // Some/some
+        if (wlen == 9 && word[1] == (u8)'t' && word[2] == (u8)'r'
+            && word[3] == (u8)'_' && word[4] == (u8)'l' && word[5] == (u8)'e'
+            && word[6] == (u8)'n' && word[7] == (u8)'g' && word[8] == (u8)'t') return 1; // str_lengt(h)?
+        if (wlen == 10 && word[1] == (u8)'t' && word[2] == (u8)'r'
+            && word[3] == (u8)'_' && word[4] == (u8)'l' && word[5] == (u8)'e'
+            && word[6] == (u8)'n' && word[7] == (u8)'g' && word[8] == (u8)'t'
+            && word[9] == (u8)'h') return 1; // str_length
+        if (wlen == 9 && word[1] == (u8)'t' && word[2] == (u8)'r'
+            && word[3] == (u8)'_' && word[4] == (u8)'c' && word[5] == (u8)'o'
+            && word[6] == (u8)'n' && word[7] == (u8)'c' && word[8] == (u8)'a') return 1; // str_conca
+        if (wlen == 9 && word[1] == (u8)'t' && word[2] == (u8)'r'
+            && word[3] == (u8)'_' && word[4] == (u8)'b' && word[5] == (u8)'y'
+            && word[6] == (u8)'t' && word[7] == (u8)'e' && word[8] == (u8)'s') return 1; // str_bytes
+        if (wlen == 8 && word[1] == (u8)'t' && word[2] == (u8)'r'
+            && word[3] == (u8)'_' && word[4] == (u8)'c' && word[5] == (u8)'s'
+            && word[6] == (u8)'t' && word[7] == (u8)'r') return 1; // str_cstr
+        if (wlen == 6 && word[1] == (u8)'p' && word[2] == (u8)'a'
+            && word[3] == (u8)'w' && word[4] == (u8)'n' && word[5] == (u8)'a') return 1; // spawnargs
+    }
+    if (c0 == (u8)'O' && wlen == 2 && word[1] == (u8)'k') return 1;          // Ok
+    if (c0 == (u8)'E' && wlen == 3 && word[1] == (u8)'r' && word[2] == (u8)'r') return 1; // Err
+    if (c0 == (u8)'N' && wlen == 4 && word[1] == (u8)'o' && word[2] == (u8)'n' && word[3] == (u8)'e') return 1; // None
+    return 0;
+}
+
+// Devuelve 1 si el caracter es alfanumerico o underscore (parte de identifier).
+// Codigos: 97='a' 122='z' 65='A' 90='Z' 48='0' 57='9' 95='_'
+i32 is_alnum_or_us(u8 c) {
+    if (c >= 97 && c <= 122) return 1;
+    if (c >= 65 && c <= 90) return 1;
+    if (c >= 48 && c <= 57) return 1;
+    if (c == 95) return 1;
+    return 0;
+}
+
+i32 is_alpha_or_us(u8 c) {
+    if (c >= 97 && c <= 122) return 1;
+    if (c >= 65 && c <= 90) return 1;
+    if (c == 95) return 1;
+    return 0;
+}
+
+i32 is_digit(u8 c) {
+    if (c >= 48 && c <= 57) return 1;
+    return 0;
+}
+
+// Devuelve 1 si el caracter es operador o punctuation Vex.
+i32 is_op(u8 c) {
+    if (c == (u8)'+' || c == (u8)'-' || c == (u8)'*' || c == (u8)'/'
+        || c == (u8)'=' || c == (u8)'<' || c == (u8)'>' || c == (u8)'!'
+        || c == (u8)'&' || c == (u8)'|' || c == (u8)'^' || c == (u8)'~'
+        || c == (u8)'%' || c == (u8)'?'
+        || c == (u8)'{' || c == (u8)'}' || c == (u8)'(' || c == (u8)')'
+        || c == (u8)'[' || c == (u8)']' || c == (u8)',' || c == (u8)';'
+        || c == (u8)':' || c == (u8)'.') return 1;
+    return 0;
+}
+
+// Highlighter de sintaxis Vex.  Mantiene estado entre llamadas a render_line
+// para soportar comentarios de bloque multilinea (/* ... */) y triple-quoted
+// strings ("""...""") que cruzan multiples lineas.
+public class SyntaxHighlighter {
+    public i32 in_block_cmt;    // 1 si dentro de /* ... */ continuando linea
+    public i32 in_triple_str;   // 1 si dentro de """ ... """ continuando linea
+    public i32 enabled;          // 1 = highlight on, 0 = render plano
+
+    public SyntaxHighlighter() {
+        this.in_block_cmt   = 0;
+        this.in_triple_str  = 0;
+        this.enabled        = 1;
+    }
+
+    // Reset state -- llamar al inicio de cada render frame.
+    public void reset_state() {
+        this.in_block_cmt  = 0;
+        this.in_triple_str = 0;
+    }
+
+    // Renderiza una linea con highlighting de sintaxis Vex.
+    //
+    // Parametros:
+    //   data       - buffer.data del buffer activo (u8* host_ptr)
+    //   length     - tamano total del buffer (para no salir de rango)
+    //   byte_start - offset del inicio de linea en `data`
+    //   sel_on     - 1 si hay seleccion activa
+    //   ss, se     - rango [ss, se) de la seleccion en bytes
+    //   max_chars  - maximo de caracteres a emitir (sc.cols - screen_col)
+    //
+    // Emite los bytes con escapes ANSI; el caller debe haber posicionado
+    // el cursor con sc.move_cursor() ANTES.  Emite ATTR_RESET al final.
+    public void render_line(u8* data, i32 length, i32 byte_start,
+                              i32 sel_on, i32 ss, i32 se, i32 max_chars) {
+        i32 i = byte_start;
+        i32 col_count = 0;
+        i32 in_invert = 0;
+        i32 cur_color = 0;       // 0=ninguno, otros = uno de SX_*
+
+        // Estado heredado de linea anterior (multi-line block cmt / triple str).
+        i32 mode_block_cmt = this.in_block_cmt;
+        i32 mode_triple    = this.in_triple_str;
+
+        while (i < length && col_count < max_chars) {
+            u8 c = data[i];
+
+            // LF termina la linea visible.
+            if (c == 10) {
+                if (in_invert == 1) print(SX_RESET);
+                if (cur_color != 0) print(SX_RESET);
+                // Persistir estado de modos para la siguiente linea.
+                this.in_block_cmt  = mode_block_cmt;
+                this.in_triple_str = mode_triple;
+                return;
+            }
+
+            // Aplicar/cambiar attr de seleccion si aplica.
+            if (sel_on == 1) {
+                i32 want = 0;
+                if (i >= ss && i < se) want = 1;
+                if (want == 1 && in_invert == 0) {
+                    if (cur_color != 0) print(SX_RESET);
+                    print("\x1b[7m");          // INVERT
+                    in_invert = 1;
+                } else if (want == 0 && in_invert == 1) {
+                    print(SX_RESET);
+                    in_invert = 0;
+                    cur_color = 0;
+                }
+            }
+
+            // --- Modo bloque comentario (/* ... */) ---
+            if (mode_block_cmt == 1) {
+                if (cur_color != 4) {
+                    if (cur_color != 0) print(SX_RESET);
+                    print(SX_CMT);
+                    cur_color = 4;
+                }
+                // Buscar `*/` para cerrar.
+                if (c == 42 && i + 1 < length && data[i + 1] == 47) {
+                    print("*/");
+                    i = i + 2;
+                    col_count = col_count + 2;
+                    mode_block_cmt = 0;
+                    print(SX_RESET);
+                    cur_color = 0;
+                    continue;
+                }
+                print_char((i32) c);
+                i = i + 1;
+                col_count = col_count + 1;
+                continue;
+            }
+
+            // --- Modo triple-quoted string (""" ... """) ---
+            if (mode_triple == 1) {
+                if (cur_color != 5) {
+                    if (cur_color != 0) print(SX_RESET);
+                    print(SX_DOCSTR);
+                    cur_color = 5;
+                }
+                // Buscar `"""` para cerrar.
+                if (c == 34 && i + 2 < length
+                    && data[i + 1] == 34 && data[i + 2] == 34) {
+                    print("\"\"\"");
+                    i = i + 3;
+                    col_count = col_count + 3;
+                    mode_triple = 0;
+                    print(SX_RESET);
+                    cur_color = 0;
+                    continue;
+                }
+                print_char((i32) c);
+                i = i + 1;
+                col_count = col_count + 1;
+                continue;
+            }
+
+            // --- Apertura de triple string: """ ---
+            // ASCII: '"'=34, '/'=47, '*'=42, '\\' (backslash)=92, "'"=39
+            // Usar literales numericos para evitar bug del cast (u8)'X'
+            // observado con chars especiales en comparaciones de Vex.
+            if (c == 34 && i + 2 < length
+                && data[i + 1] == 34 && data[i + 2] == 34) {
+                if (cur_color != 5) {
+                    if (cur_color != 0) print(SX_RESET);
+                    print(SX_DOCSTR);
+                    cur_color = 5;
+                }
+                print("\"\"\"");
+                i = i + 3;
+                col_count = col_count + 3;
+                mode_triple = 1;
+                continue;
+            }
+
+            // --- Apertura de bloque comentario: /* ---
+            if (c == 47 && i + 1 < length && data[i + 1] == 42) {
+                if (cur_color != 4) {
+                    if (cur_color != 0) print(SX_RESET);
+                    print(SX_CMT);
+                    cur_color = 4;
+                }
+                print("/*");
+                i = i + 2;
+                col_count = col_count + 2;
+                mode_block_cmt = 1;
+                continue;
+            }
+
+            // --- Linea comentario: // ---
+            if (c == 47 && i + 1 < length && data[i + 1] == 47) {
+                if (cur_color != 4) {
+                    if (cur_color != 0) print(SX_RESET);
+                    print(SX_CMT);
+                    cur_color = 4;
+                }
+                // WORKAROUND bug Vex inner-while mutation: vars locales.
+                i32 j = i;
+                i32 cc_count = col_count;
+                while (j < length && cc_count < max_chars) {
+                    u8 cc = data[j];
+                    if (cc == 10) break;
+                    print_char((i32) cc);
+                    j = j + 1;
+                    cc_count = cc_count + 1;
+                }
+                i = j;
+                col_count = cc_count;
+                continue;
+            }
+
+            // --- String literal "..." ---
+            // WORKAROUND bug Vex: usar var local `j`/`cc_count` en el inner
+            // while para evitar que las mutaciones de `i`/`col_count` se
+            // pierdan al volver al outer while.
+            if (c == 34) {
+                if (cur_color != 3) {
+                    if (cur_color != 0) print(SX_RESET);
+                    print(SX_STR);
+                    cur_color = 3;
+                }
+                print_char((i32) c);
+                i32 j  = i + 1;
+                i32 cc_count = col_count + 1;
+                while (j < length && cc_count < max_chars) {
+                    u8 cc = data[j];
+                    if (cc == 10) break;
+                    print_char((i32) cc);
+                    j = j + 1;
+                    cc_count = cc_count + 1;
+                    if (cc == 92 && j < length) {
+                        if (cc_count < max_chars && data[j] != 10) {
+                            print_char((i32) data[j]);
+                            j = j + 1;
+                            cc_count = cc_count + 1;
+                        }
+                        continue;
+                    }
+                    if (cc == 34) break;
+                }
+                i = j;
+                col_count = cc_count;
+                continue;
+            }
+
+            // --- Char literal 'x' ---
+            if (c == 39) {                                       // '
+                if (cur_color != 3) {
+                    if (cur_color != 0) print(SX_RESET);
+                    print(SX_STR);
+                    cur_color = 3;
+                }
+                print_char((i32) c);
+                i32 j = i + 1;
+                i32 cc_count = col_count + 1;
+                while (j < length && cc_count < max_chars) {
+                    u8 cc = data[j];
+                    if (cc == 10) break;
+                    print_char((i32) cc);
+                    j = j + 1;
+                    cc_count = cc_count + 1;
+                    if (cc == 92 && j < length) {
+                        if (cc_count < max_chars && data[j] != 10) {
+                            print_char((i32) data[j]);
+                            j = j + 1;
+                            cc_count = cc_count + 1;
+                        }
+                        continue;
+                    }
+                    if (cc == 39) break;
+                }
+                i = j;
+                col_count = cc_count;
+                continue;
+            }
+
+            // --- Numero ---
+            if (is_digit(c) == 1) {
+                if (cur_color != 6) {
+                    if (cur_color != 0) print(SX_RESET);
+                    print(SX_NUM);
+                    cur_color = 6;
+                }
+                i32 j = i;
+                i32 cc_count = col_count;
+                while (j < length && cc_count < max_chars) {
+                    u8 cc = data[j];
+                    i32 ok = is_digit(cc);
+                    // '.'=46 'x'=120 'X'=88 'b'=98 'B'=66 'o'=111 'O'=79
+                    // 'e'=101 'E'=69 '_'=95
+                    if (cc == 46 || cc == 120 || cc == 88
+                        || cc == 98 || cc == 66 || cc == 111
+                        || cc == 79 || cc == 101 || cc == 69
+                        || cc == 95) ok = 1;
+                    if (cc >= 97 && cc <= 102) ok = 1;
+                    if (cc >= 65 && cc <= 70) ok = 1;
+                    if (ok == 0) break;
+                    print_char((i32) cc);
+                    j = j + 1;
+                    cc_count = cc_count + 1;
+                }
+                i = j;
+                col_count = cc_count;
+                continue;
+            }
+
+            // --- Annotation @Foo (ASCII 64) ---
+            if (c == 64) {
+                if (cur_color != 7) {
+                    if (cur_color != 0) print(SX_RESET);
+                    print(SX_ANNOT);
+                    cur_color = 7;
+                }
+                print_char((i32) c);
+                i32 j = i + 1;
+                i32 cc_count = col_count + 1;
+                while (j < length && cc_count < max_chars) {
+                    u8 cc = data[j];
+                    if (is_alnum_or_us(cc) == 0) break;
+                    print_char((i32) cc);
+                    j = j + 1;
+                    cc_count = cc_count + 1;
+                }
+                i = j;
+                col_count = cc_count;
+                continue;
+            }
+
+            // --- Identifier ---
+            if (is_alpha_or_us(c) == 1) {
+                // WORKAROUND bug Vex: usar `j` para no perder el incremento.
+                i32 word_start = i;
+                i32 j = i;
+                while (j < length && is_alnum_or_us(data[j]) == 1) {
+                    j = j + 1;
+                }
+                i = j;
+                i32 wlen = j - word_start;
+                u8* word_ptr = data + word_start;
+
+                // Detectar si es func (seguido de '(').  ASCII ' '=32, '('=40.
+                i32 lookahead = j;
+                while (lookahead < length && data[lookahead] == 32) {
+                    lookahead = lookahead + 1;
+                }
+                i32 is_func_call = 0;
+                if (lookahead < length && data[lookahead] == 40) is_func_call = 1;
+
+                i32 kind = 0;  // 0=id
+                if (is_keyword(word_ptr, wlen) == 1) kind = 1;
+                else if (is_type(word_ptr, wlen) == 1) kind = 2;
+                else if (is_builtin(word_ptr, wlen) == 1) kind = 3;
+                else if (is_func_call == 1) kind = 8;
+
+                i32 want_color = 0;
+                if (kind == 1) want_color = 1;      // SX_KW
+                else if (kind == 2) want_color = 2; // SX_TYPE
+                else if (kind == 3) want_color = 3; // SX_BUILTIN
+                else if (kind == 8) want_color = 8; // SX_FUNC
+
+                if (want_color != 0) {
+                    if (cur_color != want_color) {
+                        if (cur_color != 0) print(SX_RESET);
+                        if (want_color == 1) print(SX_KW);
+                        else if (want_color == 2) print(SX_TYPE);
+                        else if (want_color == 3) print(SX_BUILTIN);
+                        else if (want_color == 8) print(SX_FUNC);
+                        cur_color = want_color;
+                    }
+                } else {
+                    if (cur_color != 0) {
+                        print(SX_RESET);
+                        cur_color = 0;
+                    }
+                }
+
+                // Emitir la palabra entera.  Var local cc_count para no
+                // perder el incremento al volver al outer.
+                i32 k = word_start;
+                i32 cc_count = col_count;
+                while (k < i && cc_count < max_chars) {
+                    print_char((i32) data[k]);
+                    k = k + 1;
+                    cc_count = cc_count + 1;
+                }
+                col_count = cc_count;
+                continue;
+            }
+
+            // --- Operadores ---
+            if (is_op(c) == 1) {
+                if (cur_color != 9) {
+                    if (cur_color != 0) print(SX_RESET);
+                    print(SX_OP);
+                    cur_color = 9;
+                }
+                print_char((i32) c);
+                i = i + 1;
+                col_count = col_count + 1;
+                continue;
+            }
+
+            // Whitespace / otros: emit plano sin color.
+            if (cur_color != 0) {
+                print(SX_RESET);
+                cur_color = 0;
+            }
+            if (c == 9) print(" ");                              // tab
+            else if (c >= 32 && c < 127) print_char((i32) c);
+            else print(".");
+            i = i + 1;
+            col_count = col_count + 1;
+        }
+
+        if (in_invert == 1) print(SX_RESET);
+        if (cur_color != 0) print(SX_RESET);
+
+        // Persistir estado modos para siguiente linea.
+        this.in_block_cmt  = mode_block_cmt;
+        this.in_triple_str = mode_triple;
+    }
+}

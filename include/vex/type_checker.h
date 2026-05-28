@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <memory>
@@ -87,6 +88,11 @@ namespace vex {
                     ///<       (ANSI codes RED/GREEN/BOLD/RESET/etc.).
                     ///<       El lowering los convierte en STR_LIT_ADDR
                     ///<       de un literal predefinido.
+        Namespace,  ///< Phase M.7: namespace de un modulo importado.
+                    ///< Sintaxis: @c "import \"lib_a\";" registra @c lib_a
+                    ///< como Symbol::Namespace.  El campo @c ns_index del
+                    ///< Symbol apunta al @c imported_namespaces_ del
+                    ///< TypeChecker para resolver @c lib_a.simbolo.
     };
 
     /**
@@ -104,6 +110,13 @@ namespace vex {
         /// registrando el import via @c register_native_import.  Sin entry
         /// para extern_lib se trata como funcion Vex normal (CALLVM).
         std::string       extern_lib;
+        /// Phase M.5: nombre real del label generado para esta funcion.
+        /// Vacio = el nombre visible coincide con el label (caso normal).
+        /// No vacio = la funcion fue importada de otro modulo con
+        /// mangling automatico (`lib__foo`); el lowering emite @c CALLVM
+        /// al label mangled mientras que el resolver de nombres sigue
+        /// usando el nombre publico (`foo`).  Cierra la limitacion L.4.
+        std::string       mangled_label;
     };
 
     /**
@@ -149,6 +162,11 @@ namespace vex {
         /// IntrospectInfo POD en static_data para que `find_type("Name")`
         /// runtime lo encuentre.
         bool                         is_introspect = false;
+        /// Phase M6.a L.3: visibilidad cross-module.  Solo se exporta a
+        /// `.vexi` si es @c true.  Sin keyword `public`/`private` en el
+        /// source: @c true (default permisivo).  Sin esto en false, otros
+        /// modulos podrian importar el struct via @c only.
+        bool                         is_public  = true;
     };
 
     /**
@@ -185,6 +203,8 @@ namespace vex {
         uint32_t                     max_payload_fields = 0; ///< 0 si todas son sin payload.
         /// marca `@Introspect`.
         bool                         is_introspect = false;
+        /// Phase M6.a L.3: visibilidad cross-module.
+        bool                         is_public     = true;
     };
 
     /**
@@ -251,6 +271,16 @@ namespace vex {
         std::vector<StructFieldInfo> static_fields;
         std::vector<ClassMethodInfo> methods;
         uint32_t                     size_bytes  = 0;
+        /// Para clases importadas cross-module via Phase M:
+        ///   - @c name lleva el nombre mangled (e.g. "buffer__Buffer")
+        ///     usado para identidad de tipo dentro del consumer.
+        ///   - @c imported_helper_suffix lleva el nombre LOCAL en el modulo
+        ///     dep (e.g. "Buffer") que es el sufijo del helper
+        ///     `__new_<helper_suffix>` ya emitido en el .vel del dep.
+        /// Para clases locales del consumer, este campo queda vacio y el
+        /// lowering usa @c name como sufijo del helper (comportamiento
+        /// historico).
+        std::string                  imported_helper_suffix;
         /// Numero de fields heredados (los primeros @c inherited_field_count
         /// elementos de @c fields fueron copiados de la superclase y NO
         /// deben re-emitirse como deffield en __module_init).  El resto
@@ -305,6 +335,8 @@ namespace vex {
         /// metodo.  El @c findclass(name) en runtime ya la encuentra.
         /// Acceso a campos via @c getfield con offsets fijos del ABI.
         bool                         is_runtime_predefined = false;
+        /// Phase M6.a L.3: visibilidad cross-module.
+        bool                         is_public             = true;
     };
 
     /**
@@ -327,6 +359,10 @@ namespace vex {
         /// el usuario escriba la builtin standalone.  Vacio para variables
         /// normales.
         std::string reflection_alias;
+        /// Phase M.7: indice en @c TypeChecker::imported_namespaces_
+        /// cuando @c kind == SymbolKind::Namespace.  Sin uso para los
+        /// demas kinds.
+        uint32_t   ns_index = 0;
     };
 
     /**
@@ -383,6 +419,14 @@ namespace vex {
         enum_layouts() const noexcept { return enum_layouts_; }
 
         /**
+         * @brief Acceso de solo lectura al ModuleNode AST.  Phase M.L7
+         * lo usa @c export_typechecker_to_vexi para iterar
+         * @c GlobalVarDecl y extraer sus tipos sin tener que mantener
+         * un mapa paralelo en el TypeChecker.
+         */
+        const ast::ModuleNode &ast_module() const noexcept { return mod_; }
+
+        /**
          * @brief Resuelve un TypeNode AST a su Type semantico.
          *
          * Aplica resolucion de aliases (typedef/using) y reconocimiento
@@ -403,6 +447,39 @@ namespace vex {
         std::string monomorphize_class(const std::string &template_name,
                                         const std::vector<Type> &args,
                                         const SourceLoc &loc);
+
+        /**
+         * @brief L2.3: monomorphizacion de enum generico.  Crea una copia
+         * concreta del template (con type_params=[T,U,...]) sustituyendo
+         * los parametros por args concretos.  Devuelve el nombre mangled
+         * (e.g. "Maybe_i32") que se usa como struct_name del Type STRUCT.
+         */
+        std::string monomorphize_enum(const std::string &template_name,
+                                       const std::vector<Type> &args,
+                                       const SourceLoc &loc);
+
+        /// L2.3: ¿el nombre es un enum template generico?
+        bool is_generic_enum_template(const std::string &name) const noexcept {
+            return generic_enum_templates_.count(name) > 0;
+        }
+
+        /// L2.3: stack de contexto.  Cuando check_var_decl o check_assign
+        /// procesa `Maybe<i32> a = Maybe.Some(42)`, push ("Maybe","Maybe_i32")
+        /// para que `Maybe.Some(42)` o `Maybe.None` resuelvan al mangled
+        /// correcto.  Pop tras el check.
+        void push_expected_enum(const std::string &templ, const std::string &mang) {
+            expected_enum_stack_.push_back({templ, mang});
+        }
+        void pop_expected_enum() noexcept {
+            if (!expected_enum_stack_.empty()) expected_enum_stack_.pop_back();
+        }
+        const std::string *expected_enum_mangled(const std::string &templ) const noexcept {
+            for (auto it = expected_enum_stack_.rbegin();
+                 it != expected_enum_stack_.rend(); ++it) {
+                if (it->first == templ) return &it->second;
+            }
+            return nullptr;
+        }
 
         /**
          * @brief Accesor publico a la firma de una funcion top-level.
@@ -574,6 +651,33 @@ namespace vex {
          */
         const Symbol *lookup_with_depth(const std::string &name,
                                         size_t *depth_out) const;
+    public:
+        /**
+         * @brief Phase M.L26: acceso de solo lectura al set de nombres que
+         * @c lookup_with_depth ha resuelto exitosamente durante el check.
+         * El @c compile_vex_project lo usa para detectar imports
+         * declarados pero no usados y emitir warnings.
+         */
+        const std::unordered_set<std::string> &referenced_names() const noexcept {
+            return referenced_names_;
+        }
+
+        /// Phase M.L23: marca un nombre como importado de otro modulo.
+        /// El export del @c .vexi del modulo actual lo filtra por
+        /// defecto (no se re-exporta).  Si @c is_reexport es @c true ,
+        /// se anyade tambien al set de re-exportados y SE EXPORTA al
+        /// @c .vexi (semantica @c public @c import @c "x"; ).
+        void mark_imported(const std::string &name, bool is_reexport) {
+            imported_names_.insert(name);
+            if (is_reexport) reexported_imported_names_.insert(name);
+        }
+        bool is_imported(const std::string &name) const noexcept {
+            return imported_names_.count(name) > 0;
+        }
+        bool is_reexported(const std::string &name) const noexcept {
+            return reexported_imported_names_.count(name) > 0;
+        }
+    private:
 
         /**
          * @brief Convierte un TypeNode AST a Type semantico.
@@ -617,6 +721,14 @@ namespace vex {
             std::vector<std::shared_ptr<ComptimeValue>> array_vals;
             std::unordered_map<std::string, std::shared_ptr<ComptimeValue>> struct_fields;
             Type        type_val;
+            // v4: atributos del usuario (@align/@hot/@cold/@section).
+            // Solo significativos para comptime constants TOP-LEVEL
+            // (GlobalVarDecl con is_comptime=true).  El lowering los
+            // propaga al @c static_data_meta tras intern.
+            uint16_t    attr_align   = 0;     ///< 0 = default; sino potencia de 2
+            bool        attr_hot     = false;
+            bool        attr_cold    = false;
+            std::string attr_section;
         };
         const std::unordered_map<std::string, ComptimeConst> &
         comptime_const_values() const noexcept { return comptime_const_values_; }
@@ -791,6 +903,136 @@ namespace vex {
         /// rellena en cada @c function_sigs_.push_back y nunca se limpia.
         std::unordered_map<std::string, uint32_t> sig_by_name_;
 
+        /// Phase M.2.e: simbolos de funcion importados via .vexi que
+        /// deben declararse en el scope global al inicio de run().  El
+        /// constructor del TypeChecker NO ha pusheado scope todavia,
+        /// asi que las llamadas a register_imported_function durante
+        /// la fase de inyeccion no pueden hacer declare() directamente.
+        /// Esta cola se drena al inicio de run() tras push_scope().
+        std::vector<std::pair<std::string, uint32_t>> pending_imported_fn_names_;
+
+        /// Phase M.L7: cola paralela para variables globales importadas.
+        struct PendingGlobal {
+            std::string name;
+            Type        type;
+            bool        is_const = false;
+            bool        has_init_value = false;
+            uint64_t    init_value = 0;
+            /// v4: si @c is_str es @c true, el valor del global es un
+            /// string almacenado en @c str_value.  El lowering materializa
+            /// via STRMAKE en @c lower_ident.
+            bool        is_str = false;
+            std::string str_value;
+        };
+        std::vector<PendingGlobal> pending_imported_globals_;
+        /// Phase M.L7: declaracion adelantada del struct + map.  El
+        /// accesor publico @c imported_global_consts() en la seccion
+        /// public devuelve este miembro.
+    public:
+        struct ImportedGlobalConst {
+            Type        type;
+            uint64_t    value = 0;
+            /// v4: para comptime const string cross-module.
+            bool        is_str = false;
+            std::string str_value;
+        };
+    private:
+        std::unordered_map<std::string, ImportedGlobalConst>
+            imported_global_consts_;
+
+        /// Phase M6.a L.3: visibilidad por simbolo top-level.
+        /// El TypeChecker rellena estos sets al procesar cada decl segun
+        /// @c FunctionDecl::is_public, @c GlobalVarDecl::is_public, etc.
+        /// El emitter de .vexi consulta para filtrar simbolos privados.
+        std::unordered_map<std::string, bool> function_is_public_;
+        std::unordered_map<std::string, bool> global_is_public_;
+        std::unordered_map<std::string, bool> typedef_is_public_;
+
+        /// Phase M.L26: set de nombres que @c lookup_with_depth resolvio
+        /// exitosamente.  Mutable porque el lookup es @c const pero el
+        /// tracking es metadata observacional, no afecta la semantica.
+        /// Util para detectar imports declarados pero nunca usados +
+        /// emitir warnings.
+        mutable std::unordered_set<std::string> referenced_names_;
+
+        /// Phase M.L23: set de nombres importados desde @c .vexi de otros
+        /// modulos.  El export del @c .vexi del modulo actual los filtra
+        /// por DEFAULT (no se re-exportan) salvo que esten tambien en
+        /// @c reexported_imported_names_ (marcados con @c public import).
+        std::unordered_set<std::string> imported_names_;
+        std::unordered_set<std::string> reexported_imported_names_;
+
+        /// LANG.fix-3: mapa persistente local_name -> ns_idx para que
+        /// @c resolve_type_node pueda resolver namespaces tras el
+        /// @c pop_scope final.  Sin esto, la lowering pierde los
+        /// namespaces porque viven en @c scopes_ (popped).
+        std::unordered_map<std::string, uint32_t> ns_idx_by_local_name_;
+    public:
+        const std::unordered_map<std::string, uint32_t> &
+        ns_idx_by_local_name() const { return ns_idx_by_local_name_; }
+    private:
+
+    public:
+        /// Phase M.7: namespace de un modulo importado.  Cada entry
+        /// contiene los simbolos publicos del @c .vexi indexados por
+        /// nombre.  Cuando el TypeChecker ve @c "buf.Buffer" o
+        /// @c "lib_a.valor_a", busca @c "buf"/@c "lib_a" en la pila de
+        /// scopes (debe ser Symbol::Namespace con @c ns_index apuntando
+        /// aqui) y resuelve el simbolo dentro del namespace.
+        struct ImportedNamespace {
+            /// Nombre del modulo original (e.g. "lib_a"); util para
+            /// emitir el label mangled al hacer CALL.
+            std::string module_name;
+            /// Simbolos del namespace: nombre publico -> indice en
+            /// @c symbols.  El lookup es O(1) en uso normal.
+            std::unordered_map<std::string, uint32_t> by_name;
+            struct Sym {
+                std::string mangled_label;  ///< label real en el .vel (e.g. "lib_a__valor_a")
+                FunctionSig sig;              ///< firma para validacion en check_call
+                Type        var_type;         ///< para Variable/Constant
+                uint8_t     kind = 0;         ///< 0=Function, 1=Variable/Const, 2=TypeAlias
+                /// Para kind=1 (Constant): valor literal si esta disponible.
+                /// El lowering lo emite como CONST inline (cero overhead vs
+                /// `const` runtime).  Solo valido cuando @c has_const_value.
+                bool        has_const_value = false;
+                int64_t     const_value     = 0;
+            };
+            std::vector<Sym> symbols;
+        };
+
+    private:
+        std::vector<ImportedNamespace> imported_namespaces_;
+
+        /// Cola de namespaces pendientes a declarar en el scope global
+        /// (mismo patron que @c pending_imported_fn_names_).
+        std::vector<std::pair<std::string, uint32_t>> pending_imported_ns_names_;
+
+    public:
+        /// @brief Acceso al registro de namespaces (para el lowering).
+        const std::vector<ImportedNamespace> &imported_namespaces() const noexcept {
+            return imported_namespaces_;
+        }
+
+        /// @brief Registra un namespace importado.  Devuelve el indice
+        /// asignado en @c imported_namespaces_.  El caller (compiler_project)
+        /// llama esto tras parsear el .vexi del dep para registrar
+        /// `import "lib_a";` o `import "lib_a" as foo;`.
+        /// @param local_name Nombre con el que se accede en el modulo
+        ///                   actual (e.g. "lib_a" o "foo" si hay alias).
+        /// @param module_name Nombre del modulo origen (para mensajes).
+        uint32_t register_imported_namespace(
+                const std::string &local_name,
+                const std::string &module_name);
+
+        /// @brief Anyade un simbolo al namespace registrado en @p ns_index.
+        /// Llamado por el compiler_project durante la inyeccion de cada
+        /// VexiSymbol cuyo modulo se importo plain (sin `only`).
+        void register_namespace_symbol(uint32_t ns_index,
+                                        const std::string &public_name,
+                                        ImportedNamespace::Sym sym);
+
+    private:
+
         /// Borrow checker compile-time.  Mantiene estado de borrows
         /// activos durante el chequeo de una funcion.  Se resetea al
         /// entrar a cada funcion.
@@ -813,6 +1055,58 @@ namespace vex {
         // el nombre alias al Type ya resuelto al tipo subyacente; alias
         // anidados (a -> b -> u32) se aplanan en collect_globals.
         std::unordered_map<std::string, Type> type_aliases_;
+
+        // Newtypes (typedef T name new) -- mapa nombre -> tipo underlying
+        // (sin nominal_id ni is_opaque) para responder a la introspeccion
+        // `X typedef is T` y al cast explicito `(T)x` que cruza la barrera
+        // nominal.  Solo poblado para aliases con @c is_newtype = true.
+        std::unordered_map<std::string, Type> newtype_underlying_;
+
+    public:
+        /// @brief Conversion declarada via @c "explicit from T;" o
+        /// @c "explicit to T;" en el bloque del typedef.  @c is_public
+        /// indica si la conversion es accesible desde otros ficheros
+        /// (default: privado al fichero donde se declaro el typedef).
+        struct ExplicitConv {
+            Type type;
+            bool is_public = false;
+        };
+
+        /// @brief Metadata por newtype: conversiones declaradas + fichero
+        /// donde se declaro el typedef.  El fichero se usa para imponer
+        /// module-privacy: una conversion sin @c public solo aplica en el
+        /// mismo fichero.
+        struct NewtypeInfo {
+            std::vector<ExplicitConv> from_conversions;
+            std::vector<ExplicitConv> to_conversions;
+            std::string               source_file;
+        };
+
+    private:
+        // Mapa de metadata por nombre de newtype.  Vacio para newtypes
+        // sin bloque @c {explicit from/to T;} declarado.
+        std::unordered_map<std::string, NewtypeInfo> newtype_info_;
+
+        // Counter global de IDs nominales asignados a newtypes.  Empieza
+        // en 0; el ID 0 esta reservado para "no es newtype" (alias clasico).
+        uint32_t newtype_counter_ = 0;
+
+    public:
+        /// @brief Acceso de solo lectura al underlying de un newtype.
+        /// Usado por el lowering para emitir el cast explicito (T)x
+        /// preservando bits.  Devuelve nullptr si @p name no es un newtype.
+        const Type *newtype_underlying(const std::string &name) const noexcept {
+            auto it = newtype_underlying_.find(name);
+            return (it != newtype_underlying_.end()) ? &it->second : nullptr;
+        }
+
+        /// @brief Metadata de conversiones de un newtype (puede ser nullptr).
+        const NewtypeInfo *newtype_info(const std::string &name) const noexcept {
+            auto it = newtype_info_.find(name);
+            return (it != newtype_info_.end()) ? &it->second : nullptr;
+        }
+
+    private:
 
         // Tabla de structs declarados con su layout pre-calculado (offsets
         // de campos y tamano total).  Acceso O(1) por nombre desde
@@ -838,6 +1132,14 @@ namespace vex {
         // monomorphiza.  Mapea nombre del template -> indice en
         // mod_.decls (para clonar el ClassDecl original).
         std::unordered_map<std::string, size_t> generic_templates_;
+        /// L2.3: templates de enum genericos.  Mapea template_name (sin
+        /// args) -> indice en mod_.decls.  Cada uso `Maybe<i32>` se
+        /// monomorphiza on demand via monomorphize_enum().
+        std::unordered_map<std::string, size_t> generic_enum_templates_;
+        /// L2.3: stack para inferir el mangled de variantes sin payload
+        /// (e.g. `Maybe<i32> a = Maybe.None`).  Pair = (template_name,
+        /// mangled_name).
+        std::vector<std::pair<std::string, std::string>> expected_enum_stack_;
 
         // Cache de monomorphizaciones: clave = "Box<i32>" mangled como
         // "Box_i32"; valor = true si ya esta generada.  Evita regenerar
@@ -869,6 +1171,161 @@ namespace vex {
             auto it = monomorph_info_.find(mangled);
             return (it == monomorph_info_.end()) ? nullptr : &it->second;
         }
+
+        // ---- Phase M.2: interop con .vexi (interfaces compiladas) ----
+        //
+        // El TypeChecker puede exportar sus simbolos publicos a un
+        // descriptor @c vex::VexiModule para que el emitter del .vexi
+        // los serialize.  Tambien puede inyectar simbolos importados
+        // desde un .vexi parseado.  Las firmas precisas viven en
+        // @c module_interop.cpp para no forzar include de vexi_format.h
+        // aqui (forward declaramos VexiModule mas abajo via traits).
+
+        /// @brief Entry para la lista de simbolos en @c only.
+        struct VexiOnlyEntry {
+            std::string name;       // nombre original en el modulo
+            std::string rename;     // nombre local (vacio = mismo)
+        };
+
+        /// @brief Resolver de typenames canonicos -> @c Type.  Re-parsea
+        /// strings tipo @c "i32", @c "u64*", @c "Optional<i32>",
+        /// @c "fn(i32) -> i64".  Devuelve @c Type{} (kind=VOID) si el
+        /// typename es desconocido en el contexto actual.  Usado por el
+        /// cargador de .vexi para resolver firmas de funciones y tipos
+        /// de fields cross-module.
+        Type resolve_type_string(const std::string &type_str) const;
+
+        /// @brief Acceso const al mapa de aliases (transparente + newtype).
+        const std::unordered_map<std::string, Type> &type_aliases() const noexcept {
+            return type_aliases_;
+        }
+
+        /// @brief Map de nombre -> sig_index (para iterar funciones top-level).
+        /// Usado por el emitter del .vexi para enumerar funciones con
+        /// sus firmas sin necesidad de mantener un getter por funcion.
+        const std::unordered_map<std::string, uint32_t> &function_names() const noexcept {
+            return sig_by_name_;
+        }
+
+        /// @brief Reserva un nominal_id univoco para un nuevo newtype
+        /// (cuando se inyecta desde .vexi).  Cada llamada devuelve un id
+        /// distinto.  No tiene efectos secundarios.
+        uint32_t allocate_nominal_id() noexcept {
+            return ++newtype_counter_;
+        }
+
+        // -- Registradores usados solo por el cargador de .vexi (M2.d).
+        // Insertan en las tablas internas SIN re-validar (asumen que el
+        // .vexi de origen es valido).  Si el nombre ya existe, no se
+        // sobreescribe (idempotente).
+
+        void register_imported_type_alias(const std::string &name, Type t) {
+            type_aliases_.emplace(name, std::move(t));
+        }
+        void register_imported_newtype(const std::string &name, Type underlying) {
+            newtype_underlying_.emplace(name, std::move(underlying));
+        }
+        /// Phase M.L8: registra el bloque @c {explicit from/to T;} de un
+        /// newtype importado.  Las conversiones se almacenan en
+        /// @c newtype_info_ y participan en @c check_cast como
+        /// allow-list para casts cross-module.
+        void register_imported_newtype_info(const std::string &name,
+                                             NewtypeInfo ni) {
+            newtype_info_.emplace(name, std::move(ni));
+        }
+        void register_imported_struct(const std::string &name, StructLayout L) {
+            // Phase M.fix-classfield: overwrite (no emplace) para soportar
+            // pre-registro de skeleton seguido de fill cross-type within
+            // mismo dep modulo.
+            struct_layouts_[name] = std::move(L);
+        }
+        void register_imported_class(const std::string &name, ClassLayout L) {
+            class_layouts_[name] = std::move(L);
+        }
+        void register_imported_enum(const std::string &name, EnumLayout L) {
+            enum_layouts_[name] = std::move(L);
+        }
+        void register_imported_function(const std::string &name, FunctionSig sig) {
+            const uint32_t idx = static_cast<uint32_t>(function_sigs_.size());
+            function_sigs_.push_back(std::move(sig));
+            sig_by_name_.emplace(name, idx);
+            // Encolar para que `run()` declare el Symbol en el scope global
+            // tras el push_scope inicial.  Sin esto, el lookup en
+            // `lookup_with_depth` no encuentra la funcion importada.
+            pending_imported_fn_names_.push_back({name, idx});
+        }
+        /// Phase M.L7: registra una variable global importada de otro
+        /// modulo via @c .vexi.  Igual que las funciones, se encola para
+        /// que @c run() la declare en el scope global tras el
+        /// @c push_scope inicial.  Si @c has_init_value es @c true y la
+        /// global es @c const , el lowering del consumidor puede
+        /// inline-ar el valor literal.
+        void register_imported_global(const std::string &name,
+                                      Type type,
+                                      bool is_const,
+                                      bool has_init_value = false,
+                                      uint64_t init_value = 0) {
+            PendingGlobal pg;
+            pg.name           = name;
+            pg.type           = std::move(type);
+            pg.is_const       = is_const;
+            pg.has_init_value = has_init_value;
+            pg.init_value     = init_value;
+            pending_imported_globals_.push_back(std::move(pg));
+        }
+
+        /// v4: registra un comptime const string importado cross-module.
+        /// El lowering puede materializar el StringObject al primer uso via
+        /// `STRMAKE` con los bytes guardados en @c imported_global_consts_.
+        void register_imported_global_str(const std::string &name,
+                                            Type type,
+                                            std::string str_value) {
+            PendingGlobal pg;
+            pg.name      = name;
+            pg.type      = std::move(type);
+            pg.is_const  = true;
+            pg.is_str    = true;
+            pg.str_value = std::move(str_value);
+            pending_imported_globals_.push_back(std::move(pg));
+        }
+
+        /// Phase M.L7: tabla de globals const importadas con valor
+        /// literal embedded.  El lowering la consulta en @c lower_ident
+        /// para inline-ar `CONST <value>` directamente cuando el ident
+        /// resuelve a uno de estos nombres.  Poblada al final de run()
+        /// drenando @c pending_imported_globals_.  El struct esta
+        /// declarado arriba en la primera seccion public anidada.
+        const std::unordered_map<std::string, ImportedGlobalConst> &
+        imported_global_consts() const noexcept {
+            return imported_global_consts_;
+        }
+
+        /// Phase M6.a L.3: setea visibilidad de un simbolo top-level.
+        /// El TypeChecker llama esto al procesar cada decl.
+        void set_function_visibility(const std::string &name, bool is_pub) {
+            function_is_public_[name] = is_pub;
+        }
+        void set_global_visibility(const std::string &name, bool is_pub) {
+            global_is_public_[name] = is_pub;
+        }
+        void set_typedef_visibility(const std::string &name, bool is_pub) {
+            typedef_is_public_[name] = is_pub;
+        }
+        /// Acceso de solo lectura.  @c true si el simbolo es publico (o
+        /// no fue registrado; default permisivo).
+        bool is_function_public(const std::string &name) const noexcept {
+            auto it = function_is_public_.find(name);
+            return (it == function_is_public_.end()) || it->second;
+        }
+        bool is_global_public(const std::string &name) const noexcept {
+            auto it = global_is_public_.find(name);
+            return (it == global_is_public_.end()) || it->second;
+        }
+        bool is_typedef_public(const std::string &name) const noexcept {
+            auto it = typedef_is_public_.find(name);
+            return (it == typedef_is_public_.end()) || it->second;
+        }
+
     private:
 
         // Tabla paralela a @c monomorphized_ que ademas guarda el
@@ -892,6 +1349,24 @@ namespace vex {
         // VOID).  Se settea al entrar en @c check_function /
         // @c check_class_method y se restaura al salir.
         Type current_fn_return_type_{PrimitiveKind::VOID};
+
+        // Bug fix 2026-05-23 (audit optres infer): tipo Result<V,E> esperado
+        // en el contexto actual (caller del check_expr).  Se setea en
+        // check_return / check_var_decl antes de check_expr cuando el destino
+        // es un Result<V,E>; @c check_call lo consulta al ver Ok(v) o Err(e)
+        // y usa V/E del contexto en lugar de los placeholders (Result<V, i64>
+        // / Result<i64, E>).  Resuelve `return Err("lit")` con string E y
+        // `Ok(i32)` que se promocionaria a i64 sin contexto.
+        Type expected_result_type_{};
+        // Idem para Optional<T>: cuando el destino es Optional<T>, propagar
+        // T al Some(v).
+        Type expected_optional_type_{};
+
+        /// BugFix R8: indica si estamos en el body de un @Macro.  Cuando
+        /// es true, check_var_decl trata las var-decls como
+        /// `comptime const` automaticamente para que los IdentExpr
+        /// posteriores sean resoluble por el comptime evaluator.
+        bool current_fn_is_macro_ = false;
 
         // Conteo de errores al inicio del run() para detectar exito.
         size_t initial_errors_ = 0;

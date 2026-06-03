@@ -1,0 +1,19 @@
+// Bench: aritmetica f64 intensiva (sqrt + fabs + fmin + fmax + floor + ceil).
+// 5M iteraciones con 6 ops FP por iter (incluyendo math builtins).
+
+i32 main() {
+    f64 acc = 0.0;
+    i32 i = 0;
+    while (i < 5000000) {
+        f64 x = (f64) i;
+        f64 s = sqrt(x);
+        f64 a = fabs(s - 1000.0);
+        f64 m = fmin(a, 999.0);
+        f64 M = fmax(s, 1.0);
+        f64 f = floor(M);
+        f64 c = ceil(f);
+        acc = acc + m + c;
+        i = i + 1;
+    }
+    return (i32) ((i64) acc & 0xFF);
+}

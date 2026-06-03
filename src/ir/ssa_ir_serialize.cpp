@@ -66,6 +66,8 @@ namespace ir {
         // queda para extensiones futuras sin cambio de formato.
         constexpr uint8_t INSTR_FLAG_PRESERVE      = 1 << 0; ///< No eliminar aunque dst este muerto (side-effect implicito)
         constexpr uint8_t INSTR_FLAG_IS_CALL_SITE  = 1 << 1; ///< Marca instruccion como call site (para stackmaps)
+        constexpr uint8_t INSTR_FLAG_HOST_ALLOCA   = 1 << 2; ///< ALLOCA auto-promovida a host stack (Phase D.jit-mem-model)
+        constexpr uint8_t INSTR_FLAG_HOST_ALLOCA_EXPLICIT_FREE = 1 << 3; ///< Sprint mem-loop-fix: RAW_FREE preservado para liberar in-loop
 
         // Bits del byte flags por IrFunction.
         constexpr uint8_t FN_FLAG_NATIVE   = 1 << 0; ///< Funcion FFI (sin body IR; solo declaracion)
@@ -158,6 +160,8 @@ namespace ir {
             uint8_t flags = 0;
             if (i.preserve)     flags |= INSTR_FLAG_PRESERVE;
             if (i.is_call_site) flags |= INSTR_FLAG_IS_CALL_SITE;
+            if (i.host_alloca)  flags |= INSTR_FLAG_HOST_ALLOCA;
+            if (i.host_alloca_explicit_free) flags |= INSTR_FLAG_HOST_ALLOCA_EXPLICIT_FREE;
             write_u8(o, flags);
             // source_line: util para diagnosticos y stack traces.  0 si
             // el frontend no aporto info de linea.
@@ -226,6 +230,8 @@ namespace ir {
             i.dst           = static_cast<IrValueId>(dst_v);
             i.preserve      = (flags & INSTR_FLAG_PRESERVE)      != 0;
             i.is_call_site  = (flags & INSTR_FLAG_IS_CALL_SITE)  != 0;
+            i.host_alloca   = (flags & INSTR_FLAG_HOST_ALLOCA)   != 0;
+            i.host_alloca_explicit_free = (flags & INSTR_FLAG_HOST_ALLOCA_EXPLICIT_FREE) != 0;
             i.source_line   = source_line;
             i.imm           = imm;
             /* operands */

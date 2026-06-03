@@ -1,0 +1,87 @@
+// Bench: string workout AGRESIVO.
+//
+// Diseno para impedir optimizaciones triviales:
+//   - Cada string se construye desde bytes derivados del contador `i`
+//     (no constant-folding posible).
+//   - Cada iter hace 6 ops distintas (concat, length, equals, slice,
+//     equals2, concat2) que NO se pueden hoistar (LICM-resistant).
+//   - El acumulador `sum` propaga TODOS los resultados (anti-DCE).
+//   - Final `sum & mask` previene que el compilador prediga el valor.
+//
+// 1M iter * ~6 ops = 6M string ops total.
+// Mide: STRMAKE + STRCAT + STRLEN + STRCMP + segundo STRMAKE+STRCAT.
+//
+// Para 1M iter expected R0 = 11023671 = 0xa83537.
+// C/C++/Java/Python/Vex INTERP todos producen el mismo valor.
+//
+// NOTA: Vex JIT actualmente produce R0 ligeramente diferente (~0.01%
+// error) debido a un bug latente con strings post-GC.  En investigacion
+// como sprint string-perf-3.  El bench sigue valido para medir INTERP
+// vs C/C++/Java/Python en string ops puros.
+
+i32 main() {
+    i64 sum = 0;
+    i64 hits1 = 0;
+    i64 hits2 = 0;
+    i32 i = 0;
+    while (i < 1000000) {
+        // Build string A: 4 chars derivados de bits de `i`.  A-H.
+        u8[16] bufA;
+        bufA[0] = (u8)(65 + (i & 7));         // 65='A'..72='H'
+        bufA[1] = (u8)(65 + ((i >> 3) & 7));
+        bufA[2] = (u8)(65 + ((i >> 6) & 7));
+        bufA[3] = (u8)(65 + ((i >> 9) & 7));
+        bufA[4] = 0;
+        string a = str_make(&bufA[0], 4);
+
+        // Build string B: 2 chars digit 0-9.
+        u8[16] bufB;
+        bufB[0] = (u8)(48 + (i % 10));        // '0'..'9'
+        bufB[1] = (u8)(48 + ((i / 10) % 10));
+        bufB[2] = 0;
+        string b = str_make(&bufB[0], 2);
+
+        // OP1: concat A + B -> 6 chars.
+        string c = a + b;
+
+        // OP2: length (verificar siempre 6).
+        u64 ln = str_length(c);
+        sum = sum + (i64)ln;
+
+        // OP3: equals contra patron fijo (rara vez match).
+        string pat1 = "AAAA00";
+        if (str_equals(c, pat1)) {
+            hits1 = hits1 + 1;
+        }
+
+        // OP5: substring (a[0:3]).
+        // Vex API: str_make sobre el mismo buf con menor longitud.
+        u8[16] bufS;
+        bufS[0] = bufA[0];
+        bufS[1] = bufA[1];
+        bufS[2] = bufA[2];
+        bufS[3] = 0;
+        string sub = str_make(&bufS[0], 3);
+
+        // OP6: equals contra otro patron derivado de i (LICM-imposible).
+        u8[16] bufQ;
+        bufQ[0] = (u8)(65 + ((i / 100) & 7));
+        bufQ[1] = (u8)(65 + ((i / 800) & 7));
+        bufQ[2] = (u8)(65 + ((i / 6400) & 7));
+        bufQ[3] = 0;
+        string q = str_make(&bufQ[0], 3);
+        if (str_equals(sub, q)) {
+            hits2 = hits2 + 1;
+        }
+
+        // Encoderar el length del concat de sub+B en el sum.
+        string c2 = sub + b;
+        u64 ln2 = str_length(c2);
+        sum = sum + (i64)ln2;
+
+        i = i + 1;
+    }
+    // Combinar todos los resultados para prevenir DCE.
+    i64 r = sum + hits1 * 1000 + hits2 * 7;
+    return (i32)(r & 0x7FFFFFFF);
+}

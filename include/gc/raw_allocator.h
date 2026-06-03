@@ -80,6 +80,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <unordered_map>
+#include <vector>
+#include <utility>
 
 #include "arena/arena.h"
 
@@ -323,6 +325,93 @@ namespace gc {
 
         size_t   total_bytes_ = 0; ///< bytes vivos actualmente (suma de AllocRecord::size)
         RawStats stats_;           ///< contadores de uso (ver RawStats)
+
+        // ---------------------------------------------------------------------
+        // Slab allocator (Sprint mem-loop-fix 2026-06-02)
+        // ---------------------------------------------------------------------
+        /// @brief Numero de size classes del slab.  Cubre 16, 32, 64, 128,
+        /// 256, 512, 1024 bytes (potencias de 2).  Cualquier alloc <= 1024
+        /// pasa por slab; > 1024 cae al path tradicional (VirtualAlloc).
+        ///
+        /// Bottleneck arreglado: bench mem_malloc_free (5M iter de
+        /// malloc(96) + free) pasaba de 20s -> ~50-100ms al evitar
+        /// 10M syscalls VirtualAlloc/VirtualFree.
+        static constexpr size_t SLAB_CLASSES = 7;
+        static constexpr size_t SLAB_SIZES[SLAB_CLASSES] = {
+            16, 32, 64, 128, 256, 512, 1024,
+        };
+        /// @brief Tamano del chunk OS por slab class.  Cada chunk se
+        /// trocea en N slots del tamano de la clase.  64 KB es el
+        /// sweet spot: pocos chunks por clase, baja fragmentacion.
+        static constexpr size_t SLAB_CHUNK_BYTES = 65536;
+
+        /// @brief Encabezado del slot del slab.  Almacena el size_class
+        /// del slot para que @c free pueda devolverlo al free list
+        /// correcto sin lookup en el mapa.  Se aloca AL INICIO del slot
+        /// (offset 0); el ptr devuelto al usuario apunta despues del header.
+        struct SlabSlotHeader {
+            uint8_t  size_class_idx; ///< indice en SLAB_SIZES
+            uint8_t  pad[7];         ///< alinear a 8 bytes (header total = 8)
+        };
+        static_assert(sizeof(SlabSlotHeader) == 8,
+                      "SlabSlotHeader debe ser 8 bytes para alinear payload");
+
+        /// @brief Nodo del free list intrusivo (vive dentro del slot
+        /// cuando esta libre).  Sobrescribe el payload del slot; en
+        /// @c alloc se vuelve a usar como payload.  LIFO O(1).
+        struct SlabFreeNode {
+            SlabFreeNode *next;
+        };
+
+        /// @brief Free list por size class.  Cabeza LIFO; @c free push,
+        /// @c alloc pop.  Inicialmente nullptr; @c slab_grow_class
+        /// aloca un chunk del SO + trocea + thread.
+        SlabFreeNode *slab_free_list_[SLAB_CLASSES] = {nullptr};
+
+        /// @brief Metadata de un chunk del slab.  Sprint mem-perf
+        /// (2026-06-02): eliminamos @c slab_payload_to_class_ (unordered_map
+        /// costaba ~150-200 ns por insert/erase).  Ahora @c free localiza
+        /// el chunk via binary search sobre @c slab_chunks_sorted_ y lee
+        /// el class_idx de la entry del chunk.  Mantiene el vector
+        /// ordenado por @c base para que el lookup sea O(log N_chunks).
+        struct SlabChunkInfo {
+            uint64_t base;       ///< chunk_base (host_ptr cast a u64)
+            uint64_t end;        ///< chunk_base + chunk_size (exclusivo)
+            uint8_t  class_idx;  ///< indice en SLAB_SIZES
+            uint8_t  _pad[7];    ///< alinear a 24 bytes para cache locality
+        };
+        static_assert(sizeof(SlabChunkInfo) == 24,
+                      "SlabChunkInfo debe ser 24 bytes para cache locality");
+
+        /// @brief Vector de chunks del slab, SIEMPRE ORDENADO por
+        /// @c base ascendente.  @c slab_grow_class anyade y reordena
+        /// (inserts son raros: ~1 por cada 500+ allocs del mismo class).
+        /// @c free hace binary search para encontrar el chunk que
+        /// contiene un ptr dado.
+        std::vector<SlabChunkInfo> slab_chunks_sorted_;
+
+        /// @brief Cache del env var @c VESTA_NO_SLAB para evitar
+        /// @c getenv en el hot path del alloc.  Valor:
+        ///   0 = no leido aun (lazy init en primera llamada)
+        ///   1 = slab habilitado (default)
+        ///   2 = slab deshabilitado (env var seteada)
+        mutable uint8_t slab_env_cache_ = 0;
+
+        // ---------------------------------------------------------------------
+        // Helpers del slab (privados)
+        // ---------------------------------------------------------------------
+        /// @brief Encuentra el indice de size class apropiado para @p size.
+        /// @return indice valido o SIZE_MAX si size > SLAB_SIZES[ultimo].
+        static size_t slab_class_for(size_t size) noexcept {
+            for (size_t i = 0; i < SLAB_CLASSES; ++i) {
+                if (size <= SLAB_SIZES[i]) return i;
+            }
+            return SIZE_MAX;
+        }
+        /// @brief Aloca un chunk OS + trocea + push al free list.
+        bool slab_grow_class(size_t class_idx);
+        /// @brief Libera todos los chunks del slab.  Llamado por @c free_all.
+        void slab_free_all();
     };
 
 } // namespace gc

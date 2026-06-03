@@ -1,0 +1,24 @@
+// Bench: copia secuencial byte-a-byte (1 MB x 100 iter = 100 MB).
+i32 main() {
+    u64 N = 1048576;  // 1 MB
+    u8* src = (u8*) malloc(N);
+    u8* dst = (u8*) malloc(N);
+    u64 i = 0;
+    while (i < N) {
+        src[i] = (u8) (i & 0xFF);
+        i = i + 1;
+    }
+    i64 iter = 0;
+    while (iter < 100) {
+        u64 j = 0;
+        while (j < N) {
+            dst[j] = src[j];
+            j = j + 1;
+        }
+        iter = iter + 1;
+    }
+    i32 r = (i32) dst[1234];
+    free(src);
+    free(dst);
+    return r;
+}

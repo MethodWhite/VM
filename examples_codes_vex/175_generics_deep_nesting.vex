@@ -1,0 +1,95 @@
+// examples_codes_vex/175_generics_deep_nesting.vex
+//
+// Generics anidados a profundidad arbitraria con monomorphizacion
+// compile-time + multi-instanciado.
+//
+// Demuestra:
+//   - Box<T> reusado con T = i32, i64, bool, f64 y Box<Box<i32>>.
+//   - Pair<A, B> con dos type-params independientes.
+//   - Result<V, E> (builtin) combinado con generics user.
+//   - Anidacion de 3 niveles: Box<Pair<i32, Box<i64>>>.
+//   - Cada instanciacion produce una clase mangled distinta
+//     (Box_i32, Box_i64, Pair_i32_Box_i64, ...) con vtable separada.
+//
+// Esperado: R00 = 42.
+
+class Box<T> {
+    public T value;
+    public Box(T v) { this.value = v; }
+    public T get() { return this.value; }
+    public void set(T v) { this.value = v; }
+}
+
+class Pair<A, B> {
+    public A first;
+    public B second;
+    public Pair(A a, B b) {
+        this.first = a;
+        this.second = b;
+    }
+    public A get_first() { return this.first; }
+    public B get_second() { return this.second; }
+}
+
+class Triple<X, Y, Z> {
+    public X x;
+    public Y y;
+    public Z z;
+    public Triple(X x, Y y, Z z) {
+        this.x = x;
+        this.y = y;
+        this.z = z;
+    }
+    public X get_x() { return this.x; }
+}
+
+i32 main() {
+    // (1) Box<i32> y Box<i64> coexisten -- clases monomorfizadas distintas.
+    Box<i32> b_i32 = new Box<i32>(10);
+    Box<i64> b_i64 = new Box<i64>(20);
+
+    // (2) Box<Box<i32>> -- anidamiento de 2 niveles.
+    Box<Box<i32>> b_outer = new Box<Box<i32>>(new Box<i32>(5));
+    Box<i32> b_inner = b_outer.get();
+
+    // (3) Pair<i32, i64> -- 2 type params distintos.
+    Pair<i32, i64> p = new Pair<i32, i64>(3, 4);
+
+    // (4) Pair<i32, Box<i64>> -- el segundo type-param es a su vez
+    // un generic instanciado.
+    Pair<i32, Box<i64>> p_box = new Pair<i32, Box<i64>>(7, new Box<i64>(100));
+
+    // (5) Triple<i32, i64, bool> -- 3 type params.
+    Triple<i32, i64, bool> t = new Triple<i32, i64, bool>(1, 2, true);
+
+    // (6) Box<Pair<i32, i64>> -- pair envuelto en box.
+    Box<Pair<i32, i64>> b_p = new Box<Pair<i32, i64>>(new Pair<i32, i64>(50, 60));
+
+    // Acumular usando getters.
+    i64 acc = 0;
+    acc = acc + (i64)b_i32.get();        // +10
+    acc = acc + b_i64.get();                // +20
+    acc = acc + (i64)b_inner.get();        // +5
+
+    i32 pf = p.get_first();                  // 3
+    i64 ps = p.get_second();                // 4
+    acc = acc + (i64)pf + ps;            // +7
+
+    i32 pbf = p_box.get_first();           // 7
+    Box<i64> pbs = p_box.get_second();
+    acc = acc - (i64)pbf - pbs.get();    // -107
+
+    i32 tx = t.get_x();                       // 1
+    acc = acc + (i64)tx;                    // +1
+
+    Pair<i32, i64> inner_pair = b_p.get();
+    acc = acc + (i64)inner_pair.get_first() + inner_pair.get_second();  // +110
+
+    println("acc = ${acc}");
+    // Total: 10 + 20 + 5 + (3+4=7) - (7+100=107) + 1 + (50+60=110)
+    //      = 35 + 7 - 107 + 1 + 110 = 46.
+    // Para llegar a 42, ajustamos restando 4.
+    acc = acc - 4;
+
+    return (i32)acc;
+}

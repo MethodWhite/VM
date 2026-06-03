@@ -61,6 +61,34 @@ namespace runtime {
         }
 
         /**
+         * @brief Lookup rapido por hash, sin std::string heap alloc.
+         *
+         * Sprint string-perf (2026-06-02): la version original llamaba
+         * @c make_intern_key que aloca un std::string nuevo CADA STRMAKE
+         * (copia bytes + concatena encoding byte).  Ese heap alloc + el
+         * hash de string completo costaban ~150-200 ns por intern call.
+         *
+         * Esta variante computa FNV-1a sobre (bytes + enc) inline y mantiene
+         * un mapa @c hash -> @c GcHandle paralelo al principal.  Los hash
+         * collisions se validan via byte-compare contra el StringObject
+         * apuntado.  Tras un hit, el caller skipea TODO el flujo de
+         * @c alloc_flat (ahorra ~200 ns adicionales).
+         *
+         * Caller debe deref el handle devuelto + verificar que su byte_len
+         * y bytes matchean los que esperaba (defensa anti-colision).
+         */
+        gc::GcHandle lookup_by_hash(uint64_t h) const {
+            auto it = hash_map_.find(h);
+            if (it != hash_map_.end()) return it->second;
+            return gc::GC_NULL_HANDLE;
+        }
+
+        /** @brief Inserta una entrada hash -> handle.  Llamar tras alloc. */
+        void insert_by_hash(uint64_t h, gc::GcHandle handle) {
+            hash_map_.emplace(h, handle);
+        }
+
+        /**
          * @brief Comprueba si existe una entrada con la clave dada.
          *
          * @param key  Clave: raw bytes + encoding byte.
@@ -80,6 +108,7 @@ namespace runtime {
 
     private:
         std::unordered_map<std::string, gc::GcHandle> map_; ///< clave -> GcHandle canonico
+        std::unordered_map<uint64_t, gc::GcHandle> hash_map_; ///< hash FNV-1a -> handle (fast path)
     };
 
 } // namespace runtime

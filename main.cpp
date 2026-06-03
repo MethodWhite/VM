@@ -29,6 +29,7 @@
 #include "cli/vsh.h"
 #include "ir/ir_emitter.h"
 #include "jit/auto_jit.h"
+#include "runtime/profile.h"          // Sprint D.6 (2026-06-03)
 #include "pkg/cli.h"
 #include "runtime/proceso_runtime.h"
 #include "cli/runtime_api_commands.h"
@@ -175,10 +176,14 @@ static void apply_dist_config(runtime::VM *vm, const cxxopts::ParseResult &resul
 }
 
 
+/* forzar registro de virtual fns runtime (callbacks Vex->C). */
+extern "C" void runtime_ensure_vex_callback_registered(void);
+
 int main(int argc, char *argv[]) {
 #if defined(WIN32) || defined(_WIN32) || defined(__WIN32) && !defined(__CYGWIN__)
     asm_multi_process::run_and_capture("chcp 65001");
 #endif
+    runtime_ensure_vex_callback_registered();
 
     // ------------------------------------------------------------------
     // Subcomando especial: @c vm pkg <subcmd> ...
@@ -238,6 +243,9 @@ int main(int argc, char *argv[]) {
             ("jit-warn",      "Imprimir warnings cada vez que el Selector encuentra una IR op no soportada (dedup por op+linea)")
             ("jit-stats",     "Imprimir snapshot final de counters del JIT: compiled/unsupported/no_ir + threshold")
             ("jit-disasm",    "Volcar hex bytes + disasm (Capstone) de cada funcion JIT-compilada a stderr")
+            // ---- opciones de profiling (D.6 PGO) ----
+            ("profile",       "Generar @c .vprof con branch/type/alloc counters al exit (PGO para C2). Path opcional; default: 'program.vprof'.",
+                cxxopts::value<std::string>()->implicit_value("program.vprof"))
             // ---- opciones de runtime distribuido ----
             ("dist-port",         "Puerto VDP del servidor distribuido (0 = sin servidor TCP)",
                 cxxopts::value<uint16_t>()->default_value("0"))
@@ -386,22 +394,32 @@ int main(int argc, char *argv[]) {
     //
     // --jit-warn activa el output detallado de IR ops no soportadas.
     // --jit-stats imprime el snapshot final al RET de main (independiente).
+    /* Prioridad: --jit-threshold > -m jit/-m interp explicito > env var
+     * VESTA_JIT_THRESHOLD > default (UINT32_MAX = JIT off).
+     *
+     * cxxopts retorna count("mode") == 0 cuando no se paso `-m` aunque
+     * la opcion tenga default_value("vm").  Usamos eso para distinguir
+     * "el usuario eligio -m algo" vs "default; mirar env var".
+     *
+     * Importante: leer el env var ANTES del Loader para que la
+     * eager-compile pass se dispare con el threshold correcto.  Sin esto
+     * el threshold se inicializa lazy en el primer maybe_compile_*, ya
+     * tarde para eager compile. */
     if (result.count("jit-threshold")) {
         jit::set_jit_threshold(result["jit-threshold"].as<uint32_t>());
     } else if (result.count("mode")) {
         const std::string m = result["mode"].as<std::string>();
         if (m == "jit") {
-            /* Preset: threshold=1 => cada metodo se JIT-compila a la
-             * primera invocacion.  Equivalente a la opcion explicita
-             * --jit-threshold 1.  Si el usuario quiere otro threshold,
-             * que use --jit-threshold N directamente. */
             jit::set_jit_threshold(1);
         } else if (m == "vm" || m == "interp") {
-            /* Desactiva el JIT explicitamente sobreescribiendo cualquier
-             * env var.  UINT32_MAX = JIT off, hook devuelve sin compilar
-             * en el fast path. */
             jit::set_jit_threshold(UINT32_MAX);
         }
+    } else {
+        /* Sin flags CLI explicitos -> consultar env var ahora.  Lo
+         * hacemos via la API publica que delega en el mismo
+         * std::call_once que el path lazy interno, asi futuras
+         * inicializaciones lazy son no-op (idempotente). */
+        jit::init_threshold_from_env_now();
     }
     if (result.count("jit-warn")) {
         jit::g_jit_warn_unsupported = true;
@@ -409,7 +427,28 @@ int main(int argc, char *argv[]) {
     if (result.count("jit-disasm")) {
         jit::g_jit_disasm = true;
     }
+    /* Sprint D.6 (2026-06-03): activar profile counters runtime.  El
+     * --profile [path] inicializa el collector y registra el atexit
+     * handler para dump automatico al finalizar el proceso.  Tambien
+     * se respeta la env var VESTA_PROFILE_DUMP cuando el flag no esta. */
+    {
+        std::string profile_path;
+        if (result.count("profile")) {
+            profile_path = result["profile"].as<std::string>();
+        } else if (const char *env = std::getenv("VESTA_PROFILE_DUMP")) {
+            profile_path = env;
+        }
+        if (!profile_path.empty()) {
+            runtime::profile::profile_init(profile_path);
+        }
+    }
     const bool jit_stats_requested = result.count("jit-stats") > 0;
+    /* Sprint string-perf-6: --stats o --jit-stats activan el counter MIPS
+     * per-block en JIT.  Sin estos flags el JIT corre sin overhead de
+     * instrumentacion (35-50% mas rapido en hot loops con muchos bloques). */
+    if (result.count("stats") || jit_stats_requested) {
+        jit::g_jit_emit_instr_counter = true;
+    }
 
     if (result.count("help")) {
         vesta::scout() << options.help() << std::endl;

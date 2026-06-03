@@ -1,0 +1,102 @@
+// examples_codes_vex/176_adt_complex_payloads.vex
+//
+// ADTs (tagged unions / sum types) con payloads complejos.
+//
+// Demuestra:
+//   - Enum con 5 variantes mezclando aridades (0, 1, 2 payloads).
+//   - Payloads heterogeneos: i32, i64, f64, string, struct.
+//   - Multiple ADTs interactuando (Shape contiene Point como payload).
+//   - Match destructuring con bindings tipados.
+//   - Match exhaustivo + arm `_` wildcard.
+//   - Match con return temprano dentro de cada arm.
+//
+// Esperado: R00 = 42.
+
+struct Point {
+    i32 x;
+    i32 y;
+}
+
+enum Shape {
+    Empty,                            // sin payload
+    Circle(i32),                      // 1 payload: radius
+    Rectangle(i32, i32),              // 2 payloads: w, h
+    Triangle(f64, f64, f64),          // 3 payloads: side a, b, c
+    Labeled(string, i32)              // mixto: string + i32
+}
+
+// Compute "score" of a Shape - exercises match with bindings of distinct types.
+i32 score_of(Shape s) {
+    match s {
+        case Empty => return 0;
+        case Circle(r) => return r * 3;                    // circle factor 3
+        case Rectangle(w, h) => return (w + h) * 2;        // rect perimeter
+        case Triangle(a, b, c) => {
+            // f64 sides -> sum truncate to i32
+            f64 sum = a + b + c;
+            return (i32)sum;
+        }
+        case Labeled(name, weight) => {
+            // El nombre se ignora; el peso vale doble.
+            return weight * 2;
+        }
+    }
+    // Inalcanzable (match exhaustivo) -- el compilador lo valida.
+    return -1;
+}
+
+// Convertir una Shape a un Point representativo (centroide aprox).
+Point shape_to_point(Shape s) {
+    Point p;
+    p.x = 0;
+    p.y = 0;
+    match s {
+        case Empty => {
+            p.x = 0; p.y = 0;
+        }
+        case Circle(r) => {
+            p.x = r; p.y = r;
+        }
+        case Rectangle(w, h) => {
+            p.x = w / 2;
+            p.y = h / 2;
+        }
+        case Triangle(a, b, c) => {
+            p.x = (i32)(a + b);
+            p.y = (i32)c;
+        }
+        case Labeled(name, weight) => {
+            p.x = weight;
+            p.y = weight + 1;
+        }
+    }
+    return p;
+}
+
+i32 main() {
+    // 5 shapes diferentes -- cada una ejercita un arm distinto.
+    Shape s0 = Shape.Empty;
+    Shape s1 = Shape.Circle(7);
+    Shape s2 = Shape.Rectangle(3, 5);
+    Shape s3 = Shape.Triangle(3.0, 4.0, 5.0);   // suma = 12.0
+    Shape s4 = Shape.Labeled("widget", 9);
+
+    i32 sc0 = score_of(s0);   // 0
+    i32 sc1 = score_of(s1);   // 7*3 = 21
+    i32 sc2 = score_of(s2);   // (3+5)*2 = 16
+    i32 sc3 = score_of(s3);   // 12
+    i32 sc4 = score_of(s4);   // 9*2 = 18
+
+    // Suma scores: 0 + 21 + 16 + 12 + 18 = 67.
+    i32 total_score = sc0 + sc1 + sc2 + sc3 + sc4;
+
+    // Convert s1 (Circle 7) a punto -> (7, 7), suma = 14.
+    Point p = shape_to_point(s1);
+    i32 point_sum = p.x + p.y;
+
+    println("scores: ${sc0} ${sc1} ${sc2} ${sc3} ${sc4} = ${total_score}");
+    println("p.x=${p.x} p.y=${p.y} sum=${point_sum}");
+
+    // Combinar: 67 - 14 - 11 = 42.
+    return total_score - point_sum - 11;
+}

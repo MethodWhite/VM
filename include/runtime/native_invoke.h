@@ -42,6 +42,7 @@
 #pragma once
 
 #include "runtime/proceso_runtime.h"
+#include "runtime/exception_runtime.h"  // set_current_executing_process (TLS proc)
 
 #include <cstdint>
 
@@ -63,6 +64,21 @@ namespace runtime {
      */
     inline uint64_t invoke_native_unchecked(void *fn, uint64_t argc,
                                              ProcessVM *vm) {
+        /* Sprint JIT-cross-fn 2026-06-01: setear TLS proc ANTES de
+         * invocar la fn nativa.  Esto permite que la fn C consulte
+         * `runtime::get_current_executing_process()` para obtener el
+         * proc actual sin pasar arg implicito.  Critico para:
+         *   - `vex_get_native_thunk` (callbacks B.1): necesita el proc
+         *     para forzar JIT compile de la fn Vex callee.
+         *   - cualquier fn C futura que necesite acceder al GC, classes,
+         *     o cualquier estado del proceso VM.
+         *
+         * Coste: 1 store TLS (~1 ns) por CALLN.  Negligible vs el
+         * coste tipico de una llamada nativa.  El scheduler tambien
+         * setea TLS pero solo cuando hay try/catch activo (optimizacion
+         * del AV recovery); este setter garantiza disponibilidad SIEMPRE
+         * para CALLNs sin necesitar try/catch envolvente. */
+        runtime::set_current_executing_process(vm);
         typedef uint64_t u64;
 #define NATIVE_INVOKE_A(n) vm->registers.regs[R##n].qword()
         switch (argc) {

@@ -1,0 +1,177 @@
+// examples_codes_vex/173b_wndproc_visible.vex
+//
+// Variante visible del WndProc Win32: abre una ventana real en pantalla,
+// la mantiene durante 3 segundos procesando mensajes, y la cierra
+// programaticamente.
+//
+// Diferencias con 173_wndproc_win32.vex (test e2e headless):
+//   1. CreateWindowExW con WS_OVERLAPPEDWINDOW + ShowWindow(SW_SHOW).
+//      La ventana aparece en pantalla con borde, barra de titulo, etc.
+//   2. SetTimer schedula un mensaje WM_TIMER tras 3 segundos.
+//   3. El WndProc maneja WM_TIMER -> PostQuitMessage para cerrar.
+//   4. Tambien maneja WM_PAINT con un BeginPaint/EndPaint minimo para
+//      que la ventana no aparezca con basura grafica.
+//   5. Message pump real con GetMessageW + TranslateMessage + DispatchMessageW
+//      hasta WM_QUIT.
+//
+// El usuario VE la ventana abierta en pantalla durante ~3 segundos.
+
+extern "user32.dll" {
+    fn RegisterClassExW(u64 wc_ptr) -> u16;
+    fn CreateWindowExW(u32 ex_style, u64 class_name, u64 win_name,
+                       u32 style, i32 x, i32 y, i32 w, i32 h,
+                       u64 parent, u64 menu, u64 hinst, u64 lparam) -> u64;
+    fn ShowWindow(u64 hwnd, i32 cmd) -> i32;
+    fn UpdateWindow(u64 hwnd) -> i32;
+    fn SetTimer(u64 hwnd, u64 id, u32 elapse, u64 timer_proc) -> u64;
+    fn KillTimer(u64 hwnd, u64 id) -> i32;
+    fn GetMessageW(u64 msg_ptr, u64 hwnd, u32 filter_min, u32 filter_max) -> i32;
+    fn TranslateMessage(u64 msg_ptr) -> i32;
+    fn DispatchMessageW(u64 msg_ptr) -> i64;
+    fn DefWindowProcW(u64 hwnd, u32 msg, u64 wparam, i64 lparam) -> i64;
+    fn PostQuitMessage(i32 code) -> void;
+    fn DestroyWindow(u64 hwnd) -> i32;
+    fn BeginPaint(u64 hwnd, u64 ps_ptr) -> u64;
+    fn EndPaint(u64 hwnd, u64 ps_ptr) -> i32;
+    fn FillRect(u64 hdc, u64 rect, u64 brush) -> i32;
+    fn GetSysColorBrush(i32 idx) -> u64;
+    fn GetClientRect(u64 hwnd, u64 rect_ptr) -> i32;
+}
+
+extern "kernel32.dll" {
+    fn GetModuleHandleW(u64 name) -> u64;
+}
+
+i32 g_paint_count = 0;
+
+// Constantes Win32 (subset).
+//   WS_OVERLAPPEDWINDOW = 0x00CF0000
+//   SW_SHOW             = 5
+//   WM_DESTROY          = 0x0002
+//   WM_PAINT            = 0x000F
+//   WM_TIMER            = 0x0113
+//   COLOR_WINDOW        = 5
+//   CW_USEDEFAULT       = 0x80000000
+
+i64 my_wnd_proc(u64 hwnd, u32 msg, u64 wparam, i64 lparam) {
+    // WM_TIMER = 0x0113 = 275.  Cerrar la ventana cuando llega.
+    if (msg == 275) {
+        KillTimer(hwnd, 1);
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    // WM_DESTROY = 2.  Salir del message loop.
+    if (msg == 2) {
+        PostQuitMessage(0);
+        return 0;
+    }
+    // WM_PAINT = 0x000F = 15.  Pintar el fondo con un color del sistema.
+    // Layout PAINTSTRUCT (~72 bytes en Win64; reservamos 96 con margen).
+    if (msg == 15) {
+        u8* ps = (u8*) malloc(96);
+        i32 i = 0;
+        while (i < 96) { ps[i] = 0; i = i + 1; }
+        u64 hdc = BeginPaint(hwnd, (u64)(&ps[0]));
+        // Layout RECT: left/top/right/bottom (16 bytes).
+        u8* rc = (u8*) malloc(16);
+        i = 0;
+        while (i < 16) { rc[i] = 0; i = i + 1; }
+        GetClientRect(hwnd, (u64)(&rc[0]));
+        u64 brush = GetSysColorBrush(5);  // COLOR_WINDOW
+        FillRect(hdc, (u64)(&rc[0]), brush);
+        EndPaint(hwnd, (u64)(&ps[0]));
+        free(ps);
+        free(rc);
+        g_paint_count = g_paint_count + 1;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+i32 main() {
+    u64 hinst = GetModuleHandleW(0);
+    i64 thunk = as_native_callback(my_wnd_proc);
+
+    // WNDCLASSEXW en memoria HOST.
+    u8* wc = (u8*) malloc(80);
+    i32 i = 0;
+    while (i < 80) { wc[i] = 0; i = i + 1; }
+    *((u32*)(&wc[0]))  = 80;        // cbSize
+    *((i64*)(&wc[8]))  = thunk;     // lpfnWndProc
+    *((u64*)(&wc[24])) = hinst;     // hInstance
+
+    // Class name "VexVisible\0" en UTF-16LE (22 bytes incl. NUL).
+    u8* cn = (u8*) malloc(24);
+    i = 0;
+    while (i < 24) { cn[i] = 0; i = i + 1; }
+    cn[0]  = 86;  // V
+    cn[2]  = 101; // e
+    cn[4]  = 120; // x
+    cn[6]  = 86;  // V
+    cn[8]  = 105; // i
+    cn[10] = 115; // s
+    cn[12] = 105; // i
+    cn[14] = 98;  // b
+    cn[16] = 108; // l
+    cn[18] = 101; // e
+    *((u64*)(&wc[64])) = (u64)(&cn[0]);
+
+    RegisterClassExW((u64)(&wc[0]));
+
+    // Window title "Vex - WndProc demo (cierra en 3s)" en UTF-16LE.
+    u8* title = (u8*) malloc(80);
+    i = 0;
+    while (i < 80) { title[i] = 0; i = i + 1; }
+    title[0]  = 86;  // V
+    title[2]  = 101; // e
+    title[4]  = 120; // x
+    title[6]  = 32;  // (space)
+    title[8]  = 45;  // -
+    title[10] = 32;  // (space)
+    title[12] = 87;  // W
+    title[14] = 110; // n
+    title[16] = 100; // d
+    title[18] = 80;  // P
+    title[20] = 114; // r
+    title[22] = 111; // o
+    title[24] = 99;  // c
+
+    // Ventana visible: WS_OVERLAPPEDWINDOW | WS_VISIBLE = 0x10CF0000.
+    u32 style = 0x10CF0000;
+    u64 hwnd = CreateWindowExW(0, (u64)(&cn[0]), (u64)(&title[0]),
+                                style,
+                                100, 100, 400, 300,
+                                0, 0, hinst, 0);
+    if (hwnd == 0) {
+        println("ERROR: CreateWindowExW retorno NULL");
+        free(wc); free(cn); free(title);
+        return 1;
+    }
+
+    ShowWindow(hwnd, 5);   // SW_SHOW
+    UpdateWindow(hwnd);
+
+    // Timer de 3000 ms.  Cuando dispara, el WndProc llama DestroyWindow
+    // y eso genera WM_DESTROY -> PostQuitMessage -> loop sale.
+    SetTimer(hwnd, 1, 3000, 0);
+
+    // Message pump.
+    u8* msg = (u8*) malloc(64);
+    i32 j = 0;
+    while (j < 64) { msg[j] = 0; j = j + 1; }
+
+    println("Ventana abierta; se cerrara automaticamente en 3 segundos...");
+
+    while (GetMessageW((u64)(&msg[0]), 0, 0, 0) > 0) {
+        TranslateMessage((u64)(&msg[0]));
+        DispatchMessageW((u64)(&msg[0]));
+    }
+
+    println("Ventana cerrada.  WM_PAINT recibidos: ${g_paint_count}");
+
+    free(wc);
+    free(cn);
+    free(title);
+    free(msg);
+    return 0;
+}

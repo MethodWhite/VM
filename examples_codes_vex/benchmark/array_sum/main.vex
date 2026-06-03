@@ -1,0 +1,21 @@
+// Bench: suma de un array i32 grande (100K) x 200 pasadas = 20M LOAD.
+i32 main() {
+    i32* arr = (i32*) malloc(100000 * 4);
+    i32 i = 0;
+    while (i < 100000) {
+        arr[i] = i;
+        i = i + 1;
+    }
+    i64 sum = 0;
+    i32 pass = 0;
+    while (pass < 200) {
+        i = 0;
+        while (i < 100000) {
+            sum = sum + (i64) arr[i];
+            i = i + 1;
+        }
+        pass = pass + 1;
+    }
+    free(arr);
+    return (i32)(sum & 0xFF);
+}

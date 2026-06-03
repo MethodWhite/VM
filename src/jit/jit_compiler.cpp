@@ -153,6 +153,21 @@ namespace jit {
         // encoder no tiene visibilidad del cache (separation of concerns:
         // genera bytes en un buffer propio que despues copiamos).
         std::memcpy(code, bytes.data(), bytes.size());
+
+        // Sprint fib-recursion (2026-06-02): patch de self-references.
+        // El encoder anyadio a @c mf.self_ref_byte_offsets las posiciones
+        // donde se emitio un MOV reg,imm64 con valor placeholder 0 que
+        // referencia a la PROPIA funcion.  Ahora que conocemos la
+        // direccion final del codigo (= @c code), escribimos esa
+        // direccion en cada posicion -> los self-recursive calls
+        // dispatchan directo en lugar de via trampoline JIT->interp.
+        const uint64_t code_addr = reinterpret_cast<uint64_t>(code);
+        for (size_t pos : mf.self_ref_byte_offsets) {
+            if (pos + 8 <= bytes.size()) {
+                std::memcpy(code + pos, &code_addr, 8);
+            }
+        }
+
         // Commit hace la transicion final RW -> RX (cuando soportemos W^X
         // en Phase E) y el flush de icache para que el CPU vea los
         // bytes nuevos en arquitecturas con icache no-coherente (ARM).

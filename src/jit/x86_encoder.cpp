@@ -123,6 +123,266 @@ namespace jit {
             case MOp::SHL:        emit_shift(fn, mi, out, 4); return true;
             case MOp::SHR:        emit_shift(fn, mi, out, 5); return true;
             case MOp::SAR:        emit_shift(fn, mi, out, 7); return true;
+            /* Math-IR-promote v2.2a: bit ops nativos.
+             * ROL/ROR reusan emit_shift con subop 0/1; POPCNT/LZCNT/TZCNT
+             * comparten encoding F3 0F <op> /r; BSWAP es 0F C8+rd. */
+            case MOp::ROL:        emit_shift(fn, mi, out, 0); return true;
+            case MOp::ROR:        emit_shift(fn, mi, out, 1); return true;
+            case MOp::POPCNT:
+            case MOp::LZCNT:
+            case MOp::TZCNT: {
+                /* F3 + REX.W + 0F + <op_byte> + ModR/M(11 dst src).
+                 * Todas reg-reg 64-bit; cae a INT3 si operandos invalidos. */
+                if (mi.dst.kind != MOperandKind::REG
+                 || mi.src1.kind != MOperandKind::REG) {
+                    put8(out, 0xCC);
+                    return true;
+                }
+                put8(out, 0xF3);                  /* prefix obligatorio */
+                const uint8_t rex = rex_byte(true,
+                                              static_cast<uint8_t>(mi.dst.reg),
+                                              static_cast<uint8_t>(mi.src1.reg));
+                if (rex) put8(out, rex);
+                put8(out, 0x0F);                  /* escape */
+                const uint8_t opcode =
+                    (mi.op == MOp::POPCNT) ? 0xB8 :
+                    (mi.op == MOp::LZCNT)  ? 0xBD :
+                                              0xBC;  /* TZCNT */
+                put8(out, opcode);
+                put8(out, modrm(3, mi.dst.reg & 7, mi.src1.reg & 7));
+                return true;
+            }
+            case MOp::BSWAP: {
+                /* BSWAP r64: REX.W + 0F C8+rd. */
+                if (mi.dst.kind != MOperandKind::REG) {
+                    put8(out, 0xCC);
+                    return true;
+                }
+                const uint8_t rex = rex_byte(true, 0,
+                                              static_cast<uint8_t>(mi.dst.reg));
+                if (rex) put8(out, rex);
+                put8(out, 0x0F);
+                put8(out, static_cast<uint8_t>(0xC8 + (mi.dst.reg & 7)));
+                return true;
+            }
+
+            /* Math-IR-promote v2.2b: FP ops nativas con XMM.
+             *
+             * Convencion: dst.reg y src1.reg son indices MReg.  Los XMM
+             * regs estan en 32..47 (XMM0..XMM15) y el encoding x86 usa
+             * los low 3 bits + REX.R/B para el bit 3.  Para distinguir
+             * GP de XMM en MOVQ, el encoder usa el reg id (32+ = XMM).
+             *
+             * Helper local: extraer el indice fisico (0..15) del MReg y
+             * el bit alto para REX. */
+            case MOp::MOVQ_GP_XMM: {
+                /* MOVQ xmm, r64: 66 + REX.W + 0F 6E /r
+                 * dst es XMM, src1 es GP.  ModR/M: mod=11, reg=xmm&7, rm=gp&7. */
+                if (mi.dst.kind != MOperandKind::REG
+                 || mi.src1.kind != MOperandKind::REG) {
+                    put8(out, 0xCC); return true;
+                }
+                const uint8_t xmm = static_cast<uint8_t>(mi.dst.reg) - 16;  /* XMM0=16 */
+                const uint8_t gp  = static_cast<uint8_t>(mi.src1.reg);
+                put8(out, 0x66);
+                /* REX.W=1, REX.R=xmm>=8, REX.B=gp>=8.  rex_byte(W, R_reg, B_reg). */
+                const uint8_t rex = rex_byte(true, xmm, gp);
+                if (rex) put8(out, rex);
+                put8(out, 0x0F);
+                put8(out, 0x6E);
+                put8(out, modrm(3, xmm & 7, gp & 7));
+                return true;
+            }
+            case MOp::MOVQ_XMM_GP: {
+                /* MOVQ r64, xmm: 66 + REX.W + 0F 7E /r
+                 * dst es GP, src1 es XMM.  ModR/M: mod=11, reg=xmm&7, rm=gp&7. */
+                if (mi.dst.kind != MOperandKind::REG
+                 || mi.src1.kind != MOperandKind::REG) {
+                    put8(out, 0xCC); return true;
+                }
+                const uint8_t gp  = static_cast<uint8_t>(mi.dst.reg);
+                const uint8_t xmm = static_cast<uint8_t>(mi.src1.reg) - 16;
+                put8(out, 0x66);
+                const uint8_t rex = rex_byte(true, xmm, gp);
+                if (rex) put8(out, rex);
+                put8(out, 0x0F);
+                put8(out, 0x7E);
+                put8(out, modrm(3, xmm & 7, gp & 7));
+                return true;
+            }
+            case MOp::SQRTSD:
+            case MOp::MINSD:
+            case MOp::MAXSD: {
+                /* SQRTSD/MINSD/MAXSD xmm_dst, xmm_src:
+                 *   F2 + (REX si hay xmm>=8) + 0F + <op> + ModR/M(11, dst&7, src&7).
+                 *   SQRTSD opcode = 0x51, MINSD = 0x5D, MAXSD = 0x5F. */
+                if (mi.dst.kind != MOperandKind::REG
+                 || mi.src1.kind != MOperandKind::REG) {
+                    put8(out, 0xCC); return true;
+                }
+                const uint8_t xd = static_cast<uint8_t>(mi.dst.reg)  - 16;
+                const uint8_t xs = static_cast<uint8_t>(mi.src1.reg) - 16;
+                put8(out, 0xF2);
+                /* REX solo si alguno >= 8.  REX.W no necesario para SSE. */
+                const uint8_t rex_R = (xd >= 8) ? 1 : 0;
+                const uint8_t rex_B = (xs >= 8) ? 1 : 0;
+                if (rex_R || rex_B) {
+                    put8(out, 0x40 | (rex_R << 2) | rex_B);
+                }
+                put8(out, 0x0F);
+                const uint8_t opcode = (mi.op == MOp::SQRTSD) ? 0x51 :
+                                       (mi.op == MOp::MINSD)  ? 0x5D :
+                                                                 0x5F;
+                put8(out, opcode);
+                put8(out, modrm(3, xd & 7, xs & 7));
+                return true;
+            }
+            case MOp::ROUNDSD: {
+                /* ROUNDSD xmm_dst, xmm_src, imm8:
+                 *   66 + (REX) + 0F 3A 0B + ModR/M + imm8(mode)
+                 *   variant tiene el rounding mode (0=nearest, 1=floor, 2=ceil, 3=trunc).
+                 *   SSE4.1 required (todo x86-64 moderno lo tiene). */
+                if (mi.dst.kind != MOperandKind::REG
+                 || mi.src1.kind != MOperandKind::REG) {
+                    put8(out, 0xCC); return true;
+                }
+                const uint8_t xd = static_cast<uint8_t>(mi.dst.reg)  - 16;
+                const uint8_t xs = static_cast<uint8_t>(mi.src1.reg) - 16;
+                const uint8_t mode = static_cast<uint8_t>(mi.variant) & 0x3;
+                put8(out, 0x66);
+                const uint8_t rex_R = (xd >= 8) ? 1 : 0;
+                const uint8_t rex_B = (xs >= 8) ? 1 : 0;
+                if (rex_R || rex_B) {
+                    put8(out, 0x40 | (rex_R << 2) | rex_B);
+                }
+                put8(out, 0x0F);
+                put8(out, 0x3A);
+                put8(out, 0x0B);
+                put8(out, modrm(3, xd & 7, xs & 7));
+                put8(out, mode);
+                return true;
+            }
+            case MOp::ADDSD:
+            case MOp::SUBSD:
+            case MOp::MULSD:
+            case MOp::DIVSD: {
+                /* ADDSD/SUBSD/MULSD/DIVSD xmm_dst, xmm_src:
+                 *   F2 + (REX) + 0F + <op_byte> + ModR/M.
+                 *   ADDSD=0x58, SUBSD=0x5C, MULSD=0x59, DIVSD=0x5E.  */
+                if (mi.dst.kind != MOperandKind::REG
+                 || mi.src1.kind != MOperandKind::REG) {
+                    put8(out, 0xCC); return true;
+                }
+                const uint8_t xd = static_cast<uint8_t>(mi.dst.reg)  - 16;
+                const uint8_t xs = static_cast<uint8_t>(mi.src1.reg) - 16;
+                put8(out, 0xF2);
+                const uint8_t rex_R = (xd >= 8) ? 1 : 0;
+                const uint8_t rex_B = (xs >= 8) ? 1 : 0;
+                if (rex_R || rex_B) {
+                    put8(out, 0x40 | (rex_R << 2) | rex_B);
+                }
+                put8(out, 0x0F);
+                const uint8_t opcode =
+                    (mi.op == MOp::ADDSD) ? 0x58 :
+                    (mi.op == MOp::SUBSD) ? 0x5C :
+                    (mi.op == MOp::MULSD) ? 0x59 :
+                                             0x5E;  /* DIVSD */
+                put8(out, opcode);
+                put8(out, modrm(3, xd & 7, xs & 7));
+                return true;
+            }
+            case MOp::CVTSI2SD: {
+                /* CVTSI2SD xmm, r64: F2 + REX.W + 0F + 2A + ModR/M(11, xmm&7, gp&7).
+                 * Convierte int64 signed a f64. */
+                if (mi.dst.kind != MOperandKind::REG
+                 || mi.src1.kind != MOperandKind::REG) {
+                    put8(out, 0xCC); return true;
+                }
+                const uint8_t xd = static_cast<uint8_t>(mi.dst.reg) - 16;
+                const uint8_t gp = static_cast<uint8_t>(mi.src1.reg);
+                put8(out, 0xF2);
+                put8(out, rex_byte(true, xd, gp));
+                put8(out, 0x0F);
+                put8(out, 0x2A);
+                put8(out, modrm(3, xd & 7, gp & 7));
+                return true;
+            }
+            case MOp::CVTTSD2SI: {
+                /* CVTTSD2SI r64, xmm: F2 + REX.W + 0F + 2C + ModR/M.
+                 * Convierte f64 a int64 signed con truncacion hacia cero. */
+                if (mi.dst.kind != MOperandKind::REG
+                 || mi.src1.kind != MOperandKind::REG) {
+                    put8(out, 0xCC); return true;
+                }
+                const uint8_t gp = static_cast<uint8_t>(mi.dst.reg);
+                const uint8_t xs = static_cast<uint8_t>(mi.src1.reg) - 16;
+                put8(out, 0xF2);
+                put8(out, rex_byte(true, gp, xs));
+                put8(out, 0x0F);
+                put8(out, 0x2C);
+                put8(out, modrm(3, gp & 7, xs & 7));
+                return true;
+            }
+            case MOp::CVTSS2SD: {
+                /* CVTSS2SD xmm, xmm: F3 + (REX) + 0F + 5A + ModR/M.
+                 * Convierte f32 a f64 (widening). */
+                if (mi.dst.kind != MOperandKind::REG
+                 || mi.src1.kind != MOperandKind::REG) {
+                    put8(out, 0xCC); return true;
+                }
+                const uint8_t xd = static_cast<uint8_t>(mi.dst.reg)  - 16;
+                const uint8_t xs = static_cast<uint8_t>(mi.src1.reg) - 16;
+                put8(out, 0xF3);
+                const uint8_t rex_R = (xd >= 8) ? 1 : 0;
+                const uint8_t rex_B = (xs >= 8) ? 1 : 0;
+                if (rex_R || rex_B) {
+                    put8(out, 0x40 | (rex_R << 2) | rex_B);
+                }
+                put8(out, 0x0F);
+                put8(out, 0x5A);
+                put8(out, modrm(3, xd & 7, xs & 7));
+                return true;
+            }
+            case MOp::CVTSD2SS: {
+                /* CVTSD2SS xmm, xmm: F2 + (REX) + 0F + 5A + ModR/M.
+                 * Convierte f64 a f32 (narrowing, truncacion). */
+                if (mi.dst.kind != MOperandKind::REG
+                 || mi.src1.kind != MOperandKind::REG) {
+                    put8(out, 0xCC); return true;
+                }
+                const uint8_t xd = static_cast<uint8_t>(mi.dst.reg)  - 16;
+                const uint8_t xs = static_cast<uint8_t>(mi.src1.reg) - 16;
+                put8(out, 0xF2);
+                const uint8_t rex_R = (xd >= 8) ? 1 : 0;
+                const uint8_t rex_B = (xs >= 8) ? 1 : 0;
+                if (rex_R || rex_B) {
+                    put8(out, 0x40 | (rex_R << 2) | rex_B);
+                }
+                put8(out, 0x0F);
+                put8(out, 0x5A);
+                put8(out, modrm(3, xd & 7, xs & 7));
+                return true;
+            }
+            case MOp::UCOMISD: {
+                /* UCOMISD xmm_a, xmm_b: 66 + (REX) + 0F + 2E + ModR/M.
+                 * Compara dos f64; setea ZF/PF/CF para SETCC/JCC. */
+                if (mi.dst.kind != MOperandKind::REG
+                 || mi.src1.kind != MOperandKind::REG) {
+                    put8(out, 0xCC); return true;
+                }
+                const uint8_t xa = static_cast<uint8_t>(mi.dst.reg)  - 16;
+                const uint8_t xb = static_cast<uint8_t>(mi.src1.reg) - 16;
+                put8(out, 0x66);
+                const uint8_t rex_R = (xa >= 8) ? 1 : 0;
+                const uint8_t rex_B = (xb >= 8) ? 1 : 0;
+                if (rex_R || rex_B) {
+                    put8(out, 0x40 | (rex_R << 2) | rex_B);
+                }
+                put8(out, 0x0F);
+                put8(out, 0x2E);
+                put8(out, modrm(3, xa & 7, xb & 7));
+                return true;
+            }
             case MOp::IDIV: {
                 /* IDIV r/m64: REX.W + F7 /7 con divisor en src1.reg. */
                 if (mi.src1.kind != MOperandKind::REG) {
@@ -369,7 +629,17 @@ namespace jit {
             /* MOV r64, imm64: REX.W + B8+r + imm64 */
             put8(out, rex_byte(true, 0, dst.reg));
             put8(out, 0xB8 + (dst.reg & 7));
+            const size_t imm64_pos = out.size();
             put64(out, v64);
+            /* Sprint fib-recursion: si este idx esta en self_ref_imm64_indices,
+             * registrar la posicion del imm64 emitido para que el JitCompiler
+             * pueda parchearlo con code_start tras la asignacion final. */
+            for (uint32_t sref_idx : fn.self_ref_imm64_indices) {
+                if (sref_idx == idx) {
+                    fn.self_ref_byte_offsets.push_back(imm64_pos);
+                    break;
+                }
+            }
             return;
         }
 
@@ -575,11 +845,29 @@ namespace jit {
                                 uint8_t shift_subop) {
         const MOperand &dst = mi.dst;
         const MOperand &src = mi.src1;
-        if (dst.kind != MOperandKind::REG || src.kind != MOperandKind::IMM32) {
+        if (dst.kind != MOperandKind::REG) {
             put8(out, 0xCC);
             return;
         }
         const uint8_t rex = rex_byte(true, 0, dst.reg);
+        if (src.kind == MOperandKind::REG) {
+            /* Variante por CL: REX.W + 0xD3 /subop -- el caller debe
+             * garantizar que la cuenta vive en CL (RCX low byte).  Solo
+             * aceptamos src == RCX explicito para que el caller sepa que
+             * debe coordinar el reg destino. */
+            if (src.reg != static_cast<uint8_t>(MReg::RCX)) {
+                put8(out, 0xCC);
+                return;
+            }
+            if (rex) put8(out, rex);
+            put8(out, 0xD3);
+            put8(out, modrm(3, shift_subop, dst.reg & 7));
+            return;
+        }
+        if (src.kind != MOperandKind::IMM32) {
+            put8(out, 0xCC);
+            return;
+        }
         if (rex) put8(out, rex);
         if ((src.value & 0xFF) == 1) {
             /* Variante por 1: REX.W + 0xD1 /subop -- mas compacta */

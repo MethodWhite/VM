@@ -521,6 +521,17 @@ namespace loader {
         /// restore saved_r1_r12 del frame ANTERIOR.
         uint8_t      inject_r0_to_reg;
         uint8_t      _ir_pad[7];
+        /// Sprint MMM-ext + leak-fix (2026-06-01): lista lazy de
+        /// host_ptrs alocados via RawAllocator dentro de este frame
+        /// como parte del flag IR `host_alloca` (auto-promote de ALLOCAs
+        /// que fluyen a CALLN).  Liberados automaticamente en RET
+        /// (exec_instr_ret) y en do_throw (al pop el frame durante
+        /// unwind).  El bytecode los registra via opcode `htrack`.
+        /// nullptr cuando este frame no contiene host_allocas (la mayoria
+        /// de frames): zero overhead para code paths sin auto-promote.
+        /// Tipo opaco (puntero a std::vector<uint8_t*>) para no introducir
+        /// dependencia de STL en oop_types.h.
+        void        *host_allocas;
     } FrameHeader;
 
     // -------------------------------------------------------------------------

@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="es"><head>
+<meta charset="utf-8">
+<title>VestaVM Benchmark Report</title>
+<style>
+    body { font-family: -apple-system,Segoe UI,Roboto,sans-serif; max-width:1280px;
+           margin:24px auto; padding:0 20px; color:#1f2328; }
+    h1 { border-bottom:2px solid #d0d7de; padding-bottom:8px; }
+    h2 { margin-top:32px; border-bottom:1px solid #d0d7de; padding-bottom:4px; }
+    dl.sysinfo { display:grid; grid-template-columns:160px 1fr; gap:4px 12px; }
+    dl.sysinfo dt { font-weight:600; color:#57606a; }
+    table { border-collapse:collapse; width:100%; margin:8px 0 24px;
+            font-variant-numeric:tabular-nums; font-size:13px; }
+    th,td { padding:6px 10px; border-bottom:1px solid #eaecef; text-align:right; }
+    th:first-child,td:first-child { text-align:left; font-weight:500; }
+    th { background:#f6f8fa; font-weight:600; }
+    tr:hover { background:#f8f9fb; }
+    .winner { font-weight:700; color:#1a7f37; }
+    .timeout { color:#cf222e; }
+    .na { color:#8c959f; }
+    .cat-good { color:#1a7f37; font-weight:600; }
+    .cat-mid { color:#bf8700; font-weight:600; }
+    .cat-bad { color:#cf222e; font-weight:600; }
+    .delta-regress { color:#cf222e; font-weight:600; }
+    .delta-improve { color:#1a7f37; font-weight:600; }
+    .delta-neutral { color:#8c959f; }
+    img.plot { max-width:100%; height:auto; border:1px solid #d0d7de;
+               border-radius:6px; margin:12px 0; }
+    .meta { color:#6e7681; font-size:12px; margin-top:24px;
+             padding-top:12px; border-top:1px solid #eaecef; }
+    .grid-plots { display:grid; grid-template-columns:repeat(auto-fit,
+                  minmax(400px,1fr)); gap:16px; }
+    </style>
+</head><body>
+<h1>VestaVM Benchmark Report</h1>
+<p class="meta">Generado 2026-06-03 21:03:08 &middot; JSON: <code>F:\C\VM\bench_results.json</code></p>
+<h2>Sistema</h2>
+<dl class="sysinfo">
+<dt>CPU</dt><dd>13th Gen Intel(R) Core(TM) i7-13700KF (16 fisicos / 24 logicos @ 3400 MHz)</dd>
+<dt>RAM</dt><dd>47.8 GB</dd>
+<dt>Arch</dt><dd>AMD64</dd>
+<dt>OS</dt><dd>Windows 10 (10.0.19045)</dd>
+</dl>
+<h2>Toolchains</h2>
+<dl class="sysinfo">
+<dt>Vex VM</dt><dd>Vesta v0.1.0</dd>
+<dt>C (gcc)</dt><dd>gcc.EXE (tdm64-1) 10.3.0</dd>
+<dt>C++ (g++)</dt><dd>g++.EXE (tdm64-1) 10.3.0</dd>
+<dt>Python</dt><dd>Python 3.11.0</dd>
+<dt>Java (javac)</dt><dd>javac 25</dd>
+<dt>Java (java)</dt><dd>java 25 2025-09-16 LTS</dd>
+</dl>
+<h2>Resultados (ms, mediana)</h2>
+<table>
+<thead><tr><th>Benchmark</th><th>Vex interp</th><th>Vex JIT</th><th>C (gcc -O3)</th><th>C++ (g++ -O3)</th><th>Python (CPython)</th><th>Java (HotSpot)</th></tr></thead>
+<tbody>
+<tr><td>alloc</td><td>149.8</td><td>33.4</td><td>3.0</td><td class="winner">2.7</td><td>535.6</td><td>69.8</td></tr>
+<tr><td>array_sum</td><td>1477.3</td><td>55.9</td><td>4.7</td><td class="winner">4.6</td><td>423.7</td><td>77.5</td></tr>
+<tr><td>bitops</td><td>3994.4</td><td>77.5</td><td class="winner">25.8</td><td>25.9</td><td>7169.7</td><td>90.0</td></tr>
+<tr><td>branch_unpredict</td><td>6624.8</td><td>562.7</td><td>17.3</td><td class="winner">17.1</td><td>3016.0</td><td>165.0</td></tr>
+<tr><td>callvirt</td><td>843.4</td><td>54.5</td><td class="winner">2.6</td><td>2.9</td><td>1771.8</td><td>68.0</td></tr>
+<tr><td>callvirt_hot</td><td>359.7</td><td>45.3</td><td>10.5</td><td class="winner">4.6</td><td>691.9</td><td>68.5</td></tr>
+<tr><td>cmp_fusion</td><td>751.7</td><td>65.7</td><td>2.8</td><td class="winner">2.8</td><td>1812.9</td><td>65.9</td></tr>
+<tr><td>fib_recursive</td><td>606.3</td><td>43.7</td><td class="winner">5.8</td><td>11.2</td><td>206.8</td><td>74.9</td></tr>
+<tr><td>fp_jit</td><td>781.8</td><td>93.5</td><td class="winner">9.8</td><td>9.8</td><td>1316.7</td><td>84.6</td></tr>
+<tr><td>hash_lookup</td><td>8583.4</td><td>103.7</td><td class="winner">12.4</td><td>13.4</td><td>6523.5</td><td>128.3</td></tr>
+<tr><td>int_mixed</td><td>4993.7</td><td>80.6</td><td class="winner">18.4</td><td>18.4</td><td>10736.0</td><td>83.0</td></tr>
+<tr><td>intops_jit</td><td>6710.1</td><td>36.3</td><td class="winner">3.0</td><td>5.7</td><td>1064.7</td><td>71.6</td></tr>
+<tr><td>jit_method</td><td>448.5</td><td>49.0</td><td class="winner">3.7</td><td>3.8</td><td>1165.0</td><td>76.8</td></tr>
+<tr><td>mem_class</td><td>665.0</td><td>83.1</td><td class="winner">2.7</td><td>3.6</td><td>147.7</td><td>72.1</td></tr>
+<tr><td>mem_malloc_free</td><td>2477.9</td><td>39.7</td><td>5.2</td><td class="winner">4.2</td><td>556.3</td><td>70.1</td></tr>
+<tr><td>mem_struct</td><td>1695.7</td><td>129.3</td><td class="winner">2.8</td><td>3.3</td><td>394.8</td><td>68.7</td></tr>
+<tr><td>memcpy_loop</td><td>2470.0</td><td>71.2</td><td>7.3</td><td class="winner">6.3</td><td>3053.5</td><td>99.3</td></tr>
+<tr><td>nested_loops</td><td>2117.9</td><td>80.6</td><td class="winner">13.6</td><td>14.1</td><td>1572.5</td><td>85.1</td></tr>
+<tr><td>pic_real</td><td>1852.4</td><td>485.5</td><td class="winner">5.2</td><td>5.9</td><td>274.4</td><td>71.3</td></tr>
+<tr><td>polymorphic</td><td>1331.9</td><td>55.9</td><td>10.8</td><td class="winner">8.8</td><td>1000.9</td><td>81.5</td></tr>
+<tr><td>quicksort</td><td>328.0</td><td>40.3</td><td>9.9</td><td class="winner">7.1</td><td>116.0</td><td>74.2</td></tr>
+<tr><td>rotops_jit</td><td>4246.4</td><td>36.4</td><td class="winner">3.6</td><td>4.8</td><td>1360.9</td><td>78.8</td></tr>
+<tr><td>state_machine</td><td>4365.7</td><td>80.2</td><td>19.4</td><td class="winner">19.4</td><td>1544.6</td><td>84.9</td></tr>
+<tr><td>string_hot</td><td>41.6</td><td>30.0</td><td>8.0</td><td class="winner">5.1</td><td>25.0</td><td>84.9</td></tr>
+<tr><td>string_workout</td><td>5556.7</td><td>416.9</td><td class="winner">30.2</td><td>39.8</td><td>524.4</td><td>192.5</td></tr>
+<tr><td>struct_field</td><td>1873.7</td><td>80.1</td><td>5.2</td><td class="winner">5.1</td><td>5152.1</td><td>74.3</td></tr>
+<tr><td>tight_loop</td><td>2047.6</td><td>80.8</td><td>12.4</td><td class="winner">12.4</td><td>992.4</td><td>75.6</td></tr>
+</tbody></table>
+<h2>Geomean slowdown vs C por categoria</h2>
+<p class="meta">Verde &lt;1.5x &middot; Amarillo &lt;3x &middot; Rojo &ge;3x</p>
+<table>
+<thead><tr><th>Categoria</th><th>N</th><th>Vex interp</th><th>Vex JIT</th><th>C++ (g++ -O3)</th><th>Python (CPython)</th><th>Java (HotSpot)</th></tr></thead>
+<tbody>
+<tr><td>alloc</td><td>4</td><td class="cat-bad">241.53x</td><td class="cat-bad">18.45x</td><td class="cat-good">1.03x</td><td class="cat-bad">109.01x</td><td class="cat-bad">21.07x</td></tr>
+<tr><td>bit</td><td>2</td><td class="cat-bad">429.84x</td><td class="cat-bad">5.55x</td><td class="cat-good">1.16x</td><td class="cat-bad">326.01x</td><td class="cat-bad">8.79x</td></tr>
+<tr><td>branch</td><td>3</td><td class="cat-bad">141.97x</td><td class="cat-bad">8.19x</td><td class="cat-good">0.89x</td><td class="cat-bad">54.63x</td><td class="cat-bad">6.79x</td></tr>
+<tr><td>fp</td><td>1</td><td class="cat-bad">80.13x</td><td class="cat-bad">9.58x</td><td class="cat-good">1.00x</td><td class="cat-bad">134.97x</td><td class="cat-bad">8.67x</td></tr>
+<tr><td>hash</td><td>1</td><td class="cat-bad">694.55x</td><td class="cat-bad">8.39x</td><td class="cat-good">1.08x</td><td class="cat-bad">527.87x</td><td class="cat-bad">10.38x</td></tr>
+<tr><td>int</td><td>7</td><td class="cat-bad">245.21x</td><td class="cat-bad">9.01x</td><td class="cat-good">1.21x</td><td class="cat-bad">202.54x</td><td class="cat-bad">11.46x</td></tr>
+<tr><td>mem</td><td>2</td><td class="cat-bad">325.86x</td><td class="cat-bad">10.76x</td><td class="cat-good">0.92x</td><td class="cat-bad">194.05x</td><td class="cat-bad">14.96x</td></tr>
+<tr><td>oop</td><td>5</td><td class="cat-bad">177.85x</td><td class="cat-bad">14.68x</td><td class="cat-good">0.85x</td><td class="cat-bad">185.57x</td><td class="cat-bad">12.06x</td></tr>
+<tr><td>string</td><td>2</td><td class="cat-bad">30.81x</td><td class="cat-bad">7.17x</td><td class="cat-good">0.91x</td><td class="cat-bad">7.34x</td><td class="cat-bad">8.20x</td></tr>
+</tbody></table>
+<h2>Graficas</h2>
+<div class="grid-plots">
+<div><h3>00_system_info</h3><img class="plot" src="00_system_info.png" alt="00_system_info"></div>
+<div><h3>01_dashboard</h3><img class="plot" src="01_dashboard.png" alt="01_dashboard"></div>
+<div><h3>02_heatmap</h3><img class="plot" src="02_heatmap.png" alt="02_heatmap"></div>
+<div><h3>03_radar_profile</h3><img class="plot" src="03_radar_profile.png" alt="03_radar_profile"></div>
+<div><h3>04_boxplot_variability</h3><img class="plot" src="04_boxplot_variability.png" alt="04_boxplot_variability"></div>
+<div><h3>05_scatter_ratio_vs_c</h3><img class="plot" src="05_scatter_ratio_vs_c.png" alt="05_scatter_ratio_vs_c"></div>
+<div><h3>06_ranking_lines</h3><img class="plot" src="06_ranking_lines.png" alt="06_ranking_lines"></div>
+<div><h3>07_grouped_ratio</h3><img class="plot" src="07_grouped_ratio.png" alt="07_grouped_ratio"></div>
+<div><h3>08_geomean_summary</h3><img class="plot" src="08_geomean_summary.png" alt="08_geomean_summary"></div>
+</div>
+<h2>Per-bench</h2>
+<div class="grid-plots">
+<div><h3>alloc</h3><img class="plot" src="per_bench/alloc.png" alt="alloc"></div>
+<div><h3>array_sum</h3><img class="plot" src="per_bench/array_sum.png" alt="array_sum"></div>
+<div><h3>bench_alloc</h3><img class="plot" src="per_bench/bench_alloc.png" alt="bench_alloc"></div>
+<div><h3>bench_array_sum</h3><img class="plot" src="per_bench/bench_array_sum.png" alt="bench_array_sum"></div>
+<div><h3>bench_bitops_jit</h3><img class="plot" src="per_bench/bench_bitops_jit.png" alt="bench_bitops_jit"></div>
+<div><h3>bench_branch_unpredict</h3><img class="plot" src="per_bench/bench_branch_unpredict.png" alt="bench_branch_unpredict"></div>
+<div><h3>bench_callvirt</h3><img class="plot" src="per_bench/bench_callvirt.png" alt="bench_callvirt"></div>
+<div><h3>bench_callvirt_hot</h3><img class="plot" src="per_bench/bench_callvirt_hot.png" alt="bench_callvirt_hot"></div>
+<div><h3>bench_cmp_fusion</h3><img class="plot" src="per_bench/bench_cmp_fusion.png" alt="bench_cmp_fusion"></div>
+<div><h3>bench_fib_recursive</h3><img class="plot" src="per_bench/bench_fib_recursive.png" alt="bench_fib_recursive"></div>
+<div><h3>bench_fp_jit</h3><img class="plot" src="per_bench/bench_fp_jit.png" alt="bench_fp_jit"></div>
+<div><h3>bench_hash_lookup</h3><img class="plot" src="per_bench/bench_hash_lookup.png" alt="bench_hash_lookup"></div>
+<div><h3>bench_int_mixed</h3><img class="plot" src="per_bench/bench_int_mixed.png" alt="bench_int_mixed"></div>
+<div><h3>bench_intops_jit</h3><img class="plot" src="per_bench/bench_intops_jit.png" alt="bench_intops_jit"></div>
+<div><h3>bench_jit_method</h3><img class="plot" src="per_bench/bench_jit_method.png" alt="bench_jit_method"></div>
+<div><h3>bench_mem_class</h3><img class="plot" src="per_bench/bench_mem_class.png" alt="bench_mem_class"></div>
+<div><h3>bench_mem_malloc_free</h3><img class="plot" src="per_bench/bench_mem_malloc_free.png" alt="bench_mem_malloc_free"></div>
+<div><h3>bench_mem_struct</h3><img class="plot" src="per_bench/bench_mem_struct.png" alt="bench_mem_struct"></div>
+<div><h3>bench_memcpy_loop</h3><img class="plot" src="per_bench/bench_memcpy_loop.png" alt="bench_memcpy_loop"></div>
+<div><h3>bench_nested_loops</h3><img class="plot" src="per_bench/bench_nested_loops.png" alt="bench_nested_loops"></div>
+<div><h3>bench_pic_real</h3><img class="plot" src="per_bench/bench_pic_real.png" alt="bench_pic_real"></div>
+<div><h3>bench_polymorphic</h3><img class="plot" src="per_bench/bench_polymorphic.png" alt="bench_polymorphic"></div>
+<div><h3>bench_rotops_jit</h3><img class="plot" src="per_bench/bench_rotops_jit.png" alt="bench_rotops_jit"></div>
+<div><h3>bench_state_machine</h3><img class="plot" src="per_bench/bench_state_machine.png" alt="bench_state_machine"></div>
+<div><h3>bench_string_hot</h3><img class="plot" src="per_bench/bench_string_hot.png" alt="bench_string_hot"></div>
+<div><h3>bench_struct_field</h3><img class="plot" src="per_bench/bench_struct_field.png" alt="bench_struct_field"></div>
+<div><h3>bench_tight_loop</h3><img class="plot" src="per_bench/bench_tight_loop.png" alt="bench_tight_loop"></div>
+<div><h3>bitops</h3><img class="plot" src="per_bench/bitops.png" alt="bitops"></div>
+<div><h3>branch_unpredict</h3><img class="plot" src="per_bench/branch_unpredict.png" alt="branch_unpredict"></div>
+<div><h3>callvirt</h3><img class="plot" src="per_bench/callvirt.png" alt="callvirt"></div>
+<div><h3>callvirt_hot</h3><img class="plot" src="per_bench/callvirt_hot.png" alt="callvirt_hot"></div>
+<div><h3>cmp_fusion</h3><img class="plot" src="per_bench/cmp_fusion.png" alt="cmp_fusion"></div>
+<div><h3>fib_recursive</h3><img class="plot" src="per_bench/fib_recursive.png" alt="fib_recursive"></div>
+<div><h3>fp_jit</h3><img class="plot" src="per_bench/fp_jit.png" alt="fp_jit"></div>
+<div><h3>hash_lookup</h3><img class="plot" src="per_bench/hash_lookup.png" alt="hash_lookup"></div>
+<div><h3>int_mixed</h3><img class="plot" src="per_bench/int_mixed.png" alt="int_mixed"></div>
+<div><h3>intops_jit</h3><img class="plot" src="per_bench/intops_jit.png" alt="intops_jit"></div>
+<div><h3>jit_method</h3><img class="plot" src="per_bench/jit_method.png" alt="jit_method"></div>
+<div><h3>mem_class</h3><img class="plot" src="per_bench/mem_class.png" alt="mem_class"></div>
+<div><h3>mem_malloc_free</h3><img class="plot" src="per_bench/mem_malloc_free.png" alt="mem_malloc_free"></div>
+<div><h3>mem_struct</h3><img class="plot" src="per_bench/mem_struct.png" alt="mem_struct"></div>
+<div><h3>memcpy_loop</h3><img class="plot" src="per_bench/memcpy_loop.png" alt="memcpy_loop"></div>
+<div><h3>nested_loops</h3><img class="plot" src="per_bench/nested_loops.png" alt="nested_loops"></div>
+<div><h3>pic_real</h3><img class="plot" src="per_bench/pic_real.png" alt="pic_real"></div>
+<div><h3>polymorphic</h3><img class="plot" src="per_bench/polymorphic.png" alt="polymorphic"></div>
+<div><h3>quicksort</h3><img class="plot" src="per_bench/quicksort.png" alt="quicksort"></div>
+<div><h3>rotops_jit</h3><img class="plot" src="per_bench/rotops_jit.png" alt="rotops_jit"></div>
+<div><h3>state_machine</h3><img class="plot" src="per_bench/state_machine.png" alt="state_machine"></div>
+<div><h3>string_hot</h3><img class="plot" src="per_bench/string_hot.png" alt="string_hot"></div>
+<div><h3>string_workout</h3><img class="plot" src="per_bench/string_workout.png" alt="string_workout"></div>
+<div><h3>struct_field</h3><img class="plot" src="per_bench/struct_field.png" alt="struct_field"></div>
+<div><h3>tight_loop</h3><img class="plot" src="per_bench/tight_loop.png" alt="tight_loop"></div>
+</div>
+</body></html>

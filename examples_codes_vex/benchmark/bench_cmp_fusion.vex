@@ -1,0 +1,25 @@
+// Bench: fusion CMP+BR_COND en JIT (sprint CCC).
+//
+// Hot loop minimo donde DOMINA el patron cmp+jmp.  Antes del sprint:
+// el selector emitia `xor rax,rax; cmp; setcc; store; load; test; jcc`
+// (8 instr).  Tras CCC: `cmp; jcc<cond>` (2 instr).
+//
+// Bench tipico: incrementar acc en un loop donde la cond es cmp puro.
+// Esperado: ~20-40% mejora sobre el JIT pre-CCC.
+
+class C {
+    public i64 run(i32 n) {
+        i64 acc = 0;
+        i32 i = 0;
+        while (i < n) {
+            acc = acc + 1;
+            i = i + 1;
+        }
+        return acc;
+    }
+}
+
+i32 main() {
+    C c = new C();
+    return (i32) c.run(50000000);
+}

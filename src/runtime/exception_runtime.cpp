@@ -482,13 +482,62 @@ namespace runtime {
     static thread_local ProcessVM *t_executing_proc = nullptr;
 #endif
 
+#if defined(_WIN32)
+    /* Sprint JIT thunk TLS-direct (Win64 only):
+     *
+     * Reservamos UN slot TLS dedicado via TlsAlloc().  El thunk
+     * x86-64 generado lee proc directamente via @c gs:[0x1480 + idx*8]
+     * (slots 0..63 viven embebidos en el TEB).  Coste: 1 instr ~3 ns
+     * vs 25-30 ns del call a @c get_current_executing_process.
+     *
+     * El offset 0x1480 corresponde a TlsSlots[0] dentro del TEB en
+     * Win64 (verificable en wikipedia.org/wiki/Win32_Thread_Information_Block).
+     * Slots >= 64 estan en TlsExpansionSlots accesibles via
+     * @c gs:[0x1780] + indirect; el thunk los rechaza y cae al call. */
+    static DWORD g_proc_tls_index = TLS_OUT_OF_INDEXES;
+    static std::once_flag g_proc_tls_once;
+
+    static void init_proc_tls_index_once() {
+        std::call_once(g_proc_tls_once, []() {
+            g_proc_tls_index = TlsAlloc();
+        });
+    }
+
+    unsigned long jit_proc_tls_index() noexcept {
+        init_proc_tls_index_once();
+        return static_cast<unsigned long>(g_proc_tls_index);
+    }
+#endif
+
     void set_current_executing_process(ProcessVM *proc) noexcept {
         t_executing_proc = proc;
+#if defined(_WIN32)
+        /* Mantener el slot TLS dedicado sincronizado con el thread_local
+         * C++.  El thunk lee el slot directo via gs:[]; sin este sync,
+         * el thunk leeria stale data. */
+        init_proc_tls_index_once();
+        if (g_proc_tls_index != TLS_OUT_OF_INDEXES) {
+            TlsSetValue(g_proc_tls_index, proc);
+        }
+#endif
     }
 
     ProcessVM *get_current_executing_process() noexcept {
         return t_executing_proc;
     }
+
+} // namespace runtime
+
+/* Sprint JIT-cross-fn 2026-06-01: extern "C" shim para que el header
+ * publico `jit/interp_jit_bridge.h` pueda invocar `set_current_executing_process`
+ * sin necesitar incluir `runtime/exception_runtime.h` (que arrastraria
+ * todo el runtime).  El shim es solo un wrapper de 1 line. */
+extern "C" void runtime_set_current_executing_process_c(void *proc) {
+    runtime::set_current_executing_process(
+        static_cast<runtime::ProcessVM *>(proc));
+}
+
+namespace runtime {
 
     static std::once_flag g_av_handler_init_flag;
 

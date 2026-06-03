@@ -1,0 +1,38 @@
+// Bench: quicksort Lomuto sobre array i32 de 100K elementos.
+i32 partition(i32* arr, i32 lo, i32 hi) {
+    i32 pivot = arr[hi];
+    i32 i = lo - 1;
+    i32 j = lo;
+    while (j < hi) {
+        if (arr[j] <= pivot) {
+            i = i + 1;
+            i32 t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+        }
+        j = j + 1;
+    }
+    i32 t2 = arr[i + 1]; arr[i + 1] = arr[hi]; arr[hi] = t2;
+    return i + 1;
+}
+void qsort_rec(i32* arr, i32 lo, i32 hi) {
+    if (lo < hi) {
+        i32 p = partition(arr, lo, hi);
+        qsort_rec(arr, lo, p - 1);
+        qsort_rec(arr, p + 1, hi);
+    }
+}
+i32 main() {
+    i32 N = 100000;
+    i32* arr = (i32*) malloc(N * 4);
+    u64 seed = 12345;
+    i32 i = 0;
+    while (i < N) {
+        seed = seed * 6364136223846793005;
+        seed = seed + 1442695040888963407;
+        arr[i] = (i32)((seed >> 33) & 0xFFFFFFFF);
+        i = i + 1;
+    }
+    qsort_rec(arr, 0, N - 1);
+    i32 r = arr[N / 2] & 0xFF;
+    free(arr);
+    return r & 0xFF;
+}

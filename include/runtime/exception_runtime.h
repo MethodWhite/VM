@@ -244,4 +244,19 @@ namespace runtime {
      */
     ProcessVM *get_current_executing_process() noexcept;
 
+#if defined(_WIN32)
+    /**
+     * @brief Indice TLS dedicado (Win64) para que el thunk del JIT
+     *        lea @c ProcessVM* directamente desde @c gs:[0x1480+idx*8]
+     *        sin llamar a @c get_current_executing_process.  Reserva el
+     *        slot via @c TlsAlloc() lazy en la primera invocacion.
+     *
+     * El offset 0x1480 corresponde a TlsSlots[0] del TEB en Win64.  Si
+     * @c TLS_OUT_OF_INDEXES (alocacion fallo), el thunk cae al call.
+     * @c TLS_MINIMUM_AVAILABLE = 64 garantiza idx < 64 en la mayoria
+     * de procesos (el thunk solo soporta los primeros 64 slots).
+     */
+    unsigned long jit_proc_tls_index() noexcept;
+#endif
+
 } // namespace runtime

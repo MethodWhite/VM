@@ -1594,6 +1594,14 @@ namespace vex::ast {
         uint8_t                   access    = 0; ///< 0 = default/public, 1 = private, 2 = protected
         bool                      is_static = false;
         bool                      is_final  = false;
+        // Sprint lombok (2026-06-03): anotaciones a nivel de campo.
+        // El pre-pase de TypeChecker genera metodos sinteticos segun
+        // estos flags antes de check_classes.
+        bool                      lombok_getter      = false; ///< @Getter -> get_<name>()
+        bool                      lombok_setter      = false; ///< @Setter -> set_<name>(v)
+        bool                      lombok_nonnull     = false; ///< @NonNull -> check runtime
+        bool                      lombok_with        = false; ///< @With -> with_<name>(v) -> nueva instancia
+        bool                      lombok_getter_lazy = false; ///< @Getter(lazy=true)
     };
 
     /**
@@ -1695,6 +1703,22 @@ namespace vex::ast {
         bool                                              is_interface = false;
         /// marca `@Introspect`.  Ver `StructDecl`.
         bool                                              is_introspect = false;
+        // Sprint lombok (2026-06-03): anotaciones tipo Lombok a nivel de
+        // clase.  El pre-pase de TypeChecker genera metodos sinteticos +
+        // expanding combos como @Data / @Value antes de check_classes.
+        bool lombok_getter         = false; ///< @Getter en todos los fields
+        bool lombok_setter         = false; ///< @Setter en todos los fields no-final
+        bool lombok_tostring       = false; ///< @ToString -> string toString()
+        bool lombok_equals_hash    = false; ///< @EqualsAndHashCode
+        bool lombok_no_args_ctor   = false; ///< @NoArgsConstructor
+        bool lombok_all_args_ctor  = false; ///< @AllArgsConstructor
+        bool lombok_required_ctor  = false; ///< @RequiredArgsConstructor (solo final/nonnull)
+        bool lombok_data           = false; ///< @Data = combo de Getter+Setter+ToString+EqHash+RequiredCtor
+        bool lombok_value          = false; ///< @Value = @Data inmutable (todos los fields final)
+        bool lombok_builder        = false; ///< @Builder -> genera clase <Name>Builder
+        bool lombok_with_all       = false; ///< @With en todos los fields
+        bool lombok_log            = false; ///< @Log -> field static logger
+        bool lombok_sync_methods   = false; ///< @Synchronized class-wide
         ClassDecl() : Node(NodeKind::ClassDecl) {}
     };
 

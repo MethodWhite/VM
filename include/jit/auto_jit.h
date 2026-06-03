@@ -50,6 +50,20 @@ namespace jit {
      */
     void set_jit_threshold(uint32_t threshold) noexcept;
 
+    /**
+     * @brief Fuerza la lectura del env var @c VESTA_JIT_THRESHOLD (+ warn +
+     *        disasm) AHORA, en lugar de esperar al primer @c maybe_compile_*.
+     *
+     * Llamado por @c main al inicio para que la eager-compile pass del
+     * Loader vea el threshold del env var (sin esta llamada, threshold
+     * sigue siendo UINT32_MAX hasta que un callvirt/callvm trigger la
+     * inicializacion lazy, momento en que la oportunidad de eager compile
+     * ya paso).
+     *
+     * Idempotente: usa @c std::call_once internamente.  Llamadas
+     * subsiguientes son no-op. */
+    void init_threshold_from_env_now() noexcept;
+
     /* ===================================================================== */
     /* Sistema de warnings para depuracion del JIT                            */
     /* ===================================================================== */
@@ -65,6 +79,16 @@ namespace jit {
      * Default: false (sin warnings, debug discretamente).
      */
     extern bool g_jit_warn_unsupported;
+
+    /**
+     * @brief Sprint string-perf-6: gate del MIPS counter per-block en JIT.
+     * Default false; main.cpp lo activa cuando se pasa --stats o
+     * VESTA_JIT_STATS=1.  Sin esto el JIT no emite las 2 instrs
+     * `mov rax, imm64; add [rax], N` per block, ahorrando ~3 ns per
+     * block ejecutado.  En hot loops con muchos bloques pequenos
+     * (e.g. branch_unpredict) la diferencia llega al 30-50% del wall.
+     */
+    extern bool g_jit_emit_instr_counter;
 
     /**
      * @brief Si true, tras cada compilacion exitosa se imprime a stderr
@@ -164,6 +188,97 @@ namespace jit {
         int32_t exc_frame_stack_offset = 0,
         int32_t exc_free_list_offset = 0,
         uint64_t jit_instr_counter_addr = 0);
+
+    /* ===================================================================== */
+    /* Sprint D.5-callvm-hook: dispatch interp -> JIT en CALLVM                */
+    /* ===================================================================== */
+
+    /**
+     * @brief Flag rapido (fast path): true si HAY al menos una funcion
+     *        registrada en el mapa @c pc -> jit_code.  Permite que
+     *        @c exec_instr_callvm haga una sola lectura atomic relaxed
+     *        antes de tocar el mapa (que requiere lock).
+     *
+     * Diseño: cuando JIT esta desactivado o no se ha compilado nada,
+     * @c g_pc_jit_active == false -> @c exec_instr_callvm evita
+     * lookup_jit_code_at_pc completamente.  Tan pronto como una funcion
+     * se eager-compila, el flag se setea a true para siempre (no se
+     * resetea por invalidate -- el coste de 1 hashmap lookup adicional
+     * por callvm tras un invalidate es despreciable).
+     */
+    extern bool g_pc_jit_active;
+
+    /**
+     * @brief Registra que la funcion en @p vaddr (bytecode VM address)
+     *        tiene codigo nativo JIT en @p fn.
+     *
+     * Llamado tras cada compilacion eager exitosa.  Multiples llamadas
+     * con el mismo @p vaddr sobreescriben (caso re-compile tras deopt).
+     *
+     * @param vaddr Direccion VM del primer byte del bytecode de la funcion.
+     * @param fn    Puntero al codigo nativo (calling convention
+     *              @c JitFn(vrt_proc*) -> uint64_t).
+     */
+    void register_jit_code_at_pc(uint64_t vaddr, void *fn) noexcept;
+
+    /**
+     * @brief Lookup O(1) amortizado: devuelve el ptr nativo si la funcion
+     *        @p vaddr tiene JIT, sino @c nullptr.
+     *
+     * Llamado por @c exec_instr_callvm en cada invocacion (solo cuando
+     * @c g_pc_jit_active == true).  Thread-safe via lock interno.
+     *
+     * @param vaddr Direccion VM del target del CALLVM.
+     * @return      Codigo JIT o @c nullptr.
+     */
+    void *lookup_jit_code_at_pc(uint64_t vaddr) noexcept;
+
+    /**
+     * @brief Limpia el mapa @c pc -> jit_code (no libera el code cache).
+     *        Util para tests; en produccion no se usa.
+     */
+    void clear_jit_code_at_pc_map() noexcept;
+
+    /**
+     * @brief Sprint D.5-callvm-trigger: dispara la compilacion JIT de la
+     *        funcion en @p target_pc cuando un CALLVM la invoca
+     *        repetidamente desde codigo interpretado.
+     *
+     * Llamado por @c exec_instr_callvm en cada CALLVM cuyo target NO
+     * tiene jit_code en el pc-map (lookup miss).  Mantiene un counter
+     * por PC; al cruzar @c g_jit_threshold, intenta compilar la funcion.
+     *
+     * El compile usa el pipeline completo de @c eager_compile_function
+     * (con resolver recursivo) asi los callees se compilan transitively.
+     * Sentinela @c UINT32_MAX en el counter = "ya intentado y fallo"
+     * (no reintenta para evitar oscilacion compile/fail/recompile).
+     *
+     * Fast path coste (counter < threshold): ~30 ns (1 lock + 1 hash
+     * lookup + 1 increment).  Tras cualquier compile exitoso, el
+     * pc-map captura todos los CALLVMs subsiguientes -> el trigger
+     * NUNCA se vuelve a invocar para ese PC.  Funcion sin IR -> cached
+     * failure inmediato.
+     *
+     * @param vm        Proceso virtual actual (necesario para acceder
+     *                  al Loader del VM).
+     * @param target_pc Direccion VM del primer byte del bytecode de la
+     *                  funcion que el CALLVM esta apuntando.
+     */
+    void maybe_compile_callvm_target(runtime::ProcessVM *vm,
+                                     uint64_t target_pc) noexcept;
+
+    class CodeCache;  // fwd decl
+    /**
+     * @brief Acceso al CodeCache global del JIT subsystem.
+     *
+     * Inicializa el subsistema JIT (lazy via @c std::call_once) si aun no
+     * existe.  Util para clientes externos al JIT que necesitan alocar
+     * codigo nativo (e.g. @c runtime::get_or_generate_native_thunk para
+     * callbacks Vex -> C, Sprint B.1).
+     *
+     * Thread-safe.  Retorna un puntero no-nulo.
+     */
+    CodeCache *get_or_init_code_cache() noexcept;
 
 } // namespace jit
 

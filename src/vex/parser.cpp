@@ -507,6 +507,22 @@ namespace vex {
         bool top_is_macro      = false;  /* A.43.16: @Macro */
         bool top_is_pure       = false;  /* A.43.20: @Pure -- memoizable */
         bool top_target_skip   = false;  /* L.24: @Target no matchea */
+        // Sprint lombok (2026-06-03): anotaciones tipo Lombok a nivel
+        // de clase.  El TypeChecker pre-pase las consume y genera
+        // ClassMethodDecls sinteticos (getters, setters, toString, etc.).
+        bool top_lk_getter        = false;
+        bool top_lk_setter        = false;
+        bool top_lk_tostring      = false;
+        bool top_lk_equals_hash   = false;
+        bool top_lk_no_args_ctor  = false;
+        bool top_lk_all_args_ctor = false;
+        bool top_lk_required_ctor = false;
+        bool top_lk_data          = false;
+        bool top_lk_value         = false;
+        bool top_lk_builder       = false;
+        bool top_lk_with_all      = false;
+        bool top_lk_log           = false;
+        bool top_lk_sync_methods  = false;
         // v4: atributos para comptime const a nivel modulo.
         bool     top_attr_hot   = false;
         bool     top_attr_cold  = false;
@@ -521,6 +537,24 @@ namespace vex {
                 else if (current_.lexeme == "Introspect") top_is_introspect = true;
                 else if (current_.lexeme == "Macro") top_is_macro = true;
                 else if (current_.lexeme == "Pure")  top_is_pure  = true;
+                // Sprint lombok (2026-06-03): anotaciones class-level.
+                // El parser solo marca los flags; el pre-pase del
+                // TypeChecker (expand_lombok_annotations) genera los
+                // ClassMethodDecls correspondientes.  Combos: @Data y
+                // @Value se descomponen en sus partes en el pre-pase.
+                else if (current_.lexeme == "Getter")              top_lk_getter        = true;
+                else if (current_.lexeme == "Setter")              top_lk_setter        = true;
+                else if (current_.lexeme == "ToString")            top_lk_tostring      = true;
+                else if (current_.lexeme == "EqualsAndHashCode")   top_lk_equals_hash   = true;
+                else if (current_.lexeme == "NoArgsConstructor")   top_lk_no_args_ctor  = true;
+                else if (current_.lexeme == "AllArgsConstructor")  top_lk_all_args_ctor = true;
+                else if (current_.lexeme == "RequiredArgsConstructor") top_lk_required_ctor = true;
+                else if (current_.lexeme == "Data")                top_lk_data          = true;
+                else if (current_.lexeme == "Value")               top_lk_value         = true;
+                else if (current_.lexeme == "Builder")             top_lk_builder       = true;
+                else if (current_.lexeme == "With")                top_lk_with_all      = true;
+                else if (current_.lexeme == "Log")                 top_lk_log           = true;
+                else if (current_.lexeme == "Synchronized")        top_lk_sync_methods  = true;
                 // v4: atributos para comptime const.
                 const bool is_align   = (current_.lexeme == "align");
                 const bool is_hot     = (current_.lexeme == "hot");
@@ -623,6 +657,22 @@ namespace vex {
             auto cd = parse_class_decl();
             if (cd && top_is_aspect)     cd->is_aspect     = true;
             if (cd && top_is_introspect) cd->is_introspect = true;
+            // Sprint lombok: propagar flags class-level.
+            if (cd) {
+                cd->lombok_getter        = top_lk_getter;
+                cd->lombok_setter        = top_lk_setter;
+                cd->lombok_tostring      = top_lk_tostring;
+                cd->lombok_equals_hash   = top_lk_equals_hash;
+                cd->lombok_no_args_ctor  = top_lk_no_args_ctor;
+                cd->lombok_all_args_ctor = top_lk_all_args_ctor;
+                cd->lombok_required_ctor = top_lk_required_ctor;
+                cd->lombok_data          = top_lk_data;
+                cd->lombok_value         = top_lk_value;
+                cd->lombok_builder       = top_lk_builder;
+                cd->lombok_with_all      = top_lk_with_all;
+                cd->lombok_log           = top_lk_log;
+                cd->lombok_sync_methods  = top_lk_sync_methods;
+            }
             apply_pending_visibility(cd.get());
             return cd;
         }
@@ -2136,17 +2186,17 @@ namespace vex {
             bool        annot_inline       = false;
             uint8_t     annot_advice_kind  = 0;  // 0=ninguno, 1=BEFORE, 2=AFTER, 3=AROUND
             std::string annot_advice_target;
+            // Sprint lombok (2026-06-03): anotaciones de campo Lombok.
+            bool        lk_getter      = false;  ///< @Getter
+            bool        lk_setter      = false;  ///< @Setter
+            bool        lk_nonnull     = false;  ///< @NonNull
+            bool        lk_with        = false;  ///< @With
+            bool        lk_getter_lazy = false;  ///< @Getter(lazy=true)
             while (current_.kind == TokenKind::AT) {
                 (void)consume();  // '@'
                 if (current_.kind == TokenKind::IDENTIFIER) {
                     const std::string aname = current_.lexeme;
                     (void)consume();
-                    // Detectar kind de advice por nombre.
-                    // Bug fix 2026-05-23: @AfterReturning alias para @After
-                    // que recibe el valor de retorno como ultimo arg.  El
-                    // codigo runtime de AOP chain trata kind=2 (AFTER) igual
-                    // que kind=4 (AFTER_RETURNING); el frontend baja un
-                    // load extra del r0 del callee para el param result.
                     uint8_t this_kind = 0;
                     if      (aname == "Before")          this_kind = 1;
                     else if (aname == "After")           this_kind = 2;
@@ -2154,19 +2204,33 @@ namespace vex {
                     else if (aname == "AfterReturning")  this_kind = 4;
                     if (aname == "Override") annot_override = true;
                     if (aname == "Inline")   annot_inline   = true;
+                    // Sprint lombok: marcas de campo.
+                    if (aname == "Getter")  lk_getter  = true;
+                    if (aname == "Setter")  lk_setter  = true;
+                    if (aname == "NonNull") lk_nonnull = true;
+                    if (aname == "With")    lk_with    = true;
 
                     if (current_.kind == TokenKind::LPAREN) {
                         (void)consume();  // '('
-                        // Si es un advice y el primer arg es STRING_LIT,
-                        // capturarlo como pointcut.  Para otras anotaciones
-                        // o args adicionales, comemos sin almacenar.
                         if (this_kind != 0
                          && current_.kind == TokenKind::STRING_LIT) {
                             annot_advice_kind   = this_kind;
-                            annot_advice_target = current_.str_val; // valor sin comillas
+                            annot_advice_target = current_.str_val;
                             (void)consume();
                         }
-                        // Avanzar hasta el ')' coincidente (saltando args adicionales).
+                        // Sprint lombok: detectar `@Getter(lazy=true)`.
+                        if (aname == "Getter"
+                         && current_.kind == TokenKind::IDENTIFIER
+                         && current_.lexeme == "lazy") {
+                            (void)consume();
+                            if (current_.kind == TokenKind::ASSIGN) (void)consume();
+                            if (current_.kind == TokenKind::TRUE_KW) {
+                                lk_getter_lazy = true;
+                                (void)consume();
+                            } else if (current_.kind == TokenKind::FALSE_KW) {
+                                (void)consume();
+                            }
+                        }
                         int depth = 1;
                         while (depth > 0
                             && current_.kind != TokenKind::END_OF_FILE) {
@@ -2439,12 +2503,18 @@ namespace vex {
             } else {
                 // Campo.  Init opcional con '='.
                 ast::ClassFieldDecl f;
-                f.loc       = mloc;
-                f.type      = std::move(type_node);
-                f.name      = std::move(member_name);
-                f.access    = access;
-                f.is_static = is_static;
-                f.is_final  = is_final;
+                f.loc                = mloc;
+                f.type               = std::move(type_node);
+                f.name               = std::move(member_name);
+                f.access             = access;
+                f.is_static          = is_static;
+                f.is_final           = is_final;
+                // Sprint lombok: propagar flags del field.
+                f.lombok_getter      = lk_getter;
+                f.lombok_setter      = lk_setter;
+                f.lombok_nonnull     = lk_nonnull;
+                f.lombok_with        = lk_with;
+                f.lombok_getter_lazy = lk_getter_lazy;
                 if (match(TokenKind::ASSIGN)) {
                     f.init = parse_expr();
                 }

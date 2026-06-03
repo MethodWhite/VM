@@ -16,6 +16,7 @@
 #include "ir/ssa_ir_serialize.h"
 #include "emmit/bytereader.h"
 #include "emmit/struct_context.h"
+#include "ffi/virtual_lib_registry.h"
 #include "runtime/manager_runtime.h"
 #include "runtime/decode_table.h"   // rebase_bytecode_addresses usa decode tables
 #include "runtime/decode_instruction.h" // InstrFormat para size_from_mode
@@ -383,8 +384,15 @@ namespace loader {
             if (entry.resolved_ptr == nullptr) {
                 const std::string &mod_name  = ffi_loader.modules[site.key.module_idx];
                 const std::string &func_name = ffi_loader.functions[site.key.function_idx];
-                void *mod = ffi_loader.load_native_module(mod_name);
-                void *fn  = ffi_loader.resolve_native_symbol(mod, func_name);
+                /* Sprint MC.20 / B.1: virtual lib registry FIRST.  Permite
+                 * que libs como "vesta_runtime" y "vesta_comptime" sean
+                 * resueltas via punteros C registrados in-process sin
+                 * pasar por LoadLibrary. */
+                void *fn = ffi::lookup_virtual_fn(mod_name, func_name);
+                if (!fn) {
+                    void *mod = ffi_loader.load_native_module(mod_name);
+                    fn        = ffi_loader.resolve_native_symbol(mod, func_name);
+                }
                 entry.resolved_ptr = fn;
             }
             const uint64_t real_offset = static_cast<uint64_t>(site.offset_bytecode)
@@ -755,6 +763,22 @@ namespace loader {
              * main tiene tryenter, skip eager-compile (su interp dispatch
              * maneja el throw correctamente).  Phase D.13 (native unwinding)
              * eliminara esta restriccion. */
+            /* Sprint JIT-cross-fn 2026-06-01: relajamos la restriccion de
+             * closures.  Antes desactivabamos TODO el JIT (set_jit_threshold
+             * UINT32_MAX) cuando el modulo tenia MAKE_CLOSURE/CALLCLOSURE.
+             * Ahora solo desactivamos el eager-compile de main + flag
+             * has_closures para que el cascade resolver evite compilar
+             * lambdas problematicas, pero el resto de fns (callvirt
+             * counters, fns ordinarias) sigue compilando.  El runtime
+             * `vrt_callclosure` ya tiene heuristica VM-vs-host PC para
+             * dispatchar correctamente.
+             *
+             * MAIN tiene closures: skip main eager (interp maneja
+             *   CALLCLOSURE con env en VM stack sin issue).
+             * OTRAS fns con closures: cascade resolver puede saltarse
+             *   esas fns specificas si fallan; resto compila.
+             */
+            bool main_has_closure = false;
             for (const auto &irf : last_exe->ir_functions) {
                 for (const auto &block : irf.blocks) {
                     for (const auto &ins : block.instrs) {
@@ -765,9 +789,11 @@ namespace loader {
                         }
                         if (ins.op == ir::IrOp::MAKE_CLOSURE
                          || ins.op == ir::IrOp::CALLCLOSURE) {
-                            skip_main_jit = true;
                             has_closures = true;
-                            break;
+                            if (irf.name == "main") {
+                                main_has_closure = true;
+                                skip_main_jit = true;
+                            }
                         }
                         /* Detectar tryenter en main especificamente. */
                         if (irf.name == "main"
@@ -781,18 +807,16 @@ namespace loader {
                 if (skip_main_jit) break;
             }
             const bool has_aop = skip_main_jit;
-            /* Si hay closures, desactivar JIT entero (no solo main eager).
-             * vrt_callclosure no puede pasar env_addr como VM vaddr a
-             * bytecode lambda (que interpreta R14 como VM), y el bytecode
-             * lambda crashea con segfault al leer env via vm_mem.  Hasta
-             * un fix proper (copy env to VM stack o JIT compile lambda),
-             * cualquier metodo invocado en programas con closures debe
-             * correr en interp. */
-            if (has_closures) {
+            (void)main_has_closure;
+            (void)has_closures;
+            /* JIT global SIGUE activo aunque haya closures.  Fns sin
+             * closures compilan normal; con closures, el cascade resolver
+             * puede saltar la fn problematica. */
+            if (false) {  /* preservar bloque para futuro deopt selectivo */
                 jit::set_jit_threshold(UINT32_MAX);
                 if (jit::g_jit_warn_unsupported) {
                     std::fprintf(stderr,
-                        "[jit] desactivado para este programa: usa closures (callclosure) que aun no son JIT-safe\n");
+                        "[jit] desactivado para este programa\n");
                 }
             }
             auto it = last_exe->ir_lookup.find("main");
@@ -811,6 +835,11 @@ namespace loader {
                     if (colon == std::string::npos) return 0;
                     std::string lib  = name.substr(0, colon);
                     std::string func = name.substr(colon + 1);
+                    /* Sprint JIT-cross-fn: virtual lib registry FIRST. */
+                    void *vfn = ffi::lookup_virtual_fn(lib, func);
+                    if (vfn != nullptr) {
+                        return reinterpret_cast<uint64_t>(vfn);
+                    }
                     try {
                         void *mod = ffi_ptr->load_native_module(lib);
                         if (!mod) return 0;

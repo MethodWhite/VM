@@ -1,0 +1,52 @@
+// examples_codes_vex/177_callback_many_args.vex
+//
+// Callback nativo con argc > 4 (limite previo en Win64) y argc > 6 (limite
+// previo en System V).  El thunk x86-64 soporta hasta 12 argumentos:
+//   - Args 1..4 en RCX/RDX/R8/R9 (Win64) o RDI/RSI/RDX/RCX/R8/R9 (SysV).
+//   - Args 5..12 leidos del stack del caller con offsets ajustados por
+//     el frame del thunk (push rbx + sub rsp, frame_size).
+//
+// Demuestra:
+//   - 12 args llegando correctamente al callback Vex.
+//   - Mezcla con globals Vex (g_total incrementado dentro del callback).
+//   - Multiples invocaciones (verifica que el cache (pc, argc) reusa el
+//     mismo thunk sin regenerarlo).
+//
+// Esperado: R00 = 42.
+
+i64 g_total = 0;
+
+i64 cb12(i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6,
+         i64 a7, i64 a8, i64 a9, i64 a10, i64 a11, i64 a12) {
+    i64 sum = a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12;
+    g_total = g_total + sum;
+    return sum;
+}
+
+i32 main() {
+    i64 cb = as_native_callback(cb12);
+
+    // Primera invocacion: 1..12 (suma = 78).
+    i64 r1 = ffi_call(cb, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+
+    // Segunda invocacion: distintos args (suma = 36).
+    i64 r2 = ffi_call(cb, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 12, 12);
+
+    // Tercera invocacion: args negativos mezclados con positivos.
+    i64 r3 = ffi_call(cb, -5, 10, -5, 10, -5, 10, -5, 10, 0, 0, 0, 0);
+    // suma = 20.
+
+    println("r1=${r1} r2=${r2} r3=${r3} g_total=${g_total}");
+
+    // Validar.  78 + 36 + 20 = 134.
+    i32 ok = 1;
+    if (r1 != 78)        { ok = 0; }
+    if (r2 != 36)        { ok = 0; }
+    if (r3 != 20)        { ok = 0; }
+    if (g_total != 134) { ok = 0; }
+
+    if (ok == 1) {
+        return 42;
+    }
+    return 1;
+}

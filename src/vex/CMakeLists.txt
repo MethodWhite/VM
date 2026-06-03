@@ -20,6 +20,7 @@ add_library(vex_lib STATIC
     ast.cpp
     parser.cpp
     type_checker.cpp
+    lombok.cpp
     lowering.cpp
     borrow_checker.cpp
     compiler.cpp

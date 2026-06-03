@@ -2726,6 +2726,43 @@ void emit_instr_fcvt(
 }
 
 // =========================================================================
+// Sprint string-perf-5: emit_instr_bitcast_zg para bitg2z/bitz2g.
+// Codifica un GP + un ZMM en el mismo byte de registros.
+// Layout: regs = (gp_idx << 4) | zmm_idx (alto=GP, bajo=ZMM).
+// =========================================================================
+void emit_instr_bitcast_zg(
+    const vm::Instruction *instruction_parser,
+    ByteWriter &           code_final,
+    const InstrInfo *      now_instr,
+    Assembler *            assembly_ctx
+) {
+    (void)assembly_ctx;
+    (void)now_instr;
+    auto *r1 = dynamic_cast<vm::RegisterOperand *>(instruction_parser->operands[0].get());
+    auto *r2 = dynamic_cast<vm::RegisterOperand *>(instruction_parser->operands[1].get());
+    if (!r1 || !r2)
+        throw std::runtime_error(instruction_parser->opcode +
+                                 ": se requieren dos operandos de registro");
+
+    uint8_t gp_idx, zmm_idx, mode;
+    if (is_zmm_register(r1->name)) {
+        // bitg2z fX, rN: r1=ZMM dst, r2=GP src
+        zmm_idx = zmm_reg_index(r1->name);
+        gp_idx  = encode_reg_general(r2->name.c_str());
+        mode    = zmm_reg_mode(r1->name);
+    } else {
+        // bitz2g rN, fX: r1=GP dst, r2=ZMM src
+        gp_idx  = encode_reg_general(r1->name.c_str());
+        zmm_idx = zmm_reg_index(r2->name);
+        mode    = zmm_reg_mode(r2->name);
+    }
+    const uint8_t ctrl = static_cast<uint8_t>(mode << 6);
+    const uint8_t regs = static_cast<uint8_t>((gp_idx << 4) | zmm_idx);
+    code_final.emit8(ctrl);
+    code_final.emit8(regs);
+}
+
+// =========================================================================
 // emit_str_two_reg: Convention B, 2 registros - para instrucciones de string
 // =========================================================================
 

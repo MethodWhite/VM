@@ -21,6 +21,7 @@
 
 #include "runtime/decode_instruction.h"
 #include "runtime/exception_runtime.h"
+#include "runtime/profile.h"   // Sprint D.6 (2026-06-03): PGO counters
 #include "distrib/dist_runtime.h"
 #include "distrib/dist_debug.h"
 #include "runtime/runtime.h"
@@ -750,6 +751,14 @@ namespace runtime {
                             case 0x0D: taken = (fl2.ZF == 1 || fl2.SF != fl2.OF); break;
                             default:   taken = true; break;
                         }
+                        // Sprint D.6: profile counter (fast path threaded).
+                        if (__builtin_expect(
+                                runtime::profile::g_profile.active.load(
+                                    std::memory_order_relaxed),
+                                0)) {
+                            runtime::profile::profile_branch(
+                                instance->registers.rip.raw(), taken);
+                        }
                         if (taken) {
                             instance->registers.rip.qword(static_cast<uint64_t>(sd.offset));
                         } else {
@@ -781,6 +790,16 @@ namespace runtime {
                             case 0x0C: taken = (fl.ZF == 0 && fl.SF == fl.OF); break;
                             case 0x0D: taken = (fl.ZF == 1 || fl.SF != fl.OF); break;
                             default:   taken = true; break;
+                        }
+                        // Sprint D.6: profile counter (fast path threaded JCC).
+                        // Solo branches condicionales (cond < 0x0E).
+                        if (cond < 0x0E
+                            && __builtin_expect(
+                                   runtime::profile::g_profile.active.load(
+                                       std::memory_order_relaxed),
+                                   0)) {
+                            runtime::profile::profile_branch(
+                                instance->registers.rip.raw(), taken);
                         }
                         if (taken) {
                             instance->registers.rip.qword(addr);
@@ -1182,6 +1201,14 @@ namespace runtime {
                             case 0x0D: taken = (fl2.ZF == 1 || fl2.SF != fl2.OF); break;
                             default:   taken = true; break;
                         }
+                        // Sprint D.6: profile counter (fast path non-threaded cmpjmp).
+                        if (__builtin_expect(
+                                runtime::profile::g_profile.active.load(
+                                    std::memory_order_relaxed),
+                                0)) {
+                            runtime::profile::profile_branch(
+                                instance->registers.rip.raw(), taken);
+                        }
                         if (taken) {
                             instance->registers.rip.qword(static_cast<uint64_t>(sd.offset));
                         } else {
@@ -1214,6 +1241,16 @@ namespace runtime {
                             case 0x0C: taken = (fl.ZF == 0 && fl.SF == fl.OF); break; // GT
                             case 0x0D: taken = (fl.ZF == 1 || fl.SF != fl.OF); break; // LE
                             default:   taken = true; break; // 0x0F y otros
+                        }
+                        // Sprint D.6: profile counter (fast path non-threaded jcc).
+                        // Solo branches condicionales (cond < 0x0E).
+                        if (cond < 0x0E
+                            && __builtin_expect(
+                                   runtime::profile::g_profile.active.load(
+                                       std::memory_order_relaxed),
+                                   0)) {
+                            runtime::profile::profile_branch(
+                                instance->registers.rip.raw(), taken);
                         }
                         if (taken) {
                             instance->registers.rip.qword(addr);

@@ -882,6 +882,14 @@ namespace vex {
         // lower_cast_expr + check_call).
         if (target.nominal_id != 0 || value.nominal_id != 0) return false;
         if (is_numeric(target.kind) && is_numeric(value.kind)) return true;
+        /* CHAR (codepoint Unicode u32) acepta coercion a/de cualquier tipo
+         * entero.  Permite `u8 b = 'H';` (caso C clasico: char literal a
+         * byte) y `u32 cp = 'A';`.  El lowering hace truncate cuando el
+         * destino es < 32 bits; sin warning porque el usuario escribio
+         * un literal char (intencion clara).  Tambien permite el sentido
+         * inverso `char c = 65;` para construir un codepoint desde int. */
+        if (is_integral(target.kind) && value.kind == PrimitiveKind::CHAR) return true;
+        if (target.kind == PrimitiveKind::CHAR && is_integral(value.kind)) return true;
         if (target.kind == PrimitiveKind::PTR && value.kind == PrimitiveKind::PTR) {
             // Tratamos un PTR sin pointee como @c void* (caso de builtins
             // historicamente declarados con @c Type{PTR} a secas).  Esto
@@ -892,6 +900,16 @@ namespace vex {
             const bool v_void = !value.pointee
                               || value.pointee->kind  == PrimitiveKind::VOID;
             if (t_void || v_void) return true;
+            // Phase D.jit-mem-model AUTO-PROMOTE: VirtualPtr<T> -> T* y
+            // T* -> VirtualPtr<T> con mismo pointee se coercen
+            // implicitamente.  El runtime (interp/JIT) decide la
+            // naturaleza host vs VM segun el ALLOCA origen + analisis
+            // host_alloca.  Para el user, ambos kinds son "pointer a T"
+            // (estilo C clasico).
+            if (target.pointee && value.pointee
+             && *target.pointee == *value.pointee) {
+                return true;
+            }
         }
         // Decay automatico de array: T[N] o T[] se convierten implicitamente
         // a T*.  Util para pasar arrays como argumentos `T*` o asignarlos a
@@ -919,6 +937,20 @@ namespace vex {
         // rechazaria `string s = "hola"`.
         if (target.kind == PrimitiveKind::STRING
          && value.kind == PrimitiveKind::PTR) return true;
+        /* C-style: `u8[N] arr = "literal"` o `char[N] arr = "literal"`.
+         * Target es ARRAY de byte-like (u8/i8/char); value es un literal
+         * de string (modelado como PTR).  El lowering del var-decl
+         * detecta el caso y emite STOREs byte-a-byte del contenido del
+         * string (con zerificacion del resto si N > strlen).  Equivalente
+         * directo a la inicializacion C de char arrays. */
+        if (target.kind == PrimitiveKind::ARRAY
+         && value.kind == PrimitiveKind::PTR
+         && target.pointee
+         && (target.pointee->kind == PrimitiveKind::U8
+          || target.pointee->kind == PrimitiveKind::I8
+          || target.pointee->kind == PrimitiveKind::CHAR)) {
+            return true;
+        }
         // null asignable a CLASS (Java-style nullability).  null se modela
         // como PTR void; CLASS es una referencia que admite null por
         // defecto.  Necesario para `return null` en metodos que devuelven

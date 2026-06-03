@@ -142,6 +142,58 @@ bool ir_pass_dce(IrFunction &fn);
 bool ir_pass_dead_alloc_elim(IrFunction &fn);
 
 /**
+ * @brief Promueve ALLOCAs cuyo ptr fluye a CALLN a host stack.
+ *
+ * Phase D.jit-mem-model AUTO-PROMOTE: detecta `&local` que llega a
+ * funciones nativas (CALLN).  Marca el dst del ALLOCA como
+ * `is_host_ptr=true`, lo que hace que el JIT lo emita en host stack
+ * (en lugar de VM-stack) -- el ptr resultante es genuino dereferenciable
+ * directamente por code C nativo.
+ *
+ * Permite sintaxis C-style sin anotaciones:
+ *
+ *     u8[1024] buf;
+ *     ReadFile(handle, &buf[0], 1024, ...);
+ *
+ * @return true si se promociono alguna ALLOCA.
+ */
+bool ir_pass_promote_callned_allocas(IrFunction &fn);
+
+/**
+ * @brief Sprint string-perf-8: promueve ALLOCAs LOCALES (no escapan a
+ *        CALL/RET/THROW/STORE-de-ptr) a `host_alloca=true`.
+ *
+ * Permite que el JIT emita los LOAD/STORE derivados como `mov` nativo
+ * directo (1 instr) en lugar del inline page cache check (~10 instr).
+ *
+ * Caso tipico: struct value-type local con field access en hot loop.
+ * Speedup esperado en bench_struct_field: 5x (150ms -> 30ms en JIT).
+ *
+ * @return true si se promociono alguna ALLOCA.
+ */
+bool ir_pass_promote_local_allocas(IrFunction &fn);
+
+/**
+ * @brief Promociona patrones `malloc(N) + ... + free(p)` locales sin
+ *        escape a `ALLOCA host_alloca`.
+ *
+ * Cuando una funcion Vex usa @c malloc/free localmente (sin escape via
+ * return ni stores a memoria GC), el coste del allocator (~200-500 ns
+ * por call) en loops domina el wall-time.  Esta pasada convierte el
+ * patron a `sub rsp, N` (1 instr, ~1 ns) y elimina el RAW_FREE
+ * correspondiente (el stack se libera al RET).
+ *
+ * Criterios:
+ *   1. RAW_ALLOC con @c operands[0] siendo CONST.
+ *   2. CONST.size <= 65536 bytes (no llenar stack con bloques gigantes).
+ *   3. El dst NO escapa (no llega a RETURN ni a stores a memoria GC).
+ *   4. Existe un RAW_FREE que recibe el dst (o derivado).
+ *
+ * @return true si se promociono algun RAW_ALLOC.
+ */
+bool ir_pass_promote_local_raw_alloc(IrFunction &fn);
+
+/**
  * @brief Pase de simplificacion algebraica + folding de cast constantes
  *        + simplificacion de phis triviales.
  *

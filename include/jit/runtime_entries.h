@@ -67,6 +67,10 @@ namespace jit {
         void       (*gc_release)      (vrt_proc *, vrt_handle)               = nullptr;
         void       (*gc_write_barrier)(vrt_proc *, vrt_handle)               = nullptr;
 
+        /* ----- Memoria HOST raw (malloc/free no-GC) ----- */
+        uint8_t   *(*raw_alloc)       (vrt_proc *, size_t)                   = nullptr;
+        void       (*raw_free)        (vrt_proc *, uint8_t *)                = nullptr;
+
         /* ----- Monitores ----- */
         int32_t    (*monitor_enter)        (vrt_proc *, vrt_handle)          = nullptr;
         void       (*monitor_exit)         (vrt_proc *, vrt_handle)          = nullptr;
@@ -111,6 +115,15 @@ namespace jit {
         /* ----- VM memory access (Phase D.3-G) ----- */
         uint64_t   (*vm_read_u64)     (vrt_proc *, uint64_t)                 = nullptr;
         void       (*vm_write_u64)    (vrt_proc *, uint64_t, uint64_t)        = nullptr;
+        /* Variantes por tamano (LOAD/STORE de i8/i16/i32 desde VM-ptr). */
+        uint32_t   (*vm_read_u32)     (vrt_proc *, uint64_t)                 = nullptr;
+        uint16_t   (*vm_read_u16)     (vrt_proc *, uint64_t)                 = nullptr;
+        uint8_t    (*vm_read_u8)      (vrt_proc *, uint64_t)                 = nullptr;
+        void       (*vm_write_u32)    (vrt_proc *, uint64_t, uint32_t)        = nullptr;
+        void       (*vm_write_u16)    (vrt_proc *, uint64_t, uint16_t)        = nullptr;
+        void       (*vm_write_u8)     (vrt_proc *, uint64_t, uint8_t)         = nullptr;
+        /* Phase D.jit-mem-model FULL: translate VM-addr/host_ptr -> host_ptr. */
+        uint8_t   *(*vm_translate)    (vrt_proc *, uint64_t)                  = nullptr;
 
         /* ----- Class registry (Phase D.3-G: findclass/newobj/defclass/...) ----- */
         vrt_class *(*findclass)       (vrt_proc *, uint64_t)                  = nullptr;
@@ -126,6 +139,18 @@ namespace jit {
         void      *(*findmethod)      (vrt_proc *, uint64_t)                  = nullptr;
         void      *(*findfield)       (vrt_proc *, uint64_t)                  = nullptr;
         void       (*setmethdbg)      (vrt_proc *, uint64_t)                  = nullptr;
+
+        /* ----- String ops (Sprint JIT-cobertura 2026-06-01) ----- */
+        vrt_handle (*str_make)        (vrt_proc *, uint64_t, uint32_t)        = nullptr;
+        uint64_t   (*str_len)         (vrt_proc *, vrt_handle)                = nullptr;
+        uint64_t   (*str_get_bytes)   (vrt_proc *, vrt_handle)                = nullptr;
+        uint64_t   (*str_raw)         (vrt_proc *, vrt_handle)                = nullptr;
+        vrt_handle (*str_cat)         (vrt_proc *, vrt_handle, vrt_handle)    = nullptr;
+        int64_t    (*str_cmp)         (vrt_proc *, vrt_handle, vrt_handle)    = nullptr;
+
+        /* ----- Panic + GC alloc payload (Sprint JIT-cobertura) ----- */
+        void       (*panic_str)         (vrt_proc *, uint64_t, uint32_t)      = nullptr;
+        uint8_t   *(*gc_alloc_payload)  (vrt_proc *, size_t)                  = nullptr;
 
         /* ----- Safepoint ----- */
         void       (*safepoint_poll)    (vrt_proc *)                         = nullptr;

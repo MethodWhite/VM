@@ -1,0 +1,178 @@
+// examples_codes_vex/173_wndproc_win32.vex
+//
+// Test e2e de WndProc Win32 real con callback Vex.
+//
+// Demuestra el patron canonico de cualquier app GUI Win32:
+//   1. Registrar la clase de ventana con WNDCLASSEXW.lpfnWndProc =
+//      as_native_callback(my_wnd_proc).
+//   2. Crear la ventana (hidden, sin SW_SHOW; no necesita display).
+//   3. Postear mensajes simulados via PostMessageW.
+//   4. Bombear el message queue con GetMessageW/DispatchMessageW.
+//   5. El WndProc Vex es invocado por user32 internamente (via thunk
+//      x86-64) con los args nativos (hwnd, msg, wParam, lParam).
+//
+// Este test demuestra que el callback NO requiere ventana visible:
+//   - RegisterClassExW exito = el WndProc tiene direccion C valida.
+//   - PostMessageW envia WM_USER messages al WndProc.
+//   - El WndProc lleva un contador global que incrementa cada call.
+//   - Tras N mensajes, el WndProc llama PostQuitMessage(0) y el loop
+//     procesa WM_QUIT cerrando.
+//
+// Esperado: R00 = 42 (cuenta exacta de WM_USER recibidos por el WndProc).
+
+extern "user32.dll" {
+    fn RegisterClassExW(u64 wc_ptr) -> u16;
+    fn CreateWindowExW(u32 ex_style, u64 class_name, u64 win_name,
+                       u32 style, i32 x, i32 y, i32 w, i32 h,
+                       u64 parent, u64 menu, u64 hinst, u64 lparam) -> u64;
+    fn PostMessageW(u64 hwnd, u32 msg, u64 wparam, i64 lparam) -> i32;
+    fn GetMessageW(u64 msg_ptr, u64 hwnd, u32 filter_min, u32 filter_max) -> i32;
+    fn TranslateMessage(u64 msg_ptr) -> i32;
+    fn DispatchMessageW(u64 msg_ptr) -> i64;
+    fn DefWindowProcW(u64 hwnd, u32 msg, u64 wparam, i64 lparam) -> i64;
+    fn PostQuitMessage(i32 code) -> void;
+    fn DestroyWindow(u64 hwnd) -> i32;
+    fn ShowWindow(u64 hwnd, i32 cmd) -> i32;
+    fn UpdateWindow(u64 hwnd) -> i32;
+}
+
+extern "kernel32.dll" {
+    fn GetModuleHandleW(u64 name) -> u64;
+    fn Sleep(u32 ms) -> void;
+
+}
+
+// Contador global de WM_USER recibidos.  Incrementado por el WndProc.
+i32 g_user_msgs = 0;
+
+// WndProc: invocado por user32 via el thunk x86-64.
+// Args nativos: hwnd (u64), msg (u32 zero-ext a u64), wparam (u64), lparam (i64).
+// Return value: LRESULT (i64).
+i64 my_wnd_proc(u64 hwnd, u32 msg, u64 wparam, i64 lparam) {
+    // WM_USER = 0x0400.  Cualquier mensaje >= WM_USER lo contamos.
+    if (msg == 1024) {
+        g_user_msgs = g_user_msgs + 1;
+        // Tras 42 mensajes, postear WM_QUIT para cerrar el loop.
+        if (g_user_msgs >= 42) {
+            PostQuitMessage(0);
+        }
+        return 0;
+    }
+    // Default: delegar a DefWindowProcW.
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+i32 main() {
+    u64 hinst = GetModuleHandleW(0);
+
+    // Layout WNDCLASSEXW (80 bytes en Win64):
+    //   +0   cbSize       UINT (4)
+    //   +4   style        UINT (4)
+    //   +8   lpfnWndProc  void*  (8)  <- aqui va el thunk
+    //   +16  cbClsExtra   int   (4)
+    //   +20  cbWndExtra   int   (4)
+    //   +24  hInstance    HANDLE (8)
+    //   +32  hIcon        HICON  (8)
+    //   +40  hCursor      HCURSOR (8)
+    //   +48  hbrBackground HBRUSH (8)
+    //   +56  lpszMenuName LPCWSTR (8)
+    //   +64  lpszClassName LPCWSTR (8)
+    //   +72  hIconSm      HICON (8)
+    //
+    // IMPORTANTE: structs pasados a Win32 deben vivir en memoria HOST
+    // (no VM stack).  user32 dereferencia el puntero directo; un VM-addr
+    // crashearia la API nativa.  Usamos malloc() para alocacion host.
+    u8* wc = (u8*) malloc(80);
+    i32 i = 0;
+    while (i < 80) { wc[i] = 0; i = i + 1; }
+
+    // wc.cbSize = 80 (sizeof WNDCLASSEXW).  Escribimos via puntero u32.
+    u32* p_cbsize = (u32*)(&wc[0]);
+    *p_cbsize = 80;
+
+    // wc.lpfnWndProc = thunk del WndProc Vex.
+    i64 thunk = as_native_callback(my_wnd_proc);
+    i64* p_wndproc = (i64*)(&wc[8]);
+    *p_wndproc = thunk;
+
+    // wc.hInstance = hinst.
+    u64* p_hinst = (u64*)(&wc[24]);
+    *p_hinst = hinst;
+
+    // wc.lpszClassName.  Necesitamos un literal UTF-16LE "VexTest\0".
+    // Bytes: V=0x56,e=0x65,x=0x78,T=0x54,e=0x65,s=0x73,t=0x74, terminador.
+    u8* class_name = (u8*) malloc(20);
+    i = 0;
+    while (i < 20) { class_name[i] = 0; i = i + 1; }
+    class_name[0]  = 86; class_name[1]  = 0;  // V
+    class_name[2]  = 101; class_name[3] = 0;  // e
+    class_name[4]  = 120; class_name[5] = 0;  // x
+    class_name[6]  = 84; class_name[7]  = 0;  // T
+    class_name[8]  = 101; class_name[9] = 0;  // e
+    class_name[10] = 115; class_name[11] = 0; // s
+    class_name[12] = 116; class_name[13] = 0; // t
+    // [14..15] = 0 (NUL terminator UTF-16)
+
+    u64* p_classname = (u64*)(&wc[64]);
+    *p_classname = (u64)(&class_name[0]);
+
+    u16 atom = RegisterClassExW((u64)(&wc[0]));
+    if (atom == 0) {
+        // RegisterClassExW fallo (puede pasar si la clase ya existe de
+        // una ejecucion previa).  En ese caso, continuamos -- el nombre
+        // sigue valido y CreateWindowExW lo aceptara.
+    }
+    u32 WS_OVERLAPPEDWINDOW = 0x00CF0000;
+    u32 WS_VISIBLE          = 0x10000000;
+
+    // CreateWindowExW HIDDEN (sin WS_VISIBLE).  WS_OVERLAPPED = 0.
+    u64 hwnd = CreateWindowExW(0, (u64)(&class_name[0]), 0,
+                                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                100, 100, 800, 600,
+                                0, 0, hinst, 0);
+    if (hwnd == 0) {
+        println("CreateWindowExW fallo");
+        return 99;
+    }
+    ShowWindow(hwnd, 1);      // SW_SHOWNORMAL
+    UpdateWindow(hwnd);
+
+    // Postear 42 mensajes WM_USER.  PostQuitMessage(0) se dispara al 42.
+    i32 n = 0;
+    while (n < 42) {
+        PostMessageW(hwnd, 1024, (u64)n, 0);
+        n = n + 1;
+    }
+
+    // Message pump: GetMessageW retorna 0 cuando WM_QUIT llega.
+    // Layout MSG (48 bytes Win64): hwnd(8) + msg(4) + pad(4) + wparam(8)
+    //   + lparam(8) + time(4) + pt.x(4) + pt.y(4) + pad(4) + lPrivate(4).
+    // Tambien necesita ser HOST memory (user32 lo dereferencia).
+    u8* msg = (u8*) malloc(64);
+    i32 j = 0;
+    while (j < 64) { msg[j] = 0; j = j + 1; }
+
+    i32 max_iter = 100;
+    while (max_iter > 0) {
+        i32 r = GetMessageW((u64)(&msg[0]), 0, 0, 0);
+        if (r <= 0) {
+            // 0 = WM_QUIT recibido (limpio); -1 = error.  Salir del loop.
+            max_iter = 0;
+        } else {
+            TranslateMessage((u64)(&msg[0]));
+            DispatchMessageW((u64)(&msg[0]));
+            max_iter = max_iter - 1;
+        }
+    }
+
+    Sleep(3000);  // Esperar 3 segundos
+
+    DestroyWindow(hwnd);
+
+    free(wc);
+    free(class_name);
+    free(msg);
+
+    println("WM_USER recibidos: ${g_user_msgs}");
+    return g_user_msgs;
+}

@@ -1,0 +1,28 @@
+// Bench: aritmetica entera mixta intensiva.
+// 10 ops por iter (add/sub/mul/and/or/xor/shl/shr) sobre 4 accumuladores
+// para ejercitar el regalloc.  Sin dependencias cruzadas para permitir
+// ILP del CPU host.
+//
+// Workload: 20M iters x 10 ops = 200M operaciones int.
+
+i32 main() {
+    i64 a = 1;
+    i64 b = 2;
+    i64 c = 3;
+    i64 d = 5;
+    i32 i = 0;
+    while (i < 20000000) {
+        a = a + (i64)i;
+        b = b - 1;
+        c = c * 3;
+        d = d + (a ^ b);
+        a = a & 0xFFFFFFFF;
+        b = b | 1;
+        c = c >> 1;
+        d = d ^ a;
+        a = a + b;
+        c = c + d;
+        i = i + 1;
+    }
+    return (i32)((a + b + c + d) & 0xFF);
+}

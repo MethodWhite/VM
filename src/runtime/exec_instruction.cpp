@@ -21,7 +21,13 @@
 #include "runtime/decode_instruction.h"
 #include "runtime/exception_runtime.h"
 #include "runtime/native_invoke.h"
+#include <cstdio>
+#include "runtime/host_alloca_tracker.h"  // Sprint MMM-ext leak-fix
 #include "loader/oop_types.h"
+#include "jit/auto_jit.h"             // D.5-callvm-hook: lookup_jit_code_at_pc
+#include "jit/interp_jit_bridge.h"    // D.5-callvm-hook: enter_jit
+#include "vesta_rt/public.h"          // D.5-callvm-hook: vrt_proc
+#include "runtime/profile.h"          // Sprint D.6 (2026-06-03): PGO counters
 
 #include "ffi/native_ffi.h"
 
@@ -341,6 +347,16 @@ namespace runtime {
             default:   taken = true; break; // incondicional (0x0F y otros)
         }
 
+        // Sprint D.6 (2026-06-03): branch frequency counter para PGO.
+        // Solo registramos branches CONDICIONALES (cond < 0x0E); los
+        // incondicionales (0x0F+) no aportan info al C2.
+        if (cond < 0x0E
+            && __builtin_expect(
+                   profile::g_profile.active.load(std::memory_order_relaxed),
+                   0)) {
+            profile::profile_branch(vm->registers.rip.raw(), taken);
+        }
+
         if (taken)
             write_rip(vm, addr); // actualizar RIP al destino del salto
     }
@@ -357,6 +373,49 @@ namespace runtime {
     void exec_instr_callvm(ProcessVM *vm, const DecodedInstr &instr) {
         const uint64_t addr     = instr.data_instruction.inmmed_data.inmmed;       // direccion del callee
         const uint64_t ret_addr = vm->registers.rip.raw() + instr.flags_info.size_instr; // siguiente PC
+
+        // D.5-callvm-hook: si el callee tiene codigo JIT compilado, despachar
+        // directo a el en lugar de interpretar el bytecode.  El JIT respeta
+        // la calling convention VM_ABI: lee args de proc->registers.regs[1..N],
+        // escribe el resultado a proc->registers.regs[0], y NO toca la pila VM
+        // (su prologo/epilogo opera sobre el host stack via host push/pop).
+        //
+        // Por eso saltamos completo el push del ret_addr: tras el retorno del
+        // JIT, ponemos RIP en ret_addr y continuamos en interp.  La pila VM
+        // del proceso queda intacta, identica a un CALLVM-y-RET secuencial.
+        //
+        // Fast path coste cuando @c g_pc_jit_active == false: 1 load + 1 branch
+        // predicted-not-taken = ~1 ns.  Programs sin JIT no pagan overhead real.
+        if (jit::g_pc_jit_active) {
+            if (void *jit_fn = jit::lookup_jit_code_at_pc(addr)) {
+                jit::enter_jit(reinterpret_cast<jit::JitFn>(jit_fn),
+                               reinterpret_cast<vrt_proc *>(vm));
+                write_rip(vm, ret_addr);
+                return;
+            }
+        }
+
+        // D.5-callvm-trigger: si el JIT esta activo y no hay codigo
+        // compilado para este PC todavia, incrementar el counter del PC
+        // y maybe disparar el compile.  El check de threshold + lookup
+        // estan dentro de maybe_compile_callvm_target.  Fast path: si JIT
+        // off (threshold = UINT32_MAX), la funcion sale en O(1).  Si JIT
+        // on pero counter por debajo, ~30ns lock + increment.  Tras el
+        // compile exitoso, el siguiente CALLVM hace HIT en el pc-map y
+        // skipea el trigger por completo.
+        if (jit::g_jit_threshold != UINT32_MAX) {
+            jit::maybe_compile_callvm_target(vm, addr);
+            /* Re-check del pc-map tras el trigger: si justo cruzo el
+             * threshold Y la compilacion tuvo exito, podemos dispatchar
+             * a JIT en ESTA misma invocacion en lugar de esperar a la
+             * siguiente -- elimina la latencia de 1 invocacion. */
+            if (void *jit_fn = jit::lookup_jit_code_at_pc(addr)) {
+                jit::enter_jit(reinterpret_cast<jit::JitFn>(jit_fn),
+                               reinterpret_cast<vrt_proc *>(vm));
+                write_rip(vm, ret_addr);
+                return;
+            }
+        }
 
         // apilar la direccion de retorno para que RET pueda recuperarla
         const uint64_t new_rsp = vm->registers.stack_pointer.qword() - 8;
@@ -414,6 +473,10 @@ namespace runtime {
             if (frame->around_chain_owns && frame->around_chain != nullptr) {
                 delete[] frame->around_chain;
             }
+            // Sprint MMM-ext leak-fix: liberar host_allocas registrados
+            // en este frame antes de devolverlo al pool.  No-op si el
+            // frame no contiene ningun host_alloca.
+            host_alloca_release_all(vm, frame);
             // LR3: si el NEXT step es un AFTER_RETURNING (inject_r0_to_reg!=0),
             // copiar R0 actual (return value del current frame) al reg destino
             // del next.  Asi el advice ve el return value como su arg.
@@ -516,6 +579,29 @@ namespace runtime {
             ? read_special(vm, instr.data_instruction.reg_data.reg1)
             : read_reg64(vm, instr.data_instruction.reg_data.reg1);
         const uint64_t ret_addr = vm->registers.rip.raw() + instr.flags_info.size_instr; // PC de retorno
+
+        // D.5-callvm-hook: dispatch a JIT si el target tiene codigo nativo
+        // compilado.  Mismo razonamiento que exec_instr_callvm: la calling
+        // convention VM_ABI hace que el JIT lea args de proc->registers y
+        // escriba el resultado ahi, sin tocar la pila VM.
+        if (jit::g_pc_jit_active) {
+            if (void *jit_fn = jit::lookup_jit_code_at_pc(addr)) {
+                jit::enter_jit(reinterpret_cast<jit::JitFn>(jit_fn),
+                               reinterpret_cast<vrt_proc *>(vm));
+                write_rip(vm, ret_addr);
+                return;
+            }
+        }
+        // D.5-callvm-trigger (mismo razonamiento que en exec_instr_callvm).
+        if (jit::g_jit_threshold != UINT32_MAX) {
+            jit::maybe_compile_callvm_target(vm, addr);
+            if (void *jit_fn = jit::lookup_jit_code_at_pc(addr)) {
+                jit::enter_jit(reinterpret_cast<jit::JitFn>(jit_fn),
+                               reinterpret_cast<vrt_proc *>(vm));
+                write_rip(vm, ret_addr);
+                return;
+            }
+        }
 
         // apilar la direccion de retorno (page-cache fast path)
         const uint64_t new_rsp = vm->registers.stack_pointer.qword() - 8;

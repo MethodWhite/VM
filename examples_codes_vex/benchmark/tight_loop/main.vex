@@ -1,0 +1,13 @@
+// Bench: tight loop aritmetico simple.
+// Workload: 50M iteraciones de suma acumulada.
+// Mide throughput basico de int ops + branch.
+
+i32 main() {
+    i64 acc = 0;
+    i32 i = 0;
+    while (i < 50000000) {
+        acc = acc + (i64) i;
+        i = i + 1;
+    }
+    return (i32) (acc & 0xFFFFFFFF);
+}

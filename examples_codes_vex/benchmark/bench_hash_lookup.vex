@@ -1,0 +1,24 @@
+// Bench: hash lookup simulado (mix de xor + shift + mod).
+// Simula el hot path de una hash table: hash + probe.  Sin alloc
+// dinamico, todo en stack + arithmetica.  Mide el coste puro de int
+// ops con dependencia de datos (cada iter lee del resultado anterior).
+//
+// Workload: 50M iters con 6 int ops + 1 branch = 350M ops totales.
+
+i32 main() {
+    u64 seed = 0xCAFEBABE_DEADBEEF;
+    u64 acc = 0;
+    i32 i = 0;
+    while (i < 50000000) {
+        // FNV-1a step inline (xor + mul) + shift + and.
+        seed = seed ^ (u64) i;
+        seed = seed * 1099511628211;  // FNV prime
+        seed = seed >> 7;
+        seed = seed | 1;  // ensure odd
+        if ((seed & 7) == 0) {
+            acc = acc + 1;
+        }
+        i = i + 1;
+    }
+    return (i32) acc;
+}

@@ -353,6 +353,9 @@ namespace Assembly::Bytecode {
          */
         {"mvtake",     {{0x00, 0x72, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
 
+        /* --- Sprint MMM-ext leak-fix: htrack r_ptr (FIXED_4, REG, 1 operando) --- */
+        {"htrack",     {{0x00, 0x7E, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_one_reg}}},
+
         /* --- Phase Z: memoria compartida cross-process (0xA6-0xAD) ---
          *  Stubs registrados para que el assembler acepte estos mnemonicos
          *  emitidos por el lowering Phase Z.  El runtime ejecuta versiones
@@ -462,6 +465,22 @@ namespace Assembly::Bytecode {
         {"fcvt.ps",  {{0x00, 0xF9, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_fcvt}}},
         {"fextend",  {{0x00, 0x5C, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
         {"fnarrow",  {{0x00, 0x5D, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
+        /* Sprint string-perf-5: FP ops escalares nativas en interp. */
+        {"fmin",      {{0x00, 0x80, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
+        {"fmin.ps",   {{0x00, 0x80, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
+        {"fmax",      {{0x00, 0x81, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
+        {"fmax.ps",   {{0x00, 0x81, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
+        {"ffloor",    {{0x00, 0x82, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
+        {"ffloor.ps", {{0x00, 0x82, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
+        {"fceil",     {{0x00, 0x83, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
+        {"fceil.ps",  {{0x00, 0x83, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
+        {"fround",    {{0x00, 0x84, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
+        {"fround.ps", {{0x00, 0x84, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
+        {"ftrunc",    {{0x00, 0x85, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
+        {"ftrunc.ps", {{0x00, 0x85, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_freg}}},
+        /* Sprint string-perf-5: bitcast GP<->ZMM directo (sin memoria). */
+        {"bitg2z",    {{0x00, 0x86, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_bitcast_zg}}},
+        {"bitz2g",    {{0x00, 0x87, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_bitcast_zg}}},
         {"fmowi",    {{0x00, 0xFA, InstrSizeMode::FIXED_11, AddressingMode::INMED, emit_instr_fmowi}}},
         {"fload",    {{0x00, 0xFB, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_fmem}}},
         {"fstore",   {{0x00, 0xFC, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_fmem}}},

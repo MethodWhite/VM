@@ -46,6 +46,8 @@
 #include "gc/raw_allocator.h"
 
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 
 namespace gc {
@@ -70,6 +72,52 @@ namespace gc {
         // de malloc en C99 cuando size==0.
         if (size == 0) return 0;
 
+        // ===== Slab fast path (Sprint mem-loop-fix 2026-06-02) =====
+        // Para bloques pequenos (<= 1024 bytes), usar el slab allocator
+        // para evitar el syscall VirtualAlloc/mmap por alloc.  Bench
+        // mem_malloc_free (5M iter de malloc(96)+free) pasaba de 20s
+        // a ~50-100ms con esto.
+        // Env var @c VESTA_NO_SLAB=1 desactiva el slab (fallback a
+        // VirtualAlloc/mmap por alloc).  Util para diagnosticar
+        // regresiones del slab vs el path tradicional.
+        // Sprint mem-perf (2026-06-02): cachear el env var VESTA_NO_SLAB
+        // para evitar @c getenv en el hot path (es 100-300 ns por
+        // llamada, mayor que el coste de un alloc del slab).
+        if (slab_env_cache_ == 0) {
+            slab_env_cache_ = (std::getenv("VESTA_NO_SLAB") != nullptr) ? 2u : 1u;
+        }
+        const size_t class_idx = (slab_env_cache_ == 2u) ? SIZE_MAX
+                                                         : slab_class_for(size);
+        if (class_idx != SIZE_MAX) {
+            // Asegurar que hay slots libres en este class; grow si no.
+            if (slab_free_list_[class_idx] == nullptr) {
+                if (!slab_grow_class(class_idx)) {
+                    // Slab grow fallo (OOM o size >SLAB_CHUNK_BYTES).
+                    // Caer al path tradicional como fallback.
+                    goto fallback_vm_alloc;
+                }
+            }
+            // Pop del free list LIFO.
+            SlabFreeNode *node = slab_free_list_[class_idx];
+            slab_free_list_[class_idx] = node->next;
+            // Zero-init del payload (consistente con alloc tradicional).
+            std::memset(node, 0, SLAB_SIZES[class_idx]);
+            const uint64_t payload_ptr = reinterpret_cast<uint64_t>(node);
+            // Sprint mem-perf: NO map insert.  El class_idx se localiza
+            // en @c free via binary search sobre @c slab_chunks_sorted_.
+            // Stats.
+            const size_t slab_size = SLAB_SIZES[class_idx];
+            total_bytes_ += slab_size;
+            stats_.alloc_count++;
+            stats_.alloc_bytes += slab_size;
+            if (total_bytes_ > stats_.peak_bytes) {
+                stats_.peak_bytes = total_bytes_;
+            }
+            return payload_ptr;
+        }
+
+    fallback_vm_alloc:
+        // ===== Slow path: VirtualAlloc/mmap para bloques grandes =====
         // Reservar memoria contigua con permisos READ|WRITE (sin EXEC: la
         // memoria raw es para datos, no para codigo).  La capa @c vm::
         // selecciona @c VirtualAlloc (Win32) o @c mmap (POSIX) segun
@@ -127,6 +175,36 @@ namespace gc {
      * es no-op" se preserva.
      */
     bool RawAllocator::free(uint64_t ptr) {
+        // ===== Slab fast path (Sprint mem-perf 2026-06-02) =====
+        // Si ptr cae en algun chunk del slab, push al free list.
+        // Lookup via binary search sobre @c slab_chunks_sorted_ (O(log N)).
+        // Reemplaza el @c slab_payload_to_class_ unordered_map (~150 ns)
+        // por ~30 ns binary search en N_chunks tipicamente 1-100.
+        if (!slab_chunks_sorted_.empty() && ptr != 0) {
+            // upper_bound: primer chunk con base > ptr.  El candidato es
+            // el anterior (si existe), que tiene base <= ptr.
+            auto it = std::upper_bound(
+                slab_chunks_sorted_.begin(), slab_chunks_sorted_.end(), ptr,
+                [](uint64_t p, const SlabChunkInfo &c) { return p < c.base; });
+            if (it != slab_chunks_sorted_.begin()) {
+                --it;
+                if (ptr >= it->base && ptr < it->end) {
+                    const uint8_t class_idx = it->class_idx;
+                    // Push al free list: el slot mismo guarda el next ptr.
+                    SlabFreeNode *node = reinterpret_cast<SlabFreeNode *>(ptr);
+                    node->next = slab_free_list_[class_idx];
+                    slab_free_list_[class_idx] = node;
+                    // Stats.
+                    const size_t slab_size = SLAB_SIZES[class_idx];
+                    stats_.free_count++;
+                    stats_.freed_bytes += slab_size;
+                    total_bytes_ -= slab_size;
+                    return true;
+                }
+            }
+        }
+
+        // ===== Slow path: bloques de allocations_ tradicional =====
         // Lookup en la tabla.  Si ptr no esta registrado (puede ser 0,
         // puntero foraneo, o doble-free), no hacemos nada y devolvemos
         // false para que el caller sepa.  Mas seguro que llamar a
@@ -255,7 +333,77 @@ namespace gc {
         // descartar la tabla de tracking.  Si pasara al reves dejariamos
         // los bloques alocados sin tracking y serian un leak real.
         allocations_.clear();
+        // Sprint mem-loop-fix: tambien liberar todos los chunks del slab.
+        slab_free_all();
         total_bytes_ = 0;
+    }
+
+    // =========================================================================
+    // Slab allocator (Sprint mem-loop-fix 2026-06-02)
+    // =========================================================================
+
+    /**
+     * @brief Aloca un chunk del SO + trocea + thread al free list.
+     *
+     * Llamado por @c alloc cuando el free list del size class esta
+     * vacio.  Pide un chunk grande (SLAB_CHUNK_BYTES = 64 KB) al SO
+     * y lo divide en N slots del tamano del class.  Cada slot incluye
+     * un @c SlabSlotHeader de 8 bytes con el class_idx, asi @c free
+     * sabe a que free list devolverlo sin lookup en el mapa.
+     *
+     * Coste: 1 syscall VirtualAlloc/mmap amortizado sobre 64 KB / size
+     * slots = N slots por chunk.  Para size=128, 64K/128 = 512 slots
+     * por syscall.
+     */
+    bool RawAllocator::slab_grow_class(size_t class_idx) {
+        if (class_idx >= SLAB_CLASSES) return false;
+        const size_t slot_size = SLAB_SIZES[class_idx];
+        if (slot_size > SLAB_CHUNK_BYTES) return false;
+        // Reservar un chunk del SO.  El chunk completo se contabiliza
+        // en slab_chunks_ para liberarlo en @c slab_free_all.
+        void *chunk = vm::allocate_memory(
+            SLAB_CHUNK_BYTES,
+            vm::MemPerm::READ | vm::MemPerm::WRITE);
+        if (!chunk) return false;
+        // Sprint mem-perf: insertar el chunk en @c slab_chunks_sorted_
+        // manteniendo el orden por base (binary insert).  Inserts son
+        // raros (~1 por cada N slots del mismo class consumidos), asi
+        // que el O(N_chunks) memmove es despreciable.
+        SlabChunkInfo info{};
+        info.base = reinterpret_cast<uint64_t>(chunk);
+        info.end  = info.base + SLAB_CHUNK_BYTES;
+        info.class_idx = static_cast<uint8_t>(class_idx);
+        auto pos = std::upper_bound(
+            slab_chunks_sorted_.begin(), slab_chunks_sorted_.end(), info.base,
+            [](uint64_t b, const SlabChunkInfo &c) { return b < c.base; });
+        slab_chunks_sorted_.insert(pos, info);
+        // Trocear el chunk en N slots y push cada uno al free list.
+        // Walk linear (los slots no necesitan estar en orden).
+        uint8_t *base = static_cast<uint8_t *>(chunk);
+        const size_t n_slots = SLAB_CHUNK_BYTES / slot_size;
+        for (size_t i = 0; i < n_slots; ++i) {
+            SlabFreeNode *node = reinterpret_cast<SlabFreeNode *>(
+                base + i * slot_size);
+            node->next = slab_free_list_[class_idx];
+            slab_free_list_[class_idx] = node;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Libera todos los chunks del slab.  Llamado por @c free_all
+     * (y por tanto por el destructor).  Tras esto, todos los punteros
+     * del slab quedan invalidos.
+     */
+    void RawAllocator::slab_free_all() {
+        for (const auto &c : slab_chunks_sorted_) {
+            vm::free_memory(reinterpret_cast<void *>(c.base),
+                            static_cast<size_t>(c.end - c.base));
+        }
+        slab_chunks_sorted_.clear();
+        for (size_t i = 0; i < SLAB_CLASSES; ++i) {
+            slab_free_list_[i] = nullptr;
+        }
     }
 
 } // namespace gc

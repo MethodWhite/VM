@@ -136,12 +136,25 @@ static std::string make_intern_key(const uint8_t *data, uint32_t byte_len, loade
  * @param capacity  Si > byte_len, reserva espacio adicional (para STRRESERVE).
  * @return          GcHandle del nuevo StringObject o GC_NULL_HANDLE.
  */
+/**
+ * @brief Sprint string-perf-2 (2026-06-02): @c alloc_flat extendido con
+ * hash precomputado opcional.
+ *
+ * Si @p precomputed_hash != 0, el caller ya lo calculo (single-pass en
+ * STRMAKE/STRCAT), evitamos una segunda pasada sobre los bytes.  El hash
+ * se almacena en @c s->str_hash (32-bit truncado del FNV-1a 64-bit).
+ *
+ * Si @p precomputed_hash == 0, computamos el hash via @c str_hash_compute
+ * para TODOS los strings (no solo cortos como antes).  Coste pequeno
+ * vs ahorro grande en STRCMP fast-reject.
+ */
 static gc::GcHandle alloc_flat(ProcessVM *vm,
                                 const uint8_t *src_data,
                                 uint32_t byte_len,
                                 uint32_t length,
                                 loader::StringEncoding enc,
-                                uint32_t capacity = 0)
+                                uint32_t capacity = 0,
+                                uint64_t precomputed_hash = 0)
 {
     uint32_t buf_size = (capacity > byte_len) ? capacity : byte_len; // usar el mayor
     size_t total = sizeof(loader::StringObject) + buf_size + 1;      // +1 para nulo Win32
@@ -151,34 +164,48 @@ static gc::GcHandle alloc_flat(ProcessVM *vm,
     // traves de calls que pueden disparar GC.  Si el StringObject estuviera
     // en young y se evacuara, el host_ptr quedaria dangling.
     gc::GcHandle h = vm->gc_heap.alloc_pinned(total);
-    if (h == gc::GC_NULL_HANDLE) return gc::GC_NULL_HANDLE;
+    if (__builtin_expect(h == gc::GC_NULL_HANDLE, 0)) return gc::GC_NULL_HANDLE;
 
     uint8_t *payload = vm->gc_heap.deref(h);
-    if (!payload) return gc::GC_NULL_HANDLE;
+    if (__builtin_expect(!payload, 0)) return gc::GC_NULL_HANDLE;
 
     auto *s = reinterpret_cast<loader::StringObject *>(payload);
 
-    // inicializar cabecera ObjectHeader
+    // inicializar cabecera ObjectHeader (todos los campos en una pasada)
     s->header.class_ptr  = nullptr;
     s->header.flags      = loader::OBJ_FLAG_GC_OWNED;
     s->header.hash_code  = static_cast<uint32_t>(h);
-    // monitor_word empaqueta owner + lock_depth; cero = unlocked.
     s->header.monitor_word.store(0, std::memory_order_relaxed);
 
     s->encoding = static_cast<uint8_t>(enc);
     s->kind     = static_cast<uint8_t>(loader::StringKind::FLAT);
     s->_pad[0]  = s->_pad[1] = 0;
     s->length   = length;
-    s->byte_len = byte_len; // byte_len es el contenido logico, no la capacidad total
-    s->str_hash = 0;        // hash calculado bajo demanda
+    s->byte_len = byte_len;
+    // Sprint string-perf-3 fix: precomputed_hash YA es FNV-1a 32-bit
+    // puro (mismo algoritmo que str_hash_compute fallback).  Solo
+    // truncar y proteger contra 0 sentinel.  Garantiza que dos strings
+    // con mismos bytes tienen el MISMO str_hash sin importar el path
+    // (fast STRMAKE vs slow STRMAKE vs STRCAT FLAT-FLAT).
+    if (precomputed_hash != 0) {
+        s->str_hash = static_cast<uint32_t>(precomputed_hash & 0xFFFFFFFFu);
+        if (s->str_hash == 0) s->str_hash = 1;
+    } else {
+        s->str_hash = 0;
+    }
 
     uint8_t *dst = loader::str_data(s);
     if (src_data && byte_len > 0) std::memcpy(dst, src_data, byte_len);
     dst[byte_len] = 0; // terminador nulo siempre presente
 
-    // calcular hash inmediatamente para strings cortos (optimizacion de rendimiento)
-    if (byte_len > 0 && byte_len <= loader::STR_INTERN_THRESHOLD)
+    // Sprint string-perf-2: precomputar hash para TODOS los strings
+    // (antes solo <= INTERN_THRESHOLD).  Coste lineal en byte_len (~1ns/byte)
+    // pero permite STRCMP fast-reject sin recomputar.  Para strings de
+    // 64 bytes son ~64 ns adicionales en alloc -- ampliamente amortizados
+    // si hay >=1 STRCMP posterior (que skipea memcmp completo via hash).
+    if (s->str_hash == 0 && byte_len > 0) {
         loader::str_hash_compute(s);
+    }
 
     return h;
 }
@@ -523,26 +550,95 @@ static uint32_t count_codepoints(const uint8_t *data, uint32_t byte_len,
 // =========================================================================
 
 /**
- * @brief Ejecuta STRMAKE: crea un StringObject FLAT desde un buffer de VM.
- *
- * Aplica compactacion de codificacion automatica (HotSpot Compact Strings).
- * Interna el string automaticamente si byte_len <= STR_INTERN_THRESHOLD.
+ * @brief Helper compartido: STRMAKE desde memoria VM.  Usado por
+ * @c exec_instr_strmake (interp) y @c vrt_str_make (JIT).  Fast path con
+ * stack buf + FNV-1a 64-bit + intern lookup-first.
  */
-void exec_instr_strmake(ProcessVM *vm, const DecodedInstr &instr) {
-    const uint8_t r_dst = (instr.data_instruction.reg_data.reg1 >> 4) & 0xF;
-    const uint8_t r_src =  instr.data_instruction.reg_data.reg1       & 0xF;
-    const uint8_t r_len = (instr.data_instruction.reg_data.reg2 >> 4) & 0xF; // nibble alto (emit_instr_three_reg)
+gc::GcHandle make_string_from_vm_mem(ProcessVM *vm,
+                                      uint64_t vm_addr,
+                                      uint32_t byte_len) noexcept {
+    constexpr uint32_t SMALL_LIMIT = 256;
+    if (byte_len <= SMALL_LIMIT) {
+        uint8_t stack_buf[SMALL_LIMIT];
+        if (byte_len > 0) {
+            vm->vm_mem.read_bytes(vm_addr, stack_buf, byte_len);
+        }
+        // Single-pass FNV-1a 64-bit (mismo algoritmo que str_hash_compute).
+        // En x86-64 multiplica con un solo IMUL (~3 ciclos).
+        bool all_ascii = true;
+        uint32_t cp_count = 0;
+        uint64_t fnv64 = 1469598103934665603ULL;
+        for (uint32_t i = 0; i < byte_len; ) {
+            uint8_t b = stack_buf[i];
+            fnv64 ^= b;
+            fnv64 *= 1099511628211ULL;
+            if ((b & 0x80) == 0) { ++cp_count; i += 1; }
+            else {
+                all_ascii = false;
+                if      ((b & 0xE0) == 0xC0) { ++cp_count; i += 2; }
+                else if ((b & 0xF0) == 0xE0) { ++cp_count; i += 3; }
+                else                         { ++cp_count; i += 4; }
+            }
+        }
+        const auto final_enc = all_ascii
+            ? loader::StringEncoding::ASCII
+            : loader::StringEncoding::UTF8;
+        // str_hash := low 32 bits of fnv64 (paridad con str_hash_compute).
+        // cache key := fnv64 con encoding mixed (distinto enc no colisiona).
+        const uint32_t str_hash32 = static_cast<uint32_t>(fnv64 & 0xFFFFFFFFu);
+        uint64_t fnv = fnv64;
+        fnv ^= static_cast<uint8_t>(final_enc);
+        fnv *= 1099511628211ULL;
 
-    uint64_t vm_addr  = vm->registers.regs[r_src].qword();
-    uint32_t byte_len = static_cast<uint32_t>(vm->registers.regs[r_len].qword());
-    auto enc = loader::StringEncoding::UTF8; // entrada asumida UTF-8; try_compact ajusta si es ASCII
+        // Sprint string-perf: intern lookup ANTES de alloc.  Si hit y
+        // bytes matchean, evitamos TODO el alloc + memset + intern map
+        // insert.  Para strings literales en hot paths este es el caso
+        // mas comun (95%+ de STRMAKEs).
+        if (byte_len > 0 && byte_len <= loader::STR_INTERN_THRESHOLD) {
+            StringInternPool &pool = get_intern_pool(vm);
+            gc::GcHandle cached = pool.lookup_by_hash(fnv);
+            if (cached != gc::GC_NULL_HANDLE) {
+                uint8_t *cp = vm->gc_heap.deref(cached);
+                if (cp) {
+                    auto *cs = reinterpret_cast<loader::StringObject *>(cp);
+                    if (cs->byte_len == byte_len
+                     && cs->encoding == static_cast<uint8_t>(final_enc)
+                     && std::memcmp(loader::str_data(cs), stack_buf, byte_len) == 0) {
+                        // Cache hit + bytes match: cero alloc, retorno directo.
+                        return cached;
+                    }
+                }
+            }
+        }
 
-    // leer bytes desde la memoria VM al host
+        gc::GcHandle h = alloc_flat(vm, stack_buf, byte_len, cp_count,
+                                    final_enc, /*capacity=*/0,
+                                    /*precomputed_hash=*/static_cast<uint64_t>(str_hash32));
+        if (__builtin_expect(h == gc::GC_NULL_HANDLE, 0)) {
+            return gc::GC_NULL_HANDLE;
+        }
+        if (byte_len > 0 && byte_len <= loader::STR_INTERN_THRESHOLD) {
+            // Sprint string-perf-3 bug fix (2026-06-02): pinear el handle
+            // como root externo del GC.  Sin esto, el intern hash cache
+            // retiene un GcHandle al StringObject pero el GC no sabe que
+            // hay una referencia activa.  Tras un major_gc, el handle
+            // puede ser liberado/reusado y la proxima lookup_by_hash
+            // devuelve un handle stale -> bytes equivocados -> JIT
+            // diverge en bench string_workout a partir de ~110K iter.
+            // gc_addref es O(1); incrementa external_refs_ que el GC
+            // marca como root durante el mark phase.
+            get_intern_pool(vm).insert_by_hash(fnv, h);
+            vm->gc_heap.gc_addref(h);
+        }
+        h = auto_intern(vm, h, stack_buf, byte_len, final_enc);
+        return h;
+    }
+
+    // Slow path: strings grandes (> 256 B) usan heap buf + path generico.
+    auto enc = loader::StringEncoding::UTF8;
     std::vector<uint8_t> buf(byte_len);
-    for (uint32_t i = 0; i < byte_len; ++i)
-        buf[i] = vm->vm_mem.read_u8(vm_addr + i);
+    vm->vm_mem.read_bytes(vm_addr, buf.data(), byte_len);
 
-    // intentar compactacion de codificacion (HotSpot-style)
     loader::StringEncoding final_enc = enc;
     std::vector<uint8_t>   compact_buf;
     uint32_t compact_len = byte_len;
@@ -554,11 +650,28 @@ void exec_instr_strmake(ProcessVM *vm, const DecodedInstr &instr) {
 
     gc::GcHandle h = alloc_flat(vm, final_data, final_byte_len, length, final_enc);
     if (h == gc::GC_NULL_HANDLE) {
-        vm->registers.regs[r_dst].qword(static_cast<uint64_t>(gc::GC_NULL_HANDLE));
-        return;
+        return gc::GC_NULL_HANDLE;
     }
 
-    h = auto_intern(vm, h, final_data, final_byte_len, final_enc); // internado automatico
+    h = auto_intern(vm, h, final_data, final_byte_len, final_enc);
+    return h;
+}
+
+/**
+ * @brief Ejecuta STRMAKE: crea un StringObject FLAT desde un buffer de VM.
+ *
+ * Aplica compactacion de codificacion automatica (HotSpot Compact Strings).
+ * Interna el string automaticamente si byte_len <= STR_INTERN_THRESHOLD.
+ */
+void exec_instr_strmake(ProcessVM *vm, const DecodedInstr &instr) {
+    const uint8_t r_dst = (instr.data_instruction.reg_data.reg1 >> 4) & 0xF;
+    const uint8_t r_src =  instr.data_instruction.reg_data.reg1       & 0xF;
+    const uint8_t r_len = (instr.data_instruction.reg_data.reg2 >> 4) & 0xF;
+
+    uint64_t vm_addr  = vm->registers.regs[r_src].qword();
+    uint32_t byte_len = static_cast<uint32_t>(vm->registers.regs[r_len].qword());
+
+    gc::GcHandle h = make_string_from_vm_mem(vm, vm_addr, byte_len);
     vm->registers.regs[r_dst].qword(static_cast<uint64_t>(h));
 }
 
@@ -584,33 +697,62 @@ void exec_instr_strmake_h(ProcessVM *vm, const DecodedInstr &instr) {
 
     uint64_t host_addr = vm->registers.regs[r_src].qword();
     uint32_t byte_len  = static_cast<uint32_t>(vm->registers.regs[r_len].qword());
-    auto enc = loader::StringEncoding::UTF8;
-
-    // leer bytes desde memoria HOST (puntero crudo).  El usuario es responsable
-    // de garantizar que [host_addr, host_addr+byte_len) sea memoria valida y
-    // accesible; si no lo es, el deref disparara un AV capturable via try/catch
-    // (FATAL_SEGMENTATION_FAULT en la instalacion del VEH/sigaction).
-    std::vector<uint8_t> buf(byte_len);
     const uint8_t *src = reinterpret_cast<const uint8_t *>(host_addr);
-    for (uint32_t i = 0; i < byte_len; ++i)
-        buf[i] = src[i];
 
-    loader::StringEncoding final_enc = enc;
-    std::vector<uint8_t>   compact_buf;
-    uint32_t compact_len = byte_len;
-    bool compacted = try_compact(buf.data(), byte_len, enc, final_enc, compact_buf, compact_len);
-    const uint8_t *final_data = compacted ? compact_buf.data() : buf.data();
-    uint32_t final_byte_len   = compacted ? compact_len         : byte_len;
+    // Sprint string-perf-3: FNV-1a 64-bit consistente con todos los paths.
+    bool all_ascii = true;
+    uint32_t cp_count = 0;
+    uint64_t fnv64 = 1469598103934665603ULL;
+    for (uint32_t i = 0; i < byte_len; ) {
+        uint8_t b = src[i];
+        fnv64 ^= b;
+        fnv64 *= 1099511628211ULL;
+        if ((b & 0x80) == 0) { ++cp_count; i += 1; }
+        else {
+            all_ascii = false;
+            if      ((b & 0xE0) == 0xC0) { ++cp_count; i += 2; }
+            else if ((b & 0xF0) == 0xE0) { ++cp_count; i += 3; }
+            else                         { ++cp_count; i += 4; }
+        }
+    }
+    const auto final_enc = all_ascii
+        ? loader::StringEncoding::ASCII
+        : loader::StringEncoding::UTF8;
+    const uint32_t str_hash32 = static_cast<uint32_t>(fnv64 & 0xFFFFFFFFu);
+    uint64_t fnv = fnv64;
+    fnv ^= static_cast<uint8_t>(final_enc);
+    fnv *= 1099511628211ULL;
 
-    uint32_t length = count_codepoints(final_data, final_byte_len, final_enc);
+    // Intern lookup-first (idem STRMAKE).
+    if (byte_len > 0 && byte_len <= loader::STR_INTERN_THRESHOLD) {
+        StringInternPool &pool = get_intern_pool(vm);
+        gc::GcHandle cached = pool.lookup_by_hash(fnv);
+        if (cached != gc::GC_NULL_HANDLE) {
+            uint8_t *cp = vm->gc_heap.deref(cached);
+            if (cp) {
+                auto *cs = reinterpret_cast<loader::StringObject *>(cp);
+                if (cs->byte_len == byte_len
+                 && cs->encoding == static_cast<uint8_t>(final_enc)
+                 && std::memcmp(loader::str_data(cs), src, byte_len) == 0) {
+                    vm->registers.regs[r_dst].qword(static_cast<uint64_t>(cached));
+                    return;
+                }
+            }
+        }
+    }
 
-    gc::GcHandle h = alloc_flat(vm, final_data, final_byte_len, length, final_enc);
-    if (h == gc::GC_NULL_HANDLE) {
+    gc::GcHandle h = alloc_flat(vm, src, byte_len, cp_count, final_enc,
+                                 /*capacity=*/0,
+                                 /*precomputed_hash=*/static_cast<uint64_t>(str_hash32));
+    if (__builtin_expect(h == gc::GC_NULL_HANDLE, 0)) {
         vm->registers.regs[r_dst].qword(static_cast<uint64_t>(gc::GC_NULL_HANDLE));
         return;
     }
-
-    h = auto_intern(vm, h, final_data, final_byte_len, final_enc);
+    if (byte_len > 0 && byte_len <= loader::STR_INTERN_THRESHOLD) {
+        get_intern_pool(vm).insert_by_hash(fnv, h);
+        vm->gc_heap.gc_addref(h);  // pin como GC root (idem fix STRMAKE)
+    }
+    h = auto_intern(vm, h, src, byte_len, final_enc);
     vm->registers.regs[r_dst].qword(static_cast<uint64_t>(h));
 }
 
@@ -679,7 +821,65 @@ void exec_instr_strcat(ProcessVM *vm, const DecodedInstr &instr) {
 
     gc::GcHandle result;
 
-    if (new_depth > loader::STR_ROPE_MAX_DEPTH) {
+    // Sprint string-perf (2026-06-02): fast path FLAT-FLAT pequeno.
+    // Si ambos operandos son FLAT, encoding compatible, y el resultado
+    // total cabe en stack buffer (<= 256 B), materializar directamente
+    // a FLAT en lugar de crear un nodo ROPE.  Beneficios:
+    //   - 1 sola alloc (vs 1 ROPE + posterior flatten en STRLEN/STRCMP).
+    //   - El subsiguiente STRCMP/STRLEN no necesita flatten_string.
+    //   - Hash precomputable en alloc_flat para strings cortos.
+    // Para strings grandes o ROPE recursivos, mantener el ROPE perezoso.
+    constexpr uint32_t SMALL_CONCAT_LIMIT = 256;
+    if (loader::str_kind(sa) == loader::StringKind::FLAT
+     && loader::str_kind(sb) == loader::StringKind::FLAT
+     && loader::str_encoding(sa) == loader::str_encoding(sb)
+     && total_byte_len <= SMALL_CONCAT_LIMIT) {
+        uint8_t stack_buf[SMALL_CONCAT_LIMIT];
+        std::memcpy(stack_buf, loader::str_data(sa), sa->byte_len);
+        std::memcpy(stack_buf + sa->byte_len, loader::str_data(sb), sb->byte_len);
+
+        // Sprint string-perf-3: FNV-1a 64-bit identico a str_hash_compute
+        // y a STRMAKE.  str_hash = low 32 bits; cache key = full 64 + enc mix.
+        uint64_t fnv64 = 1469598103934665603ULL;
+        for (uint32_t i = 0; i < total_byte_len; ++i) {
+            fnv64 ^= stack_buf[i];
+            fnv64 *= 1099511628211ULL;
+        }
+        const uint32_t str_hash32 = static_cast<uint32_t>(fnv64 & 0xFFFFFFFFu);
+        uint64_t fnv = fnv64;
+        fnv ^= static_cast<uint8_t>(enc);
+        fnv *= 1099511628211ULL;
+
+        if (total_byte_len <= loader::STR_INTERN_THRESHOLD) {
+            StringInternPool &pool = get_intern_pool(vm);
+            gc::GcHandle cached = pool.lookup_by_hash(fnv);
+            if (cached != gc::GC_NULL_HANDLE) {
+                uint8_t *cp = vm->gc_heap.deref(cached);
+                if (cp) {
+                    auto *cs = reinterpret_cast<loader::StringObject *>(cp);
+                    if (cs->byte_len == total_byte_len
+                     && cs->encoding == static_cast<uint8_t>(enc)
+                     && std::memcmp(loader::str_data(cs), stack_buf, total_byte_len) == 0) {
+                        vm->registers.regs[r_dst].qword(static_cast<uint64_t>(cached));
+                        return;
+                    }
+                }
+            }
+        }
+
+        result = alloc_flat(vm, stack_buf, total_byte_len, total_len, enc,
+                             /*capacity=*/0,
+                             /*precomputed_hash=*/static_cast<uint64_t>(str_hash32));
+        if (__builtin_expect(result == gc::GC_NULL_HANDLE, 0)) {
+            vm->registers.regs[r_dst].qword(static_cast<uint64_t>(gc::GC_NULL_HANDLE));
+            return;
+        }
+        if (total_byte_len > 0 && total_byte_len <= loader::STR_INTERN_THRESHOLD) {
+            get_intern_pool(vm).insert_by_hash(fnv, result);
+            vm->gc_heap.gc_addref(result);  // pin como GC root
+        }
+        result = auto_intern(vm, result, stack_buf, total_byte_len, enc);
+    } else if (new_depth > loader::STR_ROPE_MAX_DEPTH) {
         // arbol demasiado profundo: materializar de inmediato
         gc::GcHandle fa = flatten_string(vm, ha);
         gc::GcHandle fb = flatten_string(vm, hb);
@@ -697,7 +897,7 @@ void exec_instr_strcat(ProcessVM *vm, const DecodedInstr &instr) {
         result = alloc_flat(vm, buf.data(), static_cast<uint32_t>(buf.size()), total_len, enc);
         result = auto_intern(vm, result, buf.data(), static_cast<uint32_t>(buf.size()), enc);
     } else {
-        // crear nodo ROPE perezoso
+        // crear nodo ROPE perezoso (concat de ropes grandes)
         result = alloc_rope(vm, ha, hb, total_len, total_byte_len, enc, new_depth);
     }
 
@@ -718,10 +918,41 @@ void exec_instr_strcat(ProcessVM *vm, const DecodedInstr &instr) {
 void exec_instr_strcmp(ProcessVM *vm, const DecodedInstr &instr) {
     const uint8_t r_dst = (instr.data_instruction.reg_data.reg1 >> 4) & 0xF;
     const uint8_t r_a   =  instr.data_instruction.reg_data.reg1       & 0xF;
-    const uint8_t r_b   = (instr.data_instruction.reg_data.reg2 >> 4) & 0xF; // nibble alto (emit_instr_three_reg)
+    const uint8_t r_b   = (instr.data_instruction.reg_data.reg2 >> 4) & 0xF;
 
-    gc::GcHandle ha = flatten_string(vm, static_cast<gc::GcHandle>(vm->registers.regs[r_a].qword()));
-    gc::GcHandle hb = flatten_string(vm, static_cast<gc::GcHandle>(vm->registers.regs[r_b].qword()));
+    gc::GcHandle ha_in = static_cast<gc::GcHandle>(vm->registers.regs[r_a].qword());
+    gc::GcHandle hb_in = static_cast<gc::GcHandle>(vm->registers.regs[r_b].qword());
+
+    // Sprint string-perf (2026-06-02): fast path identity.  Si los
+    // handles son identicos (e.g. ambos son el mismo string internado),
+    // 0 sin flatten ni deref.  Cubre el patron `if (s == s)` y los
+    // strings hoisted por LICM comparados consigo mismos.
+    if (ha_in == hb_in && ha_in != gc::GC_NULL_HANDLE) {
+        vm->registers.regs[r_dst].qword(0);
+        vm->registers.flags.bits.ZF = 1;
+        vm->registers.flags.bits.SF = 0;
+        return;
+    }
+
+    // Fast path: skip flatten_string si ambos ya son FLAT.  flatten_string
+    // hace deref + chequea kind; si es FLAT retorna el mismo handle.  Para
+    // strings creados via STRMAKE o STRCAT fast-path-flat, esto evita la
+    // funcion call extra.
+    uint8_t *pa_raw = vm->gc_heap.deref(ha_in);
+    uint8_t *pb_raw = vm->gc_heap.deref(hb_in);
+    gc::GcHandle ha, hb;
+    if (pa_raw && reinterpret_cast<loader::StringObject *>(pa_raw)->kind
+                  == static_cast<uint8_t>(loader::StringKind::FLAT)) {
+        ha = ha_in;
+    } else {
+        ha = flatten_string(vm, ha_in);
+    }
+    if (pb_raw && reinterpret_cast<loader::StringObject *>(pb_raw)->kind
+                  == static_cast<uint8_t>(loader::StringKind::FLAT)) {
+        hb = hb_in;
+    } else {
+        hb = flatten_string(vm, hb_in);
+    }
 
     uint8_t *pa = vm->gc_heap.deref(ha);
     uint8_t *pb = vm->gc_heap.deref(hb);
@@ -1271,6 +1502,115 @@ gc::GcHandle make_string_flat(ProcessVM *vm,
     const uint32_t effective_length =
         (length == UINT32_MAX) ? byte_len : length;
     return alloc_flat(vm, data, byte_len, effective_length, enc);
+}
+
+/* =========================================================================
+ * Sprint JIT-cobertura (2026-06-01): exposicion publica de helpers
+ * internos de strings para que los wrappers vrt_str_* (en
+ * src/vesta_rt/public_wrapper.cpp) puedan delegar sin necesidad de
+ * construir DecodedInstr falsos.
+ *
+ * Las funciones publicas son thin wrappers sobre las helpers static
+ * `flatten_string` y `alloc_rope` ya implementadas arriba.
+ * =========================================================================
+ */
+gc::GcHandle flatten_string_public(ProcessVM *vm, gc::GcHandle h) noexcept {
+    if (!vm || h == gc::GC_NULL_HANDLE) return gc::GC_NULL_HANDLE;
+    return flatten_string(vm, h);
+}
+
+gc::GcHandle strcat_public(ProcessVM *vm,
+                            gc::GcHandle a,
+                            gc::GcHandle b) noexcept {
+    if (!vm) return gc::GC_NULL_HANDLE;
+    uint8_t *pa = vm->gc_heap.deref(a);
+    uint8_t *pb = vm->gc_heap.deref(b);
+    if (!pa || !pb) return gc::GC_NULL_HANDLE;
+    auto *sa = reinterpret_cast<loader::StringObject *>(pa);
+    auto *sb = reinterpret_cast<loader::StringObject *>(pb);
+    if (sa->byte_len == 0) return b;
+    if (sb->byte_len == 0) return a;
+    const uint32_t total_len = sa->length + sb->length;
+    const uint32_t total_bytes = sa->byte_len + sb->byte_len;
+    const auto enc = (sa->encoding == static_cast<uint8_t>(loader::StringEncoding::ASCII)
+                   && sb->encoding == static_cast<uint8_t>(loader::StringEncoding::ASCII))
+        ? loader::StringEncoding::ASCII : loader::StringEncoding::UTF8;
+
+    // Sprint string-perf-3 bug fix (2026-06-02): mismo fast path FLAT-FLAT
+    // que exec_instr_strcat.  Sin esto el JIT (via vrt_str_cat ->
+    // strcat_public) creaba siempre ROPE -> str_hash compute diferente que
+    // STRMAKE -> str_equals(c, pat) daba falso negativo aleatorio.  Ahora
+    // ambos paths producen FLAT identico cuando son operands son FLAT
+    // pequenos, y el intern hash cache los unifica al canonical handle.
+    constexpr uint32_t SMALL_CONCAT_LIMIT = 256;
+    if (loader::str_kind(sa) == loader::StringKind::FLAT
+     && loader::str_kind(sb) == loader::StringKind::FLAT
+     && loader::str_encoding(sa) == loader::str_encoding(sb)
+     && total_bytes <= SMALL_CONCAT_LIMIT) {
+        uint8_t stack_buf[SMALL_CONCAT_LIMIT];
+        std::memcpy(stack_buf, loader::str_data(sa), sa->byte_len);
+        std::memcpy(stack_buf + sa->byte_len, loader::str_data(sb), sb->byte_len);
+
+        uint64_t fnv64 = 1469598103934665603ULL;
+        for (uint32_t i = 0; i < total_bytes; ++i) {
+            fnv64 ^= stack_buf[i];
+            fnv64 *= 1099511628211ULL;
+        }
+        const uint32_t str_hash32 = static_cast<uint32_t>(fnv64 & 0xFFFFFFFFu);
+        uint64_t fnv = fnv64;
+        fnv ^= static_cast<uint8_t>(enc);
+        fnv *= 1099511628211ULL;
+
+        if (total_bytes <= loader::STR_INTERN_THRESHOLD) {
+            StringInternPool &pool = get_intern_pool(vm);
+            gc::GcHandle cached = pool.lookup_by_hash(fnv);
+            if (cached != gc::GC_NULL_HANDLE) {
+                uint8_t *cp = vm->gc_heap.deref(cached);
+                if (cp) {
+                    auto *cs = reinterpret_cast<loader::StringObject *>(cp);
+                    if (cs->byte_len == total_bytes
+                     && cs->encoding == static_cast<uint8_t>(enc)
+                     && std::memcmp(loader::str_data(cs), stack_buf, total_bytes) == 0) {
+                        return cached;
+                    }
+                }
+            }
+        }
+
+        gc::GcHandle result = alloc_flat(vm, stack_buf, total_bytes, total_len, enc,
+                                         /*capacity=*/0,
+                                         /*precomputed_hash=*/static_cast<uint64_t>(str_hash32));
+        if (result == gc::GC_NULL_HANDLE) return gc::GC_NULL_HANDLE;
+        if (total_bytes <= loader::STR_INTERN_THRESHOLD) {
+            get_intern_pool(vm).insert_by_hash(fnv, result);
+            vm->gc_heap.gc_addref(result);
+        }
+        return auto_intern(vm, result, stack_buf, total_bytes, enc);
+    }
+
+    return alloc_rope(vm, a, b, total_len, total_bytes, enc, /*depth=*/0);
+}
+
+int64_t strcmp_public(ProcessVM *vm,
+                       gc::GcHandle a,
+                       gc::GcHandle b) noexcept {
+    if (!vm) return -1;
+    gc::GcHandle fa = flatten_string(vm, a);
+    gc::GcHandle fb = flatten_string(vm, b);
+    uint8_t *pa = vm->gc_heap.deref(fa);
+    uint8_t *pb = vm->gc_heap.deref(fb);
+    if (!pa || !pb) return -1;
+    auto *sa = reinterpret_cast<loader::StringObject *>(pa);
+    auto *sb = reinterpret_cast<loader::StringObject *>(pb);
+    const uint8_t *da = reinterpret_cast<const uint8_t *>(sa) + 40;  // data offset
+    const uint8_t *db = reinterpret_cast<const uint8_t *>(sb) + 40;
+    const uint32_t la = sa->byte_len;
+    const uint32_t lb = sb->byte_len;
+    const uint32_t lmin = la < lb ? la : lb;
+    int c = std::memcmp(da, db, lmin);
+    if (c != 0) return (c < 0) ? -1 : 1;
+    if (la == lb) return 0;
+    return (la < lb) ? -1 : 1;
 }
 
 } // namespace runtime

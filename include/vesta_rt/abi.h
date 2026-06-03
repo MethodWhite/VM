@@ -185,12 +185,56 @@ extern "C" {
 /// Numero total de registros VM (R0..R15).
 #define VESTA_PROC_REGISTER_COUNT          16
 
+/// Offset de @c proc->registers.stack_pointer dentro de ProcessVM.
+/// El stack_pointer es el primer campo de @c context_registers_vm,
+/// y @c registers vive en offset (VESTA_PROC_REGISTERS_OFFSET - 32)
+/// dentro de ProcessVM.  Por tanto stack_pointer = registers_off + 0.
+/// Verificado en compile-time por @c abi_checks.cpp.
+///
+/// Usado por Phase D.jit-mem-model VM-STACK: el JIT modifica el VM-RSP
+/// al ejecutar ALLOCAs vex (consistente con interp `subsp`), salvando
+/// y restaurando el valor en prologue/epilogue.
+#define VESTA_PROC_STACK_POINTER_OFFSET    64
+
+/// Offset de @c proc->registers.base_pointer (similar al anterior).
+#define VESTA_PROC_BASE_POINTER_OFFSET     72
+
 /// El offset de @c exc_frame_stack dentro de @c ProcessVM NO es estable
 /// cross-build porque la struct tiene miembros no-POD antes (atomicos,
 /// vectores, GcHeap).  En lugar de un #define, se computa en runtime
 /// con @c offsetof y se pasa al selector via @c SelectorOptions::exc_frame_stack_offset.
 /// El JIT lo embebe como disp32 en las instrucciones inline.  Mismo patron
 /// que @c nursery_bump_offset.
+
+#ifdef __cplusplus
+namespace vesta_rt {
+    /* Phase D.jit-mem-model INLINE-CACHE: offsets resueltos en runtime
+     * via offsetof.  Defined en abi_checks.cpp. */
+    extern const int32_t kProcVmMemOffset;
+    extern const int32_t kVmMemCachedPageVaddrOffset;
+    extern const int32_t kVmMemCachedPageHostOffset;
+}
+#endif
+
+/* ----------------------------------------------------------------------- */
+/* VirtualMemory page cache offsets (Phase D.jit-mem-model INLINE-CACHE)  */
+/* ----------------------------------------------------------------------- */
+/* El JIT emite inline el page cache hit para LOAD/STORE sobre VM-addrs:
+ *   page = vaddr & ~0xFFF
+ *   if (page == proc->vm_mem.cached_page_vaddr
+ *    && (vaddr & 0xFFF) + size <= 4096)
+ *       host_ptr = proc->vm_mem.cached_page_host + (vaddr & 0xFFF)
+ *       <native mov>
+ *   else
+ *       call vrt_vm_read_u<size> / write_u<size>
+ *
+ * Coste hit (95% accesos secuenciales en mismo stack page): ~5 ns
+ * Coste miss/cross-page: ~30 ns (call al runtime entry).
+ *
+ * Los offsets NO se pueden #define: dependen del compilador y el layout
+ * runtime de ProcessVM/VirtualMemory.  Se exponen via variables extern
+ * resueltas en runtime por @c abi_checks.cpp y se pasan al selector
+ * via @c SelectorOptions::vm_mem_cached_page_*_offset. */
 
 /* ----------------------------------------------------------------------- */
 /* ClassInfo + MethodInfo offsets (inline dispatch CALLVIRT)  */
@@ -230,6 +274,15 @@ extern "C" {
  * el layout en oop_types.h, el build falla aqui forzando actualizacion.
  */
 #define VESTA_CLASSINFO_VTABLE_OFFSET      80
+/* Offset del puntero static_data (uint8_t*) en ClassInfo.  Apunta a un
+ * bloque host de bytes con los valores de los static fields.  Usado por
+ * GETSTATIC / SETSTATIC en JIT para load/store directo sin runtime call:
+ *
+ *   mov rax, [rax + VESTA_CLASSINFO_VTABLE_OFFSET + 16] ; (vtable=80, vtable_size=8, padding+static_data=16+x)
+ *
+ * El offset exacto se valida via static_assert en abi_checks.cpp.
+ */
+#define VESTA_CLASSINFO_STATIC_DATA_OFFSET 96
 #define VESTA_METHODINFO_JIT_CODE_OFFSET   104
 /* Offset del puntero advice_chain (cadena AOP BEFORE/AFTER/AROUND).
  * Si != NULL, el inline dispatch JIT debe caer al slow path para que

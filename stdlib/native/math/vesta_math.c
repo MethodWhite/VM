@@ -312,3 +312,118 @@ VESTA_PLUGIN_EXPORT uint64_t vmath_cos(uint64_t bits) {
 VESTA_PLUGIN_EXPORT uint64_t vmath_tan(uint64_t bits) {
     return f64_to_u64(tan(u64_to_f64(bits)));
 }
+
+/* =======================================================================
+ * Math-IR-promote v2.2a: ops bit + int extendidas.
+ *
+ * Estas funciones son el fallback del bytecode VM cuando el IR emitter
+ * convierte IrOp::POPCNT/CLZ/etc. en CALLN.  El JIT (Selector) las
+ * cortocircuita emitiendo @c popcnt/lzcnt/tzcnt/bswap/rol/ror nativos
+ * (~3 ciclos) en lugar de pagar el CALLN (~50ns).
+ * ======================================================================= */
+
+/** @brief Trunca un f64 hacia cero (round toward zero). */
+VESTA_PLUGIN_EXPORT uint64_t vmath_trunc(uint64_t bits) {
+    return f64_to_u64(trunc(u64_to_f64(bits)));
+}
+
+/** @brief min de dos i64 sin signo. */
+VESTA_PLUGIN_EXPORT uint64_t vmath_minu(uint64_t a, uint64_t b) {
+    return a < b ? a : b;
+}
+
+/** @brief max de dos i64 sin signo. */
+VESTA_PLUGIN_EXPORT uint64_t vmath_maxu(uint64_t a, uint64_t b) {
+    return a > b ? a : b;
+}
+
+/** @brief Log base 2 entero (posicion del bit mas alto; undef si a=0). */
+VESTA_PLUGIN_EXPORT uint64_t vmath_ilog2(uint64_t n) {
+    if (n == 0) return 0;
+#if defined(__GNUC__) || defined(__clang__)
+    return (uint64_t)(63 - __builtin_clzll(n));
+#elif defined(_MSC_VER)
+    unsigned long idx = 0;
+    _BitScanReverse64(&idx, n);
+    return (uint64_t) idx;
+#else
+    uint64_t r = 0;
+    while (n >>= 1) ++r;
+    return r;
+#endif
+}
+
+/** @brief Cuenta los bits a 1 en un u64 (popcount/Hamming weight). */
+VESTA_PLUGIN_EXPORT uint64_t vmath_popcount(uint64_t n) {
+#if defined(__GNUC__) || defined(__clang__)
+    return (uint64_t) __builtin_popcountll(n);
+#elif defined(_MSC_VER)
+    return (uint64_t) __popcnt64(n);
+#else
+    uint64_t c = 0;
+    while (n) { c += n & 1; n >>= 1; }
+    return c;
+#endif
+}
+
+/** @brief Count Leading Zeros (clz); 64 si n=0. */
+VESTA_PLUGIN_EXPORT uint64_t vmath_clz(uint64_t n) {
+    if (n == 0) return 64;
+#if defined(__GNUC__) || defined(__clang__)
+    return (uint64_t) __builtin_clzll(n);
+#elif defined(_MSC_VER)
+    unsigned long idx = 0;
+    _BitScanReverse64(&idx, n);
+    return (uint64_t)(63 - idx);
+#else
+    uint64_t c = 0;
+    while (!(n & (1ULL << 63))) { ++c; n <<= 1; }
+    return c;
+#endif
+}
+
+/** @brief Count Trailing Zeros (ctz); 64 si n=0. */
+VESTA_PLUGIN_EXPORT uint64_t vmath_ctz(uint64_t n) {
+    if (n == 0) return 64;
+#if defined(__GNUC__) || defined(__clang__)
+    return (uint64_t) __builtin_ctzll(n);
+#elif defined(_MSC_VER)
+    unsigned long idx = 0;
+    _BitScanForward64(&idx, n);
+    return (uint64_t) idx;
+#else
+    uint64_t c = 0;
+    while (!(n & 1)) { ++c; n >>= 1; }
+    return c;
+#endif
+}
+
+/** @brief Byte swap (endian conversion) sobre u64. */
+VESTA_PLUGIN_EXPORT uint64_t vmath_bswap(uint64_t n) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_bswap64(n);
+#elif defined(_MSC_VER)
+    return _byteswap_uint64(n);
+#else
+    return ((n & 0xFFULL)              << 56)
+         | ((n & 0xFF00ULL)            << 40)
+         | ((n & 0xFF0000ULL)          << 24)
+         | ((n & 0xFF000000ULL)        << 8)
+         | ((n & 0xFF00000000ULL)      >> 8)
+         | ((n & 0xFF0000000000ULL)    >> 24)
+         | ((n & 0xFF000000000000ULL)  >> 40)
+         | ((n & 0xFF00000000000000ULL) >> 56);
+#endif
+}
+
+/** @brief Rotacion de bits a la izquierda (rotate left).  n=count mod 64. */
+VESTA_PLUGIN_EXPORT uint64_t vmath_rotl(uint64_t v, uint64_t n) {
+    n &= 63;
+    return n == 0 ? v : ((v << n) | (v >> (64 - n)));
+}
+
+/** @brief Rotacion de bits a la derecha (rotate right).  n=count mod 64. */
+VESTA_PLUGIN_EXPORT uint64_t vmath_rotr(uint64_t v, uint64_t n) {
+    n &= 63;
+    return n == 0 ? v : ((v >> n) | (v << (64 - n)));
+}

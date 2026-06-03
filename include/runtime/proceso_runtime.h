@@ -523,6 +523,15 @@ namespace runtime {
                 }
                 loader::FrameHeader *f = free_list_head;
                 free_list_head = f->prev;
+                /* Sprint MMM-ext leak-fix: garantizar host_allocas=nullptr
+                 * para todo frame fresco.  Los chunks recien alocados con
+                 * `new[]` ya cumplen (default-init = zero); los frames
+                 * reciclados via release() pueden haber tenido un puntero
+                 * vivo, asi que aqui forzamos el reset.  El release()
+                 * libera la lista; este reset es defensa contra reuse.
+                 * Coste: 1 store por acquire (~1 ns), irrelevante vs el
+                 * coste de un CALLVIRT (~50 ns). */
+                f->host_allocas = nullptr;
                 return f;
             }
 

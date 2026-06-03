@@ -1,0 +1,29 @@
+// Bench: ROTL/ROTR nativos en JIT via rol/ror r64, cl (sprint BBB).
+//
+// El IR pre-pase convierte ROTL/ROTR a CALLN a vmath_rotl/vmath_rotr.
+// El JIT selector intercepta y emite `rol/ror rax, cl` directo (~3 ciclos).
+//
+// Resultados esperados (~5M iter, 2 rot ops/iter):
+//   interp: ~4-6 seg (via CALLN).
+//   JIT:    ~8-15 ms (rol/ror nativo).
+//   Speedup: ~400-600x.
+
+class RotOps {
+    public u64 run_hot(i32 n) {
+        u64 acc = 0;
+        i32 i = 1;
+        while (i < n) {
+            u64 v = (u64) i;
+            acc = acc + rotl(v, 7);
+            acc = acc + rotr(v, 3);
+            i = i + 1;
+        }
+        return acc;
+    }
+}
+
+i32 main() {
+    RotOps op = new RotOps();
+    u64 r = op.run_hot(5000000);
+    return (i32)(r & 0xFFFF);
+}

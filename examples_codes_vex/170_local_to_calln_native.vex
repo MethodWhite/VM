@@ -1,0 +1,37 @@
+// examples_codes_vex/170_local_to_calln_native.vex
+//
+// Phase D.jit-mem-model AUTO-PROMOTE: pasar &local a funcion nativa
+// SIN anotaciones, sintaxis C natural.
+//
+// El IR pass `ir_pass_promote_callned_allocas` detecta que el ALLOCA de
+// `msg` fluye a `vio_print_buf` (CALLN nativa) y marca el ALLOCA con
+// `host_alloca=true`.  El JIT selector lo emite en host stack, asi que
+// `&msg[0]` es un host_ptr genuino dereferenciable directamente por
+// el codigo C de vesta_io.dll.
+//
+// Sin esta promocion (modelo VM-stack puro), `&msg[0]` seria una
+// VM-addr que vio_print_buf trataria como host_ptr -> garbage / crash.
+//
+// Esperado: imprime "Hola Vex!" + retorna R00=42.
+//
+// NOTA: funciona en AMBOS modos (interp puro y JIT).  El IR pass
+// `ir_pass_promote_callned_allocas` corre antes del backend, y tanto
+// el JIT (selector) como el interp (bytecode emit `case IrOp::ALLOCA`)
+// respetan el flag `host_alloca` y emiten alocacion en host memoria.
+// Ademas el pass inserta `RAW_FREE` antes de cada RET / RSPAWN_RETURN /
+// FULFILL_HLT por cada ALLOCA promovida para evitar leaks.
+
+extern "stdlib/native/io/vesta_io" {
+    fn vio_print_buf(u8* buf, u64 len) -> i64;
+}
+
+i32 main() {
+    // Sintaxis C-style: string literal inicializa array de bytes.
+    u8[10] msg = "Hola Vex!\n";
+
+    // Pasar &local directamente a funcion nativa C.  Sin malloc, sin
+    // anotaciones.  El frontend + IR pass + JIT cooperan automaticamente.
+    vio_print_buf(&msg[0], 10);
+
+    return 42;
+}

@@ -609,6 +609,20 @@ namespace vex {
         void check_class_method(const ClassLayout &cls, ast::ClassMethodDecl *m);
 
         /**
+         * @brief Sprint lombok (2026-06-03): pre-pase de anotaciones Lombok.
+         *
+         * Recorre cada @c ClassDecl del modulo y, segun los flags
+         * @c lombok_* a nivel de campo y de clase, genera
+         * @c ClassMethodDecl sinteticos directamente en el AST.  Tras
+         * este pre-pase el AST aparece como si el usuario hubiera
+         * escrito los metodos a mano.  El resto del pipeline
+         * (collect_classes, check_functions, lowering) no necesita
+         * conocer Lombok.  Combos como @Data y @Value se descomponen
+         * en sus partes.
+         */
+        void expand_lombok_annotations();
+
+        /**
          * @brief Pase 0 extendido: registra todas las clases del modulo
          *        con sus layouts (fields + methods) antes del checking
          *        de cuerpos.  Permite que un metodo refiera a otra clase

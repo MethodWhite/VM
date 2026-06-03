@@ -116,6 +116,28 @@ vrt_handle vrt_gc_alloc(vrt_proc *proc, size_t size);
 vrt_handle vrt_gc_alloc_pinned(vrt_proc *proc, size_t size);
 
 /**
+ * @brief Aloca un bloque de memoria HOST cruda (no GC-managed).
+ *
+ * Equivalente a @c malloc(size) del C runtime: devuelve un puntero
+ * dereferenciable directamente por codigo C nativo (Win32, POSIX, etc).
+ * El bloque vive hasta que se invoca @c vrt_raw_free.  No participa
+ * del GC: el caller es responsable de liberarlo.
+ *
+ * Usado por callbacks Vex que necesitan alocar structs (WNDCLASSEXW,
+ * MSG, etc) o buffers para pasar a APIs nativas que esperan host_ptr.
+ *
+ * @return Puntero host dereferenciable, o @c NULL si OOM.
+ */
+uint8_t *vrt_raw_alloc(vrt_proc *proc, size_t size);
+
+/**
+ * @brief Libera un bloque previamente alocalizado con @c vrt_raw_alloc.
+ *
+ * Idempotente para ptr=NULL (no-op).  Doble free es undefined behavior.
+ */
+void vrt_raw_free(vrt_proc *proc, uint8_t *ptr);
+
+/**
  * @brief Resuelve un handle a su puntero host actual.
  * @return @c NULL si el handle es invalido o ya colectado.
  *
@@ -451,6 +473,36 @@ uint64_t vrt_vm_read_u64(vrt_proc *proc, uint64_t vaddr);
  */
 void vrt_vm_write_u64(vrt_proc *proc, uint64_t vaddr, uint64_t value);
 
+/** @brief Variantes por tamano (necesarias para LOAD/STORE de i8/i16/i32). */
+uint32_t vrt_vm_read_u32(vrt_proc *proc, uint64_t vaddr);
+uint16_t vrt_vm_read_u16(vrt_proc *proc, uint64_t vaddr);
+uint8_t  vrt_vm_read_u8 (vrt_proc *proc, uint64_t vaddr);
+void     vrt_vm_write_u32(vrt_proc *proc, uint64_t vaddr, uint32_t value);
+void     vrt_vm_write_u16(vrt_proc *proc, uint64_t vaddr, uint16_t value);
+void     vrt_vm_write_u8 (vrt_proc *proc, uint64_t vaddr, uint8_t  value);
+
+/**
+ * @brief Traduce una VM-addr a host_ptr via vm_mem.
+ *
+ * Phase D.jit-mem-model FULL: usado por el JIT en cada LOAD/STORE
+ * cuyo puntero tiene IR is_host_ptr=false (VM-addr semantica).
+ * Para is_host_ptr=true el JIT emite native mov directo sin esta
+ * llamada.
+ *
+ * Diseno portable: confia en is_host_ptr del IR (semanticamente
+ * preciso, marcado por el frontend) en lugar de range checks
+ * arbitrarios que no son portables cross-arch.
+ *
+ * Delega a @c proc->vm_mem.operator[](vaddr) que fuerza la
+ * asignacion perezosa de la pagina si no existe (igual semantica
+ * que el interp).  Coste: ~30 ns por call (page cache lookup).
+ *
+ * @param proc proceso actual.
+ * @param vaddr VM-addr.
+ * @return host_ptr al byte correspondiente.
+ */
+uint8_t *vrt_vm_translate(vrt_proc *proc, uint64_t vaddr);
+
 /* ========================================================================= */
 /* Class registry runtime entries (defclass/findclass/newobj/etc)            */
 /* ========================================================================= */
@@ -559,6 +611,47 @@ void *vrt_findfield(vrt_proc *proc, uint64_t params_vaddr);
  *        Lee @c SetMethDebugParams de vm_mem[params_vaddr].
  */
 void vrt_setmethdbg(vrt_proc *proc, uint64_t params_vaddr);
+
+/* ========================================================================= */
+/* String operations (Sprint JIT-cobertura 2026-06-01)                       */
+/* ========================================================================= */
+
+/**
+ * @brief Lanza FatalError(USER_ABORT, msg) leyendo el mensaje de
+ *        vm_mem.  Equivalente al opcode PANIC.
+ *
+ * @param proc      Proceso actual.
+ * @param msg_vaddr Direccion VM del mensaje.
+ * @param msg_len   Longitud en bytes (cap 511).
+ */
+void vrt_panic_str(vrt_proc *proc, uint64_t msg_vaddr, uint32_t msg_len);
+
+/**
+ * @brief Combinacion atomica GC_ALLOCP: alloc + deref + devuelve
+ *        host_ptr al payload.  Mismo path que el opcode gcallocp.
+ */
+uint8_t *vrt_gc_alloc_payload(vrt_proc *proc, size_t size);
+
+/**
+ * @brief Crea un StringObject FLAT desde un buffer en memoria VM.
+ *        Equivalente al opcode STRMAKE.  Autodetecta ASCII vs UTF-8.
+ */
+vrt_handle vrt_str_make(vrt_proc *proc, uint64_t vm_addr, uint32_t byte_len);
+
+/** @brief Devuelve el numero de code-points del string. */
+uint64_t vrt_str_len(vrt_proc *proc, vrt_handle h);
+
+/** @brief Devuelve el byte_len del StringObject. */
+uint64_t vrt_str_get_bytes(vrt_proc *proc, vrt_handle h);
+
+/** @brief Devuelve host_ptr al buffer de bytes (materializa ROPE/SLICE). */
+uint64_t vrt_str_raw(vrt_proc *proc, vrt_handle h);
+
+/** @brief Concatena dos StringObjects en un ROPE O(1). */
+vrt_handle vrt_str_cat(vrt_proc *proc, vrt_handle a, vrt_handle b);
+
+/** @brief Comparacion lexicografica.  Returns -1/0/1. */
+int64_t vrt_str_cmp(vrt_proc *proc, vrt_handle a, vrt_handle b);
 
 /* ========================================================================= */
 /* Safepoint (Phase E - infrastructure stub)                                  */

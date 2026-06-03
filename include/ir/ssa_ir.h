@@ -163,6 +163,19 @@ namespace ir {
         MOD      = 0x14, ///< %dst = mod.T    %a, %b
         NEG      = 0x15, ///< %dst = neg.T    %a       (negacion entera unaria)
 
+        // ---- aritmetica entera extendida (0x16-0x1F) ----
+        // raw_asm-elim wave 4 / Math-IR-promote: ops con instr nativa
+        // universal (x86 cmov/sar+xor+sub, ARM csel/abs, RISC-V min/max/abs).
+        IABS     = 0x16, ///< %dst = iabs.T %a            (|a|; INT_MIN undef en signed)
+        IMIN     = 0x17, ///< %dst = imin.T %a, %b        (min signed via cmov/csel)
+        IMAX     = 0x18, ///< %dst = imax.T %a, %b        (max signed via cmov/csel)
+        IMINU    = 0x19, ///< %dst = iminu.T %a, %b       (min unsigned)
+        IMAXU    = 0x1A, ///< %dst = imaxu.T %a, %b       (max unsigned)
+        ILOG2    = 0x1B, ///< %dst = ilog2.u32 %a         (highest bit pos; undef si a=0)
+                          ///<   Equivale a @c (63 - clz(a)) para u64.  Util en allocators,
+                          ///<   capacity calculations, hashing.  x86: @c bsr (3c) o
+                          ///<   @c (63 ^ lzcnt) ; ARM: @c clz + sub; RISC-V: @c clz.
+
         // ---- aritmetica flotante (0x20-0x2F) ----
         FADD     = 0x20, ///< %dst = fadd.fN  %a, %b
         FSUB     = 0x21, ///< %dst = fsub.fN  %a, %b
@@ -173,8 +186,14 @@ namespace ir {
         FSQRT    = 0x26, ///< %dst = fsqrt.fN %a        (raiz cuadrada)
         FMIN     = 0x27, ///< %dst = fmin.fN  %a, %b
         FMAX     = 0x28, ///< %dst = fmax.fN  %a, %b
-        // 0x29..0x2B reservados (antes FFLOOR/FCEIL/FROUND, eliminados; el
-        // frontend Vex baja a CALLN(stdlib/native/math/vesta_math:vmath_*)).
+        FFLOOR   = 0x29, ///< %dst = ffloor.fN %a        (round toward -inf)
+        FCEIL    = 0x2A, ///< %dst = fceil.fN  %a        (round toward +inf)
+        FROUND   = 0x2B, ///< %dst = fround.fN %a        (round to nearest, banker's)
+        FTRUNC   = 0x2C, ///< %dst = ftrunc.fN %a        (round toward zero)
+                          ///<   raw_asm-elim wave 4: las 4 son single-instr en x86
+                          ///<   (@c roundsd con bits 0-1 de imm8 = rounding mode), en
+                          ///<   ARM (@c frintm/p/n/z), en WASM (@c f64.floor/ceil/nearest/trunc)
+                          ///<   y en RISC-V (@c fcvt.l.d con rounding mode).  Reactivados.
 
         // ---- logica y desplazamientos (0x30-0x3F) ----
         AND      = 0x30, ///< %dst = and.T    %a, %b
@@ -184,6 +203,13 @@ namespace ir {
         SHL      = 0x34, ///< %dst = shl.T    %a, %n   (desplazamiento a izquierda)
         SHR      = 0x35, ///< %dst = shr.T    %a, %n   (logico, sin signo)
         SAR      = 0x36, ///< %dst = sar.T    %a, %n   (aritmetico, con signo)
+        // ---- bit ops extendidos (0x37-0x3F) ---- raw_asm-elim wave 4 / Math-IR-promote.
+        CLZ      = 0x37, ///< %dst = clz.u32 %a           (count leading zeros; x86 lzcnt, ARM clz)
+        CTZ      = 0x38, ///< %dst = ctz.u32 %a           (count trailing zeros; x86 tzcnt)
+        POPCNT   = 0x39, ///< %dst = popcnt.u32 %a        (Hamming weight; x86 popcnt, ARM cnt)
+        BYTESWAP = 0x3A, ///< %dst = byteswap.T %a        (endian swap; x86 bswap, ARM rev)
+        ROTL     = 0x3B, ///< %dst = rotl.T %a, %n        (rotate left; x86 rol, ARM ror neg)
+        ROTR     = 0x3C, ///< %dst = rotr.T %a, %n        (rotate right; x86 ror, ARM ror)
 
         // ---- comparaciones enteras (0x40-0x47) ----
         CMP_EQ   = 0x40, ///< %dst = cmp.eq.T  %a, %b  -> bool
@@ -336,6 +362,15 @@ namespace ir {
         ARRAY_LOAD  = 0xAC, ///< %v = array_load.T %arr, %idx       (carga con MOVC SIB stride)
         ARRAY_STORE = 0xAD, ///< array_store.T %arr, %idx, %val     (escritura + gcwb si HANDLE)
         GCDEREF_IR  = 0xAE, ///< gcderef_ir %handle                 (gcderef a cur0; ver nota)
+        GC_DEREF_HOST = 0xAF, ///< %dst = gc_deref_host.ptr %handle    (GcHandle -> host_ptr al payload)
+                              ///<   Combina @c gcderef + @c xchg en 1 IR op.  El emisor
+                              ///<   bytecode genera @c "gcderef cur0, r_src" + @c "xchg cur0, r_dst",
+                              ///<   2 instr VM como antes (sin nuevo opcode de bytecode), pero
+                              ///<   el optimizer ahora puede aplicar CSE (deduplicar conversiones
+                              ///<   del mismo handle dentro de un bloque), DCE (eliminar si
+                              ///<   dst no se usa), y el Selector JIT no tiene que parsear el
+                              ///<   patron en raw_asm.  Reemplaza el viejo blob
+                              ///<   `RAW_ASM "gcderef cur0, {src0}\nxchg cur0, {dst}\n"`.
 
         // ---- manejo de excepciones (0xB0-0xBF) ----
         THROW       = 0xB0, ///< throw %exc_obj                     (lanzar excepcion)
@@ -363,6 +398,67 @@ namespace ir {
         REJECT    = 0xC3, ///< reject   %future_handle, %error  (rechazar con codigo)
         FULFILL_HLT = 0xC4, ///< fulfillhlt %fut, %val           (fusion atomica fulfill+hlt)
         STRGETBYTES = 0xC5, ///< %n = strgetbytes.i64 %str       (byte_len del StringObject)
+        RETHROW     = 0xC6, ///< rethrow                         (relanza current_exception del handler)
+                            ///<   Terminator de bloque sin operandos.  Baja al bytecode
+                            ///<   @c rethrow (extended NONE).  Solo valido dentro del cuerpo
+                            ///<   de un catch handler donde la VM tiene @c current_exception
+                            ///<   seteada; en cualquier otro contexto el runtime lanza
+                            ///<   FATAL_ILLEGAL_INSTRUCTION.  Reemplaza el viejo
+                            ///<   RAW_ASM "rethrow\n" usado en synchronized cleanup.
+        SHARED_STAT = 0xC7, ///< %dst = shared_stat.T %op_code    (Phase Z introspect)
+                            ///<   op_code (i32 imm): 0=live_count (-> u32), 1=bytes (-> u64),
+                            ///<                       2=gc_collect (-> void).
+                            ///<   Reemplaza RAW_ASM "sharedstat ..." con un IR op tipado;
+                            ///<   el bytecode emitido sigue siendo el opcode extended 0xAD.
+        READ_VM_REG = 0xC8, ///< %dst = read_vm_reg.T imm=N      (leer @c proc->registers.regs[N])
+                            ///<   Lectura directa de un VM register por indice (0..15).
+                            ///<   Util para closure helper prologue (R14 = env_ptr), o
+                            ///<   cualquier patron donde el frontend necesita acceder a un
+                            ///<   reg fuera de la calling convention estandar R1..R12.
+                            ///<   El bytecode emitido es @c "mov {dst}, rN".  Reemplaza
+                            ///<   RAW_ASM "mov {dst}, r14\n".
+        RSPAWN_RETURN = 0xC9, ///< rspawn_return %payload         (mov r0, %payload + hlt fusionado)
+                            ///<   Terminator de bloque especifico de rspawn bodies.  El runtime
+                            ///<   distribuido detecta HALT en un proceso con
+                            ///<   @c rspawn_future_id != 0, captura R0 como payload y envia
+                            ///<   VDP_FUTURE_FULFILL al nodo origen.  Reemplaza RAW_ASM
+                            ///<   "mov r0, {src0}\nhlt\n".
+        REFLECT_COUNT = 0xCB, ///< %dst = reflect_count.<kind> %cls
+                            ///<   Reflexion: cuenta methods (kind=0) o fields (kind=1).
+                            ///<   imm = sub-op.  El emisor bytecode produce
+                            ///<   @c "methodcount/fieldcount {src0}\nmov {dst}, r0\n".
+                            ///<   Reemplaza RAW_ASM equivalente.
+        MOD_LOAD    = 0xCD, ///< %dst = mod_load.<kind> %path_addr, %path_len
+                            ///<   imm = kind: 0=loadmod, 1=unloadmod.  El emitter genera:
+                            ///<   @c "<mnem> r_path, r_len\nmov {dst}, r0\n".  loadmod ejecuta el
+                            ///<   main del modulo cargado (call site), unloadmod marca el slot
+                            ///<   como libre y devuelve 1/0.  Reemplaza RAW_ASM equivalentes.
+        DLOPEN      = 0xCE, ///< %dst = dlopen %path_addr, %path_len  (FFI runtime LoadLibrary/dlopen)
+                            ///<   Devuelve handle i64 a la libreria cargada (o 0 si falla).
+                            ///<   Reemplaza RAW_ASM "dlopen {dst}, r12, r11".
+        DLSYM       = 0xCF, ///< %dst = dlsym %handle, %name_addr, %name_len
+                            ///<   Devuelve fn_addr i64 del simbolo (o 0 si no existe).
+                            ///<   Reemplaza RAW_ASM "dlsym {dst}, r12, r11, r10".
+        REFLECT_AT  = 0xCC, ///< %dst = reflect_at.<kind> %cls, %idx
+                            ///<   Reflexion: devuelve &cls->methods[i] (kind=0) o
+                            ///<   &cls->fields[i] (kind=1).  imm = sub-op.  El emisor
+                            ///<   produce @c "getmethat/getfldat {src0}, {src1}\nmov {dst}, r0\n".
+        SMARTPTR_FREE = 0xCA, ///< smartptr_free.<kind> %ptr [, %deleter_addr] [, "label"]
+                            ///<   Cleanup deterministico de unique<T> con dispatch segun
+                            ///<   @c imm = kind:
+                            ///<     0 = SRET_DISPATCH (operands=[ptr, deleter_addr_at_slot+8],
+                            ///<                       func_name="")
+                            ///<         si ptr==0 -> skip; si deleter==0 -> free(ptr);
+                            ///<         si no -> callvmr deleter_addr(ptr).
+                            ///<     1 = EXTERN_CALLN  (operands=[ptr], func_name="<lib>:<fn>")
+                            ///<         si ptr==0 -> skip; si no -> calln @Method(...).
+                            ///<     2 = VESTA_CALLVM  (operands=[ptr], func_name="<fn_label>")
+                            ///<         si ptr==0 -> skip; si no -> callvm @Absolute("code.<fn>").
+                            ///<
+                            ///<   Reemplaza 3 blobs RAW_ASM con cmpu+jmp+mov+call+labels.
+                            ///<   El emisor bytecode expande a la secuencia equivalente con
+                            ///<   labels unicos.  Marcado side-effecting (siempre invoca un
+                            ///<   destructor o free).
 
         // ---- Meta-OOP / reflexion / Phase Z extras (0x71-0x7C) ----
         // Movido fuera del 0xA0-0xAF (OOP/GC) y 0x80-0x8F (llamadas) que
@@ -630,6 +726,27 @@ namespace ir {
         /// el RAW_ASM es un "call site" y los locales vivos quedan
         /// invalidados cuando la callee corre.
         bool     is_call_site = false;
+
+        /// Phase D.jit-mem-model AUTO-PROMOTE: si true en un IrOp::ALLOCA,
+        /// el JIT emite ese ALLOCA en host stack (en lugar de VM-stack).
+        /// El ptr resultante es directamente dereferenciable por code C
+        /// nativo (e.g. para `&local` pasado a Win API).  Lo marca el IR
+        /// pass `ir_pass_promote_callned_allocas` cuando el dst del ALLOCA
+        /// fluye a un arg de CALLN.  El bytecode emit del interp lo
+        /// IGNORA (sigue emitiendo `subsp` VM-stack) -- en interp, el
+        /// patron `&local -> CALLN` requiere JIT activo o malloc explicito.
+        bool     host_alloca = false;
+
+        /// Sprint mem-loop-fix (2026-06-02): si true en un ALLOCA con
+        /// `host_alloca=true`, indica que el RAW_FREE original SE
+        /// PRESERVO en el IR (no fue eliminado por el promote pass).
+        /// El bytecode emit del interp NO debe llamar @c htrack para
+        /// no acumular en el vector @c host_allocas del frame -- el
+        /// RAW_FREE preservado libera explicitamente el ptr en su
+        /// posicion correcta (al fin de cada iteracion, no al RET).
+        /// Resuelve el bottleneck del bench @c mem_malloc_free donde
+        /// 5M iter acumulaban 5M ptrs tracked sin liberar.
+        bool     host_alloca_explicit_free = false;
 
         IrInstr() : op(IrOp::NOP), type(IrType::VOID), dst(IR_NO_VALUE),
                     imm(0), func_ptr(IR_NO_VALUE),

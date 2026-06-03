@@ -1,0 +1,109 @@
+// examples_codes_vex/174_async_chains_complex.vex
+//
+// Cadenas de @Async complejas con paralelismo + fan-in + propagacion
+// de resultados intermedios.
+//
+// Demuestra:
+//   1. Fan-out: lanzar N tareas async en paralelo (cada una con args
+//      distintos), recolectar todos los Future<T>.
+//   2. Fan-in: await sobre cada future + acumular resultado.
+//   3. Encadenamiento: una tarea async invoca a otras async (composicion
+//      sin bloquear el scheduler principal).
+//   4. Mezcla de tipos: Future<i32>, Future<i64>, Future<bool> coexisten.
+//   5. Resultado calculado distribuyendo work sobre el scheduler.
+//
+// Topologia:
+//
+//   main
+//   |-- compute_chunk(0..9)    -> Future<i64>  worker 1
+//   |-- compute_chunk(10..19)  -> Future<i64>  worker 2
+//   |-- compute_chunk(20..29)  -> Future<i64>  worker 3
+//   |-- compute_chunk(30..39)  -> Future<i64>  worker 4
+//   |
+//   |-- validate(total)        -> Future<bool> worker 5
+//   |   (invocado tras los 4 awaits previos)
+//   |
+//   |-- format_decoration()    -> Future<i32>  worker 6
+//   |   (corre en paralelo con validate, totalmente independiente)
+//
+//   Cada compute_chunk suma a..b-1.  El total esperado:
+//     0+1+...+39 = 39*40/2 = 780.
+//
+//   validate(780) -> true (es divisible por 4).  format_decoration() -> -738.
+//
+//   acc = 780 (sum) + 1 (validate=true) - 739 (decoration) = 42.
+//
+// Esperado: R00 = 42.
+
+// Suma inclusiva-exclusiva [a, b).
+@Async
+i64 compute_chunk(i64 a, i64 b) {
+    i64 sum = 0;
+    i64 i = a;
+    while (i < b) {
+        sum = sum + i;
+        i = i + 1;
+    }
+    return sum;
+}
+
+// Validador: retorna true si el total es divisible por 4.
+@Async
+bool validate(i64 total) {
+    return total % 4 == 0;
+}
+
+// Generador de "decoracion" independiente, corre en paralelo.
+@Async
+i32 format_decoration() {
+    i32 d = 1;
+    i32 k = 0;
+    while (k < 10) {
+        d = d * 3;
+        k = k + 1;
+    }
+    // d = 3^10 = 59049. Retornamos 59049 - 59788 = -739 para que el
+    // calculo final caiga en R0=42.
+    return d - 59788;
+}
+
+i32 main() {
+    // FASE 1: fan-out de 4 workers.  Cada @Async devuelve un Future<T>
+    // que el scheduler administra en otro proceso VM.
+    Future<i64> f0 = compute_chunk(0, 10);
+    Future<i64> f1 = compute_chunk(10, 20);
+    Future<i64> f2 = compute_chunk(20, 30);
+    Future<i64> f3 = compute_chunk(30, 40);
+
+    // Worker independiente (no depende del total).  Se lanza ya para
+    // maximizar paralelismo: corre concurrentemente con los 4 chunks.
+    Future<i32> f_deco = format_decoration();
+
+    // FASE 2: fan-in.  await bloquea hasta que el worker resuelve.
+    // Los 4 awaits pueden completarse en cualquier orden segun el
+    // scheduler; el TOTAL es deterministico.
+    i64 r0 = await f0;
+    i64 r1 = await f1;
+    i64 r2 = await f2;
+    i64 r3 = await f3;
+    i64 total = r0 + r1 + r2 + r3;
+    // total = (0..9)+(10..19)+(20..29)+(30..39) = 45+145+245+345 = 780.
+
+    // FASE 3: encadenamiento.  Lanzar validator que depende del total.
+    Future<bool> f_ok = validate(total);
+    bool ok = await f_ok;
+
+    // FASE 4: combinar con el worker decorativo.
+    i32 deco = await f_deco;
+    // deco = -739.
+
+    // Sanity: el helper imprime los valores para diagnostico.
+    println("chunks: ${r0} ${r1} ${r2} ${r3} = ${total}");
+    println("validate(${total}) = ${ok}, deco = ${deco}");
+
+    i32 acc = 0;
+    if (total == 780) { acc = acc + (i32)total; }   // +780
+    if (ok)           { acc = acc + 1; }             // +1
+    acc = acc + deco;                                  // -739
+    return acc;  // 780 + 1 - 739 = 42
+}

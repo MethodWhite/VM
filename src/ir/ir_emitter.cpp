@@ -645,11 +645,23 @@ static void emit_load_spilled_arg(EmitCtx &ctx, int target_reg, ir::IrValueId vi
     auto it = ctx.alloc.spill_map.find(vid);
     if (it == ctx.alloc.spill_map.end()) return;  // no es spilled, no-op
     const std::string rd = std::string(reg_name(target_reg));
-    ctx.out << "    mov r13, rbp\n";
-    ctx.out << "    subu r13, " << ((it->second + 1) * 8) << "\n";
-    ctx.out << "    mov " << rd << ", [r13]\n";
-    ctx.r13_cache = -1;
-    if (target_reg == 14) ctx.r14_cache = -1;
+    /* Scratch para el addr.  Usamos r14 (scratch general) cuando target!=14;
+     * cuando target ES r14 reutilizamos el mismo reg (el flujo
+     * mov r14,rbp -> subu r14 -> mov r14,[r14] funciona porque el ultimo
+     * mov sobreescribe r14 con el valor cargado).
+     *
+     * Importante: NO usar r13 como scratch.  En el path CALLNI (FFI runtime
+     * indirecto), r13 contiene el fn_ptr a invocar -- pisarlo aqui causa
+     * que el callni salte a memoria invalida.  r14 esta siempre libre en
+     * este punto porque parallel_arg_moves ya termino y r14 es el scratch
+     * de cycle-breaking que liberamos al final del parallel-move. */
+    const char *scratch_reg = "r14";
+    ctx.out << "    mov " << scratch_reg << ", rbp\n";
+    ctx.out << "    subu " << scratch_reg << ", " << ((it->second + 1) * 8) << "\n";
+    ctx.out << "    mov " << rd << ", [" << scratch_reg << "]\n";
+    /* Invalidamos los caches que hayan sido clobered. */
+    ctx.r14_cache = -1;
+    if (target_reg == 13) ctx.r13_cache = -1;
     if (ctx.is_gc_value(vid)) {
         ctx.out << "    gcderef cur0, " << rd << "\n";
         ctx.out << "    xchg cur0, " << rd << "\n";
@@ -808,23 +820,17 @@ static void emit_unop(EmitCtx &ctx, const std::string &mnemonic,
 static void emit_gp_to_zmm_bits(EmitCtx &ctx,
                                  const std::string &gp_reg,
                                  const std::string &zmm_reg) {
-    ctx.out << "    subsp rsp, 8\n";
-    ctx.out << "    mov r15, rsp\n";
-    ctx.out << "    mov [r15], " << gp_reg << "\n";
-    ctx.out << "    fload " << zmm_reg << ", r15\n";
-    ctx.out << "    addsp rsp, 8\n";
+    // Sprint string-perf-5 (2026-06-02): bitcast directo via opcode bitg2z.
+    // Antes: 5 instrucciones VM (subsp + mov r15,rsp + mov [r15],gp +
+    // fload + addsp).  Ahora: 1 instruccion -> ~5x speedup en FP-heavy.
+    ctx.out << "    bitg2z " << zmm_reg << ", " << gp_reg << "\n";
 }
 
 static void emit_zmm_to_gp_bits(EmitCtx &ctx,
                                  const std::string &zmm_reg,
                                  const std::string &gp_reg) {
-    // El orden de operandos de fstore es r1=gp_addr, r2=zmm_src (al reves
-    // que fload).  Documentado en src/emmit/emmit_decl.cpp:2034.
-    ctx.out << "    subsp rsp, 8\n";
-    ctx.out << "    mov r15, rsp\n";
-    ctx.out << "    fstore r15, " << zmm_reg << "\n";
-    ctx.out << "    mov " << gp_reg << ", [r15]\n";
-    ctx.out << "    addsp rsp, 8\n";
+    // Sprint string-perf-5: bitcast directo via opcode bitz2g (1 instr VM).
+    ctx.out << "    bitz2g " << gp_reg << ", " << zmm_reg << "\n";
 }
 
 // Emite una operacion float binaria con bitcast automatico.
@@ -1492,6 +1498,27 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
         case IrOp::FSQRT:
             if (!ins.operands.empty())
                 emit_float_unop(ctx, "fsqrt", ins.type,
+                                 ins.dst, ins.operands[0]);
+            break;
+        // Sprint string-perf-5: FP unarios nativos (opcodes 0x82-0x85).
+        case IrOp::FFLOOR:
+            if (!ins.operands.empty())
+                emit_float_unop(ctx, "ffloor", ins.type,
+                                 ins.dst, ins.operands[0]);
+            break;
+        case IrOp::FCEIL:
+            if (!ins.operands.empty())
+                emit_float_unop(ctx, "fceil", ins.type,
+                                 ins.dst, ins.operands[0]);
+            break;
+        case IrOp::FROUND:
+            if (!ins.operands.empty())
+                emit_float_unop(ctx, "fround", ins.type,
+                                 ins.dst, ins.operands[0]);
+            break;
+        case IrOp::FTRUNC:
+            if (!ins.operands.empty())
+                emit_float_unop(ctx, "ftrunc", ins.type,
                                  ins.dst, ins.operands[0]);
             break;
         // --- Conversion de tipos ---
@@ -2428,6 +2455,48 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             // (variables struct); otros frontends pueden usar
             // type=i64, imm=N para arrays de N qwords.
             const uint64_t bytes = ins.imm * ir_type_size(ins.type);
+
+            // AUTO-PROMOTE (Phase D.jit-mem-model MMM ext, 2026-06-01):
+            // si `ir_pass_promote_callned_allocas` marco esta ALLOCA con
+            // `host_alloca=true`, su dst fluye a un CALLN nativo.  Emitir
+            // `alloc N` (RAW_ALLOC bytecode) en lugar de `subsp` para
+            // que el ptr sea host genuino dereferenciable directamente
+            // por la libreria C.  El IR pass tambien inserto RAW_FREE
+            // antes de cada RET / RSPAWN_RETURN / FULFILL_HLT para
+            // evitar leaks en exits normales.  THROW sin try/catch que
+            // envuelva sigue pudiendo leakear (sprint sucesor cubrira
+            // tracking runtime para cleanup en do_throw).
+            if (ins.host_alloca && ins.dst != IR_NO_VALUE) {
+                // Tratar como CALL: `alloc` clobrea r0 implicitamente y
+                // puede ejecutar codigo arbitrario (slab grow).
+                const uint32_t call_pos = lin_pos_of(ctx, bb.id, idx);
+                std::vector<int> regs_to_save =
+                    live_regs_through_call(ctx, call_pos, ins.dst);
+                emit_save_live_regs(ctx, call_pos, regs_to_save);
+                ctx.out << "    mov r0, " << bytes << "\n";
+                ctx.out << "    alloc r0\n";
+                emit_mov_if_needed(ctx, ctx.reg_of(ins.dst), "r0");
+                ctx.store_spilled(ins.dst);
+                // Sprint MMM-ext leak-fix: registrar el ptr en el frame
+                // actual via `htrack`.  RET / do_throw / TAILCALL liberan
+                // automaticamente sin necesidad de RAW_FREE explicito.
+                // Cubre TODOS los exit paths (incluido throw cross-frame).
+                //
+                // Sprint mem-loop-fix (2026-06-02): SKIPEAR htrack cuando
+                // el promote pass marco la ALLOCA con explicit_free=true.
+                // El RAW_FREE preservado en el IR libera el ptr en su
+                // sitio (al fin de cada iteracion del loop), sin
+                // acumular en el vector host_allocas del frame.
+                // Bottleneck antes: 5M iter de malloc(96)+free -> 20s
+                // por acumular 5M ptrs tracked sin liberar hasta RET.
+                if (!ins.host_alloca_explicit_free) {
+                    std::string rd_track = ctx.dst_of(ins.dst);
+                    ctx.out << "    htrack " << rd_track << "\n";
+                }
+                emit_restore_live_regs(ctx, call_pos, regs_to_save);
+                break;
+            }
+
             ctx.out << "    subsp rsp, " << bytes << "\n";
             if (ins.dst != IR_NO_VALUE) {
                 std::string rd = ctx.dst_of(ins.dst);
@@ -2522,9 +2591,42 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             std::string rp = ctx.load_src(ins.operands[1], 1); // puntero destino
             // Sufijo de tamano para que mov escriba exactamente sizeof(type)
             // bytes (no 8 por defecto).  Igual que en LOAD.
+            //
+            // Sprint mem-loop-fix (2026-06-02): el bug previo aplicaba el
+            // sufijo SOLO cuando el operando estaba en registro.  Si el
+            // valor venia de spill (rv = "r14"/"r13" tras load_src), se
+            // emitia `movh [rp], r14` sin sufijo = QWORD STORE (8 bytes)
+            // aunque el IR pidiera STORE i32 (4 bytes).
+            //
+            // Consecuencia: en un slot del slab de 16 bytes, escribir
+            // `buf[3]` con qword corrompia los bytes 12-19 (4 bytes fuera
+            // del slot, en el slot vecino).  Repro:
+            // `examples_codes_vex/59_arraylist.vex`.
+            //
+            // Fix: SIEMPRE aplicar sufijo segun ins.type, incluso cuando
+            // el reg es scratch del spill (r14/r13).  La VM ya soporta
+            // las variantes sized del `mov`/`movh` (b/w/d/q).
             std::string rv_sized = rv;
             if (ctx.is_in_reg(ins.operands[0])) {
                 rv_sized = reg_name_sized(ctx.reg_num(ins.operands[0]), ins.type);
+            } else {
+                // Operando spilled: rv es "r14" o "r13".  Aplicar sufijo
+                // de tamano segun ins.type.  reg_num_for_name retorna el
+                // indice 13/14 para construir el nombre sized.
+                int reg_idx = -1;
+                if (rv == "r13") reg_idx = 13;
+                else if (rv == "r14") reg_idx = 14;
+                else if (rv.size() >= 2 && rv[0] == 'r') {
+                    // rN con N > 9 o N < 13/14 (e.g. r12, r10).  Parse.
+                    char *endp = nullptr;
+                    long n = std::strtol(rv.c_str() + 1, &endp, 10);
+                    if (endp != rv.c_str() + 1 && n >= 0 && n <= 15) {
+                        reg_idx = static_cast<int>(n);
+                    }
+                }
+                if (reg_idx >= 0) {
+                    rv_sized = reg_name_sized(reg_idx, ins.type);
+                }
             }
             const bool host_ptr =
                 ins.operands[1] != IR_NO_VALUE
@@ -2733,6 +2835,31 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             // Este opcode es util solo cuando seguido de readcur/writecur via RAW_ASM.
             if (!ins.operands.empty())
                 ctx.out << "    gcderef cur0, " << ctx.load_src(ins.operands[0], 0) << "\n";
+            break;
+        }
+
+        case IrOp::GC_DEREF_HOST: {
+            // %dst = gc_deref_host.ptr %handle
+            //
+            // Reemplaza el viejo blob RAW_ASM:
+            //     gcderef cur0, {src0}
+            //     xchg    cur0, {dst}
+            //
+            // El primer paso baja el host_ptr del payload del handle a cur0
+            // (special register).  El segundo lo intercambia con el registro
+            // general destino.  Tras el xchg, cur0 queda con el valor previo
+            // del dst (basura, descartada).
+            //
+            // El resultado dst es un host_ptr al payload del objeto GC.
+            // Marcarlo @c is_host_ptr permite que LOAD/STORE posteriores
+            // emitan @c movh en lugar de @c mov (memoria host vs VM).
+            if (ins.dst != IR_NO_VALUE && !ins.operands.empty()) {
+                std::string rs = ctx.load_src(ins.operands[0], 0);
+                std::string rd = ctx.dst_of(ins.dst);
+                ctx.out << "    gcderef cur0, " << rs << "\n";
+                ctx.out << "    xchg cur0, " << rd << "\n";
+                ctx.store_spilled(ins.dst);
+            }
             break;
         }
 
@@ -3320,6 +3447,163 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
                         << ", " << ctx.reg_of(ins.operands[1]) << "\n";
             break;
 
+        // --- raw_asm-elim wave 3: ops nuevos sin operandos / con imm ---
+        case IrOp::RETHROW:
+            // rethrow: terminator del bloque, sin operandos.
+            ctx.out << "    rethrow\n";
+            break;
+        case IrOp::SHARED_STAT: {
+            // sharedstat r_dst, r_op_code
+            // op=0 (live_count) y op=1 (bytes) producen un valor en r_dst.
+            // op=2 (gc_collect) es void: usamos r14 dummy como dst.
+            if (ins.operands.empty()) break;
+            std::string r_op  = ctx.reg_of(ins.operands[0]);
+            std::string r_dst = (ins.dst != IR_NO_VALUE)
+                                ? ctx.dst_of(ins.dst)
+                                : std::string("r14");
+            ctx.out << "    sharedstat " << r_dst << ", " << r_op << "\n";
+            if (ins.dst != IR_NO_VALUE) ctx.store_spilled(ins.dst);
+            break;
+        }
+        case IrOp::READ_VM_REG: {
+            // mov {dst}, rN  (N = ins.imm).
+            if (ins.dst == IR_NO_VALUE) break;
+            if (ins.imm > 15) break;  // sanity check
+            ctx.out << "    mov " << ctx.dst_of(ins.dst)
+                    << ", r" << ins.imm << "\n";
+            ctx.store_spilled(ins.dst);
+            break;
+        }
+        case IrOp::RSPAWN_RETURN: {
+            // mov r0, payload + hlt fusionado.  Terminator del bloque.
+            if (ins.operands.empty()) break;
+            std::string r_payload = ctx.reg_of(ins.operands[0]);
+            // emit_mov_if_needed para evitar mov r0, r0 redundante.
+            if (r_payload != "r0") {
+                ctx.out << "    mov r0, " << r_payload << "\n";
+            }
+            ctx.out << "    hlt\n";
+            break;
+        }
+
+        case IrOp::MOD_LOAD: {
+            // raw_asm-elim wave 2: loadmod/unloadmod.
+            // imm=0 -> loadmod (ejecuta el main del plugin como sub-llamada,
+            //          R0 = init_pc o 0 si fallo).
+            // imm=1 -> unloadmod (libera el slot, R0 = 1 ok / 0 not_found).
+            if (ins.operands.size() < 2 || ins.dst == IR_NO_VALUE) break;
+            const char *mnem = (ins.imm == 0) ? "loadmod" : "unloadmod";
+            std::string r_path = ctx.load_src(ins.operands[0], 0);
+            std::string r_len  = ctx.load_src(ins.operands[1], 1);
+            std::string r_dst  = ctx.dst_of(ins.dst);
+            ctx.out << "    " << mnem << " " << r_path << ", " << r_len << "\n";
+            if (r_dst != "r0") ctx.out << "    mov " << r_dst << ", r0\n";
+            ctx.store_spilled(ins.dst);
+            break;
+        }
+        case IrOp::DLOPEN: {
+            // raw_asm-elim wave 2: LoadLibrary/dlopen wrapper.
+            // dlopen rDst, rPath, rLen (3-arg form, dst inline).
+            if (ins.operands.size() < 2 || ins.dst == IR_NO_VALUE) break;
+            std::string r_path = ctx.load_src(ins.operands[0], 0);
+            std::string r_len  = ctx.load_src(ins.operands[1], 1);
+            std::string r_dst  = ctx.dst_of(ins.dst);
+            ctx.out << "    dlopen " << r_dst << ", "
+                    << r_path << ", " << r_len << "\n";
+            ctx.store_spilled(ins.dst);
+            break;
+        }
+        case IrOp::DLSYM: {
+            // raw_asm-elim wave 2: GetProcAddress/dlsym wrapper.
+            // dlsym rDst, rHandle, rNameAddr, rNameLen (4-arg form).
+            if (ins.operands.size() < 3 || ins.dst == IR_NO_VALUE) break;
+            std::string r_handle = ctx.load_src(ins.operands[0], 0);
+            std::string r_name   = ctx.load_src(ins.operands[1], 1);
+            std::string r_len    = ctx.load_src(ins.operands[2], 2);
+            std::string r_dst    = ctx.dst_of(ins.dst);
+            ctx.out << "    dlsym " << r_dst << ", "
+                    << r_handle << ", " << r_name << ", " << r_len << "\n";
+            ctx.store_spilled(ins.dst);
+            break;
+        }
+
+        case IrOp::REFLECT_COUNT: {
+            // raw_asm-elim wave 2: methodcount/fieldcount.
+            // imm=0 -> methodcount, imm=1 -> fieldcount.
+            // Emite "<op> r_cls\nmov r_dst, r0\n" (resultado en R0).
+            if (ins.operands.empty() || ins.dst == IR_NO_VALUE) break;
+            const char *mnem = (ins.imm == 0) ? "methodcount" : "fieldcount";
+            std::string r_cls = ctx.load_src(ins.operands[0], 0);
+            std::string r_dst = ctx.dst_of(ins.dst);
+            ctx.out << "    " << mnem << " " << r_cls << "\n";
+            // Si r_dst ya es r0 (regalloc lucky), evita mov r0, r0.
+            if (r_dst != "r0") ctx.out << "    mov " << r_dst << ", r0\n";
+            ctx.store_spilled(ins.dst);
+            break;
+        }
+        case IrOp::REFLECT_AT: {
+            // raw_asm-elim wave 2: getmethat/getfldat.
+            // imm=0 -> getmethat, imm=1 -> getfldat.
+            if (ins.operands.size() < 2 || ins.dst == IR_NO_VALUE) break;
+            const char *mnem = (ins.imm == 0) ? "getmethat" : "getfldat";
+            std::string r_cls = ctx.load_src(ins.operands[0], 0);
+            std::string r_idx = ctx.load_src(ins.operands[1], 1);
+            std::string r_dst = ctx.dst_of(ins.dst);
+            ctx.out << "    " << mnem << " " << r_cls << ", " << r_idx << "\n";
+            if (r_dst != "r0") ctx.out << "    mov " << r_dst << ", r0\n";
+            ctx.store_spilled(ins.dst);
+            break;
+        }
+
+        case IrOp::SMARTPTR_FREE: {
+            // raw_asm-elim wave 2: cleanup deterministico de smart pointer
+            // con 3 variantes segun ins.imm:
+            //   0 = SRET_DISPATCH  -> operands=[ptr, del_addr], func_name=""
+            //   1 = EXTERN_CALLN   -> operands=[ptr], func_name="<lib>:<fn>"
+            //   2 = VESTA_CALLVM   -> operands=[ptr], func_name="<fn_label>"
+            //
+            // El emisor expande a la secuencia equivalente con labels
+            // unicas via contador estatico thread-local.  Reusa el espacio
+            // de labels global @c __sp_skip_<N> que el viejo RAW_ASM usaba.
+            if (ins.operands.empty()) break;
+            static thread_local uint64_t sp_label_seq = 0;
+            const uint64_t lbl = ++sp_label_seq;
+            std::string r_ptr = ctx.reg_of(ins.operands[0]);
+            if (ins.imm == 0 && ins.operands.size() >= 2) {
+                /* SRET_DISPATCH: deleter es runtime via slot+8 */
+                const std::string done_lbl = "__sp_done_" + std::to_string(lbl);
+                const std::string default_lbl = "__sp_default_" + std::to_string(lbl);
+                std::string r_del = ctx.reg_of(ins.operands[1]);
+                ctx.out << "    cmpu " << r_ptr << ", 0\n";
+                ctx.out << "    jmp.je " << done_lbl << "\n";
+                ctx.out << "    cmpu " << r_del << ", 0\n";
+                ctx.out << "    jmp.je " << default_lbl << "\n";
+                ctx.out << "    mov r14, " << r_del << "\n";   // staging deleter
+                if (r_ptr != "r1") ctx.out << "    mov r1, " << r_ptr << "\n";
+                ctx.out << "    mov r15, 1\n";
+                ctx.out << "    callvmr r14\n";
+                ctx.out << "    jmp.jmp " << done_lbl << "\n";
+                ctx.out << default_lbl << ":\n";
+                if (r_ptr != "r1") ctx.out << "    mov r1, " << r_ptr << "\n";
+                ctx.out << "    free r1\n";
+                ctx.out << done_lbl << ":\n";
+            } else if (ins.imm == 1 || ins.imm == 2) {
+                /* EXTERN_CALLN (1) o VESTA_CALLVM (2). */
+                const std::string skip_lbl = "__sp_skip_" + std::to_string(lbl);
+                ctx.out << "    cmpu " << r_ptr << ", 0\n";
+                ctx.out << "    jmp.je " << skip_lbl << "\n";
+                if (r_ptr != "r1") ctx.out << "    mov r1, " << r_ptr << "\n";
+                ctx.out << "    mov r15, 1\n";
+                if (ins.imm == 1) {
+                    ctx.out << "    calln @Method(\"" << ins.func_name << "\")\n";
+                } else {
+                    ctx.out << "    callvm @Absolute(\"code." << ins.func_name << "\")\n";
+                }
+                ctx.out << skip_lbl << ":\n";
+            }
+            break;
+        }
+
         // --- string extra ---
         case IrOp::STRGETBYTES:
             if (ins.dst != IR_NO_VALUE && !ins.operands.empty()) {
@@ -3673,6 +3957,93 @@ EmitResult ir_emit_module(const IrModule &mod_in, const EmitOptions &opts) {
 
     // Aplicar optimizaciones IR
     ir_optimize(mod, opts.opt_level);
+
+    // ===================================================================
+    // Math-IR-promote: pre-pase que convierte IR ops sin bytecode opcode
+    // a CALLN equivalente.  Estos ops (FMIN/FMAX/FFLOOR/FCEIL/FROUND/
+    // FTRUNC/IABS/IMIN/IMAX/IMINU/IMAXU/ILOG2/CLZ/CTZ/POPCNT/BYTESWAP/
+    // ROTL/ROTR) existen como IR ops para que:
+    //   (a) El optimizer pueda constant-fold cuando los operandos son
+    //       literales.
+    //   (b) El Selector JIT pueda emitir instrucciones nativas
+    //       (sqrtsd/roundsd/popcnt/lzcnt/etc.) sin mini-parser.
+    //
+    // El VM bytecode no tiene opcodes nativos para estas ops todavia, por
+    // lo que el emitter las convierte a CALLN al runtime vmath.  El path
+    // bytecode pasa por libreria; el path JIT emite hardware directo.
+    // Cuando el runtime gane opcodes nativos (futuro sprint), este
+    // pre-pase ignora los ops correspondientes.
+    {
+        struct VmathMap { IrOp op; const char *fn; ir::IrType ret_ir; };
+        static const VmathMap vmath_table[] = {
+            // Sprint string-perf-5 (2026-06-02): FMIN/FMAX/FFLOOR/FCEIL/
+            // FROUND/FTRUNC ahora tienen opcodes bytecode nativos
+            // (0x80-0x85) y se emiten directamente como mnemonicos en el
+            // switch.  Removidos del pre-pase para evitar CALLN overhead
+            // (~150ns -> ~5ns por op en interp).
+            //
+            // { IrOp::FFLOOR,   "vmath_floor",    ir::IrType::F64 },
+            // { IrOp::FCEIL,    "vmath_ceil",     ir::IrType::F64 },
+            // { IrOp::FROUND,   "vmath_round",    ir::IrType::F64 },
+            // { IrOp::FTRUNC,   "vmath_trunc",    ir::IrType::F64 },
+            // { IrOp::FMIN,     "vmath_fmin",     ir::IrType::F64 },
+            // { IrOp::FMAX,     "vmath_fmax",     ir::IrType::F64 },
+            // Int (signed/unsigned).
+            { IrOp::IABS,     "vmath_abs",      ir::IrType::I64 },
+            { IrOp::IMIN,     "vmath_min",      ir::IrType::I64 },
+            { IrOp::IMAX,     "vmath_max",      ir::IrType::I64 },
+            { IrOp::IMINU,    "vmath_minu",     ir::IrType::I64 },
+            { IrOp::IMAXU,    "vmath_maxu",     ir::IrType::I64 },
+            { IrOp::ILOG2,    "vmath_ilog2",    ir::IrType::I64 },
+            // Bit ops.
+            { IrOp::CLZ,      "vmath_clz",      ir::IrType::I64 },
+            { IrOp::CTZ,      "vmath_ctz",      ir::IrType::I64 },
+            { IrOp::POPCNT,   "vmath_popcount", ir::IrType::I64 },
+            { IrOp::BYTESWAP, "vmath_bswap",    ir::IrType::I64 },
+            { IrOp::ROTL,     "vmath_rotl",     ir::IrType::I64 },
+            { IrOp::ROTR,     "vmath_rotr",     ir::IrType::I64 },
+        };
+        const std::string lib_math = "stdlib/native/math/vesta_math";
+        bool any_used = false;
+        for (auto &fn : mod.functions) {
+            for (auto &bb : fn.blocks) {
+                for (auto &ins : bb.instrs) {
+                    for (const auto &m : vmath_table) {
+                        if (ins.op != m.op) continue;
+                        ins.op        = IrOp::CALLN;
+                        ins.func_name = lib_math + ":" + m.fn;
+                        // Mantener type del dst original.  El emitter de
+                        // CALLN ya sabe pasar args via R1..RN.
+                        any_used = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (any_used) {
+            // Registrar los imports usados.  Re-iteramos solo los que
+            // aparecieron (any_used=true).  Es O(N*M) pero solo corre 1
+            // vez por modulo + M es chico (~18 entries).
+            for (const auto &m : vmath_table) {
+                bool used_here = false;
+                for (const auto &fn : mod.functions) {
+                    for (const auto &bb : fn.blocks) {
+                        for (const auto &ins : bb.instrs) {
+                            if (ins.op == IrOp::CALLN
+                             && ins.func_name == lib_math + ":" + m.fn) {
+                                used_here = true; break;
+                            }
+                        }
+                        if (used_here) break;
+                    }
+                    if (used_here) break;
+                }
+                if (used_here) {
+                    mod.register_native_import(lib_math, m.fn);
+                }
+            }
+        }
+    }
 
     std::ostringstream out;
 

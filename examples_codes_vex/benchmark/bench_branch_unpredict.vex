@@ -1,0 +1,29 @@
+// Bench: branches no predecibles (pattern xorshift en el predicate).
+// Worst-case del branch predictor del CPU.  Mide el overhead real
+// del dispatch + branches cuando el predictor falla constantemente.
+//
+// Workload: 10M iters con 4 branches pseudo-aleatorios por iter.
+
+i32 main() {
+    u64 rng = 1;
+    i64 a = 0;
+    i64 b = 0;
+    i64 c = 0;
+    i64 d = 0;
+    i32 i = 0;
+    while (i < 10000000) {
+        // xorshift64 -- rapido y distribucion ~aleatoria.
+        rng = rng ^ (rng << 13);
+        rng = rng ^ (rng >> 7);
+        rng = rng ^ (rng << 17);
+        // 4 branches sobre bits aleatorios.  El predictor del CPU
+        // no puede aprender el patron => cada branch cuesta el full
+        // misprediction penalty (~10-20 ciclos).
+        if ((rng & 1) != 0) { a = a + 1; } else { a = a - 1; }
+        if ((rng & 2) != 0) { b = b + 1; } else { b = b - 1; }
+        if ((rng & 4) != 0) { c = c + 1; } else { c = c - 1; }
+        if ((rng & 8) != 0) { d = d + 1; } else { d = d - 1; }
+        i = i + 1;
+    }
+    return (i32)((a + b + c + d) & 0xFF);
+}

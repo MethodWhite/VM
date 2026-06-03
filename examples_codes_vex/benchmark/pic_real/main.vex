@@ -1,0 +1,53 @@
+// Bench: polymorphic inline cache REAL.  Un solo call site que ve
+// 3 tipos distintos alternados.  Antes del PIC, este patron caia al
+// slow path en 2 de cada 3 iters (MIC monomorfico solo cachea 1 tipo).
+// Con PIC de 4 entries, las 3 clases caben y todas hacen hit.
+
+interface Shape {
+    public i32 area();
+}
+
+class Circle : Shape {
+    public i32 r;
+    public Circle(i32 r) { this.r = r; }
+    public i32 area() { return this.r * this.r * 3; }
+}
+
+class Rect : Shape {
+    public i32 w;
+    public i32 h;
+    public Rect(i32 w, i32 h) { this.w = w; this.h = h; }
+    public i32 area() { return this.w * this.h; }
+}
+
+class Triangle : Shape {
+    public i32 b;
+    public i32 h;
+    public Triangle(i32 b, i32 h) { this.b = b; this.h = h; }
+    public i32 area() { return (this.b * this.h) / 2; }
+}
+
+// CLAVE: array de Shape con 3 instancias distintas.  El call site
+// `shapes[idx].area()` ve los 3 tipos en rotacion, NO 3 sitios
+// distintos cada uno monomorfico.
+class Bench {
+    public i32 run_hot(i32 n) {
+        Shape[3] shapes;
+        shapes[0] = new Circle(5);
+        shapes[1] = new Rect(4, 6);
+        shapes[2] = new Triangle(3, 8);
+        i32 sum = 0;
+        i32 i = 0;
+        while (i < n) {
+            // Un solo call site, 3 tipos alternados.
+            sum = sum + shapes[i % 3].area();
+            i = i + 1;
+        }
+        return sum;
+    }
+}
+
+i32 main() {
+    Bench b = new Bench();
+    return b.run_hot(3000000);
+}

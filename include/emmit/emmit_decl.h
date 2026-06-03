@@ -1219,6 +1219,17 @@ namespace Assembly::Bytecode {
     );
 
     /**
+     * @brief Emite bitg2z/bitz2g: bitcast directo entre un GP y un ZMM.
+     * Convention: regs = (gp_idx << 4) | zmm_idx.
+     */
+    void emit_instr_bitcast_zg(
+        const vm::Instruction *instruction_parser,
+        ByteWriter &           code_final,
+        const InstrInfo *      now_instr,
+        Assembler *            assembly_ctx
+    );
+
+    /**
      * @brief Emite instrucciones de string con dos registros (Convention B).
      *
      * Formato FIXED_4: [0x00][opcode2][b2][b3=0]

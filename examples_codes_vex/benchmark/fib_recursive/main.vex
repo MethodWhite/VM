@@ -1,0 +1,11 @@
+// Bench: Fibonacci recursivo profundo.
+// fib(32) = 2178309.  Mide call/ret overhead + branch.
+i64 fib(i64 n) {
+    if (n < 2) return n;
+    return fib(n - 1) + fib(n - 2);
+}
+
+i32 main() {
+    i64 r = fib(32);
+    return (i32) (r & 0xFFFFFFFF);
+}

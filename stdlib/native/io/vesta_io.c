@@ -1382,6 +1382,41 @@ VESTA_PLUGIN_EXPORT uint64_t vio_flush(void) {
     return 0;
 }
 
+/**
+ * @brief memcpy host-to-host: vectorizacion automatica via libc.
+ *
+ * Sprint mem-perf (2026-06-02): el IR pass @c ir_pass_loop_memcpy_idiom
+ * detecta loops byte-a-byte que copian secuencialmente y los reemplaza
+ * por una unica @c CALLN a esta funcion.  La libc usa SSE/AVX/AVX-512
+ * internamente, asi el copyloop se vectoriza sin necesidad de SIMD
+ * codegen en el JIT ni en el bytecode.
+ *
+ * @return @c dst_host (compatible API memcpy).
+ */
+VESTA_PLUGIN_EXPORT uint64_t vio_memcpy(uint64_t dst_host,
+                                        uint64_t src_host,
+                                        uint64_t n) {
+    if (dst_host == 0 || src_host == 0 || n == 0) return dst_host;
+    if (n > (1ull << 30)) n = (1ull << 30);
+    memcpy((void *) (uintptr_t) dst_host,
+           (const void *) (uintptr_t) src_host,
+           (size_t) n);
+    return dst_host;
+}
+
+/**
+ * @brief memset host: rellena bytes con un valor.  Usado por el IR pass
+ * cuando detecta loops de inicializacion `dst[i] = K`.
+ */
+VESTA_PLUGIN_EXPORT uint64_t vio_memset(uint64_t dst_host,
+                                        uint64_t val,
+                                        uint64_t n) {
+    if (dst_host == 0 || n == 0) return dst_host;
+    if (n > (1ull << 30)) n = (1ull << 30);
+    memset((void *) (uintptr_t) dst_host, (int) (val & 0xFF), (size_t) n);
+    return dst_host;
+}
+
 /* -----------------------------------------------------------------------
  * Entrada de texto hacia memoria VM (sin cambios respecto a la version
  * vieja: lectura es bloqueante y va por stdin del host).

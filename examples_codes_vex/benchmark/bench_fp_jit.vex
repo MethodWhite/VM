@@ -1,0 +1,41 @@
+// Bench: Math-IR-promote v2.2b (sprint YY).
+//
+// Mide el speedup del JIT al emitir FP ops nativas con instrucciones SSE
+// (sqrtsd/minsd/maxsd/roundsd) + GP-bitmask para fabs/fneg, en lugar de
+// pasar por CALLN a vmath_*.  Hot loop con 6 FP ops por iteracion.
+//
+// Estrategia codegen:
+//   * sqrt/fmin/fmax/floor/ceil/round/trunc: memory-roundtrip GP<->XMM via
+//     MOVQ + sqrtsd/minsd/maxsd/roundsd nativos (~4-6 ciclos + 4 movs).
+//   * fabs/fneg: bitwise mask GP-only (AND/XOR con 0x7FFF... / 0x8000...).
+//
+// Resultados esperados (~5M iter, 6 FP ops/iter = 30M FP ops):
+//   interp: ~25-40 seg (cada FP op pasa por CALLN ~50ns).
+//   JIT:    ~50-100 ms (cada FP op nativa ~3-5ns).
+//   Speedup: ~300-700x.
+//
+// R0/R1 deben ser identicos en interp y JIT (determinista IEEE 754).
+
+class FpOps {
+    public f64 run_hot(i32 n) {
+        f64 acc = 0.0;
+        i32 i = 1;
+        while (i < n) {
+            f64 x = (f64) i;
+            acc = acc + sqrt(x);
+            acc = acc + fabs(x - 1000.0);
+            acc = acc + floor(x * 0.7);
+            acc = acc + ceil(x * 0.3);
+            acc = acc + fmin(x, 500000.0);
+            acc = acc + fmax(x, 100.0);
+            i = i + 1;
+        }
+        return acc;
+    }
+}
+
+i32 main() {
+    FpOps f = new FpOps();
+    f64 r = f.run_hot(5000000);
+    return (i32)(r * 0.000001);
+}

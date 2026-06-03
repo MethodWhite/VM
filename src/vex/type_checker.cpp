@@ -47,6 +47,12 @@
 
 #include "ffi/virtual_lib_registry.h"  // registrar vex_static_assert
 
+/* extern "C" decl global del thunk generator.  La impl esta
+ * en src/runtime/native_callback.cpp.  La registramos como virtual_fn
+ * "vesta_runtime:vex_get_native_thunk" para que el builtin Vex
+ * `as_native_callback(fn)` la invoque via CALLN. */
+extern "C" uint64_t vex_get_native_thunk(uint64_t fn_pc, uint64_t argc);
+
 namespace vex {
 
     /* TypeChecker activo (thread_local) para los virtual
@@ -217,6 +223,13 @@ namespace vex {
             ffi::register_virtual_fn(
                 "vesta_comptime", "comptime_compile",
                 reinterpret_cast<void *>(&vex_comptime_compile));
+            /* Sprint B.1: thunk generator para callbacks Vex -> C nativos.
+             * Builtin `as_native_callback(fn)` se baja a un CALLN a esta
+             * fn que retorna el host_ptr al thunk callable con cc nativa.
+             * El extern "C" decl global esta arriba del namespace. */
+            ffi::register_virtual_fn(
+                "vesta_runtime", "vex_get_native_thunk",
+                reinterpret_cast<void *>(&::vex_get_native_thunk));
         });
     }
 
@@ -1342,6 +1355,19 @@ namespace vex {
             }
         }
 
+        // -------- Sprint lombok (2026-06-03): expansion de anotaciones Lombok.
+        // Antes de procesar templates / collect / check, recorremos cada
+        // ClassDecl y generamos los ClassMethodDecls sinteticos que las
+        // anotaciones Lombok piden.  Esto es un AST rewrite puro: tras el
+        // pre-pase el AST se ve como si el usuario hubiera escrito los
+        // metodos a mano, asi que el resto del pipeline funciona sin
+        // cambios.  Implementa: @Getter, @Setter, @ToString,
+        // @EqualsAndHashCode, @NoArgsConstructor, @AllArgsConstructor,
+        // @RequiredArgsConstructor, @With (en field), @Data, @Value,
+        // @Builder, @Synchronized, @Log.  @NonNull se traduce a la
+        // sintaxis `nonnull T` del lenguaje (validacion compile-time).
+        expand_lombok_annotations();
+
         // -------- registrar templates + monomorphizar.
         // Primero localizamos todas las clases con type_params y las
         // marcamos como templates (no se procesaran como concretas).
@@ -2015,6 +2041,28 @@ namespace vex {
         reg_builtin("imin",  Type{PrimitiveKind::I64}, {PrimitiveKind::I64, PrimitiveKind::I64});
         reg_builtin("imax",  Type{PrimitiveKind::I64}, {PrimitiveKind::I64, PrimitiveKind::I64});
         reg_builtin("clamp", Type{PrimitiveKind::I64}, {PrimitiveKind::I64, PrimitiveKind::I64, PrimitiveKind::I64});
+        // Math-IR-promote v2.2a: float + bit ops nuevos.
+        reg_builtin("trunc",    Type{PrimitiveKind::F64}, {PrimitiveKind::F64});
+        reg_builtin("iminu",    Type{PrimitiveKind::U64}, {PrimitiveKind::U64, PrimitiveKind::U64});
+        reg_builtin("imaxu",    Type{PrimitiveKind::U64}, {PrimitiveKind::U64, PrimitiveKind::U64});
+        reg_builtin("ilog2",    Type{PrimitiveKind::U64}, {PrimitiveKind::U64});
+        reg_builtin("popcount", Type{PrimitiveKind::U64}, {PrimitiveKind::U64});
+        reg_builtin("clz",      Type{PrimitiveKind::U64}, {PrimitiveKind::U64});
+        reg_builtin("ctz",      Type{PrimitiveKind::U64}, {PrimitiveKind::U64});
+        reg_builtin("bswap",    Type{PrimitiveKind::U64}, {PrimitiveKind::U64});
+        reg_builtin("rotl",     Type{PrimitiveKind::U64}, {PrimitiveKind::U64, PrimitiveKind::U64});
+        reg_builtin("rotr",     Type{PrimitiveKind::U64}, {PrimitiveKind::U64, PrimitiveKind::U64});
+
+        /* Sprint B.1: callback Vex -> C nativo.  Toma una fn Vex como
+         * argumento y devuelve un host_ptr (i64) a un thunk con cc C
+         * estandar (Win64 o SysV).  El check_call hace bypass especial
+         * para validar que el arg es una IdentExpr a una funcion
+         * declarada (no a un lambda value).  Sintaxis:
+         *
+         *   i32 mi_cmp(u8* a, u8* b) { ... }
+         *   u64 cb = as_native_callback(mi_cmp);
+         *   qsort(arr, n, sz, cb);  // C llama a mi_cmp via cc nativa */
+        reg_builtin("as_native_callback", Type{PrimitiveKind::I64}, {PrimitiveKind::PTR});
 
         // Identificadores magicos para colores y atributos ANSI.
         //
@@ -3282,6 +3330,275 @@ namespace vex {
         }
     }
 
+    /**
+     * @brief Sprint edge-bugs (2026-06-02): rewrite implicit-this.
+     *
+     * En metodos de instancia, identifiers como @c v dentro del body que
+     * matchean un field name de la clase contenedora se reescriben como
+     * @c this.v (FieldAccessExpr).  Convencion Java/C#.  No reescribe si:
+     *   - el ident matchea un parametro (params_set)
+     *   - el ident matchea una local declarada en un scope previo (locals_stack)
+     *   - es lhs de un VarDecl (la propia declaracion)
+     *
+     * El walker recibe @c unique_ptr<Expr>& para poder swap-ear el nodo
+     * IdentExpr por FieldAccessExpr in-place.  Walkea TODAS las statements
+     * y exprs hijas (recursivo).
+     */
+    static void rewrite_implicit_this(
+        std::unique_ptr<ast::Stmt> &stmt,
+        const std::unordered_set<std::string> &field_names,
+        const std::unordered_set<std::string> &params_set);
+
+    static void rewrite_implicit_this_expr(
+        std::unique_ptr<ast::Expr> &node,
+        const std::unordered_set<std::string> &field_names,
+        const std::unordered_set<std::string> &params_set,
+        std::vector<std::unordered_set<std::string>> &locals_stack) {
+        if (!node) return;
+        // IdentExpr: si matches field y NO en params/locals, rewrite.
+        if (node->kind == ast::NodeKind::IdentExpr) {
+            auto *id = static_cast<ast::IdentExpr *>(node.get());
+            if (field_names.count(id->name)
+             && !params_set.count(id->name)
+             && id->name != "this" && id->name != "super") {
+                bool shadowed = false;
+                for (auto &s : locals_stack) if (s.count(id->name)) { shadowed = true; break; }
+                if (!shadowed) {
+                    auto fa = std::make_unique<ast::FieldAccessExpr>();
+                    fa->loc = id->loc;
+                    auto base = std::make_unique<ast::IdentExpr>();
+                    base->loc  = id->loc;
+                    base->name = "this";
+                    fa->base       = std::move(base);
+                    fa->field_name = id->name;
+                    node = std::move(fa);
+                }
+            }
+            return;
+        }
+        switch (node->kind) {
+            case ast::NodeKind::BinaryExpr: {
+                auto *b = static_cast<ast::BinaryExpr *>(node.get());
+                rewrite_implicit_this_expr(b->lhs, field_names, params_set, locals_stack);
+                rewrite_implicit_this_expr(b->rhs, field_names, params_set, locals_stack);
+                return;
+            }
+            case ast::NodeKind::UnaryExpr: {
+                auto *u = static_cast<ast::UnaryExpr *>(node.get());
+                rewrite_implicit_this_expr(u->operand, field_names, params_set, locals_stack);
+                return;
+            }
+            case ast::NodeKind::TernaryExpr: {
+                auto *t = static_cast<ast::TernaryExpr *>(node.get());
+                rewrite_implicit_this_expr(t->cond, field_names, params_set, locals_stack);
+                rewrite_implicit_this_expr(t->then_expr, field_names, params_set, locals_stack);
+                rewrite_implicit_this_expr(t->else_expr, field_names, params_set, locals_stack);
+                return;
+            }
+            case ast::NodeKind::CallExpr: {
+                auto *c = static_cast<ast::CallExpr *>(node.get());
+                // Para el callee: si es IdentExpr (llamada simple `foo(x)`),
+                // NO reescribimos a this.foo -- la llamada se resuelve por
+                // simbolo global (clase methods se invocan con this. explicito
+                // o se inlinean).  Si es FieldAccessExpr o algo mas, recurse.
+                if (c->callee && c->callee->kind != ast::NodeKind::IdentExpr) {
+                    rewrite_implicit_this_expr(c->callee, field_names, params_set, locals_stack);
+                }
+                for (auto &a : c->args)
+                    rewrite_implicit_this_expr(a, field_names, params_set, locals_stack);
+                return;
+            }
+            case ast::NodeKind::FieldAccessExpr: {
+                auto *fa = static_cast<ast::FieldAccessExpr *>(node.get());
+                rewrite_implicit_this_expr(fa->base, field_names, params_set, locals_stack);
+                return;
+            }
+            case ast::NodeKind::IndexExpr: {
+                auto *ix = static_cast<ast::IndexExpr *>(node.get());
+                rewrite_implicit_this_expr(ix->base, field_names, params_set, locals_stack);
+                rewrite_implicit_this_expr(ix->index, field_names, params_set, locals_stack);
+                return;
+            }
+            case ast::NodeKind::AssignExpr: {
+                auto *a = static_cast<ast::AssignExpr *>(node.get());
+                rewrite_implicit_this_expr(a->target, field_names, params_set, locals_stack);
+                rewrite_implicit_this_expr(a->value, field_names, params_set, locals_stack);
+                return;
+            }
+            case ast::NodeKind::CastExpr: {
+                auto *c = static_cast<ast::CastExpr *>(node.get());
+                rewrite_implicit_this_expr(c->operand, field_names, params_set, locals_stack);
+                return;
+            }
+            case ast::NodeKind::NewExpr: {
+                auto *n = static_cast<ast::NewExpr *>(node.get());
+                for (auto &a : n->args)
+                    rewrite_implicit_this_expr(a, field_names, params_set, locals_stack);
+                return;
+            }
+            case ast::NodeKind::LambdaExpr: {
+                auto *lam = static_cast<ast::LambdaExpr *>(node.get());
+                std::unordered_set<std::string> lam_locals;
+                for (auto &p : lam->params) lam_locals.insert(p->name);
+                locals_stack.push_back(std::move(lam_locals));
+                if (lam->body)
+                    for (auto &child : lam->body->body)
+                        rewrite_implicit_this(child, field_names, params_set);
+                locals_stack.pop_back();
+                return;
+            }
+            case ast::NodeKind::StringLitExpr: {
+                auto *sl = static_cast<ast::StringLitExpr *>(node.get());
+                for (auto &ie : sl->interp_exprs)
+                    rewrite_implicit_this_expr(ie, field_names, params_set, locals_stack);
+                return;
+            }
+            case ast::NodeKind::MatchExpr: {
+                auto *me = static_cast<ast::MatchExpr *>(node.get());
+                rewrite_implicit_this_expr(me->scrutinee, field_names, params_set, locals_stack);
+                for (auto &arm : me->arms) {
+                    std::unordered_set<std::string> arm_locals;
+                    for (auto &bn : arm.bindings) arm_locals.insert(bn);
+                    locals_stack.push_back(std::move(arm_locals));
+                    if (arm.body)
+                        rewrite_implicit_this(arm.body, field_names, params_set);
+                    locals_stack.pop_back();
+                }
+                return;
+            }
+            case ast::NodeKind::InitListExpr: {
+                auto *il = static_cast<ast::InitListExpr *>(node.get());
+                for (auto &e : il->elements)
+                    rewrite_implicit_this_expr(e, field_names, params_set, locals_stack);
+                return;
+            }
+            default:
+                return;
+        }
+    }
+
+    static void rewrite_implicit_this(
+        std::unique_ptr<ast::Stmt> &stmt,
+        const std::unordered_set<std::string> &field_names,
+        const std::unordered_set<std::string> &params_set) {
+        if (!stmt) return;
+        /* Stack de scopes locales (a parte de los params).  Cada BlockStmt
+         * push/pop su scope para soportar shadowing.  El VarDecl agrega el
+         * nombre al scope ACTUAL antes de procesar las stmts siguientes. */
+        std::vector<std::unordered_set<std::string>> locals_stack;
+        std::function<void(std::unique_ptr<ast::Stmt> &)> visit;
+        visit = [&](std::unique_ptr<ast::Stmt> &s) {
+            if (!s) return;
+            switch (s->kind) {
+                case ast::NodeKind::BlockStmt: {
+                    auto *bs = static_cast<ast::BlockStmt *>(s.get());
+                    locals_stack.push_back({});
+                    for (auto &child : bs->body) visit(child);
+                    locals_stack.pop_back();
+                    return;
+                }
+                case ast::NodeKind::VarDeclStmt: {
+                    auto *vd = static_cast<ast::VarDeclStmt *>(s.get());
+                    /* Reescribir el init ANTES de declarar el local (el init
+                     * no puede referirse a si mismo). */
+                    if (vd->init)
+                        rewrite_implicit_this_expr(vd->init, field_names,
+                            params_set, locals_stack);
+                    /* Anadir el nombre al scope local actual.  Si stack vacio,
+                     * crear scope top-level. */
+                    if (locals_stack.empty()) locals_stack.push_back({});
+                    locals_stack.back().insert(vd->name);
+                    return;
+                }
+                case ast::NodeKind::ExprStmt: {
+                    auto *es = static_cast<ast::ExprStmt *>(s.get());
+                    rewrite_implicit_this_expr(es->expr, field_names,
+                        params_set, locals_stack);
+                    return;
+                }
+                case ast::NodeKind::ReturnStmt: {
+                    auto *rs = static_cast<ast::ReturnStmt *>(s.get());
+                    if (rs->value)
+                        rewrite_implicit_this_expr(rs->value, field_names,
+                            params_set, locals_stack);
+                    return;
+                }
+                case ast::NodeKind::IfStmt: {
+                    auto *is = static_cast<ast::IfStmt *>(s.get());
+                    rewrite_implicit_this_expr(is->cond, field_names,
+                        params_set, locals_stack);
+                    visit(is->then_branch);
+                    visit(is->else_branch);
+                    return;
+                }
+                case ast::NodeKind::WhileStmt: {
+                    auto *ws = static_cast<ast::WhileStmt *>(s.get());
+                    rewrite_implicit_this_expr(ws->cond, field_names,
+                        params_set, locals_stack);
+                    visit(ws->body);
+                    return;
+                }
+                case ast::NodeKind::DoWhileStmt: {
+                    auto *ds = static_cast<ast::DoWhileStmt *>(s.get());
+                    visit(ds->body);
+                    rewrite_implicit_this_expr(ds->cond, field_names,
+                        params_set, locals_stack);
+                    return;
+                }
+                case ast::NodeKind::ForStmt: {
+                    auto *fs = static_cast<ast::ForStmt *>(s.get());
+                    locals_stack.push_back({});
+                    visit(fs->init);
+                    if (fs->cond)
+                        rewrite_implicit_this_expr(fs->cond, field_names,
+                            params_set, locals_stack);
+                    if (fs->step)
+                        rewrite_implicit_this_expr(fs->step, field_names,
+                            params_set, locals_stack);
+                    visit(fs->body);
+                    locals_stack.pop_back();
+                    return;
+                }
+                case ast::NodeKind::TryStmt: {
+                    auto *ts = static_cast<ast::TryStmt *>(s.get());
+                    /* body es BlockStmt; iterar children. */
+                    if (ts->body)
+                        for (auto &child : ts->body->body)
+                            visit(child);
+                    for (auto &c : ts->catches) {
+                        locals_stack.push_back({});
+                        if (!c.var_name.empty())
+                            locals_stack.back().insert(c.var_name);
+                        if (c.body)
+                            for (auto &child : c.body->body) visit(child);
+                        locals_stack.pop_back();
+                    }
+                    if (ts->finally_body)
+                        for (auto &child : ts->finally_body->body) visit(child);
+                    return;
+                }
+                case ast::NodeKind::ThrowStmt: {
+                    auto *th = static_cast<ast::ThrowStmt *>(s.get());
+                    if (th->value)
+                        rewrite_implicit_this_expr(th->value, field_names,
+                            params_set, locals_stack);
+                    return;
+                }
+                case ast::NodeKind::SynchronizedStmt: {
+                    auto *ss = static_cast<ast::SynchronizedStmt *>(s.get());
+                    rewrite_implicit_this_expr(ss->target, field_names,
+                        params_set, locals_stack);
+                    if (ss->body)
+                        for (auto &child : ss->body->body) visit(child);
+                    return;
+                }
+                default:
+                    return;
+            }
+        };
+        visit(stmt);
+    }
+
     void TypeChecker::check_class_method(const ClassLayout &cls, ast::ClassMethodDecl *m) {
         // Semantica de modificadores:
         //  - constructor static: error (no tiene sentido).
@@ -3311,6 +3628,35 @@ namespace vex {
             sp.type = type_from_node(p->type.get());
             if (!declare(p->name, sp)) {
                 diags_.error(p->loc, "parametro repetido: '" + p->name + "'");
+            }
+        }
+        // Sprint edge-bugs (2026-06-02): pre-pase de implicit-this.
+        // Recolecta field names de la clase + sus supers transitivos.
+        // Despues walkea el body y reescribe identifiers de fields a
+        // FieldAccessExpr(this, field).  Solo para metodos de instancia
+        // (en static methods no hay this, debe ser explicito error).
+        if (!m->is_static && m->body) {
+            std::unordered_set<std::string> field_names;
+            const ClassLayout *cl_cur = &cls;
+            int depth_guard = 256;
+            while (cl_cur && depth_guard-- > 0) {
+                for (const auto &f : cl_cur->fields) field_names.insert(f.name);
+                if (cl_cur->super_name.empty()) break;
+                auto sup_it = class_layouts_.find(cl_cur->super_name);
+                if (sup_it == class_layouts_.end()) break;
+                cl_cur = &sup_it->second;
+            }
+            std::unordered_set<std::string> params_set;
+            params_set.insert("this");
+            params_set.insert("super");
+            for (auto &p : m->params) params_set.insert(p->name);
+            /* Rewrite inline las stmts del body.  m->body es
+             * unique_ptr<BlockStmt> con vector body de unique_ptr<Stmt>. */
+            std::vector<std::unordered_set<std::string>> ls;
+            for (auto &child : m->body->body) {
+                /* visit es interno de rewrite_implicit_this; lo recreamos aqui
+                 * a nivel BlockStmt iterando children y delegando. */
+                rewrite_implicit_this(child, field_names, params_set);
             }
         }
         // Tipo de retorno: VOID para constructores; el declarado para los demas.
@@ -4013,7 +4359,21 @@ namespace vex {
                     }
                 }
             }
+            // Sprint edge-bugs (2026-06-02): propagar expected_optional_type_
+            // y expected_result_type_ al check_expr del init.  Sin esto
+            // Optional<Optional<i32>> o = Some(Some(42)) NO infiere el
+            // inner Some como Optional<i32> (queda como Optional<i64> por
+            // el literal 42).  Mismo patron que check_return ya hacia.
+            const Type saved_outer_opt    = expected_optional_type_;
+            const Type saved_outer_result = expected_result_type_;
+            if (s.type.kind == PrimitiveKind::OPTIONAL) {
+                expected_optional_type_ = s.type;
+            } else if (s.type.kind == PrimitiveKind::RESULT) {
+                expected_result_type_ = s.type;
+            }
             Type t = check_expr(vd->init.get());
+            expected_optional_type_ = saved_outer_opt;
+            expected_result_type_   = saved_outer_result;
             if (pushed_expected_enum) pop_expected_enum();
             // implicit Some: si el tipo declarado es Optional<T> y el
             // init es de tipo T (o asignable a T), envolvemos el init
@@ -6385,6 +6745,51 @@ namespace vex {
         // Marcar el tipo del target en el AST.
         e->target->result_type = s->type;
 
+        // Sprint edge-bugs (2026-06-02): si el target tiene tipo FUNCTION y
+        // el value es una LambdaExpr sin annotations de tipo, propagar la
+        // firma esperada (params + return_type) a la lambda antes de
+        // check_expr.  Sin esto, la lambda infiere VOID como return y
+        // dispara 'return con valor en funcion declarada void' en su body.
+        // Mismo patron que check_var_decl + check_return ya hacen.
+        if (s->type.kind == PrimitiveKind::FUNCTION
+         && e->value && e->value->kind == ast::NodeKind::LambdaExpr) {
+            auto *lam = static_cast<ast::LambdaExpr *>(e->value.get());
+            if (lam->params.size() == s->type.fn_params.size()) {
+                for (size_t i = 0; i < lam->params.size(); ++i) {
+                    if (!lam->params[i]->type) {
+                        const Type &pt = s->type.fn_params[i];
+                        if (pt.kind == PrimitiveKind::CLASS
+                         || pt.kind == PrimitiveKind::STRUCT) {
+                            auto nt = std::make_unique<ast::NamedTypeNode>();
+                            nt->loc  = lam->params[i]->loc;
+                            nt->name = pt.struct_name;
+                            lam->params[i]->type = std::move(nt);
+                        } else {
+                            auto pn = std::make_unique<ast::PrimitiveTypeNode>();
+                            pn->loc  = lam->params[i]->loc;
+                            pn->prim = pt.kind;
+                            lam->params[i]->type = std::move(pn);
+                        }
+                    }
+                }
+                if (!lam->return_type && s->type.pointee) {
+                    const Type &rt = *s->type.pointee;
+                    if (rt.kind == PrimitiveKind::CLASS
+                     || rt.kind == PrimitiveKind::STRUCT) {
+                        auto nt = std::make_unique<ast::NamedTypeNode>();
+                        nt->loc  = lam->loc;
+                        nt->name = rt.struct_name;
+                        lam->return_type = std::move(nt);
+                    } else {
+                        auto pn = std::make_unique<ast::PrimitiveTypeNode>();
+                        pn->loc  = lam->loc;
+                        pn->prim = rt.kind;
+                        lam->return_type = std::move(pn);
+                    }
+                }
+            }
+        }
+
         const Type tv = check_expr(e->value.get());
         if (tv.kind != PrimitiveKind::COUNT && !types_assignable(s->type, tv)) {
             diags_.error(e->loc,
@@ -8049,7 +8454,22 @@ namespace vex {
                 e->result_type = Type{};
                 return Type{};
             }
+            // Sprint edge-bugs (2026-06-02): propagar expected_optional_type_
+            // al inner cuando esperamos Optional<Optional<T>>.  Sin esto el
+            // inner Some infiere T por defecto del literal (i64) en vez de
+            // del contexto outer (Optional<i32>).
+            const Type saved_outer_opt = expected_optional_type_;
+            if (expected_optional_type_.kind == PrimitiveKind::OPTIONAL
+             && expected_optional_type_.pointee
+             && expected_optional_type_.pointee->kind == PrimitiveKind::OPTIONAL) {
+                expected_optional_type_ = *expected_optional_type_.pointee;
+            } else {
+                /* Si el inner no es Optional, deshabilitar la propagacion
+                 * para que el inner check_expr no la malinterprete. */
+                expected_optional_type_ = Type{};
+            }
             Type at = check_expr(e->args[0].get());
+            expected_optional_type_ = saved_outer_opt;
             // Bug fix 2026-05-23: propagar el T esperado del Optional cuando
             // hay contexto.  Acepta el arg si es asignable al T esperado.
             Type final_t = at;
@@ -9154,6 +9574,35 @@ namespace vex {
         // CLASS, PTR, ARRAY, o entero arbitrario sin que el bypass del
         // type checker se queje del tipo.  El lowering despacha al
         // CALLN apropiado convirtiendo a uint64.
+        /* Sprint B.1: as_native_callback(fn_name) bypass.  Acepta IdentExpr
+         * que resuelve a Function (no a Variable).  Captura el nombre +
+         * argc para que el lowering emita la secuencia correcta. */
+        if (id->name == "as_native_callback") {
+            if (e->args.size() != 1) {
+                diags_.error(e->loc, "'as_native_callback' espera 1 argumento (nombre de funcion Vex)");
+                return Type{PrimitiveKind::I64};
+            }
+            auto *fn_id = dynamic_cast<ast::IdentExpr *>(e->args[0].get());
+            if (fn_id == nullptr) {
+                diags_.error(e->args[0]->loc,
+                    "'as_native_callback' requiere un identificador de funcion (no expresion)");
+                return Type{PrimitiveKind::I64};
+            }
+            /* Lookup del simbolo via lookup_with_depth. */
+            size_t depth = 0;
+            const Symbol *sym = lookup_with_depth(fn_id->name, &depth);
+            if (sym == nullptr || sym->kind != SymbolKind::Function) {
+                diags_.error(fn_id->loc,
+                    "'as_native_callback': '" + fn_id->name + "' no es una funcion conocida");
+                return Type{PrimitiveKind::I64};
+            }
+            /* Marcamos result_type del IdentExpr como I64 sentinela para
+             * que el lowering reconozca el patron (sin pasar por lower_ident
+             * normal que daria error de simbolo). */
+            fn_id->result_type = Type{PrimitiveKind::I64};
+            return Type{PrimitiveKind::I64};
+        }
+
         const bool is_io_print_relaxed =
             (id->name == "print" || id->name == "println" || id->name == "echo"
           || id->name == "print_ptr" || id->name == "print_gchandle");

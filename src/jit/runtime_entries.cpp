@@ -66,6 +66,14 @@ namespace jit {
         gc_write_barrier  = &vrt_gc_write_barrier;
 
         // -----------------------------------------------------------------
+        // Raw HOST memory (malloc/free no-GC).  Usado por RAW_ALLOC y
+        // RAW_FREE del IR, frecuentes en callbacks que necesitan alocar
+        // structs Win32 / POSIX para pasar a APIs nativas.
+        // -----------------------------------------------------------------
+        raw_alloc          = &vrt_raw_alloc;
+        raw_free           = &vrt_raw_free;
+
+        // -----------------------------------------------------------------
         // Monitores (sync primitives sobre objetos GC).  El JIT emite
         // calls a estos en lugar de inlinar el codigo del monitor porque
         // los waits y notifications cooperan con el scheduler.
@@ -116,6 +124,13 @@ namespace jit {
         // -----------------------------------------------------------------
         vm_read_u64  = &vrt_vm_read_u64;
         vm_write_u64 = &vrt_vm_write_u64;
+        vm_read_u32  = &vrt_vm_read_u32;
+        vm_read_u16  = &vrt_vm_read_u16;
+        vm_read_u8   = &vrt_vm_read_u8;
+        vm_write_u32 = &vrt_vm_write_u32;
+        vm_write_u16 = &vrt_vm_write_u16;
+        vm_write_u8  = &vrt_vm_write_u8;
+        vm_translate = &vrt_vm_translate;
         findclass    = &vrt_findclass;
         newobj         = &vrt_newobj;
         newobj_handle  = &vrt_newobj_handle;
@@ -129,6 +144,17 @@ namespace jit {
         findmethod   = &vrt_findmethod;
         findfield    = &vrt_findfield;
         setmethdbg   = &vrt_setmethdbg;
+
+        // ----- String ops (Sprint JIT-cobertura 2026-06-01) -----
+        str_make      = &vrt_str_make;
+        str_len       = &vrt_str_len;
+        str_get_bytes = &vrt_str_get_bytes;
+        str_raw       = &vrt_str_raw;
+        str_cat       = &vrt_str_cat;
+        str_cmp       = &vrt_str_cmp;
+        // ----- Panic + GC alloc payload -----
+        panic_str        = &vrt_panic_str;
+        gc_alloc_payload = &vrt_gc_alloc_payload;
 
         // -----------------------------------------------------------------
         // Safepoint: poll (cheap check del flag global) + handler (slow
@@ -166,6 +192,9 @@ namespace jit {
                findclass         && newobj          && defclass         &&
                deffield          && defmethod       && addadvice        &&
                findmethod        && findfield       && setmethdbg       &&
+               str_make          && str_len         && str_get_bytes   &&
+               str_raw           && str_cat         && str_cmp          &&
+               panic_str         && gc_alloc_payload &&
                safepoint_poll    && safepoint_handler;
     }
 

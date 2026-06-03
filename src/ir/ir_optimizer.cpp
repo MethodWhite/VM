@@ -16,11 +16,32 @@
 #include <vector>
 #include <queue>
 #include <cstdint>
+#include <cstring>
+#include <cmath>
+#include <limits>
 #include <functional>
 #include <sstream>
 #include <algorithm>
 
 namespace ir {
+
+/* Helpers locales para constant folding de math IR ops (Math-IR-promote
+ * v2.2c).  Preservan bits IEEE 754 via memcpy para no perder precision
+ * en el round-trip uint64 <-> double que el IR usa. */
+namespace {
+    inline double  bits_to_f64(uint64_t b) noexcept {
+        double d; std::memcpy(&d, &b, sizeof(d)); return d;
+    }
+    inline uint64_t f64_to_bits(double d) noexcept {
+        uint64_t b; std::memcpy(&b, &d, sizeof(b)); return b;
+    }
+    inline float   bits_to_f32(uint32_t b) noexcept {
+        float f; std::memcpy(&f, &b, sizeof(f)); return f;
+    }
+    inline uint32_t f32_to_bits(float f) noexcept {
+        uint32_t b; std::memcpy(&b, &f, sizeof(b)); return b;
+    }
+}  // namespace
 
 // =========================================================================
 //  Utilidades internas
@@ -90,6 +111,12 @@ static bool is_side_effecting(IrOp op) {
         case IrOp::GC_ALLOCP:
         case IrOp::GC_PROMOTE: case IrOp::GC_DEMOTE:
         case IrOp::GC_HANDLE_FOR_PTR:
+        // GC_DEREF_HOST: handle -> host_ptr.  Conservative: marked side-effecting
+        // porque el host_ptr puede cambiar tras un major_gc (moving GC) y CSE
+        // erroneamente fusionaria dos derefs separados por un CALL.  Cuando
+        // llegue Phase D.8 con CSE block-aware con clobber model, se puede
+        // relajar a "pure within block until next CALL/alloc".
+        case IrOp::GC_DEREF_HOST:
         case IrOp::ATOMIC_LD_I64: case IrOp::ATOMIC_ST_I64:
         case IrOp::ATOMIC_CAS_I64: case IrOp::ATOMIC_ADD_I64:
         case IrOp::GETSTATIC: case IrOp::SETSTATIC:
@@ -99,6 +126,28 @@ static bool is_side_effecting(IrOp op) {
         case IrOp::CALLSUPER:  case IrOp::PROCEED:
         case IrOp::FULFILL_HLT:
         case IrOp::STRGETBYTES:
+        // Sprint edge-bugs (2026-06-02): ops que pueden lanzar FatalError
+        // capturable o disparar AV recovery.  DCE no debe eliminarlas aunque
+        // su dst quede no-usado: el side-effect (fault) es observable.  La
+        // penalizacion en perf es modesta porque mem-CSE/constant-fold ya
+        // simplifican casos seguros (e.g. DIV por constante != 0 se folde).
+        case IrOp::LOAD:
+        case IrOp::DIV: case IrOp::MOD:
+        case IrOp::FDIV:
+        // raw_asm-elim wave 3: nuevos ops con efecto observable.
+        case IrOp::RETHROW:         // relanza excepcion (side-effect explicito)
+        case IrOp::SHARED_STAT:     // op=2 (gc_collect) dispara STW + sweep
+        case IrOp::READ_VM_REG:     // lee reg arbitrario; el optimizer no debe asumir purity
+        case IrOp::RSPAWN_RETURN:   // mov r0 + hlt fusionado, terminator
+        // raw_asm-elim wave 2: cleanup deterministico de smart pointers.
+        case IrOp::SMARTPTR_FREE:   // invoca deleter (free/CALLN/CALLVM); side-effect
+        // raw_asm-elim wave 2: reflexion queries (escriben a R0, consultan estado).
+        case IrOp::REFLECT_COUNT:
+        case IrOp::REFLECT_AT:
+        // raw_asm-elim wave 2: FFI runtime ops (cargan/descargan DLLs, side-effects).
+        case IrOp::MOD_LOAD:      // loadmod ejecuta main del plugin (call site)
+        case IrOp::DLOPEN:        // LoadLibrary/dlopen (side-effect en OS)
+        case IrOp::DLSYM:         // GetProcAddress/dlsym (lookup en DLL state)
         case IrOp::GETPID:  case IrOp::GETARGC: case IrOp::GETARG:
         // ensamblador incrustado (nunca eliminar; semantica opaca)
         case IrOp::RAW_ASM:
@@ -112,12 +161,111 @@ static bool is_side_effecting(IrOp op) {
 static bool is_terminator(IrOp op) {
     return op == IrOp::BR   || op == IrOp::BR_COND ||
            op == IrOp::RET  || op == IrOp::UNREACHABLE ||
-           op == IrOp::THROW;
+           op == IrOp::THROW || op == IrOp::RETHROW ||
+           op == IrOp::RSPAWN_RETURN || op == IrOp::FULFILL_HLT;
 }
 
 /** @brief Devuelve true si la instruccion es pura (apta para DCE y CSE). */
 static bool is_pure(IrOp op) {
     return !is_side_effecting(op);
+}
+
+/**
+ * @brief Sprint mem-perf string_hot (2026-06-02): ops "alloc-pure"
+ * hoistables por LICM.
+ *
+ * Algunas operaciones de strings (STRMAKE, STRCAT, STRINTERN, STRCONV,
+ * STRRESERVE) son side-effecting (alocan en GcHeap) PERO su semantica
+ * solo depende del CONTENIDO de los operandos.  Es decir, dos invocaciones
+ * con los mismos operandos producen StringObjects con identical bytes;
+ * solo difieren en el handle (GcHandle es opaco al programador y los
+ * builtins de string tipo STRLEN/STRCMP/STRRAW/STRGETBYTES operan sobre
+ * bytes, no comparan handles).
+ *
+ * Por tanto LICM puede hoistar estas ops cuando sus operandos son
+ * loop-invariant.  Beneficio masivo en patrones como
+ *
+ *   while (i < N) {
+ *       string s = base + suffix;     // STRCAT con bases invariant
+ *       if (str_equals(s, "lit")) {   // STRMAKE "lit" invariant
+ *           ...
+ *       }
+ *   }
+ *
+ * donde la version sin hoist hace N allocs de ROPEs identicos; con hoist
+ * 1 sola alloc.  El bench string_hot pasa de 393 ms a sub-100 ms en interp.
+ *
+ * NO incluye STRCMP/STRLEN/STRRAW/STRGETBYTES/STRHASH (esos NO alocan;
+ * ya son @c is_pure y LICM los toma).  NO incluye STRFLAT/STRFINALIZE
+ * (mutan estructuras compartidas).
+ */
+static bool is_licm_hoistable_alloc(IrOp op) {
+    switch (op) {
+        // STRCAT/STRINTERN/STRCONV/STRFLAT operan SOBRE HANDLES (GcHandles),
+        // no leen memoria mutable; alocacion idempotente con resultado
+        // content-equal por args.  Safe para hoist.
+        case IrOp::STRCAT:
+        case IrOp::STRINTERN:
+        case IrOp::STRCONV:
+        case IrOp::STRRESERVE:
+            return true;
+        // STRMAKE requiere chequeo extra (ver @c strmake_reads_immutable).
+        case IrOp::STRMAKE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/**
+ * @brief Verifica si el vm_addr operand de un STRMAKE viene de
+ * memoria INMUTABLE (STR_LIT_ADDR -> static_data).
+ *
+ * Sprint string-perf-2 bug fix (2026-06-02): LICM solo puede hoistar
+ * STRMAKE si el operand vm_addr apunta a memoria que NO muta dentro
+ * del loop.  STR_LIT_ADDR retorna un offset al static_data del modulo
+ * (read-only por convencion).  Cualquier otro origen (ALLOCA, malloc,
+ * field load, etc.) puede ser mutable.
+ *
+ * Tracing simple: busca el IrOp que produce @p vm_addr.  Si es
+ * STR_LIT_ADDR, safe.  Si es ADD entre STR_LIT_ADDR y CONST (offset
+ * dentro del bloque literal), tambien safe.  Otros casos -> unsafe.
+ */
+static bool strmake_reads_immutable(const IrFunction &fn, IrValueId vm_addr) {
+    if (vm_addr == IR_NO_VALUE || vm_addr >= fn.values.size()) return false;
+    // Buscar el IrOp que define vm_addr.
+    for (const auto &bb : fn.blocks) {
+        for (const auto &ins : bb.instrs) {
+            if (ins.dst != vm_addr) continue;
+            switch (ins.op) {
+                case IrOp::STR_LIT_ADDR:
+                    return true;
+                case IrOp::ADD:
+                case IrOp::SUB: {
+                    // ADD/SUB de STR_LIT_ADDR + const -> tambien immutable.
+                    if (ins.operands.size() != 2) return false;
+                    // Recurse en operand[0] (asumiendo que es la base ptr).
+                    if (strmake_reads_immutable(fn, ins.operands[0])) {
+                        // operand[1] debe ser CONST (offset literal).
+                        IrValueId off = ins.operands[1];
+                        if (off < fn.values.size() && fn.values[off].is_const) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                case IrOp::BITCAST:
+                case IrOp::MOV:
+                    if (ins.operands.size() == 1) {
+                        return strmake_reads_immutable(fn, ins.operands[0]);
+                    }
+                    return false;
+                default:
+                    return false;
+            }
+        }
+    }
+    return false;
 }
 
 // =========================================================================
@@ -201,6 +349,712 @@ bool ir_pass_dead_alloc_elim(IrFunction &fn) {
         }
         instrs.resize(write);
     }
+    return changed;
+}
+
+// =========================================================================
+//  Pase ir_pass_promote_callned_allocas
+//
+//  Phase D.jit-mem-model AUTO-PROMOTE: detecta `&local` (ALLOCAs) que
+//  fluyen a CALLN (funciones nativas).  Esos ALLOCAs SE PROMUEVEN a host
+//  stack via marca `is_host_ptr=true` en el dst del ALLOCA.  El JIT
+//  selector consulta esa marca y emite host stack en lugar de VM-stack.
+//
+//  Sin esta promocion, &local seria una VM-addr que la funcion nativa
+//  trataria como host_ptr -> garbage/crash.  Con la promocion, &local
+//  es un host_ptr genuino dereferenciable directamente por code C.
+//
+//  Permite escribir codigo natural C-style:
+//
+//      u8[1024] buf;
+//      ReadFile(handle, &buf[0], 1024, &bytes_read, null);
+//
+//  El frontend NO necesita anotaciones del usuario (@host etc).  El
+//  analisis es backward-flow desde args PTR de cada CALLN.
+//
+//  Algoritmo:
+//    1. Forward seed: por cada CALLN, marca todos sus operands como
+//       "reaches_calln".
+//    2. Backward fix-point: si dst ya marcado, propagar a operands a
+//       traves de ADD/SUB/BITCAST/MOV/CAST/SEXT/ZEXT/TRUNC/PHI/LOAD.
+//    3. Final: ALLOCAs cuyo dst esta marcado -> set is_host_ptr=true.
+//       Tambien propagar is_host_ptr forward por la cadena de uses para
+//       que LOAD/STORE de pointers derivados emita native mov.
+// =========================================================================
+
+bool ir_pass_promote_callned_allocas(IrFunction &fn) {
+    if (fn.is_native) return false;
+    if (fn.values.empty()) return false;
+
+    /* Step 1: detectar valores que llegan a args de CALLN. */
+    std::vector<bool> reaches_calln(fn.values.size(), false);
+    bool found_any_calln = false;
+    for (const auto &blk : fn.blocks) {
+        for (const auto &ins : blk.instrs) {
+            if (ins.op == IrOp::CALLN) {
+                found_any_calln = true;
+                for (auto opv : ins.operands) {
+                    if (opv != IR_NO_VALUE && opv < reaches_calln.size()) {
+                        reaches_calln[opv] = true;
+                    }
+                }
+            }
+        }
+    }
+    if (!found_any_calln) return false;
+
+    /* Step 2: backward fix-point a traves de ops ptr-arithmetic. */
+    bool changed_bp = true;
+    int max_iter = 16;
+    while (changed_bp && max_iter-- > 0) {
+        changed_bp = false;
+        for (const auto &blk : fn.blocks) {
+            for (const auto &ins : blk.instrs) {
+                if (ins.dst == IR_NO_VALUE) continue;
+                if (ins.dst >= reaches_calln.size()) continue;
+                if (!reaches_calln[ins.dst]) continue;
+                /* Propagar a operands segun op. */
+                switch (ins.op) {
+                    case IrOp::ADD:
+                    case IrOp::SUB:
+                    case IrOp::BITCAST:
+                    case IrOp::MOV:
+                    case IrOp::CAST:
+                    case IrOp::SEXT:
+                    case IrOp::ZEXT:
+                    case IrOp::TRUNC:
+                    case IrOp::LOAD:
+                        for (auto opv : ins.operands) {
+                            if (opv != IR_NO_VALUE && opv < reaches_calln.size()
+                             && !reaches_calln[opv]) {
+                                reaches_calln[opv] = true;
+                                changed_bp = true;
+                            }
+                        }
+                        break;
+                    case IrOp::PHI:
+                        for (const auto &pa : ins.phi_args) {
+                            if (pa.value != IR_NO_VALUE && pa.value < reaches_calln.size()
+                             && !reaches_calln[pa.value]) {
+                                reaches_calln[pa.value] = true;
+                                changed_bp = true;
+                            }
+                        }
+                        break;
+                    default: break;
+                }
+            }
+        }
+    }
+
+    /* Step 3: marcar ALLOCAs cuyo dst alcanza CALLN con
+     * `host_alloca=true` y recolectar sus dsts para insertar
+     * `RAW_FREE` antes de cada RET de la funcion.  El interp YA respeta
+     * `host_alloca` en su bytecode emit: emite `alloc N` (RAW_ALLOC
+     * bytecode) en lugar de `subsp`, y el `free` correspondiente lo
+     * provee el RAW_FREE insertado aqui. */
+    bool changed = false;
+    std::vector<IrValueId> promoted_dsts;
+    for (auto &blk : fn.blocks) {
+        for (auto &ins : blk.instrs) {
+            if (ins.op == IrOp::ALLOCA
+             && ins.dst != IR_NO_VALUE
+             && ins.dst < reaches_calln.size()
+             && reaches_calln[ins.dst]
+             && !ins.host_alloca) {
+                ins.host_alloca = true;
+                promoted_dsts.push_back(ins.dst);
+                changed = true;
+            }
+        }
+    }
+
+    /* Step 4 (post-leak-fix 2026-06-01): el cleanup en exit-points
+     * ahora lo hace el runtime via `htrack` + cleanup automatico al
+     * destruir el frame.  El bytecode emit del case ALLOCA emite
+     * `htrack r_dst` tras el `alloc`; el frame guarda los ptrs en una
+     * lista lazy y los libera en RET / do_throw / TAILCALL.
+     *
+     * Ventajas vs la version anterior (RAW_FREE inserted en IR):
+     *   - Cubre THROW cross-frame correctamente (do_throw libera al
+     *     pop frames durante unwind).
+     *   - Cubre todos los exit paths sin enumerar IR ops (los exits
+     *     del runtime son responsables del cleanup).
+     *   - Sin transformaciones IR extra: el IR queda mas limpio. */
+
+    /* Step 5: propagar is_host_ptr=true forward por las ops derivadas
+     * (ADD/SUB/BITCAST/MOV/CAST/*EXT/TRUNC/PHI) desde el dst de cada
+     * ALLOCA promovida.  Necesario para que LOAD/STORE downstream
+     * emitan `movh` (host mem) en lugar de `mov` (vm mem).
+     *
+     * Ahora que el interp tambien respeta `host_alloca` y emite `alloc
+     * N` (RAW_ALLOC bytecode) en lugar de `subsp` VM-stack, el ptr ES
+     * host genuino: propagar es seguro y correcto tanto para interp
+     * como para JIT. */
+    if (!promoted_dsts.empty()) {
+        /* Seed: marcar los dsts promovidos. */
+        for (auto vid : promoted_dsts) {
+            if (vid < fn.values.size()) {
+                fn.values[vid].is_host_ptr = true;
+            }
+        }
+        /* Fix-point forward propagation. */
+        bool prop_changed = true;
+        while (prop_changed) {
+            prop_changed = false;
+            for (auto &blk : fn.blocks) {
+                for (auto &ins : blk.instrs) {
+                    if (ins.dst == IR_NO_VALUE
+                     || ins.dst >= fn.values.size()) continue;
+                    auto &dst_v = fn.values[ins.dst];
+                    if (dst_v.is_host_ptr) continue;
+                    bool any_host = false;
+                    auto check = [&](IrValueId v) {
+                        if (v == IR_NO_VALUE
+                         || v >= fn.values.size()) return;
+                        if (fn.values[v].is_host_ptr) any_host = true;
+                    };
+                    switch (ins.op) {
+                        case IrOp::ADD: case IrOp::SUB:
+                        case IrOp::BITCAST: case IrOp::MOV:
+                        case IrOp::CAST: case IrOp::SEXT:
+                        case IrOp::ZEXT: case IrOp::TRUNC:
+                            for (auto v : ins.operands) check(v);
+                            break;
+                        case IrOp::PHI:
+                            for (auto &pa : ins.phi_args) check(pa.value);
+                            break;
+                        default: break;
+                    }
+                    if (any_host) {
+                        dst_v.is_host_ptr = true;
+                        prop_changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    return changed;
+}
+
+//==============================================================================
+//  Sprint string-perf-8 (2026-06-02): ir_pass_promote_local_allocas
+//
+//  Promueve ALLOCAs LOCALES (no escapan al interp, no se pasan a CALL*,
+//  no se almacenan en memoria heap) a `host_alloca=true`.  Esto permite
+//  que el JIT emita `sub rsp, N` en host stack y los LOAD/STORE
+//  derivados usen `mov [rbp+offset]` nativo (1 instr) en lugar del
+//  inline page cache hit + fallback runtime call (~10 instr).
+//
+//  Caso tipico: struct value-type local (e.g. `Vec3 v = {1,2,3};` con
+//  field access en hot loop).  bench_struct_field paga ~10 instrs por
+//  cada `v.x` o `v.x = ...`; tras la promocion, 1 instr.
+//
+//  Algoritmo:
+//    1. Recolectar ALLOCAs candidatas (no `host_alloca` ya, dst valido).
+//    2. Por cada candidate, calcular el set transitivo `derived` via
+//       forward-flow desde su dst a traves de ADD/SUB/BITCAST/MOV/etc.
+//    3. Por cada uso del candidate o sus derivados, clasificar:
+//       - SAFE: LOAD/STORE addr/ADD/SUB/CMP/BITCAST/MOV/CAST/etc.
+//       - UNSAFE: CALL*/RET/THROW/TAILCALL si operand esta en derived;
+//         STORE val (no addr) en derived implica escape.
+//    4. Si TODOS los usos son SAFE, set host_alloca=true.
+//
+//  Diferencias con `ir_pass_promote_callned_allocas`:
+//    - Aquel promueve para CALLN nativos (host_ptr REQUERIDO para
+//      pasarlo a la fn nativa).  Este promueve por OPORTUNIDAD (host
+//      stack es mas rapido que VM stack en JIT).
+//    - Aquel marca ALLOCAs que ALCANZAN un CALLN.  Este marca ALLOCAs
+//      que NO escapan a ningun sitio.
+//==============================================================================
+
+bool ir_pass_promote_local_allocas(IrFunction &fn) {
+    if (fn.is_native) return false;
+    if (fn.values.empty()) return false;
+
+    /* Step 1: identificar ALLOCAs candidatas (no host_alloca ya). */
+    std::vector<IrValueId> candidates;
+    candidates.reserve(8);
+    for (const auto &blk : fn.blocks) {
+        for (const auto &ins : blk.instrs) {
+            if (ins.op == IrOp::ALLOCA
+             && ins.dst != IR_NO_VALUE
+             && !ins.host_alloca) {
+                candidates.push_back(ins.dst);
+            }
+        }
+    }
+    if (candidates.empty()) return false;
+
+    /* Step 2: forward-flow del conjunto "derivado" desde TODAS las
+     * ALLOCAs candidatas.  Mantenemos una map vid -> origen (uno de los
+     * candidates) para que el escape de UN candidato no contamine los
+     * otros.
+     *
+     * Simplificacion: usamos un solo set "all_derived" + map dst->src.
+     * Si un dst tiene multiple sources (PHI con args de distintos
+     * candidates), conservativo: marcamos AMBOS como unsafe. */
+    std::vector<int8_t> derived_from(fn.values.size(), -1);  /* -1 = no, >=0 = idx en candidates */
+    std::vector<bool>   ambiguous(fn.values.size(), false);  /* derivado de >1 candidate */
+
+    auto set_derived = [&](IrValueId v, int8_t origin) {
+        if (v >= fn.values.size()) return false;
+        if (derived_from[v] == -1) {
+            derived_from[v] = origin;
+            return true;
+        }
+        if (derived_from[v] != origin) {
+            ambiguous[v] = true;
+        }
+        return false;
+    };
+    /* Seed: cada candidate es derived from itself. */
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        set_derived(candidates[i], static_cast<int8_t>(i & 0x7F));
+    }
+
+    /* Propagacion forward.  Cota dura 16 iter para convergencia. */
+    bool changed = true;
+    int it = 16;
+    while (changed && it-- > 0) {
+        changed = false;
+        for (const auto &blk : fn.blocks) {
+            for (const auto &ins : blk.instrs) {
+                if (ins.dst == IR_NO_VALUE || ins.dst >= fn.values.size()) continue;
+                if (derived_from[ins.dst] >= 0) continue;  /* ya marcado */
+                auto from_op = [&](IrValueId v) -> int {
+                    if (v == IR_NO_VALUE || v >= fn.values.size()) return -1;
+                    return derived_from[v];
+                };
+                switch (ins.op) {
+                    case IrOp::ADD: case IrOp::SUB:
+                    case IrOp::BITCAST: case IrOp::MOV:
+                    case IrOp::CAST: case IrOp::SEXT:
+                    case IrOp::ZEXT: case IrOp::TRUNC:
+                        for (auto opv : ins.operands) {
+                            int from = from_op(opv);
+                            if (from >= 0) {
+                                if (set_derived(ins.dst, static_cast<int8_t>(from)))
+                                    changed = true;
+                                break;
+                            }
+                        }
+                        break;
+                    case IrOp::PHI:
+                        for (const auto &pa : ins.phi_args) {
+                            int from = from_op(pa.value);
+                            if (from >= 0) {
+                                if (set_derived(ins.dst, static_cast<int8_t>(from)))
+                                    changed = true;
+                                break;
+                            }
+                        }
+                        break;
+                    default: break;
+                }
+            }
+        }
+    }
+
+    /* Step 3: clasificar usos.  Para cada candidate, escape=true si
+     * cualquier uso del candidate o sus derivados es UNSAFE.
+     *
+     * UNSAFE ops:
+     *   - CALL/CALLVIRT/CALLM/CALLN/CALLIND/CALLCLOSURE: cualquier operand
+     *     que sea derived es escape (el callee puede ser interp).
+     *   - RET/THROW/TAILCALL: cualquier operand derived es escape.
+     *   - STORE: si el VAL (operands[0]) es derived (pero NO el addr en
+     *     operands[1]), escapa a memoria fuera del candidato.  Si addr
+     *     ES derived, OK (es access local).
+     *
+     * SAFE ops sobre derived:
+     *   - LOAD addr=derived: OK (lee del slot local).
+     *   - STORE addr=derived val=non-derived: OK (escribe al slot local).
+     *   - ADD/SUB/BITCAST/MOV/CAST/SEXT/ZEXT/TRUNC/PHI: ya tracked.
+     *   - CMP: read-only.
+     *   - ALLOCA itself: el propio seed.
+     */
+    /* uint8_t en lugar de bool para evitar std::vector<bool>::reference. */
+    std::vector<uint8_t> escapes(candidates.size(), 0u);
+    auto mark_escape = [&](IrValueId v) {
+        if (v == IR_NO_VALUE || v >= derived_from.size()) return;
+        if (derived_from[v] < 0) return;
+        if (ambiguous[v]) {
+            /* multiple candidates -> escapan TODOS por conservadurismo. */
+            for (size_t k = 0; k < escapes.size(); ++k) escapes[k] = 1u;
+            return;
+        }
+        int idx = derived_from[v];
+        if (idx >= 0 && static_cast<size_t>(idx) < escapes.size()) {
+            escapes[idx] = 1u;
+        }
+    };
+
+    auto is_derived = [&](IrValueId v) -> bool {
+        if (v == IR_NO_VALUE || v >= derived_from.size()) return false;
+        return derived_from[v] >= 0;
+    };
+
+    /* Whitelist de SAFE ops: solo estas pueden tener operands derived
+     * sin que el ptr "escape" del alcance JIT-local.  Cualquier OTRA op
+     * (RAW_ASM, CALL*, GC_*, FINDCLASS, etc.) se trata como UNSAFE por
+     * defecto (los operands derived marcan escape). */
+    auto is_safe_op = [](IrOp op) -> bool {
+        switch (op) {
+            /* ALLOCA: seed.  No escapa por si misma. */
+            case IrOp::ALLOCA:
+            /* Aritmetica entera: produce nuevo valor, tracked via
+             * derived_from. */
+            case IrOp::ADD: case IrOp::SUB: case IrOp::MUL:
+            case IrOp::DIV: case IrOp::MOD: case IrOp::NEG:
+            case IrOp::AND: case IrOp::OR:  case IrOp::XOR: case IrOp::NOT:
+            case IrOp::SHL: case IrOp::SHR: case IrOp::SAR:
+            /* Casts: forward. */
+            case IrOp::BITCAST: case IrOp::MOV:
+            case IrOp::CAST: case IrOp::SEXT:
+            case IrOp::ZEXT: case IrOp::TRUNC:
+            /* CMP: read-only. */
+            case IrOp::CMP_EQ: case IrOp::CMP_NE:
+            case IrOp::CMP_LT: case IrOp::CMP_GT:
+            case IrOp::CMP_LE: case IrOp::CMP_GE:
+            case IrOp::CMP_ULT: case IrOp::CMP_UGT:
+            case IrOp::CMP_ULE: case IrOp::CMP_UGE:
+            /* Control flow: no escapa el ptr. */
+            case IrOp::BR: case IrOp::BR_COND:
+            case IrOp::NOP: case IrOp::CONST:
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    for (const auto &blk : fn.blocks) {
+        for (const auto &ins : blk.instrs) {
+            if (ins.op == IrOp::LOAD) {
+                /* LOAD addr=operands[0]: addr derived OK (lee slot).
+                 * dst NO se considera derived del candidate (es el
+                 * valor cargado de memoria, no el ptr). */
+                continue;
+            }
+            if (ins.op == IrOp::STORE) {
+                /* STORE val=operands[0], addr=operands[1].
+                 * addr derived -> OK (escribe al slot).
+                 * val derived -> ESCAPA (escribe el PTR a memoria). */
+                if (ins.operands.size() >= 2 && is_derived(ins.operands[0])) {
+                    mark_escape(ins.operands[0]);
+                }
+                continue;
+            }
+            if (ins.op == IrOp::PHI) {
+                /* PHI: si el dst NO es derived pero phi_args SI lo son,
+                 * los args "salen" del dominio local -> escape. */
+                if (ins.dst < derived_from.size()
+                 && derived_from[ins.dst] < 0) {
+                    for (const auto &pa : ins.phi_args) mark_escape(pa.value);
+                }
+                continue;
+            }
+            if (is_safe_op(ins.op)) continue;
+
+            /* UNSAFE op (CALL*, RAW_ASM, GC_*, FINDCLASS, RET, THROW, ...).
+             * Cualquier operand derived escapa. */
+            for (auto opv : ins.operands) mark_escape(opv);
+            for (const auto &pa : ins.phi_args) mark_escape(pa.value);
+        }
+    }
+
+    /* Step 4: promover ALLOCAs que NO escapan. */
+    bool any_promoted = false;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (escapes[i]) continue;
+        IrValueId v = candidates[i];
+        for (auto &blk : fn.blocks) {
+            for (auto &ins : blk.instrs) {
+                if (ins.op == IrOp::ALLOCA && ins.dst == v && !ins.host_alloca) {
+                    ins.host_alloca = true;
+                    /* NO explicit_free: el JIT libera con leave/ret;
+                     * el interp con htrack + frame cleanup. */
+                    any_promoted = true;
+                    /* Propagar is_host_ptr al dst para que el dataflow
+                     * de host_in_jit del JIT lo recoja. */
+                    if (v < fn.values.size()) {
+                        fn.values[v].is_host_ptr = true;
+                    }
+                }
+            }
+        }
+    }
+    if (!any_promoted) return false;
+
+    /* Step 5: propagar is_host_ptr forward por las cadenas de derived. */
+    bool prop = true; int p_it = 16;
+    while (prop && p_it-- > 0) {
+        prop = false;
+        for (auto &blk : fn.blocks) {
+            for (auto &ins : blk.instrs) {
+                if (ins.dst == IR_NO_VALUE || ins.dst >= fn.values.size()) continue;
+                auto &dv = fn.values[ins.dst];
+                if (dv.is_host_ptr) continue;
+                bool any_host = false;
+                auto chk = [&](IrValueId v) {
+                    if (v != IR_NO_VALUE && v < fn.values.size()
+                     && fn.values[v].is_host_ptr) any_host = true;
+                };
+                switch (ins.op) {
+                    case IrOp::ADD: case IrOp::SUB:
+                    case IrOp::BITCAST: case IrOp::MOV:
+                    case IrOp::CAST: case IrOp::SEXT:
+                    case IrOp::ZEXT: case IrOp::TRUNC:
+                        for (auto opv : ins.operands) { chk(opv); if (any_host) break; }
+                        break;
+                    case IrOp::PHI:
+                        for (const auto &pa : ins.phi_args) { chk(pa.value); if (any_host) break; }
+                        break;
+                    default: break;
+                }
+                if (any_host) {
+                    dv.is_host_ptr = true;
+                    prop = true;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+
+//==============================================================================
+//  Pase ir_pass_promote_local_raw_alloc
+//
+//  Convierte `malloc(N_const) + ... + free(p)` locales sin escape a un
+//  `ALLOCA host_alloca`.  El JIT selector emite `sub rsp, N` (host stack);
+//  el RAW_FREE correspondiente se reemplaza por NOP porque el stack se
+//  libera automaticamente al exit de la funcion (mov rsp, rbp + pop rbp).
+//
+//  Beneficio: malloc/free de ~200-500 ns por iter en hot loops -> ~1 ns
+//  (sub/add rsp).  Speedup del alloc puro ~100-500x.
+//==============================================================================
+
+bool ir_pass_promote_local_raw_alloc(IrFunction &fn) {
+    if (fn.is_native) return false;
+    if (fn.values.empty()) return false;
+
+    constexpr uint64_t MAX_PROMOTE_SIZE = 65536; // bytes
+
+    // Collect RAW_ALLOC candidates (CONST size, size razonable).
+    struct AllocSite {
+        size_t       block_idx;
+        size_t       ins_idx;
+        IrValueId    dst;
+        uint64_t     size_bytes;
+    };
+    std::vector<AllocSite> candidates;
+
+    for (size_t bi = 0; bi < fn.blocks.size(); ++bi) {
+        const auto &blk = fn.blocks[bi];
+        for (size_t ii = 0; ii < blk.instrs.size(); ++ii) {
+            const auto &ins = blk.instrs[ii];
+            if (ins.op != IrOp::RAW_ALLOC) continue;
+            if (ins.operands.empty()) continue;
+            if (ins.dst == IR_NO_VALUE) continue;
+            const IrValueId size_vid = ins.operands[0];
+            if (size_vid >= fn.values.size()) continue;
+            const auto &size_v = fn.values[size_vid];
+            if (!size_v.is_const) continue;
+            const uint64_t bytes = size_v.const_val;
+            if (bytes == 0 || bytes > MAX_PROMOTE_SIZE) continue;
+            candidates.push_back({bi, ii, ins.dst, bytes});
+        }
+    }
+    if (candidates.empty()) return false;
+
+    // Para cada candidato, hacer escape analysis:
+    //   - forward fix-point: marcar valores derivados del dst.
+    //   - rechazar si algun derivado llega a un uso prohibido (RETURN,
+    //     STORE a memoria GC, CALL externo distinto del RAW_FREE).
+    bool changed = false;
+    for (auto &c : candidates) {
+        // derivados[v] = true si v puede ser un alias del dst (forward
+        // flow desde el RAW_ALLOC dst a traves de ADD/SUB/BITCAST/MOV/
+        // CAST/*EXT/TRUNC/PHI).
+        std::vector<bool> derivados(fn.values.size(), false);
+        derivados[c.dst] = true;
+        bool prop = true;
+        int iters = 0;
+        while (prop && iters++ < 32) {
+            prop = false;
+            for (const auto &blk : fn.blocks) {
+                for (const auto &ins : blk.instrs) {
+                    if (ins.dst == IR_NO_VALUE) continue;
+                    if (ins.dst >= derivados.size()) continue;
+                    if (derivados[ins.dst]) continue;
+                    auto check = [&](IrValueId v) -> bool {
+                        return v != IR_NO_VALUE
+                            && v < derivados.size()
+                            && derivados[v];
+                    };
+                    bool any_d = false;
+                    switch (ins.op) {
+                        case IrOp::ADD:    case IrOp::SUB:
+                        case IrOp::BITCAST:case IrOp::MOV:
+                        case IrOp::CAST:   case IrOp::SEXT:
+                        case IrOp::ZEXT:   case IrOp::TRUNC:
+                            for (auto v : ins.operands) if (check(v)) { any_d = true; break; }
+                            break;
+                        case IrOp::PHI:
+                            for (auto &pa : ins.phi_args) if (check(pa.value)) { any_d = true; break; }
+                            break;
+                        default: break;
+                    }
+                    if (any_d) {
+                        derivados[ins.dst] = true;
+                        prop = true;
+                    }
+                }
+            }
+        }
+
+        // Escape check: contar RAW_FREEs que reciben un derivado, y
+        // rechazar si hay usos prohibidos.
+        bool escapes = false;
+        std::vector<std::pair<size_t,size_t>> free_sites;  // (block_idx, ins_idx)
+
+        auto is_derived = [&](IrValueId v) -> bool {
+            return v != IR_NO_VALUE
+                && v < derivados.size()
+                && derivados[v];
+        };
+
+        for (size_t bi = 0; bi < fn.blocks.size() && !escapes; ++bi) {
+            const auto &blk = fn.blocks[bi];
+            for (size_t ii = 0; ii < blk.instrs.size() && !escapes; ++ii) {
+                const auto &ins = blk.instrs[ii];
+
+                switch (ins.op) {
+                    case IrOp::RET:
+                    case IrOp::TAILCALL:
+                    case IrOp::RSPAWN_RETURN:
+                    case IrOp::FULFILL_HLT:
+                        // El ptr llega a return / tailcall / fulfill -> escapa.
+                        for (auto v : ins.operands) {
+                            if (is_derived(v)) { escapes = true; break; }
+                        }
+                        break;
+
+                    case IrOp::RAW_FREE:
+                        // Free directo: marca el site para eliminar
+                        // si la promocion procede.  NO marca escape.
+                        if (!ins.operands.empty() && is_derived(ins.operands[0])) {
+                            free_sites.push_back({bi, ii});
+                        }
+                        break;
+
+                    case IrOp::STORE: {
+                        // STORE val, addr.  Si val es derivado y la addr
+                        // apunta a memoria GC o globals, ESCAPA.  Si addr
+                        // es local (otro ALLOCA / RAW_ALLOC del mismo
+                        // scope), tracking conservativo: marcar escape
+                        // SOLO si la addr es is_host_ptr=false (= memoria
+                        // GC) o si el target es un global.
+                        //
+                        // MVP conservativo: cualquier STORE de un derivado
+                        // a una direccion que NO sea otro derivado del
+                        // mismo ALLOCA cuenta como escape.
+                        if (ins.operands.size() >= 2) {
+                            const IrValueId val_v = ins.operands[0];
+                            const IrValueId addr_v = ins.operands[1];
+                            if (is_derived(val_v) && !is_derived(addr_v)) {
+                                escapes = true;
+                            }
+                        }
+                        break;
+                    }
+
+                    case IrOp::CALL:
+                    case IrOp::CALLVIRT:
+                    case IrOp::CALLM:
+                    case IrOp::CALLIND:
+                    case IrOp::CALLCLOSURE:
+                    case IrOp::CALLN: {
+                        // El ptr pasado a otra fn ESCAPA conservativamente.
+                        // Excepcion: si fuera el callee es de tipo "trampoline
+                        // pure" (no toca el ptr), seria seguro -- pero no
+                        // tenemos esa info aqui.  Conservador: escape.
+                        for (auto v : ins.operands) {
+                            if (is_derived(v)) { escapes = true; break; }
+                        }
+                        if (ins.func_ptr != IR_NO_VALUE && is_derived(ins.func_ptr)) {
+                            escapes = true;
+                        }
+                        break;
+                    }
+
+                    case IrOp::THROW:
+                        // El ptr llega a throw -> escapa cross-frame.
+                        for (auto v : ins.operands) {
+                            if (is_derived(v)) { escapes = true; break; }
+                        }
+                        break;
+
+                    default: break;
+                }
+            }
+        }
+
+        if (escapes) continue;
+        if (free_sites.empty()) continue;  // sin free -> es leak, no promovemos
+
+        // Promote: convertir RAW_ALLOC en ALLOCA con host_alloca=true.
+        // El bytecode emitter ya respeta host_alloca y emite el path
+        // de `alloc N + htrack` (que el runtime libera al RET del frame
+        // automaticamente).  El JIT selector emite `sub rsp, N` (host
+        // stack directo, sin allocator).
+        auto &alloc_ins = fn.blocks[c.block_idx].instrs[c.ins_idx];
+        alloc_ins.op = IrOp::ALLOCA;
+        alloc_ins.imm = c.size_bytes;
+        alloc_ins.type = IrType::I8;  // ALLOCA convencion: type=I8, imm=N bytes
+        alloc_ins.host_alloca = true;
+        alloc_ins.operands.clear();  // ALLOCA no toma operands (tamano en imm)
+
+        // Marcar el dst como is_host_ptr para que LOAD/STORE emitan movh.
+        if (c.dst < fn.values.size()) {
+            fn.values[c.dst].is_host_ptr = true;
+        }
+
+        // Sprint mem-loop-fix (2026-06-02): PRESERVAR los RAW_FREE
+        // explicitos en lugar de eliminarlos.  Bottleneck encontrado
+        // en bench mem_malloc_free: el path original eliminaba RAW_FREE
+        // y dependia de `host_alloca_release_all` al RET del frame,
+        // pero si el ALLOCA esta DENTRO de un loop (inlineado o no),
+        // el vector @c host_allocas del frame acumula N punteros
+        // tracked sin liberar -- O(N) memoria + O(N) cleanup al RET.
+        //
+        // Con el RAW_FREE preservado, el alloc/free emparejan
+        // correctamente DENTRO de cada iteracion del loop.  El ALLOCA
+        // se marca con @c host_alloca_explicit_free=true para que el
+        // bytecode emit del interp SKIPE el `htrack` (porque el free
+        // explicito ya libera el ptr en su sitio).
+        alloc_ins.host_alloca_explicit_free = true;
+        // NO eliminar los RAW_FREE: dejarlos para que el bytecode emit
+        // los convierta en `free` opcodes correctamente.
+
+        changed = true;
+    }
+
+    // Compactar bloques: eliminar instrucciones NOP introducidas por
+    // este pass.  El bytecode emitter de NOP emite `nop1` que NO esta
+    // soportado correctamente por el decoder (decode_fn=nullptr).
+    // Mas seguro eliminar fisicamente las RAW_FREE convertidas.
+    if (changed) {
+        for (auto &blk : fn.blocks) {
+            auto &is = blk.instrs;
+            is.erase(std::remove_if(is.begin(), is.end(), [](const IrInstr &i) {
+                return i.op == IrOp::NOP && i.operands.empty() && i.dst == IR_NO_VALUE;
+            }), is.end());
+        }
+    }
+
     return changed;
 }
 
@@ -309,6 +1163,17 @@ void rewrite_as_const(IrInstr &ins, uint64_t imm) {
     ins.false_block = IR_NO_BLOCK;
 }
 
+/** @brief Como @c rewrite_as_const pero ademas marca @c is_const + @c const_val
+ *         en el @c IrValue correspondiente para que consumers downstream
+ *         (regalloc/selector imm32 fold) detecten la constante. */
+void rewrite_as_const_with_value(IrFunction &fn, IrInstr &ins, uint64_t imm) {
+    rewrite_as_const(ins, imm);
+    if (ins.dst != IR_NO_VALUE && ins.dst < fn.values.size()) {
+        fn.values[ins.dst].is_const  = true;
+        fn.values[ins.dst].const_val = imm;
+    }
+}
+
 } // namespace
 
 bool ir_pass_simplify(IrFunction &fn) {
@@ -355,7 +1220,7 @@ bool ir_pass_simplify(IrFunction &fn) {
                         rewrite_as_mov(ins, ins.operands[0]);
                         changed = true;
                     } else if (ins.operands[0] == ins.operands[1]) {
-                        rewrite_as_const(ins, 0);
+                        rewrite_as_const_with_value(fn, ins, 0);
                         const_vids[ins.dst] = 0;
                         changed = true;
                     }
@@ -369,7 +1234,7 @@ bool ir_pass_simplify(IrFunction &fn) {
                             rewrite_as_mov(ins, ins.operands[0]);
                             changed = true;
                         } else if (c == 0) {
-                            rewrite_as_const(ins, 0);
+                            rewrite_as_const_with_value(fn, ins, 0);
                             const_vids[ins.dst] = 0;
                             changed = true;
                         }
@@ -378,7 +1243,7 @@ bool ir_pass_simplify(IrFunction &fn) {
                             rewrite_as_mov(ins, ins.operands[1]);
                             changed = true;
                         } else if (c == 0) {
-                            rewrite_as_const(ins, 0);
+                            rewrite_as_const_with_value(fn, ins, 0);
                             const_vids[ins.dst] = 0;
                             changed = true;
                         }
@@ -396,7 +1261,7 @@ bool ir_pass_simplify(IrFunction &fn) {
                         /* x / x = 1 (cuidado con x = 0 -> division by zero,
                          * pero el codigo SSA implica que ya se ha dividido,
                          * asi que x != 0; seguro reescribir como const 1) */
-                        rewrite_as_const(ins, 1);
+                        rewrite_as_const_with_value(fn, ins, 1);
                         const_vids[ins.dst] = 1;
                         changed = true;
                     }
@@ -407,12 +1272,12 @@ bool ir_pass_simplify(IrFunction &fn) {
                     int64_t c = 0;
                     /* x % 1 = 0 */
                     if (get_const(ins.operands[1], c) && c == 1) {
-                        rewrite_as_const(ins, 0);
+                        rewrite_as_const_with_value(fn, ins, 0);
                         const_vids[ins.dst] = 0;
                         changed = true;
                     } else if (ins.operands[0] == ins.operands[1]) {
                         /* x % x = 0 (x != 0 implicito) */
-                        rewrite_as_const(ins, 0);
+                        rewrite_as_const_with_value(fn, ins, 0);
                         const_vids[ins.dst] = 0;
                         changed = true;
                     }
@@ -424,7 +1289,7 @@ bool ir_pass_simplify(IrFunction &fn) {
                     /* commutative: probar ambos operandos */
                     if (get_const(ins.operands[1], c)) {
                         if (c == 0) {
-                            rewrite_as_const(ins, 0);
+                            rewrite_as_const_with_value(fn, ins, 0);
                             const_vids[ins.dst] = 0;
                             changed = true;
                         } else if (c == -1) {
@@ -433,7 +1298,7 @@ bool ir_pass_simplify(IrFunction &fn) {
                         }
                     } else if (get_const(ins.operands[0], c)) {
                         if (c == 0) {
-                            rewrite_as_const(ins, 0);
+                            rewrite_as_const_with_value(fn, ins, 0);
                             const_vids[ins.dst] = 0;
                             changed = true;
                         } else if (c == -1) {
@@ -454,7 +1319,7 @@ bool ir_pass_simplify(IrFunction &fn) {
                             rewrite_as_mov(ins, ins.operands[0]);
                             changed = true;
                         } else if (c == -1) {
-                            rewrite_as_const(ins, static_cast<uint64_t>(-1));
+                            rewrite_as_const_with_value(fn, ins, static_cast<uint64_t>(-1));
                             const_vids[ins.dst] = -1;
                             changed = true;
                         }
@@ -463,7 +1328,7 @@ bool ir_pass_simplify(IrFunction &fn) {
                             rewrite_as_mov(ins, ins.operands[1]);
                             changed = true;
                         } else if (c == -1) {
-                            rewrite_as_const(ins, static_cast<uint64_t>(-1));
+                            rewrite_as_const_with_value(fn, ins, static_cast<uint64_t>(-1));
                             const_vids[ins.dst] = -1;
                             changed = true;
                         }
@@ -483,7 +1348,7 @@ bool ir_pass_simplify(IrFunction &fn) {
                         rewrite_as_mov(ins, ins.operands[1]);
                         changed = true;
                     } else if (ins.operands[0] == ins.operands[1]) {
-                        rewrite_as_const(ins, 0);
+                        rewrite_as_const_with_value(fn, ins, 0);
                         const_vids[ins.dst] = 0;
                         changed = true;
                     }
@@ -516,7 +1381,7 @@ bool ir_pass_simplify(IrFunction &fn) {
                     int64_t c = 0;
                     if (get_const(ins.operands[0], c)) {
                         int64_t ext = sign_extend_from(c, from_t);
-                        rewrite_as_const(ins, static_cast<uint64_t>(ext));
+                        rewrite_as_const_with_value(fn, ins, static_cast<uint64_t>(ext));
                         const_vids[ins.dst] = ext;
                         changed = true;
                     }
@@ -535,7 +1400,7 @@ bool ir_pass_simplify(IrFunction &fn) {
                     int64_t c = 0;
                     if (get_const(ins.operands[0], c)) {
                         uint64_t z = static_cast<uint64_t>(c) & type_mask(from_t);
-                        rewrite_as_const(ins, z);
+                        rewrite_as_const_with_value(fn, ins, z);
                         const_vids[ins.dst] = static_cast<int64_t>(z);
                         changed = true;
                     }
@@ -563,7 +1428,7 @@ bool ir_pass_simplify(IrFunction &fn) {
                         } else {
                             out_val = static_cast<int64_t>(v);
                         }
-                        rewrite_as_const(ins, static_cast<uint64_t>(out_val));
+                        rewrite_as_const_with_value(fn, ins, static_cast<uint64_t>(out_val));
                         const_vids[ins.dst] = out_val;
                         changed = true;
                     }
@@ -582,10 +1447,320 @@ bool ir_pass_simplify(IrFunction &fn) {
                     }
                     int64_t c = 0;
                     if (get_const(ins.operands[0], c)) {
-                        rewrite_as_const(ins, static_cast<uint64_t>(c));
+                        rewrite_as_const_with_value(fn, ins, static_cast<uint64_t>(c));
                         const_vids[ins.dst] = c;
                         changed = true;
                     }
+                    break;
+                }
+
+                /* ---- (D) Math IR ops constant folding (sprint v2.2c) ----
+                 *
+                 * Cuando todos los operandos son CONST conocidos, evaluamos
+                 * la operacion en compile-time y reemplazamos por CONST
+                 * literal.  Float ops preservan bits IEEE 754 via memcpy.
+                 * Habilita propagacion downstream (e.g. `sqrt(25.0) + 3.0`
+                 * pliega a CONST 8.0 directamente). */
+                case IrOp::FSQRT:
+                case IrOp::FABS:
+                case IrOp::FNEG:
+                case IrOp::FFLOOR:
+                case IrOp::FCEIL:
+                case IrOp::FROUND:
+                case IrOp::FTRUNC: {
+                    if (ins.operands.empty()) break;
+                    int64_t c0 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    const bool is_f32 = (ins.type == IrType::F32);
+                    double in_v = is_f32
+                        ? static_cast<double>(bits_to_f32(static_cast<uint32_t>(c0)))
+                        : bits_to_f64(static_cast<uint64_t>(c0));
+                    double out_v = 0.0;
+                    switch (ins.op) {
+                        case IrOp::FSQRT:  out_v = std::sqrt(in_v); break;
+                        case IrOp::FABS:   out_v = std::fabs(in_v); break;
+                        case IrOp::FNEG:   out_v = -in_v;           break;
+                        case IrOp::FFLOOR: out_v = std::floor(in_v); break;
+                        case IrOp::FCEIL:  out_v = std::ceil(in_v);  break;
+                        case IrOp::FROUND: out_v = std::nearbyint(in_v); break;
+                        case IrOp::FTRUNC: out_v = std::trunc(in_v); break;
+                        default: break;
+                    }
+                    uint64_t out_bits = is_f32
+                        ? static_cast<uint64_t>(f32_to_bits(static_cast<float>(out_v)))
+                        : f64_to_bits(out_v);
+                    rewrite_as_const_with_value(fn, ins, out_bits);
+                    const_vids[ins.dst] = static_cast<int64_t>(out_bits);
+                    changed = true;
+                    break;
+                }
+                case IrOp::FADD:
+                case IrOp::FSUB:
+                case IrOp::FMUL:
+                case IrOp::FDIV:
+                case IrOp::FMIN:
+                case IrOp::FMAX: {
+                    if (ins.operands.size() < 2) break;
+                    int64_t c0 = 0, c1 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    if (!get_const(ins.operands[1], c1)) break;
+                    const bool is_f32 = (ins.type == IrType::F32);
+                    auto bits_to_dbl = [&](int64_t v) -> double {
+                        return is_f32
+                            ? static_cast<double>(bits_to_f32(static_cast<uint32_t>(v)))
+                            : bits_to_f64(static_cast<uint64_t>(v));
+                    };
+                    double a = bits_to_dbl(c0);
+                    double b = bits_to_dbl(c1);
+                    double r = 0.0;
+                    bool ok = true;
+                    switch (ins.op) {
+                        case IrOp::FADD: r = a + b; break;
+                        case IrOp::FSUB: r = a - b; break;
+                        case IrOp::FMUL: r = a * b; break;
+                        case IrOp::FDIV:
+                            /* Folding de FDIV por 0 produciria NaN/Inf
+                             * deterministico en IEEE 754; aceptable. */
+                            r = a / b; break;
+                        case IrOp::FMIN: r = std::fmin(a, b); break;
+                        case IrOp::FMAX: r = std::fmax(a, b); break;
+                        default: ok = false; break;
+                    }
+                    if (!ok) break;
+                    uint64_t out_bits = is_f32
+                        ? static_cast<uint64_t>(f32_to_bits(static_cast<float>(r)))
+                        : f64_to_bits(r);
+                    rewrite_as_const_with_value(fn, ins, out_bits);
+                    const_vids[ins.dst] = static_cast<int64_t>(out_bits);
+                    changed = true;
+                    break;
+                }
+                case IrOp::IABS: {
+                    if (ins.operands.empty()) break;
+                    int64_t c0 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    /* INT_MIN -> UB en C; el IR doc dice "undef".  Para no
+                     * crashear, dejar como esta (no foldear). */
+                    if (c0 == std::numeric_limits<int64_t>::min()) break;
+                    int64_t r = c0 < 0 ? -c0 : c0;
+                    rewrite_as_const_with_value(fn, ins, static_cast<uint64_t>(r));
+                    const_vids[ins.dst] = r;
+                    changed = true;
+                    break;
+                }
+                case IrOp::IMIN:
+                case IrOp::IMAX: {
+                    if (ins.operands.size() < 2) break;
+                    int64_t c0 = 0, c1 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    if (!get_const(ins.operands[1], c1)) break;
+                    int64_t r = (ins.op == IrOp::IMIN)
+                        ? (c0 < c1 ? c0 : c1)
+                        : (c0 > c1 ? c0 : c1);
+                    rewrite_as_const_with_value(fn, ins, static_cast<uint64_t>(r));
+                    const_vids[ins.dst] = r;
+                    changed = true;
+                    break;
+                }
+                case IrOp::IMINU:
+                case IrOp::IMAXU: {
+                    if (ins.operands.size() < 2) break;
+                    int64_t c0 = 0, c1 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    if (!get_const(ins.operands[1], c1)) break;
+                    uint64_t u0 = static_cast<uint64_t>(c0);
+                    uint64_t u1 = static_cast<uint64_t>(c1);
+                    uint64_t r = (ins.op == IrOp::IMINU)
+                        ? (u0 < u1 ? u0 : u1)
+                        : (u0 > u1 ? u0 : u1);
+                    rewrite_as_const_with_value(fn, ins, r);
+                    const_vids[ins.dst] = static_cast<int64_t>(r);
+                    changed = true;
+                    break;
+                }
+                case IrOp::ILOG2: {
+                    if (ins.operands.empty()) break;
+                    int64_t c0 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    uint64_t u = static_cast<uint64_t>(c0);
+                    if (u == 0) break; /* undef segun doc IR; no foldear. */
+                    int r = 63;
+                #if defined(__GNUC__) || defined(__clang__)
+                    r = 63 - __builtin_clzll(u);
+                #else
+                    for (r = 63; r >= 0 && ((u >> r) & 1ULL) == 0; --r) {}
+                #endif
+                    rewrite_as_const_with_value(fn, ins, static_cast<uint64_t>(r));
+                    const_vids[ins.dst] = r;
+                    changed = true;
+                    break;
+                }
+                case IrOp::POPCNT: {
+                    if (ins.operands.empty()) break;
+                    int64_t c0 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    uint64_t u = static_cast<uint64_t>(c0);
+                    int r;
+                #if defined(__GNUC__) || defined(__clang__)
+                    r = __builtin_popcountll(u);
+                #else
+                    r = 0; for (; u; u &= u - 1) ++r;
+                #endif
+                    rewrite_as_const_with_value(fn, ins, static_cast<uint64_t>(r));
+                    const_vids[ins.dst] = r;
+                    changed = true;
+                    break;
+                }
+                case IrOp::CLZ: {
+                    if (ins.operands.empty()) break;
+                    int64_t c0 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    uint64_t u = static_cast<uint64_t>(c0);
+                    if (u == 0) break; /* clz(0) undef en x86 lzcnt; no foldear. */
+                    int r;
+                #if defined(__GNUC__) || defined(__clang__)
+                    r = __builtin_clzll(u);
+                #else
+                    r = 0; while (((u >> 63) & 1ULL) == 0) { u <<= 1; ++r; }
+                #endif
+                    rewrite_as_const_with_value(fn, ins, static_cast<uint64_t>(r));
+                    const_vids[ins.dst] = r;
+                    changed = true;
+                    break;
+                }
+                case IrOp::CTZ: {
+                    if (ins.operands.empty()) break;
+                    int64_t c0 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    uint64_t u = static_cast<uint64_t>(c0);
+                    if (u == 0) break; /* ctz(0) undef. */
+                    int r;
+                #if defined(__GNUC__) || defined(__clang__)
+                    r = __builtin_ctzll(u);
+                #else
+                    r = 0; while ((u & 1ULL) == 0) { u >>= 1; ++r; }
+                #endif
+                    rewrite_as_const_with_value(fn, ins, static_cast<uint64_t>(r));
+                    const_vids[ins.dst] = r;
+                    changed = true;
+                    break;
+                }
+                case IrOp::BYTESWAP: {
+                    if (ins.operands.empty()) break;
+                    int64_t c0 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    uint64_t u = static_cast<uint64_t>(c0);
+                #if defined(__GNUC__) || defined(__clang__)
+                    u = __builtin_bswap64(u);
+                #else
+                    u = ((u & 0xFF00000000000000ULL) >> 56)
+                      | ((u & 0x00FF000000000000ULL) >> 40)
+                      | ((u & 0x0000FF0000000000ULL) >> 24)
+                      | ((u & 0x000000FF00000000ULL) >> 8)
+                      | ((u & 0x00000000FF000000ULL) << 8)
+                      | ((u & 0x0000000000FF0000ULL) << 24)
+                      | ((u & 0x000000000000FF00ULL) << 40)
+                      | ((u & 0x00000000000000FFULL) << 56);
+                #endif
+                    rewrite_as_const_with_value(fn, ins, u);
+                    const_vids[ins.dst] = static_cast<int64_t>(u);
+                    changed = true;
+                    break;
+                }
+                case IrOp::ROTL:
+                case IrOp::ROTR: {
+                    if (ins.operands.size() < 2) break;
+                    int64_t c0 = 0, c1 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    if (!get_const(ins.operands[1], c1)) break;
+                    uint64_t u = static_cast<uint64_t>(c0);
+                    unsigned n = static_cast<unsigned>(c1) & 63u;
+                    uint64_t r = (ins.op == IrOp::ROTL)
+                        ? ((u << n) | (n ? (u >> (64 - n)) : 0))
+                        : ((u >> n) | (n ? (u << (64 - n)) : 0));
+                    rewrite_as_const_with_value(fn, ins, r);
+                    const_vids[ins.dst] = static_cast<int64_t>(r);
+                    changed = true;
+                    break;
+                }
+                case IrOp::ITOF: {
+                    if (ins.operands.empty()) break;
+                    int64_t c0 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    const bool is_f32 = (ins.type == IrType::F32);
+                    double d = static_cast<double>(c0);
+                    uint64_t b = is_f32
+                        ? static_cast<uint64_t>(f32_to_bits(static_cast<float>(d)))
+                        : f64_to_bits(d);
+                    rewrite_as_const_with_value(fn, ins, b);
+                    const_vids[ins.dst] = static_cast<int64_t>(b);
+                    changed = true;
+                    break;
+                }
+                case IrOp::UITOF: {
+                    if (ins.operands.empty()) break;
+                    int64_t c0 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    const bool is_f32 = (ins.type == IrType::F32);
+                    double d = static_cast<double>(static_cast<uint64_t>(c0));
+                    uint64_t b = is_f32
+                        ? static_cast<uint64_t>(f32_to_bits(static_cast<float>(d)))
+                        : f64_to_bits(d);
+                    rewrite_as_const_with_value(fn, ins, b);
+                    const_vids[ins.dst] = static_cast<int64_t>(b);
+                    changed = true;
+                    break;
+                }
+                case IrOp::FTOI:
+                case IrOp::FTOUI: {
+                    if (ins.operands.empty()) break;
+                    int64_t c0 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    /* El tipo de la SOURCE (no del dst) decide ancho.  Para
+                     * conservar correctness, leemos el tipo del operando. */
+                    IrType src_t = (ins.operands[0] < fn.values.size())
+                                   ? fn.values[ins.operands[0]].type
+                                   : IrType::F64;
+                    double v = (src_t == IrType::F32)
+                        ? static_cast<double>(bits_to_f32(static_cast<uint32_t>(c0)))
+                        : bits_to_f64(static_cast<uint64_t>(c0));
+                    /* Out-of-range -> UB en C; saltar fold para NaN/Inf y
+                     * valores que no entran en int64.  Conservador. */
+                    if (!std::isfinite(v)) break;
+                    if (ins.op == IrOp::FTOI) {
+                        if (v < -9.2233720368547758e18 || v > 9.2233720368547758e18) break;
+                        int64_t r = static_cast<int64_t>(v);
+                        rewrite_as_const_with_value(fn, ins, static_cast<uint64_t>(r));
+                        const_vids[ins.dst] = r;
+                    } else {
+                        if (v < 0.0 || v > 1.8446744073709552e19) break;
+                        uint64_t r = static_cast<uint64_t>(v);
+                        rewrite_as_const_with_value(fn, ins, r);
+                        const_vids[ins.dst] = static_cast<int64_t>(r);
+                    }
+                    changed = true;
+                    break;
+                }
+                case IrOp::F32TOF64: {
+                    if (ins.operands.empty()) break;
+                    int64_t c0 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    double d = static_cast<double>(bits_to_f32(static_cast<uint32_t>(c0)));
+                    uint64_t b = f64_to_bits(d);
+                    rewrite_as_const_with_value(fn, ins, b);
+                    const_vids[ins.dst] = static_cast<int64_t>(b);
+                    changed = true;
+                    break;
+                }
+                case IrOp::F64TOF32: {
+                    if (ins.operands.empty()) break;
+                    int64_t c0 = 0;
+                    if (!get_const(ins.operands[0], c0)) break;
+                    float f = static_cast<float>(bits_to_f64(static_cast<uint64_t>(c0)));
+                    uint64_t b = static_cast<uint64_t>(f32_to_bits(f));
+                    rewrite_as_const_with_value(fn, ins, b);
+                    const_vids[ins.dst] = static_cast<int64_t>(b);
+                    changed = true;
                     break;
                 }
 
@@ -1068,8 +2243,14 @@ bool ir_pass_const_fold(IrFunction &fn) {
                     case IrOp::ADD:     res = a + b;                        break;
                     case IrOp::SUB:     res = a - b;                        break;
                     case IrOp::MUL:     res = a * b;                        break;
-                    case IrOp::DIV:     res = (sb != 0) ? (uint64_t)(sa / sb) : 0; break;
-                    case IrOp::MOD:     res = (sb != 0) ? (uint64_t)(sa % sb) : 0; break;
+                    /* Sprint edge-bugs (2026-06-02): si el divisor es CONST 0,
+                     * NO foldear -- dejar la operacion en runtime para que el
+                     * interp/JIT lance FatalError capturable.  Antes esto se
+                     * foldeaba a 0 silencioso ocultando el bug del programa. */
+                    case IrOp::DIV:     if (sb == 0) { folded = false; break; }
+                                        res = (uint64_t)(sa / sb); break;
+                    case IrOp::MOD:     if (sb == 0) { folded = false; break; }
+                                        res = (uint64_t)(sa % sb); break;
                     case IrOp::AND:     res = a & b;                        break;
                     case IrOp::OR:      res = a | b;                        break;
                     case IrOp::XOR:     res = a ^ b;                        break;
@@ -1117,7 +2298,49 @@ bool ir_pass_const_fold(IrFunction &fn) {
                     case IrOp::NEG:     res = (uint64_t)(-sa);  break;
                     case IrOp::NOT:     res = ~a;                break;
                     case IrOp::ZEXT:    res = a;                 break;
-                    case IrOp::TRUNC:   res = a & 0xFFFFFFFFULL; break;
+                    case IrOp::TRUNC: {
+                        /* Sprint edge-bugs (2026-06-02): TRUNC debe
+                         * preservar el signo si el tipo destino es
+                         * signed (i8/i16/i32).  Antes hacia
+                         * `a & 0xFFFFFFFF` lo que para `-7` (signed i32)
+                         * truncado dejaba `0x00000000FFFFFFF9` -- valor
+                         * UNSIGNED 4294967289, no -7.  Operaciones
+                         * downstream (e.g. const-fold de `mod.i32`) lo
+                         * interpretaban como positivo -> resultado
+                         * equivocado del modulo signed.
+                         *
+                         * Fix: para tipos signed, sign-extender el bit
+                         * mas alto del ancho destino al resto del u64.
+                         * Para unsigned, mask simple. */
+                        uint64_t mask;
+                        bool sign_extend = false;
+                        switch (ins.type) {
+                            case IrType::I8:
+                                mask = 0xFFULL; sign_extend = true; break;
+                            case IrType::I16:
+                                mask = 0xFFFFULL; sign_extend = true; break;
+                            case IrType::I32:
+                                mask = 0xFFFFFFFFULL; sign_extend = true; break;
+                            case IrType::U8:  mask = 0xFFULL; break;
+                            case IrType::U16: mask = 0xFFFFULL; break;
+                            case IrType::U32: mask = 0xFFFFFFFFULL; break;
+                            case IrType::BOOL: mask = 0x1ULL; break;
+                            default:
+                                /* Sin truncacion real (mismo ancho). */
+                                mask = 0xFFFFFFFFFFFFFFFFULL;
+                                break;
+                        }
+                        res = a & mask;
+                        if (sign_extend) {
+                            const uint64_t sign_bit = (mask >> 1) + 1;
+                            if (res & sign_bit) {
+                                /* Bit alto del ancho destino set -> negativo.
+                                 * Or-ear los bits altos para sign-extend a u64. */
+                                res |= ~mask;
+                            }
+                        }
+                        break;
+                    }
                     case IrOp::MOV:     res = a;                 break;
                     default: folded = false; break;
                 }
@@ -1264,6 +2487,35 @@ bool ir_pass_dse(IrFunction &fn) {
                 case IrOp::NEWOBJ: case IrOp::GC_ALLOC:
                 case IrOp::RAW_ALLOC: case IrOp::RAW_FREE:
                 case IrOp::THROW: case IrOp::TRYENTER: case IrOp::TRYLEAVE:
+                // Sprint string-perf-2 bug fix (2026-06-02): STRMAKE/STRCAT/
+                // STRCONV LEEN memoria en runtime (STRMAKE lee vm_mem para
+                // construir el StringObject; STRCAT puede materializar bytes;
+                // STRCONV lee el src y escribe el converted).  Sin invalidar
+                // last_store_val, DSE elimina STOREs previos pensando que
+                // nadie los lee, pero STRMAKE LOS LEE en runtime.
+                // Bug reproducido en patron `buf[i]=X; STRMAKE(buf); buf[i]=Y;
+                // STRMAKE(buf)`: el primer set de stores se eliminaba.
+                case IrOp::STRMAKE: case IrOp::STRCAT: case IrOp::STRCONV:
+                case IrOp::STRFLAT: case IrOp::STRINTERN: case IrOp::STRRESERVE:
+                // Sprint edge-bugs (2026-06-02): MVTAKE_IR muta memoria
+                // (copia src->dst + zerifica src), por lo que invalida
+                // last_store_val para ambos punteros.  Conservadoramente
+                // clearamos todo el mapa.  Sin esto, ptr_of() despues de
+                // move() retornaba el host_ptr ORIGINAL (SLF leia el store
+                // anterior al mvtake) en vez del 0 que el runtime escribio.
+                case IrOp::MVTAKE_IR:
+                // GC_PROMOTE/GC_DEMOTE copian memoria cross-heap.
+                case IrOp::GC_PROMOTE: case IrOp::GC_DEMOTE:
+                // ATOMIC_ST_I64 / ATOMIC_CAS_I64 / ATOMIC_ADD_I64 escriben
+                // memoria; ATOMIC_LD_I64 lee (que es OK para SLF si no hay
+                // store intermedio, pero conservativo clearamos).
+                case IrOp::ATOMIC_LD_I64: case IrOp::ATOMIC_ST_I64:
+                case IrOp::ATOMIC_CAS_I64: case IrOp::ATOMIC_ADD_I64:
+                // SMARTPTR_FREE invoca deleter que puede tocar memoria.
+                case IrOp::SMARTPTR_FREE:
+                // FFI runtime puede mutar cualquier cosa.
+                case IrOp::DLOPEN: case IrOp::DLSYM:
+                case IrOp::MOD_LOAD:
                     last_store_idx.clear();
                     last_store_val.clear();
                     break;
@@ -2407,10 +3659,23 @@ bool ir_pass_licm(IrFunction &fn) {
 
         /* Helper: instr es candidato para mover? */
         auto is_invariant_candidate = [&](const IrInstr &ins) -> bool {
-            if (!is_pure(ins.op)) return false;
+            /* Sprint mem-perf string_hot: anyadir STRMAKE/STRCAT/STRINTERN/
+             * STRCONV/STRRESERVE como hoistables a pesar de side-effecting.
+             * El alloc-identity no es observable; el contenido si.  Ver
+             * @c is_licm_hoistable_alloc. */
+            if (!is_pure(ins.op) && !is_licm_hoistable_alloc(ins.op)) return false;
             if (ins.op == IrOp::PHI) return false;
             if (ins.preserve) return false;
             if (ins.dst == IR_NO_VALUE) return false;
+            /* Sprint string-perf-2 bug fix: STRMAKE solo es seguro hoistar
+             * si su vm_addr operand apunta a memoria immutable (literal
+             * en static_data via STR_LIT_ADDR).  Para mutable buffers
+             * (ALLOCA + stores), hoistar = capturar bytes en momento
+             * incorrecto. */
+            if (ins.op == IrOp::STRMAKE) {
+                if (ins.operands.empty()) return false;
+                if (!strmake_reads_immutable(fn, ins.operands[0])) return false;
+            }
             /* Ops que LEEN memoria: solo hoistables si NO hay writes en el
              * loop (v1 sin alias analysis).  Conservador pero correcto. */
             switch (ins.op) {
@@ -2794,6 +4059,18 @@ static bool is_sched_barrier(IrOp op) {
         case IrOp::SETFIELD: case IrOp::ARRAY_STORE:
         case IrOp::MEMCPY:
         case IrOp::STRFINALIZE: case IrOp::GCWB_IR:
+        // Sprint string-perf-2 bug fix (2026-06-02): STRMAKE LEE
+        // bytes desde vm_mem en runtime (via vm_addr).  Sin marcarla
+        // como barrera, el scheduler podia reordenar STOREs a vm_mem
+        // PASADO la STRMAKE, leyendo bytes stale.  Bug capturado en
+        // patron `buf[i]=X; STRMAKE(buf); buf[i]=Y; STRMAKE(buf)`
+        // donde el segundo STORE quedaba post-STRMAKE.
+        // STRCAT/STRCONV/STRFLAT NO leen vm_mem (operan sobre handles),
+        // pero pueden disparar alloc -> GC -> rearrange objects.  Mas
+        // seguro tratar TODAS las str ops alloc-side como barreras
+        // hasta confirmar safety por op.
+        case IrOp::STRMAKE: case IrOp::STRCAT: case IrOp::STRCONV:
+        case IrOp::STRFLAT: case IrOp::STRINTERN: case IrOp::STRRESERVE:
         case IrOp::FUTURE: case IrOp::AWAIT: case IrOp::FULFILL: case IrOp::REJECT:
         case IrOp::FULFILL_HLT:
         case IrOp::MSGSEND: case IrOp::MSGRECV:
@@ -3048,6 +4325,200 @@ bool ir_pass_schedule(IrFunction &fn) {
 }
 
 // =========================================================================
+//  Pase ir_pass_loop_memcpy_idiom (Sprint mem-perf 2026-06-02)
+// =========================================================================
+//
+// Reconocimiento de loop-idiom byte-a-byte de la forma:
+//
+//   while_header:
+//       %i_phi = phi.u64 [%i_init, pred]  [%i_next, body]
+//       %cond  = cmp.ult.bool %i_phi, %N_ub
+//       br.cond %cond, body, exit
+//   body:
+//       (%i_or_cast = bitcast %i_phi)?
+//       %src_p = add.ptr %src_base, %i_or_cast
+//       %dst_p = add.ptr %dst_base, %i_or_cast
+//       %v     = load.u8 %src_p
+//       store %v, %dst_p
+//       %i_next = add %i_phi, %1_const
+//       br while_header
+//
+// Lo reemplaza por una sola @c CALLN a @c vio_memcpy.  La libc nativa
+// vectoriza con SSE/AVX/AVX-512 segun la CPU, asi el copy loop se
+// acelera ~50-100x sin necesidad de SIMD codegen explicito.
+//
+// Pre-condiciones:
+//   - El bloque body tiene EXACTAMENTE los 6-7 instrs del patron.
+//   - El PHI del header solo tiene un valor de loop-carry (no PHIs
+//     multiples).
+//   - %i_init es CONST 0 (o cualquier const; usado como offset inicial
+//     que ignoramos -- el memcpy copia [0, N)).  Por simplicidad
+//     exigimos 0.
+//   - %i_next = add %i_phi, 1 (step de 1).
+//
+// Tras el match: el body se reemplaza por `CALLN vio_memcpy(dst, src,
+// N) + br exit`.  El header sigue invocando body solo la primera vez;
+// la siguiente iteracion el cond falla porque body cambio el flow.
+// Mas correcto: el body NO retorna a header (br exit directo), asi
+// el loop nunca itera.
+bool ir_pass_loop_memcpy_idiom(IrFunction &fn) {
+    bool changed = false;
+    if (fn.is_native) return false;
+
+    for (size_t hi = 0; hi < fn.blocks.size(); ++hi) {
+        IrBlock &header = fn.blocks[hi];
+        // Header debe tener exactamente: 1 phi, 1 cmp, 1 br.cond.
+        if (header.instrs.size() != 3) continue;
+        const IrInstr &phi    = header.instrs[0];
+        const IrInstr &cmp_in = header.instrs[1];
+        const IrInstr &brc    = header.instrs[2];
+        if (phi.op != IrOp::PHI) continue;
+        if (phi.phi_args.size() != 2) continue;
+        if (cmp_in.op != IrOp::CMP_ULT && cmp_in.op != IrOp::CMP_LT) continue;
+        if (brc.op != IrOp::BR_COND) continue;
+        if (brc.operands.empty() || brc.operands[0] != cmp_in.dst) continue;
+        if (cmp_in.operands.size() != 2 || cmp_in.operands[0] != phi.dst) continue;
+        IrValueId v_N = cmp_in.operands[1];
+        IrBlockId body_id = brc.target_block;
+        IrBlockId exit_id = brc.false_block;
+        if (body_id >= fn.blocks.size() || exit_id >= fn.blocks.size()) continue;
+
+        // Identificar el predecessor (entry) y el body en los phi_args.
+        IrValueId v_init = IR_NO_VALUE;
+        IrBlockId pred_id = IR_NO_VALUE;
+        IrValueId v_next = IR_NO_VALUE;
+        IrBlockId loop_pred = IR_NO_VALUE;
+        for (const auto &pa : phi.phi_args) {
+            if (pa.block == body_id) { v_next = pa.value; loop_pred = pa.block; }
+            else                      { v_init = pa.value; pred_id   = pa.block; }
+        }
+        if (v_init == IR_NO_VALUE || v_next == IR_NO_VALUE) continue;
+
+        // %i_init debe ser CONST 0.
+        if (v_init >= fn.values.size() || !fn.values[v_init].is_const) continue;
+        if (fn.values[v_init].const_val != 0) continue;
+
+        // Body matching.
+        IrBlock &body = fn.blocks[body_id];
+        // Patron flexible: 5 o 6 instrs (con o sin bitcast).
+        if (body.instrs.size() < 5 || body.instrs.size() > 7) continue;
+        // Ultima instr debe ser br header.
+        const IrInstr &body_term = body.instrs.back();
+        if (body_term.op != IrOp::BR) continue;
+        if (body_term.target_block != header.id) continue;
+
+        // Buscar: load.u8, store, add (= i+1).
+        IrValueId v_src_p = IR_NO_VALUE, v_dst_p = IR_NO_VALUE;
+        IrValueId v_loaded = IR_NO_VALUE;
+        IrValueId v_inc_step = IR_NO_VALUE;
+        IrValueId v_index_used = IR_NO_VALUE;
+        bool found_load = false, found_store = false, found_inc = false;
+        IrValueId v_src_base = IR_NO_VALUE, v_dst_base = IR_NO_VALUE;
+        for (const auto &ins : body.instrs) {
+            if (ins.op == IrOp::LOAD && ins.type == IrType::U8
+             && ins.operands.size() == 1) {
+                v_src_p  = ins.operands[0];
+                v_loaded = ins.dst;
+                found_load = true;
+            } else if (ins.op == IrOp::STORE && ins.operands.size() >= 2) {
+                if (ins.operands[0] != v_loaded) { found_store = false; break; }
+                v_dst_p = ins.operands[1];
+                found_store = true;
+            } else if (ins.op == IrOp::ADD && ins.operands.size() == 2
+                    && ins.dst == v_next) {
+                if (ins.operands[0] != phi.dst) continue;
+                v_inc_step = ins.operands[1];
+                found_inc = true;
+            } else if (ins.op == IrOp::ADD && ins.operands.size() == 2) {
+                // posible add.ptr base + index -- lo procesamos despues.
+            } else if (ins.op == IrOp::BITCAST && ins.operands.size() == 1
+                    && ins.operands[0] == phi.dst) {
+                // ok, lo trataremos como un alias del index.
+            } else if (ins.op == IrOp::BR) {
+                // terminator OK
+            } else {
+                // instr inesperada -> rechazar.
+                found_load = false;
+                break;
+            }
+        }
+        if (!found_load || !found_store || !found_inc) continue;
+
+        // v_inc_step debe ser const 1.
+        if (v_inc_step >= fn.values.size() || !fn.values[v_inc_step].is_const) continue;
+        if (fn.values[v_inc_step].const_val != 1) continue;
+
+        // Identificar bases via los ADDs.  Cada add.ptr produce v_src_p o v_dst_p.
+        // operands son (base, index).  Index debe ser phi.dst o un bitcast de phi.dst.
+        auto resolve_base = [&](IrValueId pv) -> IrValueId {
+            for (const auto &ins : body.instrs) {
+                if (ins.op == IrOp::ADD && ins.dst == pv
+                 && ins.operands.size() == 2) {
+                    IrValueId idx = ins.operands[1];
+                    bool ok = (idx == phi.dst);
+                    if (!ok) {
+                        // chequear bitcast
+                        for (const auto &b2 : body.instrs) {
+                            if (b2.op == IrOp::BITCAST && b2.dst == idx
+                             && !b2.operands.empty() && b2.operands[0] == phi.dst) {
+                                ok = true; break;
+                            }
+                        }
+                    }
+                    if (ok) return ins.operands[0];
+                }
+            }
+            return IR_NO_VALUE;
+        };
+        v_src_base = resolve_base(v_src_p);
+        v_dst_base = resolve_base(v_dst_p);
+        if (v_src_base == IR_NO_VALUE || v_dst_base == IR_NO_VALUE) continue;
+
+        // OK match completo.  Reemplazar el body por:
+        //   CALLN vio_memcpy(dst, src, N) + br exit
+        IrInstr call_ins;
+        call_ins.op = IrOp::CALLN;
+        call_ins.type = IrType::I64;
+        call_ins.dst = IR_NO_VALUE;
+        call_ins.func_name = "stdlib/native/io/vesta_io:vio_memcpy";
+        call_ins.operands = { v_dst_base, v_src_base, v_N };
+        call_ins.source_line = body.instrs.front().source_line;
+
+        IrInstr br_exit;
+        br_exit.op = IrOp::BR;
+        br_exit.target_block = exit_id;
+        br_exit.dst = IR_NO_VALUE;
+
+        body.instrs.clear();
+        body.instrs.push_back(call_ins);
+        body.instrs.push_back(br_exit);
+
+        // Fix succs/preds: body ya no apunta a header.
+        body.succs.clear();
+        body.succs.push_back(exit_id);
+        // Quitar body de header.preds (mantener el original pred).
+        auto &hpreds = header.preds;
+        hpreds.erase(std::remove(hpreds.begin(), hpreds.end(), body_id),
+                     hpreds.end());
+        // Anyadir body a exit.preds si no esta.
+        IrBlock &exit_blk = fn.blocks[exit_id];
+        if (std::find(exit_blk.preds.begin(), exit_blk.preds.end(), body_id)
+            == exit_blk.preds.end()) {
+            exit_blk.preds.push_back(body_id);
+        }
+        // Quitar el phi_arg de body en el PHI del header (ahora 1-arg).
+        IrInstr &header_phi = fn.blocks[hi].instrs[0];
+        header_phi.phi_args.erase(
+            std::remove_if(header_phi.phi_args.begin(), header_phi.phi_args.end(),
+                [body_id](const IrPhiArg &pa) { return pa.block == body_id; }),
+            header_phi.phi_args.end());
+
+        changed = true;
+    }
+    return changed;
+}
+
+// =========================================================================
 //  Punto de entrada principal
 // =========================================================================
 
@@ -3059,6 +4530,47 @@ void ir_optimize(IrModule &mod, OptLevel level) {
      * el codigo expandido. */
     if (level >= OptLevel::O1) {
         ir_pass_inline(mod);
+    }
+
+    /* Phase D.jit-mem-model AUTO-PROMOTE: marca ALLOCAs que fluyen a
+     * CALLN como is_host_ptr=true.  El JIT selector las emite en host
+     * stack; el ptr resultante es directamente dereferenciable por
+     * funciones nativas (Win API, libc, etc.).  Sin esto, `&local`
+     * pasado a CALLN seria VM-addr -> garbage.  Cero anotaciones del
+     * usuario: el analisis es backward-flow desde args PTR de CALLN.
+     * UNA pasada (no se itera con el resto). */
+    if (level >= OptLevel::O1) {
+        for (auto &fn : mod.functions) {
+            if (!fn.is_native) ir_pass_promote_callned_allocas(fn);
+        }
+    }
+
+    /* Sprint string-perf-8 (2026-06-02): promueve ALLOCAs LOCALES (no
+     * escapan a CALL*, RET, THROW, etc.) a `host_alloca=true`.  El JIT
+     * emite `sub rsp, N` en host stack y los LOAD/STORE usan native mov
+     * directo (1 instr) en lugar del inline cache check (~10 instr).
+     * Skippable via VESTA_NO_PROMOTE_LOCAL_ALLOCAS=1 para A/B testing. */
+    if (level >= OptLevel::O1) {
+        const char *skip = std::getenv("VESTA_NO_PROMOTE_LOCAL_ALLOCAS");
+        if (!skip || skip[0] == '\0' || skip[0] == '0') {
+            for (auto &fn : mod.functions) {
+                if (!fn.is_native) ir_pass_promote_local_allocas(fn);
+            }
+        }
+    }
+
+    /* Promocionar malloc(N_const)+free(p) locales sin escape a
+     * ALLOCA host_alloca.  Convierte ~200-500 ns por alloc/free en
+     * loops a ~1 ns (sub/add rsp del host stack).  UNA pasada.
+     * Skippable via VESTA_NO_PROMOTE_RAW_ALLOC=1 para A/B testing. */
+    if (level >= OptLevel::O1) {
+        const char *skip = std::getenv("VESTA_NO_PROMOTE_RAW_ALLOC");
+        const bool do_promote = !(skip && skip[0] != '\0' && skip[0] != '0');
+        if (do_promote) {
+            for (auto &fn : mod.functions) {
+                if (!fn.is_native) ir_pass_promote_local_raw_alloc(fn);
+            }
+        }
     }
 
     // Iterar hasta punto fijo o maximo 8 pasadas

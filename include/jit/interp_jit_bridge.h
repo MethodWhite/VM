@@ -72,7 +72,20 @@ namespace jit {
      * @return el valor que la funcion JIT devuelva (normalmente 0,
      *         con el resultado real en @c proc->registers.regs[0]).
      */
+    /* Sprint JIT-cross-fn 2026-06-01: setear TLS proc antes de entrar
+     * al JIT.  Esto asegura que cualquier callback C invocado DESDE el
+     * JIT-eated code (e.g. CALLN a vex_get_native_thunk para callbacks
+     * Vex->C, o cualquier FFI nativa que necesite acceder al
+     * ProcessVM) pueda hacer `runtime::get_current_executing_process()`
+     * y obtener el proc correcto.  Coste: 1 store TLS (~1 ns) al
+     * entrar al JIT.  Negligible vs el coste del JIT dispatch.
+     *
+     * Forward-decl para no incluir exception_runtime.h en este header
+     * publico (rompe el include order). */
+    extern "C" void runtime_set_current_executing_process_c(vrt_proc *proc);
+
     inline uint64_t enter_jit(JitFn fn, vrt_proc *proc) {
+        runtime_set_current_executing_process_c(proc);
         return fn(proc);
     }
 

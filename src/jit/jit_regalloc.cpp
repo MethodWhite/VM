@@ -81,6 +81,26 @@ namespace jit {
                 info[iv.id].last_use_pos = iv.end;
             }
 
+            /* Fix critico: params nacen con def=0 (sintetico) y end=0.
+             * Si su primer uso real esta en pos=0, mark_use(p, 0) NO actualiza
+             * end porque `0 > 0` es false.  Quedan con rango [0,0] que el
+             * ranges_overlap con touching `<=` trata como no-solapado ->
+             * varios params terminan compartiendo el mismo reg.
+             *
+             * Fix: para cada param que tenga >=1 uso, garantizar que
+             * end > def asi su live range tiene ancho >0 y conflicta
+             * correctamente con los otros params. */
+            for (ir::IrValueId pid : fn.params) {
+                if (pid >= info.size()) continue;
+                auto &pinfo = info[pid];
+                if (pinfo.def_pos == UINT32_MAX) continue;
+                if (pinfo.last_use_pos <= pinfo.def_pos) {
+                    /* Extender al menos hasta el siguiente "tick" para que
+                     * varios params (todos con def=0) solapen entre si. */
+                    pinfo.last_use_pos = pinfo.def_pos + 1;
+                }
+            }
+
             /* Contar usos lexicos y detectar CALLs.
              *
              * use_count es heuristica para priorizar pinning (mas usos =
@@ -188,6 +208,15 @@ namespace jit {
                     vi.excluded = true;
                     continue;
                 }
+                /* Excluir CONSTS: rematerializan baratos como imm32 en
+                 * el selector.  Pinearlos a reg + coalescing con phi dst
+                 * provoca corrupcion silenciosa cuando el CONST se usa
+                 * tanto como phi_arg como en otra parte del loop (el
+                 * reg coalescido lleva el valor del phi, no del const). */
+                if (val.is_const) {
+                    vi.excluded = true;
+                    continue;
+                }
             }
         }
 
@@ -256,10 +285,28 @@ namespace jit {
                 const auto &a = info[a_idx];
                 const auto &b = info[b_idx];
                 if (!ranges_overlap(a, b)) return false;
-                /* Son partners? -> overlap benigno. */
+                /* Sprint string-perf-3 bug fix (2026-06-02): phi-partner
+                 * coalescing solo es safe cuando uno de los VIDs MUERE en
+                 * el punto del phi (live range termina <= def del otro).
+                 * Si ambos viven MAS ALLA del phi-copy point (e.g., un
+                 * phi_arg que se usa DESPUES del loop ademas del phi),
+                 * compartir reg les hace pisar valores -> bug correctness.
+                 *
+                 * Caso clasico: `string c = pat; while (...) c = ...;
+                 * str_equals(c, pat)`.  %pat es phi_arg de %c.  El
+                 * coalescing los unia a un solo reg, pero el strcmp
+                 * post-loop necesita AMBOS valores -- pisaba pat con
+                 * el ultimo c.
+                 *
+                 * Test: si A es phi_arg de B (= B en phi_partners[A]),
+                 * el coalescing es safe SOLO si A muere antes/en el def
+                 * de B (a.last_use <= b.def_pos).  Idem inversa. */
                 auto it = phi_partners.find(a.vid);
                 if (it != phi_partners.end() && it->second.count(b.vid)) {
-                    return false;
+                    /* Son partners: chequear si uno muere al definirse el otro. */
+                    if (a.last_use_pos <= b.def_pos) return false; /* a -> b clean */
+                    if (b.last_use_pos <= a.def_pos) return false; /* b -> a clean */
+                    /* Ambos sobreviven al punto del phi -> overlap REAL. */
                 }
                 return true;
             };

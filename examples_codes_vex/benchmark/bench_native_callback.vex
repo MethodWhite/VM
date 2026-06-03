@@ -1,0 +1,58 @@
+// examples_codes_vex/benchmark/bench_native_callback.vex
+//
+// Benchmark del overhead del thunk Vex->C->Vex.
+//
+// Estrategia: usamos qsort de msvcrt como driver C que invoca un
+// comparator Vex N log N veces.  Comparamos:
+//   - qsort con N=1024 elementos -> ~10K invocaciones del thunk.
+//   - bench_callvirt con 30M iter -> CALLVIRT puro Vex->Vex sin thunk.
+//
+// Esto mide el OVERHEAD DEL BRIDGE NATIVO (thunk + TLS + JIT call) en
+// micro-segundos por callback.
+//
+// Esperado: R00 = 42 (suma de chequeos).
+
+extern "msvcrt.dll" {
+    fn qsort(u64 base, u64 nmemb, u64 size, u64 cmp) -> void;
+}
+
+// Comparator trivial - el costo del callback domina, no el comparator.
+i32 cmp_i32(i64 a_ptr, i64 b_ptr) {
+    i32* pa = (i32*) a_ptr;
+    i32* pb = (i32*) b_ptr;
+    i32 a = *pa;
+    i32 b = *pb;
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
+
+i32 main() {
+    // Array de 8192 i32.  qsort hara ~108K comparaciones (8192 log2 8192).
+    // 50 iter -> ~5.4M invocaciones del thunk = bench representativo.
+    i32[8192] arr;
+    i32 i = 0;
+    while (i < 8192) {
+        // Patron pseudo-random.
+        arr[i] = (8192 - i) * 31 + 7;
+        i = i + 1;
+    }
+
+    i64 cb = as_native_callback(cmp_i32);
+
+    i32 iter = 0;
+    while (iter < 50) {
+        qsort((u64)(&arr[0]), 8192, 4, (u64)cb);
+        iter = iter + 1;
+    }
+
+    // Verificar que arr quedo ordenado (al menos la primera y ultima).
+    i32 ok = 1;
+    if (arr[0] >= arr[8191]) { ok = 0; }
+    if (arr[100] > arr[2000]) { ok = 0; }
+    if (arr[5000] > arr[8000]) { ok = 0; }
+
+    i32 acc = 0;
+    if (ok == 1) { acc = 42; }
+    return acc;
+}

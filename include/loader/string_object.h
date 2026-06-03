@@ -243,12 +243,19 @@ namespace loader {
         if (str_kind(s) != StringKind::FLAT) return 0; // rope/slice: sin hash directo
         if (s->str_hash != 0) return s->str_hash;       // ya cacheado
 
+        // Sprint string-perf-3 (2026-06-02): FNV-1a 64-bit en lugar de
+        // 32-bit.  En x86-64 una sola multiplicacion 64x64=64 cuesta lo
+        // mismo que la 32x32=32 (mismo unit/latency en CPUs modernos)
+        // pero distribuye mejor + acepta el mismo algoritmo que los
+        // fast paths en exec_instruction_string.cpp (STRMAKE/STRCAT).
+        // El campo str_hash es uint32_t -> truncamos al low half.
         const uint8_t *data = str_data(s);
-        uint32_t h          = 0x811C9DC5u;               // offset inicial FNV-1a
+        uint64_t h64        = 1469598103934665603ULL;  // FNV-1a 64-bit offset
         for (uint32_t i = 0; i < s->byte_len; ++i) {
-            h ^= data[i];         // XOR byte
-            h *= 0x01000193u;     // multiplicador FNV primo
+            h64 ^= data[i];
+            h64 *= 1099511628211ULL;                    // FNV-1a 64-bit prime
         }
+        uint32_t h = static_cast<uint32_t>(h64 & 0xFFFFFFFFu);
         if (h == 0) h = 1;        // 0 es centinela; usar 1 en su lugar
         s->str_hash = h;
         return h;

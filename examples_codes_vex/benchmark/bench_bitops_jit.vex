@@ -1,0 +1,32 @@
+// Bench: Math-IR-promote v2.2a (sprint WW).
+//
+// Mide el speedup del JIT al emitir bit ops nativas (popcnt/lzcnt/tzcnt/bswap)
+// en lugar del CALLN a vmath_*.  Hot loop con tres bit ops por iteracion.
+//
+// Resultados esperados (~5M iter):
+//   interp: ~5-8 seg  (~20-30 MIPS) -- via CALLN a vmath_popcount/clz/bswap.
+//   JIT:    ~5-10 ms  (~10000 MIPS) -- popcnt/lzcnt/bswap nativos.
+//   Speedup: ~500-1000x.
+//
+// R0 final: bits bajos (& 0xFFFF) del acumulador.  Determinista: interp y
+// JIT deben producir EXACTAMENTE el mismo R0 (mismatch indica bug).
+
+class BitOps {
+    public u64 run_hot(i32 n) {
+        u64 acc = 0;
+        i32 i = 0;
+        while (i < n) {
+            acc = acc + popcount((u64) i);
+            acc = acc + clz((u64) i + 1);
+            acc = acc ^ bswap((u64) i);
+            i = i + 1;
+        }
+        return acc;
+    }
+}
+
+i32 main() {
+    BitOps b = new BitOps();
+    u64 r = b.run_hot(5000000);
+    return (i32)(r & 0xFFFF);
+}

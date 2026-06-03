@@ -292,7 +292,13 @@ namespace jit {
         MOVZX       = 23,   ///< MOVZX dst, src (zero-extend u8/u16 -> u64)
         MOVSX       = 24,   ///< MOVSX dst, src (sign-extend i8/i16/i32 -> i64)
         INC         = 25,   ///< INC dst (++dst, mas compacto que ADD dst, 1)
-        DEC         = 26,   ///< DEC dst (--dst, mas compacto que SUB dst, 1)
+        DEC         = 26,   ///< DEC dst (--dst, mas compacto que SUq dst, 1)
+
+        /* Bit ops universales (Math-IR-promote v2.2a).
+         * Cada uno es 1 instr nativa en x86 (BMI1/SSE4.2) y ARM/RISC-V. */
+        POPCNT      = 27,   ///< POPCNT dst, src (F3 0F B8 /r REX.W) -- count set bits (SSE4.2)
+        LZCNT       = 28,   ///< LZCNT  dst, src (F3 0F BD /r REX.W) -- count leading zeros (BMI1)
+        TZCNT       = 29,   ///< TZCNT  dst, src (F3 0F BC /r REX.W) -- count trailing zeros (BMI1)
 
         /* Comparacion + condicionales */
         CMP         = 30,
@@ -313,7 +319,36 @@ namespace jit {
         COMMENT     = 52,   ///< no-op con texto debug (skipped en release)
         CALL_ABS    = 53,   ///< CALL a direccion absoluta (via mov rax, imm64 + call rax)
 
-        COUNT       = 64
+        /* Bit ops adicionales (Math-IR-promote v2.2a, continuacion). */
+        BSWAP       = 60,   ///< BSWAP dst (0F C8+rd REX.W) -- byte swap full register
+        ROL         = 61,   ///< ROL dst, cl/imm (D3/C1 /0 REX.W) -- rotate left
+        ROR         = 62,   ///< ROR dst, cl/imm (D3/C1 /1 REX.W) -- rotate right
+
+        /* FP scalar ops (Math-IR-promote v2.2b).
+         * Mov data entre GP regs y XMM regs via memory roundtrip o MOVQ
+         * directo.  XMM regs estan FUERA del regalloc D.7 (que solo conoce
+         * GP); las cases del Selector hardcodean XMM0/XMM1 como scratch. */
+        MOVQ_GP_XMM = 63,   ///< MOVQ xmm, rGP (66 REX.W 0F 6E /r) -- GP -> XMM
+        SQRTSD      = 65,   ///< SQRTSD xmm_dst, xmm_src (F2 0F 51 /r)
+        MINSD       = 66,   ///< MINSD  xmm_dst, xmm_src (F2 0F 5D /r) -- NaN: returns src2
+        MAXSD       = 67,   ///< MAXSD  xmm_dst, xmm_src (F2 0F 5F /r)
+        ROUNDSD     = 68,   ///< ROUNDSD xmm_dst, xmm_src, imm8 (66 0F 3A 0B /r ib)
+                            ///<   imm8 modes: 0=round-to-nearest, 1=floor, 2=ceil, 3=trunc.
+                            ///<   variant field carga el mode.  Requiere SSE4.1 (universal x86-64).
+        MOVQ_XMM_GP = 69,   ///< MOVQ rGP, xmm (66 REX.W 0F 7E /r) -- XMM -> GP
+
+        /* FP arith scalar (Math-IR-promote v2.2b cont). */
+        ADDSD       = 70,   ///< ADDSD xmm_dst, xmm_src (F2 0F 58 /r) -- f64 add
+        SUBSD       = 71,   ///< SUBSD xmm_dst, xmm_src (F2 0F 5C /r) -- f64 sub
+        MULSD       = 72,   ///< MULSD xmm_dst, xmm_src (F2 0F 59 /r) -- f64 mul
+        DIVSD       = 73,   ///< DIVSD xmm_dst, xmm_src (F2 0F 5E /r) -- f64 div
+        CVTSI2SD    = 74,   ///< CVTSI2SD xmm, r64 (F2 REX.W 0F 2A /r) -- int signed -> f64
+        CVTTSD2SI   = 75,   ///< CVTTSD2SI r64, xmm (F2 REX.W 0F 2C /r) -- f64 -> int truncado
+        UCOMISD     = 76,   ///< UCOMISD xmm_a, xmm_b (66 0F 2E /r) -- f64 compare, set ZF/PF/CF
+        CVTSS2SD    = 77,   ///< CVTSS2SD xmm, xmm (F3 0F 5A /r) -- f32 -> f64 (widen)
+        CVTSD2SS    = 78,   ///< CVTSD2SS xmm, xmm (F2 0F 5A /r) -- f64 -> f32 (narrow)
+
+        COUNT       = 80
     };
 
     /* ===================================================================== */
@@ -539,6 +574,19 @@ namespace jit {
         /// binary search durante stack walk.  Cada Stackmap describe los
         /// slots GC vivos en ese punto especifico.
         std::vector<Stackmap>      stackmaps;
+
+        /// Sprint mem-loop-fix-v2 / fib-recursion (2026-06-02):
+        /// indices del @c imm64_pool que contienen referencias a la
+        /// PROPIA funcion (self-recursive call).  El encoder, al emitir
+        /// un MOV reg,imm64 cuyo @c IMM64_IDX matchea, registra la
+        /// posicion del imm64 en @c self_ref_byte_offsets.  Tras alocar
+        /// el code cache, el JitCompiler escribe @c code_start en cada
+        /// una de esas posiciones para resolver las self-refs.
+        std::vector<uint32_t>      self_ref_imm64_indices;
+        /// Posiciones (byte offsets) DENTRO de la code emitida donde
+        /// hay un imm64 self-ref que necesita patching.  Poblado por
+        /// el encoder.
+        std::vector<size_t>        self_ref_byte_offsets;
 
         /** @brief Reserva un nuevo label_id (zero overhead). */
         MLabelId new_label() {

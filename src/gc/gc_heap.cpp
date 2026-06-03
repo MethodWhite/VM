@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
+#include <algorithm>
 #ifdef _WIN32
 #  include <io.h>      // _write, _fileno
 #  define GC_DBG_WRITE _write
@@ -244,6 +245,25 @@ namespace gc {
         nursery_base_ = static_cast<uint8_t *>(a->ptr);
         nursery_bump_ = nursery_base_;
         nursery_end_  = nursery_base_ + nursery_bytes;
+
+        /* Sprint alloc-pool (2026-06-02): reserva inicial de capacidad
+         * para evitar reallocs en hot paths de alocacion masiva.
+         *
+         * Estimacion: nursery_bytes / 40 (avg obj size incluyendo header)
+         * = handles vivos esperados en un ciclo del nursery.  Pero como
+         * los handles persisten cross-minor_gc hasta release, multiplicar
+         * por ~8 para programas con vida media larga.
+         *
+         * 1 MB nursery -> 25K objetos -> ~200K handles cap = ~3 MB para
+         * @c handles_ (struct HandleEntry = ~16 bytes).  Aceptable. */
+        const size_t avg_obj_bytes = 40;
+        const size_t live_obj_estimate = nursery_bytes / avg_obj_bytes;
+        const size_t handles_reserve = std::min<size_t>(
+            std::max<size_t>(live_obj_estimate * 8, 4096),
+            1u << 20);  /* cap 1M handles para no inflar al inicio */
+        handles_.reserve(handles_reserve);
+        free_handles_.reserve(handles_reserve / 4);
+        ptr_to_handle_.reserve(handles_reserve);
     }
 
     GcHeap::~GcHeap() {

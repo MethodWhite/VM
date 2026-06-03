@@ -1,0 +1,66 @@
+// examples_codes_vex/171_callback_qsort.vex
+//
+// Callback nativo Vex->C real: msvcrt:qsort invoca un comparator escrito
+// en Vex via `as_native_callback`.  Ordena un array i32[16] y verifica
+// que quede ascendente.
+//
+// Demuestra:
+//   - `as_native_callback(fn) -> i64` genera un thunk x86-64 que cumple
+//     la calling convention C nativa (3+ args probados).
+//   - Comparator Vex recibe `i64,i64` (punteros host crudos a i32), los
+//     deref-erea, retorna i32 (negativo/cero/positivo).
+//   - El thunk preserva callee-saved regs Win64/SysV.
+//
+// Esperado: R00 = 42 (suma de chequeos validados).
+//
+// Bytes ASCII: arr inicial = [9,3,7,1,5,8,2,4,6,0,11,15,13,10,12,14],
+// post-qsort debe quedar 0..15 ascendente.
+
+extern "msvcrt.dll" {
+    fn qsort(u64 base, u64 nmemb, u64 size, u64 cmp) -> void;
+}
+
+// Comparator: recibe dos host_ptr a i32.  Lee los valores, devuelve
+// negative/zero/positive segun el orden.
+i32 my_cmp(i64 a_ptr, i64 b_ptr) {
+    i32* pa = (i32*) a_ptr;
+    i32* pb = (i32*) b_ptr;
+    i32 a = *pa;
+    i32 b = *pb;
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
+
+i32 main() {
+    // Array nativo en VM-stack, con valores barajados.
+    i32[16] arr;
+    arr[0]  = 9;  arr[1]  = 3;  arr[2]  = 7;  arr[3]  = 1;
+    arr[4]  = 5;  arr[5]  = 8;  arr[6]  = 2;  arr[7]  = 4;
+    arr[8]  = 6;  arr[9]  = 0;  arr[10] = 11; arr[11] = 15;
+    arr[12] = 13; arr[13] = 10; arr[14] = 12; arr[15] = 14;
+
+    // Thunk para my_cmp con calling convention C nativa.
+    i64 cb = as_native_callback(my_cmp);
+
+    // Invocar qsort.  &arr[0] = host_ptr (VM-stack o host segun JIT mode);
+    // los 16 i32 son contiguos.
+    qsort((u64)(&arr[0]), 16, 4, (u64)cb);
+
+    // Verificar que quedo ordenado.
+    i32 ok = 1;
+    i32 i = 0;
+    while (i < 16) {
+        if (arr[i] != i) { ok = 0; }
+        i = i + 1;
+    }
+
+    // Bonus: comparator funciona standalone tambien (sin thunk).
+    i32 direct = my_cmp((i64)(&arr[3]), (i64)(&arr[7]));
+    // arr[3] = 3, arr[7] = 7 -> direct = -1.
+
+    i32 acc = 0;
+    if (ok == 1) { acc = acc + 41; }
+    if (direct == -1) { acc = acc + 1; }
+    return acc;
+}

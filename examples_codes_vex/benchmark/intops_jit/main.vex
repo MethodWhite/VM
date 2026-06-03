@@ -1,0 +1,40 @@
+// Bench: Math-IR-promote v2.2c+ (sprint AAA).
+//
+// Mide el speedup del JIT al emitir IMIN/IMAX/IABS nativos via cmov/sar
+// en lugar de pasar por CALLN a vmath_min/max/abs.  Hot loop con tres
+// int ops por iteracion.
+//
+// Estrategia codegen:
+//   * imin: cmp + cmovg (2 instr; ~2 ciclos vs ~50ns CALLN).
+//   * imax: cmp + cmovl.
+//   * abs:  mov+sar 63+xor+sub (branchless, 4 instr; ~3 ciclos).
+//
+// Resultados esperados (~5M iter, 3 int ops/iter):
+//   interp: ~6 seg  (via CALLN).
+//   JIT:    ~8-10 ms (cmov/sar inline).
+//   Speedup: ~600-800x.
+//
+// R0 deben ser identicos en interp y JIT (operaciones puramente
+// enteras + deterministicas).
+
+class IntOps {
+    public i64 run_hot(i32 n) {
+        i64 acc = 0;
+        i32 i = 1;
+        while (i < n) {
+            i64 a = (i64) i;
+            i64 b = (i64) (i + 7);
+            acc = acc + imin(a, b);
+            acc = acc + imax(a, b);
+            acc = acc + abs(a - 5000);
+            i = i + 1;
+        }
+        return acc;
+    }
+}
+
+i32 main() {
+    IntOps op = new IntOps();
+    i64 r = op.run_hot(5000000);
+    return (i32)(r & 0xFFFF);
+}

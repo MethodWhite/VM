@@ -1,0 +1,15 @@
+// Bench: 5M alloc + free de bloques pequenos (96 bytes).
+void do_iter(i32 i) {
+    u8* buf = (u8*) malloc(96);
+    buf[0] = (u8) i;
+    buf[95] = (u8) (i + 95);
+    free(buf);
+}
+i32 main() {
+    i32 i = 0;
+    while (i < 5000000) {
+        do_iter(i);
+        i = i + 1;
+    }
+    return 42;
+}

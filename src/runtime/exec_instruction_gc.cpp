@@ -17,10 +17,12 @@
  * GCWB, GCCONFIG, GCALLOC, GCDEREF y las operaciones de cursor (READCUR, WRITECUR).
  */#include "runtime/exec_instruction.h"
 #include "runtime/proceso_runtime.h"
+#include "runtime/host_alloca_tracker.h"
 #include "gc/gc_heap.h"
 #include "gc/raw_allocator.h"
 #include "loader/oop_types.h"
 #include "util/simd_copy.h"
+#include "runtime/profile.h"
 
 namespace runtime {
 
@@ -285,6 +287,28 @@ namespace runtime {
         vm->vm_mem.write_u64(src_addr, 0ULL);
     }
 
+    /**
+     * @brief Registra el host_ptr en r_ptr para cleanup automatico
+     * cuando el frame actual se destruye (RET / do_throw / TAILCALL).
+     *
+     * Sprint MMM-ext leak-fix (opcode 0x7E, FIXED_4).  Emitido por el
+     * bytecode emit del interp tras un `alloc` cuyo IR ALLOCA lleva
+     * flag `host_alloca=true`.  Si no hay frame activo (codigo
+     * top-level), el ptr queda sin tracking y debe liberarse
+     * manualmente (caso raro).
+     *
+     * encoding: [0x00][0x7E][byte2][0x00], byte2 = (r_ptr<<4) | 0.
+     * El decode_instr_two_op_reg pone reg1=r_ptr.
+     */
+    void exec_instr_htrack(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t  r_ptr = instr.data_instruction.reg_data.reg1;
+        const uint64_t ptr   = vm->registers.regs[r_ptr].qword();
+        if (vm->frame_stack != nullptr && ptr != 0) {
+            host_alloca_track(vm->frame_stack,
+                              reinterpret_cast<uint8_t *>(ptr));
+        }
+    }
+
     // -------------------------------------------------------------------------
     // GC generacional - opcodes 0x00 0xA0 .. 0xA5
     // -------------------------------------------------------------------------
@@ -303,6 +327,13 @@ namespace runtime {
     void exec_instr_newobj(ProcessVM *vm, const DecodedInstr &instr) {
         const uint8_t r_cls = instr.data_instruction.reg_data.reg1; // registro con el puntero ClassInfo
         auto *cls = reinterpret_cast<loader::ClassInfo *>(vm->registers.regs[r_cls].qword());
+
+        // Sprint D.6 (2026-06-03): alloc count para escape analysis en C2.
+        if (__builtin_expect(
+                profile::g_profile.active.load(std::memory_order_relaxed),
+                0)) {
+            profile::profile_newobj(vm->registers.rip.raw());
+        }
 
         if (cls == nullptr) {
             // clase nula: devolver handle invalido

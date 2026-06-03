@@ -52,6 +52,7 @@ namespace vm {
         ArenaManager       &arena_mgr;          ///< Gestor de bloques de memoria real
         MemPerm             permsDefault;        ///< Permisos usados en lazy allocation (RWX por defecto)
 
+    public:
         /**
          * @brief Cache de pagina de 1 entrada para acelerar accesos secuenciales.
          *
@@ -59,6 +60,12 @@ namespace vm {
          * de @c enter / @c leave / @c push / @c pop golpean la misma pagina
          * en sucesion.  Cachear la traduccion (vaddr_base -> host_ptr) salta
          * el TLB walk de 3 niveles para hits.
+         *
+         * **Publico para inline page cache hit del JIT** (Phase D.jit-mem-model
+         * INLINE-CACHE): el codigo nativo emite cmp directo contra
+         * cached_page_vaddr y carga cached_page_host sin call al runtime.
+         * Los offsets se expone via @c vesta_rt/abi.h con @c static_assert
+         * de drift.
          *
          * Invalidacion: el cache se invalida cuando se llama a @c map() o se
          * crea una arena nueva (lazy allocation).

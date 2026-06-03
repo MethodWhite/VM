@@ -1,0 +1,19 @@
+// Bench: strings en hot loop (concat + length + compare).
+i32 main() {
+    string base = "abc";
+    string suffix = "xyz";
+    i64 hits = 0;
+    i32 i = 0;
+    while (i < 200000) {
+        string combo = base + suffix;
+        u64 ln = str_length(combo);
+        if (ln == 6) {
+            hits = hits + 1;
+        }
+        if (str_equals(combo, "abcxyz")) {
+            hits = hits + 1;
+        }
+        i = i + 1;
+    }
+    return (i32) hits;
+}

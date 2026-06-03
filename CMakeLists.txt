@@ -210,6 +210,16 @@ add_subdirectory(libs/SourceCode/keystone)
 
 
 add_executable(vm ${VM_SOURCES})
+
+# Sprint edge-bugs (2026-06-02): exec_instruction_float.cpp implementa
+# semantica IEEE 754 estricta (NaN, Inf).  -ffast-math global asume no
+# NaN/Inf, lo que folda isnan(x) a false y rompe FCMP con NaN.
+# Override por-archivo: -fno-fast-math + -fno-finite-math-only.
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_float.cpp
+    PROPERTIES COMPILE_FLAGS "-fno-fast-math -fno-finite-math-only"
+)
+
 target_include_directories(vm
         PRIVATE ${VM_INCLUDES}
 )
@@ -274,6 +284,13 @@ target_compile_options(vm PRIVATE
 if (WIN32)
 target_link_options(vm PRIVATE
         -static
+        # Stack reserve 128 MB para el thread principal (donde corre el
+        # scheduler single-thread bypass + JIT que aloca buffers grandes
+        # via host_alloca, arrays nativos `u8[N]` con N grande, etc).
+        # Default Win64 era 1 MB que limita programas con recursion profunda
+        # o arrays nativos grandes en stack.  La memoria es VirtualAlloc
+        # RESERVE (no commit) -- solo paginas tocadas consumen memoria real.
+        -Wl,--stack,134217728   # 128 MB reserve (commit on touch)
 )
 endif()
 
@@ -425,6 +442,15 @@ set(VESTA_RT_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_meta.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_coro.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_float.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/host_alloca_tracker.cpp
+        # Sprint D.6 (2026-06-03): profile counters runtime para PGO + C2.
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/profile.cpp
+        # Sprint edge-bugs (2026-06-02): exec_instruction_float.cpp implementa
+        # operaciones IEEE 754 (FCMP con NaN, etc.) y NO puede usar
+        # -ffast-math (que rompe isnan/isinf + asume no NaN).  Override
+        # con flags por-archivo: -fno-fast-math + -fno-finite-math-only.
+        # set_source_files_properties debe ir DESPUES de listar las sources.
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/native_callback.cpp
 
         # Distribucion - VDP protocol + mailbox + dirty tracker
         ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/mailbox.cpp

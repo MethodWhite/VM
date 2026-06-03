@@ -347,6 +347,20 @@ namespace vm {
         {"fcvt.ps",  {"fcvt.ps",  OpArity::TWO}},
         {"fextend",  {"fextend",  OpArity::TWO}},
         {"fnarrow",  {"fnarrow",  OpArity::TWO}},
+        {"fmin",     {"fmin",     OpArity::TWO}},
+        {"fmin.ps",  {"fmin.ps",  OpArity::TWO}},
+        {"fmax",     {"fmax",     OpArity::TWO}},
+        {"fmax.ps",  {"fmax.ps",  OpArity::TWO}},
+        {"ffloor",   {"ffloor",   OpArity::TWO}},
+        {"ffloor.ps",{"ffloor.ps",OpArity::TWO}},
+        {"fceil",    {"fceil",    OpArity::TWO}},
+        {"fceil.ps", {"fceil.ps", OpArity::TWO}},
+        {"fround",   {"fround",   OpArity::TWO}},
+        {"fround.ps",{"fround.ps",OpArity::TWO}},
+        {"ftrunc",   {"ftrunc",   OpArity::TWO}},
+        {"ftrunc.ps",{"ftrunc.ps",OpArity::TWO}},
+        {"bitg2z",   {"bitg2z",   OpArity::TWO}},
+        {"bitz2g",   {"bitz2g",   OpArity::TWO}},
         {"fmowi",    {"fmowi",    OpArity::TWO}},
         {"fload",    {"fload",    OpArity::TWO}},
         {"fstore",   {"fstore",   OpArity::TWO}},
@@ -459,6 +473,10 @@ namespace vm {
 
         /* --- Move-and-take (primitivo de smart pointers unique<T> / shared<T>) --- */
         {"mvtake",    {"mvtake",    OpArity::TWO}},
+
+        /* --- Sprint MMM-ext leak-fix: registra host_ptr para cleanup
+         *     automatico cuando el frame actual se destruye. --- */
+        {"htrack",    {"htrack",    OpArity::ONE}},
 
         /* --- Phase Z: memoria compartida cross-process ---
          *  Todos arity TWO (reg, reg).  El lowering los emite cuando un

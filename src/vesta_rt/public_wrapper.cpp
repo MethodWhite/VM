@@ -42,10 +42,13 @@
 #include "loader/oop_types.h"
 #include "runtime/decode_instruction.h"
 #include "runtime/exception_runtime.h"
+#include "runtime/host_alloca_tracker.h"
 #include "runtime/manager_runtime.h"
 #include "runtime/native_invoke.h"
 #include "runtime/proceso_runtime.h"
 #include "runtime/runtime.h"
+#include "runtime/string_runtime.h"
+#include "loader/string_object.h"
 
 #include <cstring>
 
@@ -87,6 +90,20 @@ vrt_handle vrt_gc_alloc(vrt_proc *proc, size_t size) {
 vrt_handle vrt_gc_alloc_pinned(vrt_proc *proc, size_t size) {
     if (!proc) return VRT_NULL_HANDLE;
     return as_proc(proc)->gc_heap.alloc_pinned(size);
+}
+
+/* Raw heap host (malloc/free): bloque no-GC, dereferenciable directo
+ * por codigo C nativo.  Usado por callbacks que necesitan alocar
+ * structs Win32/POSIX para pasar a APIs nativas. */
+uint8_t *vrt_raw_alloc(vrt_proc *proc, size_t size) {
+    if (!proc) return nullptr;
+    uint64_t ptr = as_proc(proc)->raw_alloc.alloc(size);
+    return reinterpret_cast<uint8_t *>(ptr);
+}
+
+void vrt_raw_free(vrt_proc *proc, uint8_t *ptr) {
+    if (!proc || !ptr) return;
+    as_proc(proc)->raw_alloc.free(reinterpret_cast<uint64_t>(ptr));
 }
 
 uint8_t *vrt_gc_deref(vrt_proc *proc, vrt_handle h) {
@@ -400,15 +417,54 @@ uint64_t vrt_callvirt_ic(vrt_proc *proc, uint8_t *obj_payload,
         }
     }
 
-    /* Actualizar el slot IC: solo cuando hay jit_code Y NO hay advices
-     * (esos requieren fallback siempre).  Si advice_chain != null o
-     * jit_code == null, NO actualizar el slot -- de esa forma el slot
-     * permanece a 0 y el fast path inline siempre va al miss path. */
+    /* Actualizar el slot PIC (Polymorphic Inline Cache, 4 entries de
+     * 16 bytes cada una).  Layout:
+     *   slot[0,1]  -> entry 0: [class_ptr, jit_code]
+     *   slot[2,3]  -> entry 1
+     *   slot[4,5]  -> entry 2
+     *   slot[6,7]  -> entry 3
+     *
+     * Politica de reemplazo:
+     *   1. Si hay alguna entry con class==0 (libre), poner ahi.
+     *   2. Si todas estan ocupadas (4 tipos distintos vistos en este
+     *      call site = megamorfico), rotar: shift entries 1..3 a 0..2
+     *      y poner la nueva en [3].  Esto mantiene la "ultima vista"
+     *      al final, beneficiando el orden de chequeo del JIT (que
+     *      prueba entry 0 primero).
+     *
+     * Solo se actualiza si hay jit_code Y NO hay advices.  Sin
+     * jit_code el inline cache no sirve (no podriamos llamar
+     * directo); con advices necesitamos el slow path siempre. */
     if (ic_slot_addr != 0 && method->jit_code != nullptr
      && method->advice_chain == nullptr) {
         uint64_t *slot = reinterpret_cast<uint64_t *>(ic_slot_addr);
-        slot[0] = reinterpret_cast<uint64_t>(cls);
-        slot[1] = reinterpret_cast<uint64_t>(method->jit_code);
+        const uint64_t cls_u  = reinterpret_cast<uint64_t>(cls);
+        const uint64_t code_u = reinterpret_cast<uint64_t>(method->jit_code);
+        /* Buscar entry vacia.  Si la clase YA esta cacheada (caso raro
+         * de race en multi-thread), actualizar su jit_code. */
+        int free_idx = -1;
+        for (int i = 0; i < 4; ++i) {
+            const uint64_t s_cls = slot[i * 2];
+            if (s_cls == cls_u) {
+                slot[i * 2 + 1] = code_u;
+                free_idx = -2;  /* sentinel: ya cacheada, no insertar */
+                break;
+            }
+            if (free_idx < 0 && s_cls == 0) {
+                free_idx = i;
+            }
+        }
+        if (free_idx >= 0) {
+            slot[free_idx * 2]     = cls_u;
+            slot[free_idx * 2 + 1] = code_u;
+        } else if (free_idx == -1) {
+            /* Todas ocupadas con otras clases -> rotar.  Entry 0 cae,
+             * 1->0, 2->1, 3->2, nueva clase en 3. */
+            slot[0] = slot[2]; slot[1] = slot[3];
+            slot[2] = slot[4]; slot[3] = slot[5];
+            slot[4] = slot[6]; slot[5] = slot[7];
+            slot[6] = cls_u;   slot[7] = code_u;
+        }
     }
 
     if (method->jit_code != nullptr && method->advice_chain == nullptr) {
@@ -546,6 +602,8 @@ static uint64_t vrt_run_method_in_interp(runtime::ProcessVM *p,
     if (p->frame_stack == frame) {
         /* No se hizo pop -- liberar el frame manualmente. */
         p->frame_stack = saved_frame_stack;
+        /* Sprint MMM-ext leak-fix. */
+        runtime::host_alloca_release_all(p, frame);
         p->frame_pool.release(frame);
     }
     p->decoded_ptr = saved_decoded_ptr;
@@ -732,6 +790,60 @@ uint64_t vrt_vm_read_u64(vrt_proc *proc, uint64_t vaddr) {
 void vrt_vm_write_u64(vrt_proc *proc, uint64_t vaddr, uint64_t value) {
     if (!proc) return;
     as_proc(proc)->vm_mem.write_u64_fast(vaddr, value);
+}
+
+/* Variantes por tamano para LOAD/STORE de tipos menores que 8 bytes.
+ * El JIT las usa segun el ancho del IR LOAD/STORE para evitar:
+ *   (a) leer pagina no mapeada al final de la region (read_u64 sobre los
+ *       ultimos 4 bytes de una pagina cruzaria el limite).
+ *   (b) escribir 8 bytes sobrescribiendo el siguiente elemento del array
+ *       (4 bytes adyacentes corruptos).
+ * Cada variante delega al metodo size-specifico de @c VirtualMemory. */
+uint32_t vrt_vm_read_u32(vrt_proc *proc, uint64_t vaddr) {
+    if (!proc) return 0;
+    return as_proc(proc)->vm_mem.read_u32(vaddr);
+}
+uint16_t vrt_vm_read_u16(vrt_proc *proc, uint64_t vaddr) {
+    if (!proc) return 0;
+    return as_proc(proc)->vm_mem.read_u16(vaddr);
+}
+uint8_t vrt_vm_read_u8(vrt_proc *proc, uint64_t vaddr) {
+    if (!proc) return 0;
+    return as_proc(proc)->vm_mem.read_u8(vaddr);
+}
+void vrt_vm_write_u32(vrt_proc *proc, uint64_t vaddr, uint32_t value) {
+    if (!proc) return;
+    as_proc(proc)->vm_mem.write_u32(vaddr, value);
+}
+void vrt_vm_write_u16(vrt_proc *proc, uint64_t vaddr, uint16_t value) {
+    if (!proc) return;
+    as_proc(proc)->vm_mem.write_u16(vaddr, value);
+}
+void vrt_vm_write_u8(vrt_proc *proc, uint64_t vaddr, uint8_t value) {
+    if (!proc) return;
+    as_proc(proc)->vm_mem.write_u8(vaddr, value);
+}
+
+uint8_t *vrt_vm_translate(vrt_proc *proc, uint64_t vaddr) {
+    /* Phase D.jit-mem-model FULL: traduccion VM-addr -> host_ptr.
+     *
+     * Diseno portable: confiamos en que el frontend marca
+     * is_host_ptr correctamente en el IR.  El JIT emite la llamada
+     * a vrt_vm_translate SOLO para LOAD/STORE de ptrs con
+     * is_host_ptr=false (VM-addrs).  Para is_host_ptr=true (malloc
+     * /new/fields GC) usa native mov directo, sin traduccion.
+     *
+     * Asi evitamos range checks arbitrarios (no portables a
+     * arquitecturas distintas o programas con address layouts
+     * inusuales) y nos apoyamos en la informacion semantica que
+     * el frontend ya tiene.
+     *
+     * El JIT garantiza llamar solo con un VM-addr; aqui asumimos
+     * eso y delegamos a vm_mem.  Si vaddr == 0 retornamos null
+     * para mantener la semantica de deref nulo. */
+    if (vaddr == 0) return nullptr;
+    if (!proc) return nullptr;
+    return &as_proc(proc)->vm_mem[vaddr];
 }
 
 /* ----------------------------------------------------------------------- */
@@ -1017,6 +1129,116 @@ void vrt_setmethdbg(vrt_proc *proc, uint64_t params_vaddr) {
     runtime::register_method_debug(
         reinterpret_cast<loader::MethodInfo *>(sp.method_ptr),
         fbuf, flen, sp.start_line);
+}
+
+/* =========================================================================
+ * Sprint JIT-cobertura (2026-06-01): wrappers para string ops.
+ *
+ * Cada wrapper recibe handles/args directos del codigo JIT (Native ABI:
+ * proc en RCX/RDI, args en RDX/RSI/R8/RDX/...).  Delega a las helpers
+ * publicas expuestas en @c runtime/string_runtime.h.
+ * =========================================================================
+ */
+
+/* PANIC: lanza FatalError(USER_ABORT, msg) leyendo el mensaje de
+ * vm_mem[msg_addr, msg_addr+msg_len).  Equivalente al opcode bytecode
+ * panic.  Convierte el path FATAL_USER_ABORT del runtime entry
+ * throw_fatal a una API mas directa para el JIT. */
+void vrt_panic_str(vrt_proc *proc, uint64_t msg_vaddr, uint32_t msg_len) {
+    if (!proc) return;
+    runtime::ProcessVM *p = as_proc(proc);
+    char msg[512];
+    if (msg_len >= sizeof(msg)) msg_len = sizeof(msg) - 1;
+    if (msg_len > 0 && msg_vaddr != 0) {
+        p->vm_mem.read_bytes(msg_vaddr, msg, msg_len);
+    }
+    msg[msg_len] = '\0';
+    /* throw_fatal(proc, FATAL_USER_ABORT, msg) -- nunca retorna.  El
+     * handler del JIT (run_jit -> longjmp) propaga la excepcion al
+     * frame de tryenter mas cercano o termina el proceso si no hay
+     * uno. */
+    runtime::throw_fatal(p, runtime::FATAL_USER_ABORT, msg);
+}
+
+/* GC_ALLOCP: alloc en GC heap + deref + devuelve host_ptr al payload.
+ * Combinacion atomica que el opcode bytecode gcallocp implementa en
+ * 1 instr.  Para el JIT usamos 1 CALL nativo en lugar de 2. */
+uint8_t *vrt_gc_alloc_payload(vrt_proc *proc, size_t size) {
+    if (!proc) return nullptr;
+    runtime::ProcessVM *p = as_proc(proc);
+    vrt_handle h = vrt_gc_alloc(proc, size);
+    if (h == VRT_NULL_HANDLE) return nullptr;
+    return p->gc_heap.deref(h);
+}
+
+/* STRMAKE: %dst = strmake.handle vm_addr, byte_len.  La codificacion la
+ * detectamos como UTF-8 por defecto (mismo path que el opcode bytecode);
+ * el helper interno auto-compacta a ASCII si todos los bytes son < 0x80. */
+vrt_handle vrt_str_make(vrt_proc *proc, uint64_t vm_addr, uint32_t byte_len) {
+    if (!proc) return VRT_NULL_HANDLE;
+    runtime::ProcessVM *p = as_proc(proc);
+    if (byte_len > (1u << 24)) return VRT_NULL_HANDLE; /* sanity: 16 MB cap */
+    /* Sprint string-perf-4 (2026-06-02): bypass del path antiguo
+     * (heap std::vector + make_string_flat sin cache).  Delega al
+     * helper compartido con exec_instr_strmake -> stack buf <=256 B,
+     * single-pass FNV-1a 64-bit, intern lookup-first, alloc_flat con
+     * precomputed_hash.  Speedup esperado en JIT: ~3-5x en hot loops
+     * porque el 95%+ de STRMAKEs hit cache. */
+    return static_cast<vrt_handle>(
+        runtime::make_string_from_vm_mem(p, vm_addr, byte_len));
+}
+
+/* STRLEN: numero de code points del StringObject. */
+uint64_t vrt_str_len(vrt_proc *proc, vrt_handle h) {
+    if (!proc || h == VRT_NULL_HANDLE) return 0;
+    runtime::ProcessVM *p = as_proc(proc);
+    uint8_t *payload = p->gc_heap.deref(static_cast<gc::GcHandle>(h));
+    if (!payload) return 0;
+    auto *s = reinterpret_cast<loader::StringObject *>(payload);
+    return static_cast<uint64_t>(s->length);
+}
+
+/* STRGETBYTES: byte_len del StringObject. */
+uint64_t vrt_str_get_bytes(vrt_proc *proc, vrt_handle h) {
+    if (!proc || h == VRT_NULL_HANDLE) return 0;
+    runtime::ProcessVM *p = as_proc(proc);
+    uint8_t *payload = p->gc_heap.deref(static_cast<gc::GcHandle>(h));
+    if (!payload) return 0;
+    auto *s = reinterpret_cast<loader::StringObject *>(payload);
+    return static_cast<uint64_t>(s->byte_len);
+}
+
+/* STRRAW: host pointer al buffer de bytes (offset 40 dentro del payload
+ * del StringObject).  Materializa ROPE/SLICE primero. */
+uint64_t vrt_str_raw(vrt_proc *proc, vrt_handle h) {
+    if (!proc || h == VRT_NULL_HANDLE) return 0;
+    runtime::ProcessVM *p = as_proc(proc);
+    gc::GcHandle flat = runtime::flatten_string_public(
+        p, static_cast<gc::GcHandle>(h));
+    uint8_t *payload = p->gc_heap.deref(flat);
+    if (!payload) return 0;
+    /* StringObject layout: header(24) + encoding(1) + pad(3) + length(4)
+     *                       + byte_len(4) + hash(4) + data[] @ offset 40. */
+    return reinterpret_cast<uint64_t>(payload + 40);
+}
+
+/* STRCAT: %dst = strcat.handle a, b.  Crea un ROPE O(1) (lazy concat). */
+vrt_handle vrt_str_cat(vrt_proc *proc, vrt_handle a, vrt_handle b) {
+    if (!proc) return VRT_NULL_HANDLE;
+    runtime::ProcessVM *p = as_proc(proc);
+    return static_cast<vrt_handle>(
+        runtime::strcat_public(p,
+            static_cast<gc::GcHandle>(a),
+            static_cast<gc::GcHandle>(b)));
+}
+
+/* STRCMP: comparacion lexicografica.  Returns -1, 0 o 1. */
+int64_t vrt_str_cmp(vrt_proc *proc, vrt_handle a, vrt_handle b) {
+    if (!proc) return -1;
+    runtime::ProcessVM *p = as_proc(proc);
+    return runtime::strcmp_public(p,
+        static_cast<gc::GcHandle>(a),
+        static_cast<gc::GcHandle>(b));
 }
 
 } /* extern "C" */

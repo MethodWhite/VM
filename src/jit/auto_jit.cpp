@@ -19,23 +19,32 @@
 #include "jit/jit_compiler.h"
 #include "jit/code_cache.h"
 #include "jit/runtime_entries.h"
+#include "jit/vreg_pipeline.h"
+#include "jit/regalloc_rewrite.h"       // OSR glue (set_osr_handler / osr_loop_*)
 #include "vesta_rt/public.h"
 #include "ffi/virtual_lib_registry.h"  // Sprint JIT-cross-fn: virtual fn lookup
 #include "loader/loader.h"
 #include "loader/oop_types.h"
+#include "ir/ir_optimizer.h"            // C2.4: devirt especulativa + inline
 #include "runtime/proceso_runtime.h"
 #include "runtime/runtime.h"
 #include "runtime/scheduler.h"
+#include "runtime/exception_runtime.h"  // callback-ABI: get_current_executing_process + jit_proc_tls_index
 #include "ir/ssa_ir.h"
 #include <cstring>
 
 #include <capstone/capstone.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <utility>
+#include <vector>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace jit {
 
@@ -44,16 +53,40 @@ namespace jit {
     /* ===================================================================== */
 
     /**
-     * @brief Default: UINT32_MAX (JIT off).  Override via @c set_jit_threshold
-     *        o env var @c VESTA_JIT_THRESHOLD.
+     * @brief Default: 1500 (JIT por defecto, tier C1-like estilo HotSpot).
+     *
+     * Un metodo/funcion se JIT-compila tras 1500 invocaciones.  Valor por
+     * estudio empirico: el threshold NO es sensible en [100,20000] (mismo
+     * resultado), 1500 esta sobre el break-even de metodos pesados (~1k) y bajo
+     * los call-counts de codigo hot (millones); los metodos triviales (break-
+     * even alto ~20k) se inlinean antes de compilar -> sin compile-waste.
+     * Coincide con el tier C1 de HotSpot.
+     *
+     * Seguridad: el sandbox bajo JIT esta cerrado (maybe_compile_method /
+     * maybe_compile_callvm_target / eager-compile de main bailan si
+     * sandbox_active -> el interp enforcea las caps).
+     *
+     * Validado: e2e 263/0 forzando T=1500.  Un bug previo del path
+     * native-callback (el thunk no forzaba el compile a threshold moderado ->
+     * test 173 colgaba) se arreglo en native_callback.cpp (vex_get_native_thunk
+     * fuerza el compile inmediato sea cual sea el threshold).
+     *
+     * Override: @c set_jit_threshold / env var @c VESTA_JIT_THRESHOLD;
+     * `-m jit` = 1 (agresivo), `-m vm`/`-m interp` = UINT32_MAX (interp puro).
      */
-    uint32_t g_jit_threshold = UINT32_MAX;
+    uint32_t g_jit_threshold = 1500;
 
     /**
      * @brief Warning toggleable + counters de auditoria.
      */
     bool     g_jit_warn_unsupported  = false;
     bool     g_jit_disasm            = false;
+    /* Phase D.7: path de registros virtuales (opt-in via VESTA_JIT_VREGS).
+     * Default OFF -> el JIT usa el path de slots de siempre (cero cambio).
+     * Con el flag, las funciones del subset soportado por el selector vreg
+     * (aritmetica / control de flujo / loops, sin GC) se compilan por el
+     * register allocator; el resto cae al path de slots via fallback. */
+    bool     g_jit_use_vregs         = false;
     /* Sprint string-perf-6 (2026-06-02): emit del MIPS counter per-block
      * en el JIT.  Default OFF porque cuesta ~3ns por block ejecutado;
      * en hot loops con muchos bloques (e.g. bench_branch_unpredict con
@@ -63,6 +96,30 @@ namespace jit {
     uint64_t g_jit_compiled_count    = 0;
     uint64_t g_jit_unsupported_count = 0;
     uint64_t g_jit_no_ir_count       = 0;
+
+    /* C2 tier-up (2026-06-07).  OPT-IN: g_c2_threshold == 0 (default) deja el
+     * C2 totalmente apagado -> el Selector NO emite el contador on-entry y el
+     * comportamiento C1 queda intacto (cero regresion).  Cuando se setea
+     * VESTA_C2_THRESHOLD=N>0, las funciones con CALLVIRT compiladas por el path
+     * Selector llevan un contador de invocaciones; al cruzar N se recompilan
+     * (C2) y se hace swap atomico del codigo.  VESTA_C2_LOG=1 loguea las clases
+     * observadas en los IC slots durante el recompile (PoC C2.1/C2.2).
+     * VESTA_C2_TIER_ALL=1 instrumenta TODAS las funciones (no solo las con
+     * CALLVIRT) -- para A/B futuro.
+     *
+     * NOTA: la observacion de clases solo existe en el path Selector (que usa
+     * el PIC via vrt_callvirt_ic); el path vreg (default) hace dispatch inline
+     * sin PIC.  Por eso el C2 se valida con VESTA_JIT_VREGS=0.  Wirearlo al
+     * path vreg (PIC) y el OSR para hotness de loop-en-main son follow-ups. */
+    uint32_t g_c2_threshold = 0;
+    bool     g_c2_log       = false;
+    bool     g_c2_tier_all  = false;
+    bool     g_c2_vreg      = false;  /* experimento: recompilar C2 por path vreg */
+    uint64_t g_c2_tierup_count = 0;
+
+    /* C2 reclaim: true cuando el C2 esta activo -> enter_jit instrumenta la
+     * quiescencia (ver interp_jit_bridge.h).  Default false = cero overhead. */
+    bool g_jit_reclaim_active = false;
 
     /* Lazy init del threshold desde env var en la primera consulta. */
     namespace {
@@ -93,6 +150,33 @@ namespace jit {
             if (stats && stats[0] != '\0' && stats[0] != '0') {
                 g_jit_emit_instr_counter = true;
             }
+            /* Phase D.7: el path de REGISTROS VIRTUALES es el DEFAULT del JIT
+             * (mide ~2x sobre el path de slots en codigo con presion de
+             * registros; fallback transparente a slots para ops no soportadas,
+             * con la misma robustez -- vregs==slots en la suite e2e).
+             * VESTA_JIT_VREGS=0 lo desactiva (fuerza slots, para A/B testing). */
+            const char *vr = std::getenv("VESTA_JIT_VREGS");
+            g_jit_use_vregs = !(vr && vr[0] == '0');
+            /* C2 tier-up (opt-in).  VESTA_C2_THRESHOLD=N activa el tier-up con
+             * umbral N; ausente o 0 = C2 apagado (default). */
+            const char *c2t = std::getenv("VESTA_C2_THRESHOLD");
+            if (c2t && c2t[0] != '\0') {
+                char *end = nullptr;
+                const unsigned long v = std::strtoul(c2t, &end, 10);
+                if (end != c2t && v <= UINT32_MAX) {
+                    g_c2_threshold = static_cast<uint32_t>(v);
+                }
+            }
+            const char *c2l = std::getenv("VESTA_C2_LOG");
+            if (c2l && c2l[0] != '\0' && c2l[0] != '0') g_c2_log = true;
+            const char *c2a = std::getenv("VESTA_C2_TIER_ALL");
+            if (c2a && c2a[0] != '\0' && c2a[0] != '0') g_c2_tier_all = true;
+            const char *c2v = std::getenv("VESTA_C2_VREG");
+            if (c2v && c2v[0] != '\0' && c2v[0] != '0') g_c2_vreg = true;
+            /* Activar la quiescencia de enter_jit SOLO si el C2 esta on.
+             * Se setea aqui (init unica, antes de cualquier enter_jit) para
+             * que los pares enter/exit esten siempre balanceados. */
+            g_jit_reclaim_active = (g_c2_threshold != 0);
         }
 
         /* Singleton lazy del JIT subsystem (compiler + cache + entries). */
@@ -102,11 +186,128 @@ namespace jit {
         JitCompiler       *g_compiler      = nullptr;
         std::mutex         g_compile_mtx;
 
+        /* OSR (Phase D.8, 2c): tabla loop_id -> direccion del OSR-entry del C2
+         * precompilado.  Se rellena en eager_compile_function tras compilar el
+         * C1 de cada funcion (un C2-con-OSR-entry por loop detectado).  El
+         * handler instalado en regalloc_rewrite la consulta cuando un loop
+         * cruza el umbral; devolver la direccion dispara el frame-swap C1->C2.
+         * Lookup-puro en runtime (sin compilar -> sin GC) => el state-transfer
+         * por buffer es GC-safe (host_ptr capturados siguen frescos). */
+        std::unordered_map<uint64_t, uint64_t> g_osr_entry_map;
+
+        /** @brief Gate del C2 OPTIMIZADO del OSR (default ON).  VESTA_OSR_OPT=0
+         *  -> el C2 es un recompile plano (== C1) para A/B del beneficio del
+         *  inline agresivo.  Cacheado (1 getenv). */
+        bool osr_opt_enabled() {
+            static const bool on = []{
+                const char *v = std::getenv("VESTA_OSR_OPT");
+                return !(v && v[0] == '0');  // default ON; solo "0" lo apaga
+            }();
+            return on;
+        }
+
+        /** @brief Handler de OSR instalado via set_osr_handler.  Lookup del
+         *  OSR-entry precompilado para @p loop_id (0 si no hay variante). */
+        uint64_t osr_lookup_handler(uint64_t loop_id) {
+            auto it = g_osr_entry_map.find(loop_id);
+            return (it != g_osr_entry_map.end()) ? it->second : 0;
+        }
+
         void init_jit_subsystem() {
             g_code_cache      = new CodeCache();
             g_runtime_entries = new RuntimeEntries();
             g_runtime_entries->resolve();
             g_compiler        = new JitCompiler(*g_code_cache, *g_runtime_entries);
+            /* OSR: instalar el handler de lookup (antes de cualquier compile,
+             * por tanto antes de cualquier trigger en runtime). */
+            set_osr_handler(&osr_lookup_handler);
+        }
+
+        /* Construye el VregEntries desde los runtime entries resueltos. */
+        VregEntries make_vreg_entries() {
+            VregEntries e;
+            if (g_runtime_entries) {
+                e.callvirt  = reinterpret_cast<uint64_t>(g_runtime_entries->callvirt);
+                e.gc_deref  = reinterpret_cast<uint64_t>(g_runtime_entries->gc_deref);
+                e.gc_handle = reinterpret_cast<uint64_t>(g_runtime_entries->gc_handle_for_ptr);
+                e.raw_alloc = reinterpret_cast<uint64_t>(g_runtime_entries->raw_alloc);
+                e.raw_free  = reinterpret_cast<uint64_t>(g_runtime_entries->raw_free);
+                e.gc_allocp = reinterpret_cast<uint64_t>(g_runtime_entries->gc_alloc_payload);
+            }
+            return e;
+        }
+
+        /* C2-cimiento (2026-06-07): IC slots DIRECCIONABLES por call site.
+         *
+         * g_ic_slots:    clave (fn_pc<<8 | ordinal) -> addr del slot PIC
+         *                (64 bytes: 4 entradas [class_ptr][jit_code]).
+         * g_fn_ic_keys:  fn_pc -> lista de claves de sus IC sites (CALLVIRT),
+         *                para que el futuro pase C2 itere los slots de una fn
+         *                caliente y lea las clases observadas (especular).
+         *
+         * Ambos se tocan SOLO en compile time (bajo g_compile_mtx).  El runtime
+         * (vrt_callvirt_ic) escribe DENTRO de los slots, no en estos mapas.
+         *
+         * @c get_ic_slot(key): si key!=0 reusa el slot existente del call site
+         * (estable entre recompilaciones) o lo crea; si key==0 aloca un slot
+         * fresco no-direccionable (NATIVE_ABI / ICs no-PIC). */
+        std::unordered_map<uint64_t, uint64_t>              g_ic_slots;
+        std::unordered_map<uint64_t, std::vector<uint64_t>> g_fn_ic_keys;
+
+        uint64_t get_ic_slot(uint64_t key) {
+            if (g_code_cache == nullptr) return 0;
+            if (key != 0) {
+                auto it = g_ic_slots.find(key);
+                if (it != g_ic_slots.end()) return it->second;
+            }
+            uint8_t *slot = g_code_cache->alloc(64, 64);
+            if (slot == nullptr) return 0;
+            std::memset(slot, 0, 64);
+            const uint64_t addr = reinterpret_cast<uint64_t>(slot);
+            if (key != 0) {
+                g_ic_slots[key] = addr;
+                g_fn_ic_keys[key >> 8].push_back(key);
+            }
+            return addr;
+        }
+
+        /* C2 tier-up: contador de invocaciones por funcion (keyed por fn_pc),
+         * conjunto de fns ya tieradas (idempotencia), y mapa fn_pc -> MethodInfo
+         * (para hacer swap de method->jit_code ademas del pc-map).  Tocados
+         * bajo g_compile_mtx. */
+        std::unordered_map<uint64_t, uint64_t>            g_tier_counters;
+        std::unordered_set<uint64_t>                      g_tiered_pcs;
+        std::unordered_map<uint64_t, loader::MethodInfo*> g_pc_to_method;
+        /* fn_pc -> (code_start, code_size) del C1, para devolver la region al
+         * free-list del CodeCache cuando la funcion sube a C2. */
+        std::unordered_map<uint64_t, std::pair<uint8_t*, size_t>> g_c1_region;
+
+        /* Quiescencia + free-list pendiente (reclaim C2).  g_jit_active_frames
+         * es la profundidad de frames JIT en pila nativa (atomic, tocado en el
+         * borde enter_jit).  g_pending_free son regiones C1 a reciclar; se
+         * drenan (devuelven al CodeCache) cuando g_jit_active_frames llega a 0.
+         * g_pending_free + g_pending_free_count se mutan bajo g_compile_mtx;
+         * g_pending_free_count se lee lock-free en jit_frame_exit para decidir
+         * si drenar (eventual-consistente: una lectura obsoleta solo difiere el
+         * drain al proximo 0). */
+        std::atomic<int64_t>                              g_jit_active_frames{0};
+        std::vector<std::pair<uint8_t*, size_t>>          g_pending_free;
+        std::atomic<size_t>                               g_pending_free_count{0};
+
+        /* Reserva (o reusa) el contador de 8 bytes para fn_pc en el code cache
+         * (mismo pool RWX que el codigo; el JIT lee/escribe estos bytes pero no
+         * los ejecuta).  Zero-init.  Estable entre recompilaciones del call
+         * site (mismo fn_pc -> mismo contador). */
+        uint64_t reserve_tier_counter(uint64_t fn_pc) {
+            if (g_code_cache == nullptr || fn_pc == 0) return 0;
+            auto it = g_tier_counters.find(fn_pc);
+            if (it != g_tier_counters.end()) return it->second;
+            uint8_t *slot = g_code_cache->alloc(8, 8);
+            if (slot == nullptr) return 0;
+            std::memset(slot, 0, 8);
+            const uint64_t addr = reinterpret_cast<uint64_t>(slot);
+            g_tier_counters[fn_pc] = addr;
+            return addr;
         }
     }
 
@@ -147,6 +348,11 @@ namespace jit {
         std::call_once(g_env_init_flag, init_threshold_from_env);
     }
 
+    /* C2 tier-up: handler invocado por el contador on-entry del codigo C1
+     * cuando cruza el umbral.  Recompila la funcion (C2) y hace swap del
+     * codigo.  Definido mas abajo; se toma su direccion en las opts. */
+    void c2_tier_up(runtime::ProcessVM *vm, uint64_t fn_pc) noexcept;
+
     /* ===================================================================== */
     /* maybe_compile_method                                                   */
     /* ===================================================================== */
@@ -163,6 +369,16 @@ namespace jit {
         if (g_jit_threshold == UINT32_MAX) return;
         if (method->jit_code != nullptr)   return;
         if (method->invocation_count < g_jit_threshold) return;
+
+        /* SEGURIDAD (sandbox bajo JIT): si hay un sandbox activo (algun modulo
+         * con caps restringidas, M.sandbox Sprint A), NO JIT-compilar.  El
+         * codigo JIT-eated emite CALLN/CALLNI/dlopen/spawn/etc. SIN el check de
+         * capabilities que el interprete SI hace (check_cap_at_pc) -> dejar la
+         * funcion en interp garantiza el enforcement del sandbox.  Coste cero
+         * cuando no hay sandbox (1 branch predicho not-taken; sandbox_active es
+         * false en el caso default).  Prerrequisito para habilitar JIT por
+         * defecto sin abrir un hueco de seguridad. */
+        if (vm->scheduler.vm_reference.loader_public.sandbox_active) return;
 
         /* Slow path: el counter cruzo el threshold y el metodo NO
          * tiene jit_code aun.  Intentar compilar. */
@@ -253,6 +469,30 @@ namespace jit {
          * compilado mientras nosotros esperabamos). */
         if (method->jit_code != nullptr) return;
 
+        /* Phase D.7 (opt-in): intentar primero el path de registros
+         * virtuales.  Si la funcion es del subset soportado por el selector
+         * vreg, la compila el register allocator; si no, cae al path de
+         * slots de abajo (fallback transparente). */
+        if (g_jit_use_vregs) {
+            uint8_t *vcode = vreg_compile(*ir_fn, *g_code_cache, {}, make_vreg_entries(), {});
+            if (vcode != nullptr) {
+                method->jit_code = reinterpret_cast<void *>(vcode);
+                if (method->code_vaddr != 0) {
+                    register_jit_code_at_pc(method->code_vaddr,
+                                            reinterpret_cast<void *>(vcode));
+                }
+                ++g_jit_compiled_count;
+                if (g_jit_warn_unsupported) {
+                    std::fprintf(stderr, "[jit-vreg] compilado '%s'\n", key.c_str());
+                }
+                return;
+            }
+            if (g_jit_warn_unsupported) {
+                std::fprintf(stderr,
+                    "[jit-vreg] '%s' no soportada -> fallback a slots\n", key.c_str());
+            }
+        }
+
         /* Phase: compile_with_opts pasando el symbol_table de la
          * executable que poseyo este metodo, para que el mini-parser
          * resuelva @Absolute("X") y los CALLs a __module_init / __new_<X>. */
@@ -273,21 +513,24 @@ namespace jit {
         /* IC slot reservation: aloca 16 bytes en el code cache (mismo
          * pool RWX) y los zero-init.  El JIT-eated codigo lee/escribe
          * estos bytes pero no los ejecuta. */
-        CodeCache *cc_ptr = g_code_cache;
-        mc_opts.reserve_ic_slot = [cc_ptr]() -> uint64_t {
-            /* PIC: 4 entries x 16 bytes (class + jit_code) = 64 bytes.
-             * Layout:
-             *   +0..+15  entry 0: [class_ptr][jit_code]
-             *   +16..+31 entry 1: [class_ptr][jit_code]
-             *   +32..+47 entry 2: [class_ptr][jit_code]
-             *   +48..+63 entry 3: [class_ptr][jit_code]
-             * Cache-line aligned (64 bytes). */
-            uint8_t *slot = cc_ptr->alloc(64, 64);
-            if (slot) {
-                for (int i = 0; i < 64; ++i) slot[i] = 0;
-            }
-            return reinterpret_cast<uint64_t>(slot);
+        /* IC slots direccionables por call site (C2-cimiento).  PIC de 4
+         * entradas x 16 bytes = 64 bytes, cache-line aligned, zero-init.
+         * @c get_ic_slot reusa el slot del call site (clave != 0) o aloca uno
+         * fresco (clave 0). */
+        mc_opts.reserve_ic_slot = [](uint64_t key) -> uint64_t {
+            return get_ic_slot(key);
         };
+        /* C2 tier-up (opt-in): instrumentar el prologo con el contador
+         * on-entry cuando C2 esta activo.  El Selector solo lo emite si la
+         * funcion tiene >=1 CALLVIRT (o tier_all). */
+        if (g_c2_threshold != 0) {
+            mc_opts.tier_up_handler_addr =
+                reinterpret_cast<uint64_t>(&c2_tier_up);
+            mc_opts.tier_up_threshold = g_c2_threshold;
+            mc_opts.tier_up_all_fns   = g_c2_tier_all;
+            mc_opts.reserve_tier_counter =
+                [](uint64_t pc) -> uint64_t { return reserve_tier_counter(pc); };
+        }
         ffi::FFI *ffi_ptr = &owning_vm.loader_public.ffi_loader;
         auto native_resolver = [ffi_ptr](const std::string &name) -> uint64_t {
             size_t colon = name.find(':');
@@ -419,6 +662,26 @@ namespace jit {
                 child_opts.exc_frame_stack_offset = exc_off_mc;
                 child_opts.exc_free_list_offset = exc_free_off_mc;
                 child_opts.jit_instr_counter_addr = jit_counter_mc;
+                /* Phase D.7 (opt-in): callee por el path de registros
+                 * virtuales si esta soportada; si no, slots. */
+                if (g_jit_use_vregs) {
+                    uint8_t *vc = vreg_compile(child_ir, *g_code_cache, {}, make_vreg_entries(), native_resolver);
+                    if (vc != nullptr) {
+                        const uint64_t a = reinterpret_cast<uint64_t>(vc);
+                        g_eager_cache[n] = a;
+                        ++g_jit_compiled_count;
+                        if (st_ptr2) {
+                            auto sit = st_ptr2->find("code." + n);
+                            if (sit != st_ptr2->end() && sit->second != 0)
+                                register_jit_code_at_pc(sit->second,
+                                                        reinterpret_cast<void *>(vc));
+                        }
+                        if (g_jit_warn_unsupported)
+                            std::fprintf(stderr,
+                                "[jit-vreg] eager callee compilado '%s'\n", n.c_str());
+                        return a;
+                    }
+                }
                 CompileResult cres = g_compiler->compile_with_opts(child_ir, child_opts);
                 const uint64_t addr = cres.fn ? reinterpret_cast<uint64_t>(cres.fn) : 0;
                 g_eager_cache[n] = addr;
@@ -466,6 +729,20 @@ namespace jit {
                 register_jit_code_at_pc(method->code_vaddr,
                                         reinterpret_cast<void *>(res.fn));
             }
+            /* C2 tier-up: mapear fn_pc (symbol "code.<name>", el mismo que el
+             * contador on-entry pasa al handler) -> method + region del codigo
+             * C1, para que el swap actualice method->jit_code (ademas del
+             * pc-map) y para reciclar la region C1 al subir a C2. */
+            if (g_c2_threshold != 0 && owning_symtab != nullptr) {
+                auto sit = owning_symtab->find("code." + ir_fn->name);
+                if (sit != owning_symtab->end() && sit->second != 0) {
+                    g_pc_to_method[sit->second] = method;
+                    if (res.code_start != nullptr && res.code_size != 0) {
+                        g_c1_region[sit->second] = {
+                            const_cast<uint8_t *>(res.code_start), res.code_size };
+                    }
+                }
+            }
             ++g_jit_compiled_count;
             if (g_jit_warn_unsupported) {
                 std::fprintf(stderr,
@@ -512,7 +789,10 @@ namespace jit {
         std::function<uint64_t(uint64_t)> read_vmem_u64,
         int32_t exc_frame_stack_offset,
         int32_t exc_free_list_offset,
-        uint64_t jit_instr_counter_addr) {
+        uint64_t jit_instr_counter_addr,
+        bool callback_entry,
+        uint64_t callback_get_proc_addr,
+        int32_t callback_tls_gs_disp) {
         /* Init lazy de threshold desde env (1 vez por proceso). */
         std::call_once(g_env_init_flag, init_threshold_from_env);
 
@@ -528,8 +808,11 @@ namespace jit {
          * JitRegistry necesita acceso exclusivo). */
         std::lock_guard<std::mutex> lk(g_compile_mtx);
 
-        /* Si ya esta cacheado, retornar el ptr (excepto sentinelas). */
-        if (!ir_fn.name.empty()) {
+        /* Si ya esta cacheado, retornar el ptr (excepto sentinelas).
+         * En modo callback NO usamos g_eager_cache para el top-level: su
+         * ABI (entry nativo) difiere del VM_ABI que la cache by-name asume;
+         * confundirlos daria un caller VM_ABI saltando a un entry nativo. */
+        if (!callback_entry && !ir_fn.name.empty()) {
             auto it = g_eager_cache.find(ir_fn.name);
             if (it != g_eager_cache.end()
              && it->second != 0 && it->second != EAGER_IN_PROGRESS) {
@@ -538,6 +821,16 @@ namespace jit {
                 return cached;
             }
         }
+
+        /* Phase D.7 perf-gaps (2026-06-06): el intento vreg top-level se
+         * MOVIO mas abajo (tras construir el resolver recursivo de user-fns),
+         * para que `main` y cualquier funcion que llame a otras funciones Vex
+         * compile por el path de registros virtuales en vez de caer a slots.
+         * Antes este bloque corria aqui con resolve_call = {} (vacio): el
+         * primer `IrOp::CALL` a una user-fn hacia bailar el vreg a slots
+         * (codegen inferior).  Medido: mem_struct/mem_class/pic_real/callvirt
+         * tenian su hot loop en main -> corrian por slots.  Ver el bloque
+         * reubicado tras `resolver = *resolver_holder;`. */
 
         /* Recursive resolver: cuando el Selector encuentra CALL a una
          * funcion user, llama a este callback que (1) chequea cache,
@@ -572,11 +865,8 @@ namespace jit {
              * la recursion pueda referenciar el mismo callback en cada
              * nivel.  Esto permite resolucion arbitrariamente profunda
              * sin perder el callback. */
-            CodeCache *cc_for_ic = g_code_cache;
-            auto ic_reserver = [cc_for_ic]() -> uint64_t {
-                uint8_t *slot = cc_for_ic->alloc(16, 16);
-                if (slot) std::memset(slot, 0, 16);
-                return reinterpret_cast<uint64_t>(slot);
+            auto ic_reserver = [](uint64_t key) -> uint64_t {
+                return get_ic_slot(key);
             };
             *resolver_holder = [lookup_ptr, funcs_ptr, resolver_holder, sym_resolver, resolve_native_fn, ic_reserver, read_vmem_u64, exc_frame_stack_offset, exc_free_list_offset, jit_instr_counter_addr]
                                (const std::string &name) -> uint64_t {
@@ -612,6 +902,26 @@ namespace jit {
                 opts.exc_frame_stack_offset = exc_frame_stack_offset; /* inline tryleave */
                 opts.exc_free_list_offset = exc_free_list_offset;     /* no leak */
                 opts.jit_instr_counter_addr = jit_instr_counter_addr; /* MIPS counter */
+                /* Phase D.7 (opt-in): callee por el path de registros virtuales.
+                 * Pasamos el PROPIO resolver (recursivo) para que los CALLs
+                 * del callee se resuelvan a sus direcciones. */
+                if (g_jit_use_vregs) {
+                    uint8_t *vc = vreg_compile(child_ir, *g_code_cache, *resolver_holder, make_vreg_entries(), resolve_native_fn);
+                    if (vc != nullptr) {
+                        const uint64_t va = reinterpret_cast<uint64_t>(vc);
+                        g_eager_cache[name] = va;
+                        ++g_jit_compiled_count;
+                        if (sym_resolver) {
+                            const uint64_t pc = sym_resolver("code." + name);
+                            if (pc != 0)
+                                register_jit_code_at_pc(pc, reinterpret_cast<void *>(vc));
+                        }
+                        if (g_jit_warn_unsupported)
+                            std::fprintf(stderr,
+                                "[jit-vreg] eager callee compilado '%s'\n", name.c_str());
+                        return va;
+                    }
+                }
                 CompileResult cres = g_compiler->compile_with_opts(child_ir, opts);
                 const uint64_t addr = cres.fn ? reinterpret_cast<uint64_t>(cres.fn) : 0;
                 g_eager_cache[name] = addr;
@@ -657,27 +967,176 @@ namespace jit {
         top_opts.exc_free_list_offset = exc_free_list_offset;
         top_opts.jit_instr_counter_addr = jit_instr_counter_addr;
         {
-            CodeCache *cc_top = g_code_cache;
-            top_opts.reserve_ic_slot = [cc_top]() -> uint64_t {
-                uint8_t *slot = cc_top->alloc(16, 16);
-                if (slot) std::memset(slot, 0, 16);
-                return reinterpret_cast<uint64_t>(slot);
+            top_opts.reserve_ic_slot = [](uint64_t key) -> uint64_t {
+                return get_ic_slot(key);
             };
         }
+        /* NOTA C2: NO instrumentamos el contador on-entry en los compiles
+         * top-level (eager).  Esas funciones (main + targets de CALLVM) son
+         * "address-taken" (su direccion la entrego resolve_user_fn / quedan en
+         * g_eager_cache) -> el reclaim de su C1 requeriria redirigir CALLs
+         * directas horneadas, que no es seguro en v1.  El C2 tier-up se limita
+         * a metodos alcanzados por CALLVIRT (path maybe_compile_method), cuyo
+         * C1 SI es reciclable (solo refs de PIC + frames en vuelo).  La
+         * generalizacion (tabla de CALL indirecta) es un follow-up. */
 
-        /* Marcar IN_PROGRESS antes de compilar para detectar self-recursion. */
-        if (!ir_fn.name.empty()) {
+        /* callback-ABI: el top-level se compila con entry nativo.  El cuerpo
+         * sigue siendo VM_ABI (RBX=proc) -> los callees usan el resolver
+         * normal (VM_ABI), solo cambia el entry de esta funcion. */
+        if (callback_entry) {
+            top_opts.callback_entry = true;
+            top_opts.callback_get_proc_addr = callback_get_proc_addr;
+            top_opts.callback_tls_gs_disp = callback_tls_gs_disp;
+        }
+
+        /* Marcar IN_PROGRESS antes de compilar para detectar self-recursion.
+         * En callback NO tocamos g_eager_cache (su ABI difiere del VM_ABI). */
+        if (!callback_entry && !ir_fn.name.empty()) {
             g_eager_cache[ir_fn.name] = EAGER_IN_PROGRESS;
+        }
+
+        /* Phase D.7 perf-gaps (2026-06-06): intento vreg top-level CON el
+         * resolver recursivo de user-fns ya construido.  Ahora `main` (y
+         * cualquier funcion con `IrOp::CALL` a otra funcion Vex) compila por
+         * el path de registros virtuales en vez de bailar a slots al primer
+         * call.  El resolver compila recursivamente las callees y devuelve su
+         * direccion; los CALLs del vreg emiten `CALL addr` directo.
+         *
+         * El path vreg NO conoce el modo callback (entry nativo); en callback
+         * forzamos el path del Selector (slots + regalloc rewrite) que SI lo
+         * implementa. */
+        if (g_jit_use_vregs && !callback_entry) {
+            uint8_t *vcode = vreg_compile(ir_fn, *g_code_cache, resolver,
+                                          make_vreg_entries(), resolve_native_fn);
+            if (vcode != nullptr) {
+                if (!ir_fn.name.empty())
+                    g_eager_cache[ir_fn.name] = reinterpret_cast<uint64_t>(vcode);
+                /* NOTA: el registro pc->jit lo hace el caller
+                 * (maybe_compile_callvm_target) desde el CompileResult; no lo
+                 * duplicamos aqui para no registrar compiles degenerados. */
+                /* --- OSR 2c: precompilar una variante C2-con-OSR-entry por cada
+                 * loop que el C1 acaba de detectar para esta funcion.  El C1
+                 * (vreg_compile arriba) registro sus back-edges en
+                 * regalloc_rewrite (loop_ids + header_block).  Aqui, con los
+                 * MISMOS resolvers, compilamos el C2 con OSR-entry y guardamos
+                 * su direccion en g_osr_entry_map[loop_id].  El handler de
+                 * runtime hace lookup -> dispara el frame-swap.  No-op si OSR
+                 * esta off (osr_loop_count()==0).  Plano (sin opt) en 2c; la
+                 * optimizacion del C2 es el paso siguiente. */
+                if (!ir_fn.name.empty()) {
+                    const uint32_t nloops = osr_loop_count();
+                    for (uint64_t lid = 0; lid < nloops; ++lid) {
+                        if (g_osr_entry_map.count(lid)) continue;  // ya precompilado
+                        std::string fnm; uint32_t hdr = 0;
+                        if (!osr_loop_info(lid, fnm, hdr)) continue;  // abortado/oob
+                        if (fnm != ir_fn.name) continue;             // otra funcion
+                        /* Red de seguridad: los vids que el C1 capturo al buffer.
+                         * El OSR-entry del C2 solo puede leer estos (si su live-in
+                         * pide otro, vreg_compile_osr aborta -> no swap). */
+                        std::vector<uint32_t> captured;
+                        osr_loop_captures(lid, captured);
+
+                        /* --- PASO 4: C2 OPTIMIZADO ---
+                         * Inline AGRESIVO de las CALLs del loop caliente (el
+                         * code-size no importa: el loop domina el tiempo).  O2
+                         * dejo helpers como CALL por su threshold conservador
+                         * (12); aqui subimos a 256 -> elimina el CALL + el
+                         * marshalling VM_ABI de args por memoria.  Block ids
+                         * preservados (el inline esplicea single-block en sitio)
+                         * -> el header_block del C1 sigue valido.  Gate
+                         * VESTA_OSR_OPT=0 -> recompile plano (para A/B). */
+                        const ir::IrFunction *compile_ir = &ir_fn;
+                        ir::IrFunction opt_clone;
+                        if (osr_opt_enabled() && ir_lookup != nullptr
+                         && ir_functions != nullptr) {
+                            opt_clone = ir_fn;  /* clon mutable */
+                            ir::IrModule tmp;
+                            tmp.functions.push_back(opt_clone);
+                            /* Anadir las user-fns que el loop llama (para inline). */
+                            std::unordered_set<std::string> added;
+                            for (const auto &blk : opt_clone.blocks)
+                                for (const auto &in2 : blk.instrs)
+                                    if (in2.op == ir::IrOp::CALL
+                                     && !in2.func_name.empty()
+                                     && !added.count(in2.func_name)) {
+                                        auto cl = ir_lookup->find(in2.func_name);
+                                        if (cl != ir_lookup->end()
+                                         && cl->second < ir_functions->size()) {
+                                            tmp.functions.push_back(
+                                                (*ir_functions)[cl->second]);
+                                            added.insert(in2.func_name);
+                                        }
+                                    }
+                            /* Inline agresivo + limpieza a fixpoint. */
+                            bool any_opt = false;
+                            for (int it = 0; it < 5; ++it) {
+                                bool any = ir::ir_pass_inline(tmp, 256);
+                                any = ir::ir_pass_const_fold(tmp.functions[0]) || any;
+                                any = ir::ir_pass_copy_prop(tmp.functions[0])  || any;
+                                any = ir::ir_pass_simplify(tmp.functions[0])   || any;
+                                any = ir::ir_pass_dce(tmp.functions[0])        || any;
+                                any_opt = any_opt || any;
+                                if (!any) break;
+                            }
+                            opt_clone = std::move(tmp.functions[0]);
+                            compile_ir = &opt_clone;
+                            if (g_jit_warn_unsupported && any_opt)
+                                std::fprintf(stderr,
+                                    "[jit-osr] C2 optimizado (inline agresivo) "
+                                    "para loop %llu (fn '%s')\n",
+                                    static_cast<unsigned long long>(lid),
+                                    ir_fn.name.c_str());
+                        }
+
+                        uint8_t *osr_entry = nullptr;
+                        uint8_t *c2 = vreg_compile_osr(
+                            *compile_ir, *g_code_cache, resolver,
+                            make_vreg_entries(), resolve_native_fn, hdr,
+                            &osr_entry, &captured);
+                        if (c2 != nullptr && osr_entry != nullptr) {
+                            g_osr_entry_map[lid] =
+                                reinterpret_cast<uint64_t>(osr_entry);
+                            if (g_jit_warn_unsupported)
+                                std::fprintf(stderr,
+                                    "[jit-osr] C2-entry para loop %llu (fn '%s', "
+                                    "header bb%u) @ %p\n",
+                                    static_cast<unsigned long long>(lid),
+                                    ir_fn.name.c_str(), hdr,
+                                    static_cast<void *>(osr_entry));
+                        } else if (g_jit_warn_unsupported) {
+                            std::fprintf(stderr,
+                                "[jit-osr] loop %llu (fn '%s') no precompilo C2 "
+                                "(unsupported o live-in mismatch)\n",
+                                static_cast<unsigned long long>(lid),
+                                ir_fn.name.c_str());
+                        }
+                    }
+                }
+                CompileResult r{};
+                r.fn = reinterpret_cast<JitFn>(vcode);
+                r.code_start = vcode;
+                if (g_jit_warn_unsupported)
+                    std::fprintf(stderr, "[jit-vreg] eager compilado '%s'\n",
+                                 ir_fn.name.c_str());
+                return r;
+            }
+            if (g_jit_warn_unsupported)
+                std::fprintf(stderr,
+                    "[jit-vreg] '%s' no soportada (eager) -> slots\n",
+                    ir_fn.name.c_str());
         }
 
         const CompileResult res = g_compiler->compile_with_opts(ir_fn, top_opts);
         if (res.fn != nullptr) {
             ++g_jit_compiled_count;
-            if (!ir_fn.name.empty()) {
+            /* callback-ABI: NO cachear by-name ni registrar en el pc-map (su
+             * entry es nativo, no VM_ABI).  El caller cachea por fn_pc en su
+             * propia tabla.  Los callees (VM_ABI) ya se registraron normal. */
+            if (!callback_entry && !ir_fn.name.empty()) {
                 g_eager_cache[ir_fn.name] = reinterpret_cast<uint64_t>(res.fn);
             }
             /* D.5-callvm-hook: registrar pc -> jit en el mapa global. */
-            if (sym_resolver && !ir_fn.name.empty()) {
+            if (!callback_entry && sym_resolver && !ir_fn.name.empty()) {
                 const uint64_t pc = sym_resolver("code." + ir_fn.name);
                 if (pc != 0) {
                     register_jit_code_at_pc(pc, reinterpret_cast<void *>(res.fn));
@@ -689,7 +1148,7 @@ namespace jit {
             }
         } else {
             ++g_jit_unsupported_count;
-            if (!ir_fn.name.empty()) {
+            if (!callback_entry && !ir_fn.name.empty()) {
                 g_eager_cache[ir_fn.name] = 0;  /* cachear failure */
             }
         }
@@ -875,6 +1334,12 @@ namespace jit {
         /* Si ya esta compilado (otro hilo gano la carrera), salir. */
         if (lookup_jit_code_at_pc(target_pc) != nullptr) return;
 
+        /* SEGURIDAD (sandbox bajo JIT): mismo guard que maybe_compile_method.
+         * El codigo CALLVM JIT-eated emite CALLN/CALLNI/spawn/etc. sin el check
+         * de capabilities (check_cap_at_pc); dejar la funcion en interp garantiza
+         * el enforcement.  Coste cero sin sandbox (branch predicho not-taken). */
+        if (vm->scheduler.vm_reference.loader_public.sandbox_active) return;
+
         /* Acquire mutex para counter + tabla de executables.  Necesario
          * porque maybe_compile_method tambien usa g_compile_mtx; la
          * separacion en mutex distinto (g_callvm_mtx para counters) evita
@@ -1022,7 +1487,7 @@ namespace jit {
          * todo.  Si exito, el pc-map captura este PC y todos sus
          * callees transitivamente. */
         try {
-            (void) eager_compile_function(
+            CompileResult __cr = eager_compile_function(
                 *ir_fn,
                 &owning_exe->ir_lookup,
                 &owning_exe->ir_functions,
@@ -1032,6 +1497,19 @@ namespace jit {
                 exc_off,
                 exc_free_off,
                 jit_counter_addr);
+            /* BugFix 171 native-callback (2026-06-05): la rama VREG de
+             * eager_compile_function registra el codigo SOLO por nombre
+             * (g_eager_cache), NO por PC.  El path slot si registra por PC
+             * via la registracion top-level, pero el vreg retornaba antes.
+             * Sin la entrada pc-map, `lookup_jit_code_at_pc(target_pc)`
+             * devuelve null y `as_native_callback` (que busca por PC) genera
+             * un thunk=0 -> qsort recibe comparator NULL -> no ordena.
+             * Registramos aqui el resultado top-level por PC para cubrir
+             * ambos paths (idempotente: register sobrescribe con el mismo fn). */
+            if (__cr.fn != nullptr) {
+                register_jit_code_at_pc(target_pc,
+                                        reinterpret_cast<void *>(__cr.fn));
+            }
             /* Independiente del resultado: si exito, register_jit_code_at_pc
              * ya se llamo desde dentro de eager_compile_function via la
              * registracion top-level.  Si fallo, queda como cached failure
@@ -1047,6 +1525,597 @@ namespace jit {
         } catch (...) {
             /* Cualquier excepcion del compile se ignora; quedamos en
              * cached failure y futuras invocaciones fallback a interp. */
+        }
+    }
+
+    /* ===================================================================== */
+    /* compile_native_callback: entry de ABI C nativo para callbacks Vex      */
+    /* ===================================================================== */
+
+    uint64_t compile_native_callback(runtime::ProcessVM *vm,
+                                     uint64_t vex_fn_pc) noexcept {
+        if (vm == nullptr) return 0;
+
+        /* Cache propia por PC: la misma fn puede tener version VM_ABI (pc-map)
+         * y version callback-ABI (esta tabla).  Sentinela 0 = aun no/ fallo. */
+        static std::mutex g_cb_mtx;
+        static std::unordered_map<uint64_t, uint64_t> g_cb_cache;
+        {
+            std::lock_guard<std::mutex> lk(g_cb_mtx);
+            auto it = g_cb_cache.find(vex_fn_pc);
+            if (it != g_cb_cache.end()) return it->second;
+        }
+
+        /* Buscar el IrFunction + executable propietario para este PC.
+         * Mismo procedimiento que @c maybe_compile_callvm_target. */
+        runtime::VM &owning_vm = vm->scheduler.vm_reference;
+        const ir::IrFunction *ir_fn = nullptr;
+        const loader::Executable *owning_exe = nullptr;
+        {
+            /* g_exec_pc_to_name esta protegido por g_callvm_mtx (mismo que
+             * maybe_compile_callvm_target).  NO usar g_compile_mtx aqui: lo
+             * tomara eager_compile_function despues -> deadlock. */
+            std::lock_guard<std::mutex> cmlk(g_callvm_mtx);
+            for (auto &exe_ptr : owning_vm.loader_public.executables) {
+                const loader::Executable *exe = exe_ptr.get();
+                auto &pc_to_name = g_exec_pc_to_name[exe];
+                if (pc_to_name.empty() && !exe->symbol_table.empty()) {
+                    for (const auto &kv : exe->symbol_table) {
+                        if (kv.first.rfind("code.", 0) == 0) {
+                            pc_to_name[kv.second] = kv.first.substr(5);
+                        }
+                    }
+                }
+                auto pn_it = pc_to_name.find(vex_fn_pc);
+                if (pn_it == pc_to_name.end()) continue;
+                std::string candidate_name = pn_it->second;
+                /* Strip sufijo `_entry_<N>` igual que maybe_compile_callvm_target. */
+                {
+                    const std::string suffix = "_entry_";
+                    auto pos = candidate_name.rfind(suffix);
+                    if (pos != std::string::npos) {
+                        bool only_digits = true;
+                        for (size_t k = pos + suffix.size(); k < candidate_name.size(); ++k) {
+                            if (candidate_name[k] < '0' || candidate_name[k] > '9') {
+                                only_digits = false; break;
+                            }
+                        }
+                        if (only_digits) candidate_name = candidate_name.substr(0, pos);
+                    }
+                }
+                auto lit = exe->ir_lookup.find(candidate_name);
+                if (lit == exe->ir_lookup.end()) continue;
+                if (lit->second >= exe->ir_functions.size()) continue;
+                ir_fn = &exe->ir_functions[lit->second];
+                owning_exe = exe;
+                break;
+            }
+        }
+        if (ir_fn == nullptr || owning_exe == nullptr) {
+            std::lock_guard<std::mutex> lk(g_cb_mtx);
+            g_cb_cache[vex_fn_pc] = 0;
+            return 0;
+        }
+
+        /* Callbacks de resolucion identicos a maybe_compile_callvm_target. */
+        ffi::FFI *ffi_ptr = &owning_vm.loader_public.ffi_loader;
+        auto resolve_native = [ffi_ptr](const std::string &name) -> uint64_t {
+            size_t colon = name.find(':');
+            if (colon == std::string::npos) return 0;
+            std::string lib  = name.substr(0, colon);
+            std::string func = name.substr(colon + 1);
+            void *vfn = ffi::lookup_virtual_fn(lib, func);
+            if (vfn != nullptr) return reinterpret_cast<uint64_t>(vfn);
+            try {
+                void *mod = ffi_ptr->load_native_module(lib);
+                if (!mod) return 0;
+                void *fn = ffi_ptr->resolve_native_symbol(mod, func);
+                return reinterpret_cast<uint64_t>(fn);
+            } catch (...) { return 0; }
+        };
+        runtime::ProcessVM *proc_for_read = vm;
+        auto read_vmem_cb = [proc_for_read](uint64_t vaddr) -> uint64_t {
+            try { return proc_for_read->vm_mem.read_u64(vaddr); }
+            catch (...) { return 0; }
+        };
+        int32_t exc_off = 0, exc_free_off = 0;
+        {
+            const int64_t off64 =
+                reinterpret_cast<int64_t>(&vm->exc_frame_stack) - reinterpret_cast<int64_t>(vm);
+            const int64_t free64 =
+                reinterpret_cast<int64_t>(&vm->exc_free_list) - reinterpret_cast<int64_t>(vm);
+            if (off64  >= INT32_MIN && off64  <= INT32_MAX) exc_off      = static_cast<int32_t>(off64);
+            if (free64 >= INT32_MIN && free64 <= INT32_MAX) exc_free_off = static_cast<int32_t>(free64);
+        }
+        const uint64_t jit_counter_addr = g_jit_emit_instr_counter
+            ? reinterpret_cast<uint64_t>(&vm->scheduler.profiler_jit_instr_counter)
+            : 0;
+
+        /* Resolver TLS-direct (Win64) o fallback por call para LOAD_PROC. */
+        const uint64_t getproc_addr =
+            reinterpret_cast<uint64_t>(&runtime::get_current_executing_process);
+        int32_t tls_gs_disp = -1;
+#if defined(_WIN32)
+        {
+            const unsigned long idx = runtime::jit_proc_tls_index();
+            if (idx != 0xFFFFFFFFu && idx < 64) {
+                tls_gs_disp = static_cast<int32_t>(0x1480u + idx * 8u);
+            }
+        }
+#endif
+
+        /* El callback REQUIERE codigo nativo AHORA (su direccion va a Win32/
+         * qsort).  Forzar el compile aunque el JIT este desactivado por flag
+         * (-m vm): salvar/forzar/restaurar el threshold global, como hacia el
+         * wrapper del thunk previo. */
+        uint64_t result = 0;
+        try {
+            const uint32_t saved_thr = g_jit_threshold;
+            if (saved_thr == UINT32_MAX) set_jit_threshold(1);
+            CompileResult cr = eager_compile_function(
+                *ir_fn,
+                &owning_exe->ir_lookup,
+                &owning_exe->ir_functions,
+                &owning_exe->symbol_table,
+                resolve_native,
+                read_vmem_cb,
+                exc_off,
+                exc_free_off,
+                jit_counter_addr,
+                /*callback_entry=*/true,
+                getproc_addr,
+                tls_gs_disp);
+            if (saved_thr == UINT32_MAX) set_jit_threshold(saved_thr);
+            result = cr.fn ? reinterpret_cast<uint64_t>(cr.fn) : 0;
+            if (g_jit_warn_unsupported) {
+                std::fprintf(stderr,
+                    "[jit] native-callback pc=0x%llx -> %s\n",
+                    static_cast<unsigned long long>(vex_fn_pc),
+                    result ? "compiled" : "unsupported");
+            }
+        } catch (...) {
+            result = 0;
+        }
+
+        std::lock_guard<std::mutex> lk(g_cb_mtx);
+        g_cb_cache[vex_fn_pc] = result;
+        return result;
+    }
+
+    /* ===================================================================== */
+    /* C2 reclaim: quiescencia (enter_jit) + drain del free-list             */
+    /* ===================================================================== */
+
+    namespace {
+        /* Devuelve las regiones C1 pendientes al free-list del CodeCache.
+         * Solo se invoca con g_jit_active_frames == 0 (ningun frame JIT en
+         * pila nativa) -> las regiones son inalcanzables (PIC limpiado,
+         * dispatch reapuntado a C2, frames en vuelo drenados). */
+        void drain_pending_free() {
+            std::lock_guard<std::mutex> lk(g_compile_mtx);
+            size_t freed = 0;
+            if (!g_pending_free.empty() && g_code_cache != nullptr) {
+                for (auto &r : g_pending_free) {
+                    g_code_cache->free_region(r.first, r.second);
+                    ++freed;
+                }
+            }
+            g_pending_free.clear();
+            g_pending_free_count.store(0, std::memory_order_release);
+            if (g_c2_log && freed != 0) {
+                std::fprintf(stderr,
+                    "[c2] reclaim: %zu region(es) C1 liberada(s) al free-list "
+                    "(quiescencia); free-list ahora = %zu\n",
+                    freed, g_code_cache->free_region_count());
+            }
+        }
+    } // namespace anonymous
+
+    void jit_frame_enter() noexcept {
+        g_jit_active_frames.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void jit_frame_exit() noexcept {
+        /* fetch_sub devuelve el valor PREVIO; == 1 significa que acabamos de
+         * dejarlo en 0 -> instante sin ningun frame JIT en pila.  Si hay
+         * regiones pendientes, es seguro reciclarlas ahora. */
+        if (g_jit_active_frames.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            if (g_pending_free_count.load(std::memory_order_acquire) != 0) {
+                drain_pending_free();
+            }
+        }
+    }
+
+    /* ===================================================================== */
+    /* C2 tier-up: recompile-and-swap                                         */
+    /* ===================================================================== */
+    /*
+     * Invocado por el contador on-entry del codigo C1 al cruzar el umbral.
+     * (1) resuelve fn_pc -> IrFunction (igual que maybe_compile_callvm_target),
+     * (2) [PoC C2.1/C2.2] lee los IC slots del call site y loguea las clases
+     *     observadas (frio / monomorfico / polimorfico / megamorfico) si
+     *     VESTA_C2_LOG=1,
+     * (3) recompila la funcion por el path Selector con opts C2 (mismas que C1
+     *     pero SIN contador -> codigo terminal), reusando los IC slots
+     *     calientes; las callees ya estan compiladas (resolver no-recursivo via
+     *     g_eager_cache),
+     * (4) swap atomico: pc-map (dispatch CALLVM) + method->jit_code (CALLVIRT).
+     *
+     * El codigo C1 viejo NO se libera (leak aceptable v1, sin use-after-free:
+     * los frames en curso y las entradas de PIC que lo referencian siguen
+     * siendo validos).  Idempotente via g_tiered_pcs.  El recompile corre en el
+     * host stack del frame JIT que disparo el contador; no ejecuta codigo Vex
+     * -> no hay GC ni re-entrancia de compile (g_compile_mtx no lo tiene este
+     * thread).
+     */
+    void c2_tier_up(runtime::ProcessVM *vm, uint64_t fn_pc) noexcept {
+        if (vm == nullptr || fn_pc == 0) return;
+        try {
+            /* --- Resolucion pc -> IR (bajo g_callvm_mtx, orden consistente
+             *     con maybe_compile_callvm_target). --- */
+            runtime::VM &owning_vm = vm->scheduler.vm_reference;
+            const ir::IrFunction *ir_fn = nullptr;
+            const loader::Executable *owning_exe = nullptr;
+            std::string fn_name;
+            {
+                std::lock_guard<std::mutex> cmlk(g_callvm_mtx);
+                for (auto &exe_ptr : owning_vm.loader_public.executables) {
+                    const loader::Executable *exe = exe_ptr.get();
+                    auto &pc_to_name = g_exec_pc_to_name[exe];
+                    if (pc_to_name.empty() && !exe->symbol_table.empty()) {
+                        for (const auto &kv : exe->symbol_table) {
+                            if (kv.first.rfind("code.", 0) == 0)
+                                pc_to_name[kv.second] = kv.first.substr(5);
+                        }
+                    }
+                    auto pn_it = pc_to_name.find(fn_pc);
+                    if (pn_it == pc_to_name.end()) continue;
+                    std::string cand = pn_it->second;
+                    /* strip sufijo _entry_<N> (igual que las otras rutas). */
+                    {
+                        const std::string suffix = "_entry_";
+                        auto pos = cand.rfind(suffix);
+                        if (pos != std::string::npos) {
+                            bool only_digits = true;
+                            for (size_t k = pos + suffix.size(); k < cand.size(); ++k)
+                                if (cand[k] < '0' || cand[k] > '9') { only_digits = false; break; }
+                            if (only_digits) cand = cand.substr(0, pos);
+                        }
+                    }
+                    auto lit = exe->ir_lookup.find(cand);
+                    if (lit == exe->ir_lookup.end() || lit->second >= exe->ir_functions.size())
+                        continue;
+                    ir_fn = &exe->ir_functions[lit->second];
+                    owning_exe = exe;
+                    fn_name = cand;
+                    break;
+                }
+            }
+            if (ir_fn == nullptr || owning_exe == nullptr) return;
+
+            std::lock_guard<std::mutex> lk(g_compile_mtx);
+            /* Idempotencia: solo una vez por fn_pc.  La insercion ocurre ya
+             * (incluso si saltamos abajo) para que el contador on-entry no
+             * vuelva a invocar el handler. */
+            if (g_tiered_pcs.count(fn_pc)) return;
+            g_tiered_pcs.insert(fn_pc);
+            std::call_once(g_jit_init_flag, init_jit_subsystem);
+
+            /* SKIP address-taken: si la direccion de esta funcion fue
+             * entregada por resolve_user_fn (esta en g_eager_cache), hay CALLs
+             * directas con imm horneado a su C1 que NO podemos redirigir sin
+             * recompilar a los callers.  Liberar su C1 seria use-after-free.
+             * En v1 NO la subimos a C2 (asi no se crea ningun C1 huerfano ->
+             * cero leak).  El target reclaimable son metodos via CALLVIRT
+             * (no quedan en g_eager_cache).  La generalizacion (tabla de CALL
+             * indirecta) es un follow-up. */
+            {
+                auto eit = g_eager_cache.find(fn_name);
+                if (eit != g_eager_cache.end()
+                 && eit->second != 0 && eit->second != EAGER_IN_PROGRESS) {
+                    if (g_c2_log)
+                        std::fprintf(stderr,
+                            "[c2] skip-tier '%s' (address-taken) -- queda C1 (sin leak)\n",
+                            fn_name.c_str());
+                    return;
+                }
+            }
+
+            /* --- (2) PoC C2.1/C2.2: leer IC slots + loguear clases. --- */
+            if (g_c2_log) {
+                auto kit = g_fn_ic_keys.find(fn_pc);
+                if (kit == g_fn_ic_keys.end() || kit->second.empty()) {
+                    std::fprintf(stderr,
+                        "[c2] tier-up '%s' (pc=0x%llx): sin IC sites\n",
+                        fn_name.c_str(),
+                        static_cast<unsigned long long>(fn_pc));
+                } else {
+                    for (uint64_t key : kit->second) {
+                        auto sit = g_ic_slots.find(key);
+                        if (sit == g_ic_slots.end() || sit->second == 0) continue;
+                        const uint64_t *slot =
+                            reinterpret_cast<const uint64_t *>(sit->second);
+                        int distinct = 0;
+                        for (int e = 0; e < 4; ++e)
+                            if (slot[e * 2] != 0) ++distinct;
+                        const char *kind = (distinct == 0) ? "frio"
+                                         : (distinct == 1) ? "monomorfico"
+                                         : (distinct < 4)  ? "polimorfico"
+                                                           : "megamorfico";
+                        std::fprintf(stderr,
+                            "[c2] call site %s:%u -> %s (clases distintas=%d)\n",
+                            fn_name.c_str(),
+                            static_cast<unsigned>(key & 0xFFu), kind, distinct);
+                    }
+                }
+            }
+
+            /* --- (3) recompile C2 por el path Selector (terminal). --- */
+            SelectorOptions c2;
+            c2.mode = SelectorMode::VM_ABI;
+            c2.runtime = g_runtime_entries;
+            c2.safepoint_handler_addr =
+                reinterpret_cast<uint64_t>(g_runtime_entries->safepoint_handler);
+            const auto *st_ptr = &owning_exe->symbol_table;
+            c2.resolve_symbol = [st_ptr](const std::string &n) -> uint64_t {
+                auto it = st_ptr->find(n);
+                return it == st_ptr->end() ? 0 : it->second;
+            };
+            c2.reserve_ic_slot = [](uint64_t key) -> uint64_t {
+                return get_ic_slot(key);  /* reusa el PIC caliente */
+            };
+            ffi::FFI *ffi_ptr = &owning_vm.loader_public.ffi_loader;
+            c2.resolve_native_fn = [ffi_ptr](const std::string &name) -> uint64_t {
+                size_t colon = name.find(':');
+                if (colon == std::string::npos) return 0;
+                std::string lib  = name.substr(0, colon);
+                std::string func = name.substr(colon + 1);
+                void *vfn = ffi::lookup_virtual_fn(lib, func);
+                if (vfn != nullptr) return reinterpret_cast<uint64_t>(vfn);
+                try {
+                    void *mod = ffi_ptr->load_native_module(lib);
+                    if (!mod) return 0;
+                    return reinterpret_cast<uint64_t>(
+                        ffi_ptr->resolve_native_symbol(mod, func));
+                } catch (...) { return 0; }
+            };
+            runtime::ProcessVM *proc = vm;
+            c2.read_vmem_u64 = [proc](uint64_t v) -> uint64_t {
+                try { return proc->vm_mem.read_u64(v); } catch (...) { return 0; }
+            };
+            /* Callees ya compiladas en C1 -> resolver NO-recursivo via cache. */
+            c2.resolve_user_fn = [](const std::string &n) -> uint64_t {
+                auto it = g_eager_cache.find(n);
+                if (it != g_eager_cache.end()
+                 && it->second != 0 && it->second != EAGER_IN_PROGRESS)
+                    return it->second;
+                return 0;
+            };
+            /* Offsets de nursery + register_alloc para inline de NEWOBJ. */
+            {
+                const int64_t nb = reinterpret_cast<int64_t>(&proc->gc_heap.nursery_bump_)
+                                 - reinterpret_cast<int64_t>(proc);
+                const int64_t ne = reinterpret_cast<int64_t>(&proc->gc_heap.nursery_end_)
+                                 - reinterpret_cast<int64_t>(proc);
+                if (nb >= INT32_MIN && nb <= INT32_MAX && ne >= INT32_MIN && ne <= INT32_MAX) {
+                    c2.nursery_bump_offset = static_cast<int32_t>(nb);
+                    c2.nursery_end_offset  = static_cast<int32_t>(ne);
+                    c2.register_alloc_addr = reinterpret_cast<uint64_t>(&vrt_register_alloc);
+                }
+            }
+            /* Offsets de exc para inline de tryleave. */
+            {
+                const int64_t eo = reinterpret_cast<int64_t>(&proc->exc_frame_stack)
+                                 - reinterpret_cast<int64_t>(proc);
+                const int64_t fo = reinterpret_cast<int64_t>(&proc->exc_free_list)
+                                 - reinterpret_cast<int64_t>(proc);
+                if (eo >= INT32_MIN && eo <= INT32_MAX) c2.exc_frame_stack_offset = static_cast<int32_t>(eo);
+                if (fo >= INT32_MIN && fo <= INT32_MAX) c2.exc_free_list_offset   = static_cast<int32_t>(fo);
+            }
+            c2.jit_instr_counter_addr = g_jit_emit_instr_counter
+                ? reinterpret_cast<uint64_t>(&proc->scheduler.profiler_jit_instr_counter)
+                : 0;
+            /* NO tier_up_* -> el codigo C2 es terminal (no se re-instrumenta). */
+
+            /* --- C2.4: devirt especulativa de los IC sites monomorficos. ---
+             * Para cada CALLVIRT cuyo PIC observo EXACTAMENTE 1 clase, emite
+             * un guard (clase == T) ? CALL directo : CALLVIRT, e inlinea el
+             * CALL (si el callee es 1-bloque-RET) + plega.  Correcto por
+             * construccion: el callee se resuelve de C->vtable[vtbl_idx] con
+             * la MISMA C del guard, asi que si el guard pasa el target es
+             * exacto; si no, cae al CALLVIRT original. */
+            const ir::IrFunction *compile_target = ir_fn;
+            ir::IrFunction spec_clone;
+            {
+                /* ordinal -> (dst, vtbl_idx) recorriendo los CALLVIRT en el
+                 * mismo orden en que el Selector asigno las claves de IC. */
+                std::vector<std::pair<ir::IrValueId, uint64_t>> cv_by_ord;
+                for (const auto &bb : ir_fn->blocks)
+                    for (const auto &ins : bb.instrs)
+                        if (ins.op == ir::IrOp::CALLVIRT)
+                            cv_by_ord.push_back({ins.dst, ins.imm});
+
+                std::vector<ir::SpecDevirtSite> sites;
+                std::unordered_set<std::string> callee_names;
+                auto kit2 = g_fn_ic_keys.find(fn_pc);
+                if (kit2 != g_fn_ic_keys.end()) {
+                    for (uint64_t key : kit2->second) {
+                        const uint32_t ord = static_cast<uint32_t>(key & 0xFFu);
+                        if (ord >= cv_by_ord.size()) continue;
+                        auto sit = g_ic_slots.find(key);
+                        if (sit == g_ic_slots.end() || sit->second == 0) continue;
+                        const uint64_t *slot =
+                            reinterpret_cast<const uint64_t *>(sit->second);
+                        int distinct = 0; uint64_t cptr = 0;
+                        for (int e = 0; e < 4; ++e)
+                            if (slot[e * 2] != 0) { ++distinct; if (distinct == 1) cptr = slot[e * 2]; }
+                        if (distinct != 1 || cptr == 0) continue;   /* solo monomorfico */
+                        const ir::IrValueId cv_dst = cv_by_ord[ord].first;
+                        const uint64_t vtbl_idx    = cv_by_ord[ord].second;
+                        if (cv_dst == ir::IR_NO_VALUE) continue;     /* void: sin PHI */
+                        loader::ClassInfo *cls = reinterpret_cast<loader::ClassInfo *>(cptr);
+                        if (!cls->vtable || vtbl_idx >= cls->vtable_size) continue;
+                        loader::MethodInfo *m = cls->vtable[vtbl_idx];
+                        if (!m || !m->name.data || m->name.size == 0) continue;
+                        std::string cn = (cls->name.data && cls->name.size)
+                            ? std::string(reinterpret_cast<const char *>(cls->name.data), cls->name.size)
+                            : std::string();
+                        std::string mn(reinterpret_cast<const char *>(m->name.data), m->name.size);
+                        std::string callee = cn + "__" + mn;
+                        /* callee debe existir y ser inlineable (1 bloque, RET):
+                         * si no, el CALL del fast-path quedaria sin resolver. */
+                        auto cl = owning_exe->ir_lookup.find(callee);
+                        if (cl == owning_exe->ir_lookup.end()
+                         || cl->second >= owning_exe->ir_functions.size()) continue;
+                        const ir::IrFunction &cf = owning_exe->ir_functions[cl->second];
+                        if (cf.blocks.size() != 1 || cf.blocks[0].instrs.empty()
+                         || cf.blocks[0].instrs.back().op != ir::IrOp::RET) continue;
+                        sites.push_back(ir::SpecDevirtSite{cv_dst, cptr, callee});
+                        callee_names.insert(callee);
+                    }
+                }
+
+                if (!sites.empty()) {
+                    spec_clone = *ir_fn;  /* clon mutable */
+                    if (ir::ir_pass_speculative_devirt(spec_clone, sites)) {
+                        ir::IrModule tmp;
+                        tmp.functions.push_back(spec_clone);
+                        for (const auto &cn : callee_names) {
+                            auto cl = owning_exe->ir_lookup.find(cn);
+                            if (cl != owning_exe->ir_lookup.end()
+                             && cl->second < owning_exe->ir_functions.size())
+                                tmp.functions.push_back(owning_exe->ir_functions[cl->second]);
+                        }
+                        /* inline del CALL fast-path + limpieza a fixpoint. */
+                        for (int it = 0; it < 5; ++it) {
+                            bool any = ir::ir_pass_inline(tmp);
+                            any = ir::ir_pass_const_fold(tmp.functions[0]) || any;
+                            any = ir::ir_pass_copy_prop(tmp.functions[0])  || any;
+                            any = ir::ir_pass_simplify(tmp.functions[0])   || any;
+                            any = ir::ir_pass_dce(tmp.functions[0])        || any;
+                            if (!any) break;
+                        }
+                        spec_clone = std::move(tmp.functions[0]);
+                        compile_target = &spec_clone;
+                        if (g_c2_log)
+                            std::fprintf(stderr,
+                                "[c2] devirt especulativa: %zu site(s) monomorfico(s) en '%s'\n",
+                                sites.size(), fn_name.c_str());
+                    }
+                }
+            }
+
+            /* Compilar el IR especulado.  Por defecto via el Selector (slots);
+             * con VESTA_C2_VREG via el path de registros virtuales (regalloc
+             * real) -- experimento para medir si el inline rinde cuando los
+             * valores viven en registros y no en slots. */
+            JitFn    c2_fn         = nullptr;
+            size_t   c2_size       = 0;
+            const uint8_t *c2_code = nullptr;
+            bool     c2_unsupported = false;
+            if (g_c2_vreg) {
+                ffi::FFI *ffi2 = &owning_vm.loader_public.ffi_loader;
+                auto nat_res = [ffi2](const std::string &name) -> uint64_t {
+                    size_t colon = name.find(':');
+                    if (colon == std::string::npos) return 0;
+                    std::string lib  = name.substr(0, colon);
+                    std::string func = name.substr(colon + 1);
+                    void *vfn = ffi::lookup_virtual_fn(lib, func);
+                    if (vfn) return reinterpret_cast<uint64_t>(vfn);
+                    try {
+                        void *m = ffi2->load_native_module(lib);
+                        if (!m) return 0;
+                        return reinterpret_cast<uint64_t>(ffi2->resolve_native_symbol(m, func));
+                    } catch (...) { return 0; }
+                };
+                auto user_res = [](const std::string &n) -> uint64_t {
+                    auto it = g_eager_cache.find(n);
+                    if (it != g_eager_cache.end()
+                     && it->second != 0 && it->second != EAGER_IN_PROGRESS)
+                        return it->second;
+                    return 0;
+                };
+                uint8_t *vc = vreg_compile(*compile_target, *g_code_cache, user_res,
+                                           make_vreg_entries(), nat_res);
+                if (vc != nullptr) { c2_fn = reinterpret_cast<JitFn>(vc); c2_code = vc; }
+            }
+            CompileResult res{};
+            if (c2_fn == nullptr) {
+                res = g_compiler->compile_with_opts(*compile_target, c2);
+                c2_fn = res.fn; c2_size = res.code_size; c2_code = res.code_start;
+                c2_unsupported = res.unsupported;
+            }
+            if (c2_fn == nullptr) {
+                /* No se pudo recompilar (alguna op sin contexto recursivo).
+                 * Queda C1; g_tiered_pcs evita reintentos. */
+                if (g_c2_log)
+                    std::fprintf(stderr,
+                        "[c2] recompile '%s' fallo (unsupported=%d) -- queda C1\n",
+                        fn_name.c_str(), c2_unsupported ? 1 : 0);
+                return;
+            }
+
+            /* --- (4) swap + reclaim sin leak. ---
+             *
+             * (a) Capturar el entry C1 (lo que el PIC cachea) ANTES del swap.
+             * (b) Reapuntar dispatch a C2: pc-map (CALLVM) + method->jit_code
+             *     (CALLVIRT).  Son stores de puntero; los lectores ven C1 o C2,
+             *     ambos validos.
+             * (c) Invalidar las entradas de PIC que cachean C1: poner SOLO el
+             *     class_ptr a 0 (store de 8 bytes alineado = atomico en x86).
+             *     Un lector concurrente del PIC o (i) ve class=0 -> miss ->
+             *     re-popula con C2, o (ii) ve la class vieja -> carga el code
+             *     viejo (C1, AUN VIVO) -> lo llama sin crash.  NO tocamos el
+             *     campo code; el class=0 ya basta para que nadie nuevo entre.
+             * (d) Encolar la region C1 a pending-free; se LIBERA recien en la
+             *     quiescencia (g_jit_active_frames==0, drain en jit_frame_exit)
+             *     cuando NO hay frames en vuelo -> ningun lector la ejecuta y
+             *     ningun frame la tiene en pila.  Cero leak, cero
+             *     use-after-free. */
+            auto mit = g_pc_to_method.find(fn_pc);
+            loader::MethodInfo *method =
+                (mit != g_pc_to_method.end()) ? mit->second : nullptr;
+            const uint64_t old_code = method
+                ? reinterpret_cast<uint64_t>(method->jit_code)
+                : reinterpret_cast<uint64_t>(lookup_jit_code_at_pc(fn_pc));
+
+            register_jit_code_at_pc(fn_pc, reinterpret_cast<void *>(c2_fn));
+            if (method) method->jit_code = reinterpret_cast<void *>(c2_fn);
+
+            /* (c) invalidar entradas de PIC == old_code (class_ptr -> 0). */
+            if (old_code != 0) {
+                for (auto &kv : g_ic_slots) {
+                    uint64_t *slot = reinterpret_cast<uint64_t *>(kv.second);
+                    if (slot == nullptr) continue;
+                    for (int e = 0; e < 4; ++e) {
+                        if (slot[e * 2 + 1] == old_code) {
+                            slot[e * 2] = 0;  /* class_ptr: future miss -> C2 */
+                        }
+                    }
+                }
+            }
+
+            /* (d) encolar la region C1 para reciclar en la quiescencia. */
+            auto rit = g_c1_region.find(fn_pc);
+            if (rit != g_c1_region.end()) {
+                g_pending_free.push_back(rit->second);
+                g_pending_free_count.store(g_pending_free.size(),
+                                           std::memory_order_release);
+                g_c1_region.erase(rit);
+            }
+
+            ++g_c2_tierup_count;
+            if (g_c2_log) {
+                std::fprintf(stderr,
+                    "[c2] tier-up '%s' (pc=0x%llx) -> C2 (%zu bytes, %s); C1 a free-list pendiente\n",
+                    fn_name.c_str(), static_cast<unsigned long long>(fn_pc),
+                    c2_size, g_c2_vreg ? "vreg" : "slots");
+            }
+            if (g_jit_disasm && c2_code != nullptr && c2_size != 0) {
+                debug_dump_jit_code(fn_name + " [C2]", c2_code, c2_size);
+            }
+        } catch (...) {
+            /* Cualquier fallo deja la funcion en C1 (correcto). */
         }
     }
 

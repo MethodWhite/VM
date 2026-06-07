@@ -521,6 +521,10 @@ namespace jit {
             case MOp::COMMENT:
                 /* skip en release */
                 return true;
+            case MOp::ARG:
+                /* pseudo: el rewrite ya lo expandio a moves a arg_regs antes
+                 * del CALL.  No deberia llegar aqui; si llega, no emite. */
+                return true;
             case MOp::SAFEPOINT: {
                 /* poll expansion: lee safepoint_flag desde [rbx+0],
                  * si != 0 salta al slow path que llama al handler.
@@ -584,6 +588,39 @@ namespace jit {
                 put8(out, modrm(3, 2, 0));  /* /2 reg=rax */
                 return true;
             }
+            case MOp::LOAD_PROC: {
+                /* Carga ProcessVM* en dst (RBX por convencion del callback).
+                 *
+                 * TLS-direct (src1.value != -1, Win64):
+                 *   65 48 8B <modrm> 25 <disp32>   mov dst, gs:[disp32]
+                 *   modrm = mod=00, reg=dst, r/m=100 (SIB);  SIB=0x25 (disp32 abs).
+                 *
+                 * Fallback (src1.value == -1):
+                 *   48 B8 <imm64>   mov rax, get_current_executing_process
+                 *   FF D0           call rax
+                 *   48 89 C0|dst    mov dst, rax
+                 */
+                const uint8_t dst = mi.dst.reg;  /* reg id completo (RBX=3) */
+                if (mi.src1.value != -1) {
+                    put8(out, 0x65);                            /* gs: prefix */
+                    put8(out, rex_byte(true, dst, 0, 0));       /* REX.W (+R si dst>=8) */
+                    put8(out, 0x8B);                            /* mov r64, r/m64 */
+                    put8(out, modrm(0, dst, 4));                /* mod=00 reg=dst rm=SIB */
+                    put8(out, 0x25);                            /* SIB: disp32 absoluto */
+                    put32(out, static_cast<uint32_t>(mi.src1.value));
+                } else {
+                    const uint32_t pool_idx = static_cast<uint32_t>(mi.src2.value);
+                    const uint64_t getproc  = (pool_idx < fn.imm64_pool.size())
+                        ? fn.imm64_pool[pool_idx] : 0ULL;
+                    put8(out, 0x48); put8(out, 0xB8); put64(out, getproc); /* mov rax, imm64 */
+                    put8(out, 0xFF); put8(out, modrm(3, 2, 0));            /* call rax */
+                    /* mov dst, rax: REX.W (+B si dst>=8) + 0x89 + modrm(3, rax, dst) */
+                    put8(out, rex_byte(true, 0, dst, 0));
+                    put8(out, 0x89);
+                    put8(out, modrm(3, 0, dst));
+                }
+                return true;
+            }
             default:
                 /* Opcode no implementado en este encoder. */
                 return false;
@@ -599,11 +636,17 @@ namespace jit {
         const MOperand &dst = mi.dst;
         const MOperand &src = mi.src1;
 
-        /* Caso 1: MOV reg, reg */
+        /* Caso 1: MOV reg, reg.  Ancho via dst.width (commit 9):
+         *   8 -> REX.W + 0x89 (mov r64,r64)
+         *   4 -> 0x89 sin REX.W (mov r32,r32 -> zero-extiende a 64)
+         *   2 -> 66 + 0x89; 1 -> 0x88. */
         if (dst.kind == MOperandKind::REG && src.kind == MOperandKind::REG) {
-            const uint8_t rex = rex_byte(true, src.reg, dst.reg);
+            const uint8_t w = dst.width;
+            if (w == 2) put8(out, 0x66);
+            const bool need_rex_w = (w == 8);
+            const uint8_t rex = rex_byte(need_rex_w, src.reg, dst.reg);
             if (rex) put8(out, rex);
-            put8(out, 0x89);  /* MOV r/m64, r64 */
+            put8(out, (w == 1) ? 0x88 : 0x89);
             put8(out, modrm(3, src.reg & 7, dst.reg & 7));
             return;
         }
@@ -981,7 +1024,27 @@ namespace jit {
             });
             return;
         }
-        /* JMP reg/mem absoluto no soportado en v1. */
+        /* JMP reg INDIRECTO: FF /4 (mod=11).  Usado por el frame-swap del OSR
+         * (salto C1->C2 a una direccion absoluta en un registro).  Mismo patron
+         * que CALL reg (FF /2) pero con el campo reg del ModRM = 4. */
+        if (mi.src1.kind == MOperandKind::REG) {
+            const uint8_t rex = rex_byte(false, 0, mi.src1.reg);
+            if (rex) put8(out, rex);
+            put8(out, 0xFF);
+            put8(out, modrm(3, 4, mi.src1.reg & 7));
+            return;
+        }
+        /* JMP mem INDIRECTO: FF /4 con un operando de memoria. */
+        if (mi.src1.kind == MOperandKind::MEM) {
+            const uint8_t base  = mi.src1.reg;
+            const uint8_t index = static_cast<uint8_t>(mi.src1.mem_index());
+            const bool has_index = (index != static_cast<uint8_t>(MReg::NONE));
+            const uint8_t rex = rex_byte(false, 0, base, has_index ? index : 0);
+            if (rex) put8(out, rex);
+            put8(out, 0xFF);
+            emit_modrm_mem(mi.src1, 4, out);
+            return;
+        }
         put8(out, 0xCC);
     }
 

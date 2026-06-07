@@ -69,6 +69,12 @@ public comptime i32 VK_CTRL_HOME   = 3005;
 public comptime i32 VK_CTRL_END    = 3006;
 public comptime i32 VK_CTRL_PGUP   = 3007;
 public comptime i32 VK_CTRL_PGDN   = 3008;
+// Borrar palabras: Ctrl+Backspace (izquierda), Ctrl+Delete (derecha).
+public comptime i32 VK_CTRL_BACKSPACE = 3009;
+public comptime i32 VK_CTRL_DEL       = 3010;
+// Mover linea entera (Alt+Up / Alt+Down): patrones de IDE.
+public comptime i32 VK_ALT_UP    = 5001;
+public comptime i32 VK_ALT_DOWN  = 5002;
 
 // =============================================================================
 // Validacion compile-time: las constantes no pueden colisionar entre si.

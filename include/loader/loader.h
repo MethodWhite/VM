@@ -366,6 +366,18 @@ namespace loader {
          */
         uint64_t next_dyn_base = 0x80000000ULL;
 
+        /**
+         * @brief Phase M.sandbox: flag global "hay algun modulo sandboxed".
+         *
+         * Default @c false (sin sandbox).  Se pone a @c true cuando se aplica
+         * un conjunto de caps restringido a algun Executable (via --vex-caps
+         * o loadmodule con caps).  Permite que @c check_cap_at_pc retorne de
+         * inmediato (1 branch predicho) en el caso comun sin sandbox, en lugar
+         * de iterar @c executables en cada CALLN/dlopen/spawn/etc.  Resultado:
+         * el sandbox es CERO-overhead cuando no se usa.
+         */
+        bool sandbox_active = false;
+
 
         /**
          * referencia al manager de instancias de VM
@@ -500,6 +512,30 @@ namespace loader {
          */
         uint64_t load_module_dynamic(runtime::VM &vm,
                                       std::vector<uint8_t> raw_bytecode_file);
+
+        /**
+         * @brief Phase M.sandbox: comprueba si el codigo en @p pc tiene
+         *        concedida la capability @p required.
+         *
+         * Localiza el @c Executable cuya seccion de codigo contiene @p pc y
+         * consulta sus @c caps.  Si ese modulo esta sin restringir (default
+         * ALL granted) o @p pc no pertenece a ningun modulo sandboxed,
+         * devuelve @c true (permitir).  Solo deniega cuando el modulo
+         * propietario del @p pc tiene un sandbox activo que NO concede la
+         * cap requerida.
+         *
+         * Fast path: si @c executables esta vacio o ninguno esta restringido
+         * el bucle sale en O(N_modulos) con @c caps.unrestricted() (1 branch
+         * predicho por modulo) -> coste despreciable cuando no hay sandbox.
+         *
+         * @param pc       Direccion VM de la instruccion que solicita la cap.
+         * @param required Bitmask de @c loader::Caps (p.ej. @c Caps::FFI_CALL).
+         * @return @c true si la operacion esta permitida; @c false si el
+         *         modulo propietario del @p pc tiene el sandbox y le falta la
+         *         cap.
+         */
+        [[nodiscard]] bool check_cap_at_pc(uint64_t pc,
+                                           uint32_t required) const noexcept;
 
         /**
          * @brief Variante de load_module_dynamic que registra source_path.

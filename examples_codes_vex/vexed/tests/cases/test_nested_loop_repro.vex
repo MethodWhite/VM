@@ -1,0 +1,50 @@
+// =============================================================================
+// test_nested_loop_repro.vex - bug C minimal repro (~25 LOC).
+//
+// Patron MINIMO que dispara SEGV silente:
+//   1. Clase con campo GC (next) + i32 (id) + linked-list circular.
+//   2. Nested while loops (outer frame x N, inner i x 2).
+//   3. Interpolacion `${cur.field}` (CALL a vio_int_to_vmbuf + STRMAKE).
+//   4. `print(label)` (CALLN).
+//   5. Acceso posterior a OTRO field del MISMO objeto (acc + cur.id).
+//   6. `cur = cur.next` (acceso a field GC tras los CALLs).
+//
+// Quitar CUALQUIERA de (3), (4) o (5) hace que el test pase.  Eso
+// indica que el bug es del regalloc/save_live_regs cuando el host_ptr
+// `cur` debe sobrevivir a la secuencia de CALLs y aun se accede
+// despues.  Patron Heisenbug: anyadir CALLs intermedios o instrumentacion
+// mueve el patron del bug.
+//
+// Sprint dedicado D.7-full (regalloc target-aware) requerido para fix.
+// =============================================================================
+
+class Tab {
+    public i32 id;
+    public Tab next;
+    public Tab(i32 i) { this.id = i; this.next = null; }
+}
+
+public i32 run() {
+    Tab t1 = new Tab(1);
+    Tab t2 = new Tab(2);
+    t1.next = t2; t2.next = t1;
+    i32 frame = 0;
+    i32 total = 0;
+    while (frame < 3) {
+        Tab cur = t1;
+        i32 i = 0;
+        while (i < 2) {
+            string label = " ${cur.id} ";
+            print(label);
+            total = total + cur.id;
+            cur = cur.next;
+            i = i + 1;
+        }
+        frame = frame + 1;
+    }
+    println("");
+    // 3 frames x (1+2) = 9.  El test FALLA en builds con bug C activo:
+    // crashea con SEGV silente en alguna iteracion antes de imprimir total.
+    if (total != 9) return 1;
+    return 0;
+}

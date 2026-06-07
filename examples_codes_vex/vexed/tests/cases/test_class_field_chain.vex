@@ -1,0 +1,56 @@
+// =============================================================================
+// test_class_field_chain.vex - acceso a fields encadenados de clases
+// con CALLs intermedios.  Bug C dispara aqui de forma robusta.
+// =============================================================================
+
+public class Buffer {
+    public i32 dirty;
+    public i32 length;
+    public Buffer() { this.dirty = 0; this.length = 0; }
+}
+
+public class Tab {
+    public i32 id;
+    public string title;
+    public Buffer buf;
+    public Tab next;
+    public Tab(i32 i, string t) {
+        this.id = i;
+        this.title = t;
+        this.buf = new Buffer();
+        this.next = null;
+    }
+}
+
+i32 stringify_count(Tab t) {
+    string s = "tab-${t.id}-${t.title}";
+    return (i32) str_bytes(s);
+}
+
+public i32 run() {
+    Tab t1 = new Tab(1, "alpha");
+    Tab t2 = new Tab(2, "beta");
+    t1.next = t2; t2.next = t1;
+    i32 frame = 0;
+    while (frame < 3) {
+        Tab cur = t1;
+        i32 i = 0;
+        i32 acc = 0;
+        while (i < 2) {
+            string mark = "";
+            if (cur.buf.dirty == 1) mark = "*";
+            string label = " ${cur.id} ${cur.title}${mark} ";
+            print(label);
+            print("\x1b[0m");
+            acc = acc + cur.id;
+            cur = cur.next;
+            i = i + 1;
+        }
+        if (acc != 3) return 1000 + frame;
+        i32 sl = stringify_count(t1);
+        if (sl <= 0) return 2000 + frame;
+        frame = frame + 1;
+    }
+    println("");
+    return 0;
+}

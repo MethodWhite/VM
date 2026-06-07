@@ -130,11 +130,39 @@ namespace jit {
          */
         bool contains(const uint8_t *ptr) const noexcept;
 
+        /**
+         * @brief Devuelve una region [ptr, ptr+size) al free-list para que
+         *        @c alloc la reuse en compilaciones futuras.
+         *
+         * Usado por el reclaim del C2 tier-up: cuando una funcion sube de
+         * tier (C1 -> C2) y se ha comprobado que NINGUNA referencia al codigo
+         * C1 sobrevive (frames en vuelo drenados por quiescencia, entradas de
+         * PIC limpiadas, campos de dispatch reapuntados a C2), su region C1 se
+         * devuelve aqui.  La region se envenena con @c 0xCC (INT3) por defensa:
+         * si una referencia perdida la ejecutase antes de reusarse, trapearia
+         * en vez de correr basura.
+         *
+         * NO es thread-safe por si mismo: el caller debe serializar (en el JIT
+         * todas las mutaciones del cache van bajo @c g_compile_mtx).  El espacio
+         * NO se devuelve al SO (las regiones son sub-alocaciones de chunks de
+         * 1 MiB); se recicla internamente.
+         */
+        void free_region(uint8_t *ptr, size_t size) noexcept;
+
+        /** @brief Numero de regiones libres en el free-list (introspeccion). */
+        size_t free_region_count() const noexcept { return free_list_.size(); }
+
     private:
         struct Chunk {
             uint8_t *base   = nullptr; ///< inicio de la pagina (page-aligned)
             size_t   size   = 0;       ///< tamano total reservado
             size_t   used   = 0;       ///< bump pointer dentro del chunk
+        };
+
+        /// Region liberada disponible para reuso por @c alloc (free-list).
+        struct FreeRegion {
+            uint8_t *ptr  = nullptr;
+            size_t   size = 0;
         };
 
         /// Reserva un nuevo chunk del SO con permisos RWX (o RW si W^X).
@@ -146,10 +174,11 @@ namespace jit {
         /// Flush icache (CPU-specific).
         void flush_icache(const uint8_t *ptr, size_t size);
 
-        std::vector<Chunk> chunks_;
-        size_t             chunk_bytes_;
-        size_t             max_total_;
-        size_t             used_;
+        std::vector<Chunk>      chunks_;
+        std::vector<FreeRegion> free_list_;  ///< regiones recicladas (reclaim C2)
+        size_t                  chunk_bytes_;
+        size_t                  max_total_;
+        size_t                  used_;
     };
 
 } // namespace jit

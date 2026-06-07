@@ -80,6 +80,17 @@ namespace vex {
         bool        dump_graphviz_ir_post = false;
         bool        dump_graphviz_vel     = false;
 
+        /// Variantes HTML interactivas (CSS+JS embebidos, sin dependencias).
+        /// Producen un .html autocontenido por vista que el usuario abre en
+        /// el navegador para analizar el flujo de codigo con pan/zoom, panel
+        /// de detalle por nodo, busqueda y filtros de aristas.  Internamente
+        /// reutilizan el generador Graphviz (paridad de info garantizada).
+        /// Coexisten con los flags Mermaid/Graphviz.
+        bool        dump_html_ast         = false;
+        bool        dump_html_ir_pre      = false;
+        bool        dump_html_ir_post     = false;
+        bool        dump_html_vel         = false;
+
         /// Lenguaje destino del transpiler IR -> codigo fuente.  Vacio = no
         /// transpilar (default).  Valores soportados: "c" (Phase 1).
         /// Futuros: "java", "js", "rust", etc.
@@ -130,6 +141,13 @@ namespace vex {
         std::string graphviz_ir_pre;
         std::string graphviz_ir_post;
         std::string graphviz_vel;
+        /// Variantes HTML interactivas (documento completo `<!DOCTYPE html>...`)
+        /// llenas cuando los flags @c dump_html_* estan activos.  Vacias en
+        /// otro caso.  Cada una es una pagina autocontenida lista para abrir.
+        std::string html_ast;
+        std::string html_ir_pre;
+        std::string html_ir_post;
+        std::string html_vel;
         Diagnostics diagnostics;        ///< Errores y warnings acumulados.
 
         /**

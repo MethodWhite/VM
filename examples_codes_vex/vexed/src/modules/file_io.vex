@@ -121,16 +121,32 @@ public class FileReader {
         this.length = 0;
     }
 
+    // Cierra el FILE* huerfano si quedo abierto + libera el buffer leido.
+    // Sin este destructor, cada FileReader que sale de scope deja bytes
+    // en el heap raw del proceso (acumulativo con cada apertura).
     public ~FileReader() {
-        // Cleanup deferido (test: el dtor cross-module + FFI parece
-        // tropezar con el regalloc/GC dance; investigar como sprint
-        // independiente).  El proceso al exit libera estos handles.
+        if (this.fp != 0) {
+            ensure_loaded();
+            ffi_call(g_fclose, this.fp);
+            this.fp = 0;
+        }
+        if (this.data != null) {
+            free(this.data);
+            this.data = null;
+        }
     }
 
     // Abre el archivo + lee TODO el contenido en `this.data`.
     // Returns: Result<i64, i32> donde Ok = bytes leidos, Err = codigo FE_*.
     public Result<i64, i32> read_all(string path) {
         ensure_loaded();
+        // Si el FileReader ya tenia datos de una lectura previa, liberar
+        // antes de sobrescribir para evitar leak.
+        if (this.data != null) {
+            free(this.data);
+            this.data   = null;
+            this.length = 0;
+        }
         u8* path_c = str_cstr(path);
         u8* mode_c = str_cstr(MODE_READ);
         if (path_c == null || mode_c == null) return Err(FE_READ_FAIL);

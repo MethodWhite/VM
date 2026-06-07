@@ -1,0 +1,20 @@
+// =============================================================================
+// test_cross_module_string.vex - cross-module comptime string + print
+// reproduce el patron `print(screen.ATTR_RESET)` del editor.
+// =============================================================================
+
+import "strings_lib";
+
+public i32 run() {
+    // Imprimir el comptime string cross-module en loop (como el render
+    // del editor que llama print(ATTR_RESET) muchas veces).
+    i32 i = 0;
+    while (i < 50) {
+        print(strings_lib.MARKER_A);
+        print(strings_lib.MARKER_B);
+        print(strings_lib.MARKER_C);
+        i = i + 1;
+    }
+    println("");
+    return 0;
+}

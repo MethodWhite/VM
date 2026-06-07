@@ -316,6 +316,73 @@ namespace jit {
                 || t == ir::IrType::I32 || t == ir::IrType::I64;
         }
 
+        /**
+         * @brief callback-ABI: true si @p op es "hoja-segura", es decir,
+         *        NO escribe @c proc->registers.regs[0..15] ni reentra a la
+         *        ejecucion de la VM.
+         *
+         * Para una funcion-callback cuyo cuerpo solo contiene ops hoja-seguras,
+         * el prologo NO necesita salvar el banco de registros VM (save-set
+         * vacio), porque los args entran directo a los slots de params y el
+         * cuerpo nunca toca @c proc->registers[].  Cualquier op fuera de esta
+         * whitelist fuerza el modo "safe" (salvar/restaurar R0..R15, igual que
+         * el thunk previo).  Whitelist conservadora: una op no listada ->
+         * safe (correcto, solo sin speedup).
+         *
+         * Excluidas (fuerzan safe): toda la familia CALL (marshalling +
+         * reentrada), RAW_ASM (arbitrario), READ_VM_REG (lee proc->regs;
+         * en fast-mode los args no estan ahi), y por defecto cualquier op
+         * no enumerada (OOP dinamico, async, distrib, sync, reflexion, etc.).
+         */
+        inline bool cb_is_leaf_safe_op(ir::IrOp op) noexcept {
+            switch (op) {
+                /* constantes / movimiento */
+                case ir::IrOp::CONST: case ir::IrOp::MOV: case ir::IrOp::NOP:
+                case ir::IrOp::STR_LIT_ADDR: case ir::IrOp::LABEL_ADDR:
+                /* aritmetica entera + extendida */
+                case ir::IrOp::ADD: case ir::IrOp::SUB: case ir::IrOp::MUL:
+                case ir::IrOp::DIV: case ir::IrOp::MOD: case ir::IrOp::NEG:
+                case ir::IrOp::IABS: case ir::IrOp::IMIN: case ir::IrOp::IMAX:
+                case ir::IrOp::IMINU: case ir::IrOp::IMAXU: case ir::IrOp::ILOG2:
+                /* aritmetica flotante */
+                case ir::IrOp::FADD: case ir::IrOp::FSUB: case ir::IrOp::FMUL:
+                case ir::IrOp::FDIV: case ir::IrOp::FNEG: case ir::IrOp::FABS:
+                case ir::IrOp::FSQRT: case ir::IrOp::FMIN: case ir::IrOp::FMAX:
+                case ir::IrOp::FFLOOR: case ir::IrOp::FCEIL: case ir::IrOp::FROUND:
+                case ir::IrOp::FTRUNC:
+                /* logica / shifts / bit ops */
+                case ir::IrOp::AND: case ir::IrOp::OR: case ir::IrOp::XOR:
+                case ir::IrOp::NOT: case ir::IrOp::SHL: case ir::IrOp::SHR:
+                case ir::IrOp::SAR: case ir::IrOp::CLZ: case ir::IrOp::CTZ:
+                case ir::IrOp::POPCNT: case ir::IrOp::BYTESWAP:
+                case ir::IrOp::ROTL: case ir::IrOp::ROTR:
+                /* comparaciones */
+                case ir::IrOp::CMP_EQ: case ir::IrOp::CMP_NE: case ir::IrOp::CMP_LT:
+                case ir::IrOp::CMP_GT: case ir::IrOp::CMP_LE: case ir::IrOp::CMP_GE:
+                case ir::IrOp::CMP_ULT: case ir::IrOp::CMP_UGT: case ir::IrOp::CMP_ULE:
+                case ir::IrOp::CMP_UGE:
+                case ir::IrOp::FCMP_EQ: case ir::IrOp::FCMP_NE: case ir::IrOp::FCMP_LT:
+                case ir::IrOp::FCMP_GT: case ir::IrOp::FCMP_LE: case ir::IrOp::FCMP_GE:
+                /* conversiones */
+                case ir::IrOp::CAST: case ir::IrOp::ZEXT: case ir::IrOp::SEXT:
+                case ir::IrOp::TRUNC: case ir::IrOp::ITOF: case ir::IrOp::UITOF:
+                case ir::IrOp::FTOI: case ir::IrOp::FTOUI: case ir::IrOp::F32TOF64:
+                case ir::IrOp::F64TOF32: case ir::IrOp::BITCAST:
+                /* control de flujo */
+                case ir::IrOp::BR: case ir::IrOp::BR_COND: case ir::IrOp::RET:
+                case ir::IrOp::UNREACHABLE: case ir::IrOp::PHI:
+                /* memoria (LOAD/STORE usan page-cache+RBX+scratch; ALLOCA
+                 * toca proc->stack_pointer, manejado aparte por fn_has_alloca) */
+                case ir::IrOp::ALLOCA: case ir::IrOp::LOAD: case ir::IrOp::STORE:
+                case ir::IrOp::GETFIELD: case ir::IrOp::SETFIELD:
+                case ir::IrOp::ISNULL: case ir::IrOp::GEP:
+                case ir::IrOp::GETPROC:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         /** @brief Cond code x86 correspondiente al IrOp signed/unsigned. */
         inline MCond cond_for_cmp_op(ir::IrOp op) {
             switch (op) {
@@ -343,6 +410,73 @@ namespace jit {
         MFunction mf;
         mf.name = ir_fn.name;
         bool unsupported = false;
+
+        /* Phase D.7-exc (2026-06-04): exception handling.  El modelo v1 del
+         * throw (do_throw modifica proc->rip + epilogue + el scheduler reanuda
+         * el handler en INTERP) SOLO funciona si el catch esta en bytecode
+         * separado.  Cuando el metodo se JIT-compila ENTERO, el handler vive en
+         * el frame JIT y sus valores SSA estan en slots del HOST stack que el
+         * interp no ve -> estado corrupto -> segfault (caso 30_unwrap_null).
+         *
+         * Hasta el sprint dedicado de unwinding host-aware (landing pad host +
+         * longjmp manual, parte de D.13), los metodos con TRYENTER caen a
+         * interp -- que maneja las excepciones correctamente.  CERO coste para
+         * el happy path: los metodos sin try/catch tienen JIT completo; las
+         * excepciones son el camino EXCEPCIONAL (raro y ya lento por diseno). */
+        for (const auto &blk : ir_fn.blocks) {
+            for (const auto &ins : blk.instrs) {
+                if (ins.op == ir::IrOp::TRYENTER) {
+                    if (out_unsupported) *out_unsupported = true;
+                    return mf;
+                }
+            }
+        }
+
+        /* C2-cimiento (2026-06-07): clave de call site para IC slots
+         * DIRECCIONABLES.  fn_pc se resuelve una vez (via el symbol_table del
+         * .velb); el ordinal incrementa por cada IC reservado en la funcion,
+         * en el orden deterministico en que el selector recorre las instrs.
+         * Asi el mismo call site obtiene la misma clave entre recompilaciones
+         * -> el pase C2 puede encontrar el slot y leer las clases observadas.
+         * Si no hay symbol_table (NATIVE_ABI/tests) -> clave 0 = slot fresco
+         * no-direccionable (comportamiento previo). */
+        const uint64_t ic_fn_pc =
+            (opts_.resolve_symbol && !ir_fn.name.empty())
+                ? opts_.resolve_symbol("code." + ir_fn.name)
+                : 0;
+        uint32_t ic_ordinal = 0;
+        auto next_ic_key = [&]() -> uint64_t {
+            const uint32_t o = ic_ordinal++;
+            return ic_fn_pc ? ((ic_fn_pc << 8) | (o & 0xFFu)) : 0;
+        };
+
+        /* C2 tier-up (2026-06-07): decidir si esta funcion lleva contador
+         * on-entry de tier-up.  Condiciones:
+         *   - C2 activo (tier_up_handler_addr + threshold + reserve_tier_counter),
+         *   - VM_ABI sin entry de callback (el conteo + recompile asume VM_ABI),
+         *   - fn_pc resoluble (clave estable para el contador y el recompile),
+         *   - y (tier_up_all_fns || la funcion tiene >=1 CALLVIRT).  Por defecto
+         *     solo se instrumentan las funciones con CALLVIRT (candidato real a
+         *     especulacion); las hojas/aritmetica no pagan nada.
+         * El contador (8 bytes, keyed por fn_pc) se reserva aqui; su direccion
+         * se embebe en el prologo mas abajo. */
+        uint64_t tier_counter_addr = 0;
+        if (opts_.tier_up_handler_addr != 0 && opts_.tier_up_threshold != 0
+         && opts_.reserve_tier_counter && ic_fn_pc != 0
+         && opts_.mode == SelectorMode::VM_ABI && !opts_.callback_entry) {
+            bool has_callvirt = opts_.tier_up_all_fns;
+            if (!has_callvirt) {
+                for (const auto &blk : ir_fn.blocks) {
+                    for (const auto &ins : blk.instrs) {
+                        if (ins.op == ir::IrOp::CALLVIRT) { has_callvirt = true; break; }
+                    }
+                    if (has_callvirt) break;
+                }
+            }
+            if (has_callvirt) {
+                tier_counter_addr = opts_.reserve_tier_counter(ic_fn_pc);
+            }
+        }
 
         /* regalloc del JIT.
          *
@@ -722,6 +856,55 @@ namespace jit {
         const int32_t hoisted_base_off = -static_cast<int32_t>(slot_bytes + 16);
         const uint32_t VM_STACK_SLOTS_BYTES = 16;
 
+        /* ===== callback-ABI: analisis del prologo/epilogo nativo ===== */
+        const bool cb_entry = opts_.callback_entry
+                           && opts_.mode == SelectorMode::VM_ABI;
+        /* argc del callback = numero de params (cap 12 = calling convention VM). */
+        const uint32_t cb_argc = cb_entry
+            ? static_cast<uint32_t>(ir_fn.params.size() > 12 ? 12 : ir_fn.params.size())
+            : 0u;
+        /* TLS-direct disponible? (-1 = usar el call fallback). */
+        const bool cb_use_call = cb_entry && (opts_.callback_tls_gs_disp == -1);
+        /* Numero de args que viajan en registros segun el ABI nativo. */
+#if defined(_WIN32)
+        const uint32_t CB_N_REG_ARGS = 4;
+#else
+        const uint32_t CB_N_REG_ARGS = 6;
+#endif
+        const uint32_t cb_n_reg_args = cb_entry
+            ? (cb_argc < CB_N_REG_ARGS ? cb_argc : CB_N_REG_ARGS) : 0u;
+        /* save-set: cuerpo hoja-puro -> no salvar nada; cualquier op no
+         * hoja-segura -> salvar el banco completo R0..R15 (modo "safe",
+         * equivalente al thunk previo). */
+        bool cb_save_all = false;
+        if (cb_entry) {
+            for (const auto &blk : ir_fn.blocks) {
+                for (const auto &ins : blk.instrs) {
+                    if (!cb_is_leaf_safe_op(ins.op)) { cb_save_all = true; break; }
+                }
+                if (cb_save_all) break;
+            }
+        }
+        /* Work area del callback, debajo de los VM-STACK slots:
+         *   - save area de proc->regs[0..15] (128 B) si cb_save_all.
+         *   - spill area de los reg-args (si cb_use_call). */
+        const uint32_t cb_save_bytes  = (cb_entry && cb_save_all) ? 128u : 0u;
+        const uint32_t cb_spill_bytes = (cb_entry && cb_use_call)
+            ? ((cb_n_reg_args * 8u + 15u) & ~15u) : 0u;
+        uint32_t cb_work_bytes = cb_save_bytes + cb_spill_bytes;
+        if (cb_work_bytes & 15) cb_work_bytes = (cb_work_bytes + 15) & ~15u;
+        /* Base de la work area (offset positivo desde RBP, se niega al usar). */
+        const int32_t cb_work_base = static_cast<int32_t>(slot_bytes + 16);
+        /* Offset del slot de save del VM reg r (0..15) desde RBP. */
+        auto cb_save_off = [&](uint32_t r) -> int32_t {
+            return -(cb_work_base + 8 + static_cast<int32_t>(r) * 8);
+        };
+        /* Offset del slot de spill del reg-arg nativo i desde RBP. */
+        auto cb_spill_off = [&](uint32_t i) -> int32_t {
+            return -(cb_work_base + static_cast<int32_t>(cb_save_bytes)
+                     + 8 + static_cast<int32_t>(i) * 8);
+        };
+
         /* Padding fijo para alinear rsp + shadow space (solo Win64). */
         constexpr uint32_t ALIGN_PAD = 8;
 #if defined(_WIN32)
@@ -729,7 +912,8 @@ namespace jit {
 #else
         constexpr uint32_t SHADOW_SPACE = 0;
 #endif
-        uint32_t frame_size = slot_bytes + VM_STACK_SLOTS_BYTES + ALIGN_PAD + SHADOW_SPACE;
+        uint32_t frame_size = slot_bytes + VM_STACK_SLOTS_BYTES
+                            + cb_work_bytes + ALIGN_PAD + SHADOW_SPACE;
         mf.stack_frame_size = frame_size;
 
         /* Internar la direccion del safepoint handler en el imm64_pool
@@ -808,19 +992,23 @@ namespace jit {
         MBlockId prologue = mf.new_block(mf.new_label());
 
         if (opts_.mode == SelectorMode::VM_ABI) {
-            /* push rbx (preservar) */
+            /* push rbx (preservar; RBX = ProcessVM* durante toda la fn) */
             mf.blocks[prologue].instrs.push_back(
                 MInstr::make_unary(MOp::PUSH, {}, MOperand::make_reg(MReg::RBX)));
-            /* mov rbx, <proc_reg> */
+            if (!cb_entry) {
+                /* mov rbx, <proc_reg>: en VM_ABI el proc llega como arg0.
+                 * En callback-ABI NO hay arg de proc; se carga mas abajo via
+                 * LOAD_PROC (tras montar el frame, por si usa el fallback). */
 #if defined(_WIN32)
-            const MReg PROC_REG = MReg::RCX;
+                const MReg PROC_REG = MReg::RCX;
 #else
-            const MReg PROC_REG = MReg::RDI;
+                const MReg PROC_REG = MReg::RDI;
 #endif
-            mf.blocks[prologue].instrs.push_back(
-                MInstr::make_unary(MOp::MOV,
-                    MOperand::make_reg(MReg::RBX),
-                    MOperand::make_reg(PROC_REG)));
+                mf.blocks[prologue].instrs.push_back(
+                    MInstr::make_unary(MOp::MOV,
+                        MOperand::make_reg(MReg::RBX),
+                        MOperand::make_reg(PROC_REG)));
+            }
         }
 
         /* Profiler MIPS counter para JIT.  Se emite per-bloque (no
@@ -862,6 +1050,109 @@ namespace jit {
                 MInstr::make_unary(MOp::SUB,
                     MOperand::make_reg(MReg::RSP),
                     MOperand::make_imm32(static_cast<int32_t>(frame_size))));
+        }
+
+        /* ===== C2 tier-up: contador on-entry + check (HotSpot-style) =====
+         *
+         * Emitido aqui, justo tras montar el frame (rsp 16-alineado + shadow
+         * space dentro de frame_size) y antes de cualquier ALLOCA (que moveria
+         * rsp).  RBX = ProcessVM* ya esta cargado (VM_ABI, !cb_entry).  Patron:
+         *
+         *     mov rax, &counter
+         *     add qword [rax], 1
+         *     cmp qword [rax], threshold
+         *     jne tier_skip                 ; != threshold -> seguir normal
+         *     mov arg0, rbx                  ; proc
+         *     mov arg1, imm64(fn_pc)
+         *     mov rax, &handler
+         *     call rax                       ; c2_tier_up(proc, fn_pc): recompila+swap
+         *   tier_skip:
+         *
+         * El `jne` (==) hace que dispare EXACTAMENTE una vez: tras cruzar el
+         * umbral el contador sigue creciendo y nunca vuelve a igualarlo.  El
+         * codigo C2 resultante NO lleva contador (terminal).  El frame C1 en
+         * curso termina en C1; las entradas futuras van al C2 via el swap.
+         * Los regs caller-saved que clobbea el call son seguros: el cuerpo aun
+         * no cargo ningun valor VM (vienen de proc->regs en memoria). */
+        if (tier_counter_addr != 0) {
+#if defined(_WIN32)
+            const MReg TU_ARG0 = MReg::RCX;
+            const MReg TU_ARG1 = MReg::RDX;
+#else
+            const MReg TU_ARG0 = MReg::RDI;
+            const MReg TU_ARG1 = MReg::RSI;
+#endif
+            const MLabelId tier_skip = mf.new_label();
+            const uint32_t cnt_idx = mf.intern_imm64(tier_counter_addr);
+            /* mov rax, &counter */
+            mf.blocks[prologue].instrs.push_back(MInstr::make_unary(MOp::MOV,
+                MOperand::make_reg(MReg::RAX),
+                MOperand::make_imm64_idx(cnt_idx)));
+            /* add qword [rax], 1 */
+            mf.blocks[prologue].instrs.push_back(MInstr::make_unary(MOp::ADD,
+                MOperand::make_mem(MReg::RAX, 0),
+                MOperand::make_imm32(1)));
+            /* cmp qword [rax], threshold */
+            mf.blocks[prologue].instrs.push_back(MInstr::make_unary(MOp::CMP,
+                MOperand::make_mem(MReg::RAX, 0),
+                MOperand::make_imm32(static_cast<int32_t>(opts_.tier_up_threshold))));
+            /* jne tier_skip */
+            mf.blocks[prologue].instrs.push_back(
+                MInstr::make_jcc(MCond::NE, tier_skip));
+            /* mov arg0, rbx (proc) */
+            mf.blocks[prologue].instrs.push_back(MInstr::make_unary(MOp::MOV,
+                MOperand::make_reg(TU_ARG0),
+                MOperand::make_reg(MReg::RBX)));
+            /* mov arg1, imm64(fn_pc) */
+            const uint32_t pc_idx = mf.intern_imm64(ic_fn_pc);
+            mf.blocks[prologue].instrs.push_back(MInstr::make_unary(MOp::MOV,
+                MOperand::make_reg(TU_ARG1),
+                MOperand::make_imm64_idx(pc_idx)));
+            /* mov rax, &handler */
+            const uint32_t h_idx = mf.intern_imm64(opts_.tier_up_handler_addr);
+            mf.blocks[prologue].instrs.push_back(MInstr::make_unary(MOp::MOV,
+                MOperand::make_reg(MReg::RAX),
+                MOperand::make_imm64_idx(h_idx)));
+            /* call rax */
+            {
+                MInstr tu_call;
+                tu_call.op = MOp::CALL;
+                tu_call.src1 = MOperand::make_reg(MReg::RAX);
+                mf.blocks[prologue].instrs.push_back(tu_call);
+            }
+            /* tier_skip: */
+            mf.blocks[prologue].instrs.push_back(
+                MInstr::make_label_def(tier_skip));
+        }
+
+        /* ===== callback-ABI: cargar ProcessVM* en RBX ===== */
+        if (cb_entry) {
+            /* Registros de args nativos en orden del ABI. */
+#if defined(_WIN32)
+            const MReg CB_ARG_REGS[] = {MReg::RCX, MReg::RDX, MReg::R8, MReg::R9};
+#else
+            const MReg CB_ARG_REGS[] = {MReg::RDI, MReg::RSI, MReg::RDX,
+                                        MReg::RCX, MReg::R8, MReg::R9};
+#endif
+            /* Si usamos el call-fallback, el call de LOAD_PROC clobbeara los
+             * registros de args nativos; spill-earlos AHORA (antes del call).
+             * En TLS-direct LOAD_PROC es un solo gs-mov a RBX que no toca los
+             * arg regs, asi que el spill no hace falta (se leen directo en el
+             * param-setup). */
+            if (cb_use_call) {
+                for (uint32_t i = 0; i < cb_n_reg_args; ++i) {
+                    mf.blocks[prologue].instrs.push_back(
+                        MInstr::make_unary(MOp::MOV,
+                            MOperand::make_mem(MReg::RBP, cb_spill_off(i)),
+                            MOperand::make_reg(CB_ARG_REGS[i])));
+                }
+            }
+            /* LOAD_PROC: RBX = ProcessVM* (TLS-direct o call fallback). */
+            const uint32_t getproc_idx =
+                mf.intern_imm64(opts_.callback_get_proc_addr);
+            mf.blocks[prologue].instrs.push_back(
+                MInstr::make_load_proc(MReg::RBX,
+                    opts_.callback_tls_gs_disp, getproc_idx));
         }
 
         /* Phase D.jit-mem-model VM-STACK: ALLOCAs ahora viven en VM-stack
@@ -957,6 +1248,98 @@ namespace jit {
             for (size_t i = 0; i < ir_fn.params.size() && i < MAX_REG_ARGS; ++i) {
                 store_op(mf, ir_fn.params[i], arg_regs[i]);
             }
+        } else if (cb_entry) {
+            /* ===== callback-ABI: mover args nativos a los homes de params =====
+             *
+             * Los args llegan por la convencion C nativa (regs + stack), NO en
+             * proc->registers.  Los movemos directo al home de cada param
+             * (slot stack o vreg, resuelto por el regalloc rewrite).
+             *
+             * En modo SAFE (cuerpo con CALL/raw_asm/etc.) ademas:
+             *   - salvamos proc->registers[0..15] al save area ANTES de
+             *     pisarlos (re-entrancia del callback);
+             *   - replicamos cada arg en proc->registers[R1+i] (para que
+             *     READ_VM_REG y el marshalling de CALLs vean los args);
+             *   - seteamos proc->registers[R15] = argc.
+             * En modo FAST (hoja pura) NO se toca proc->registers en absoluto. */
+#if defined(_WIN32)
+            const MReg CB_ARG_REGS[] = {MReg::RCX, MReg::RDX, MReg::R8, MReg::R9};
+#else
+            const MReg CB_ARG_REGS[] = {MReg::RDI, MReg::RSI, MReg::RDX,
+                                        MReg::RCX, MReg::R8, MReg::R9};
+#endif
+            const int32_t N_cs = static_cast<int32_t>(regalloc.callee_saved_used.size());
+            /* Offset (desde RBP) del arg nativo i cuando viaja en el stack del
+             * caller (i >= CB_N_REG_ARGS).  Deriva del layout de pushes:
+             *   [rbp], CS[N_cs-1..0], rbx, retaddr, [shadow Win64], stack-args. */
+            auto cb_caller_arg_off = [&](uint32_t i) -> int32_t {
+#if defined(_WIN32)
+                return 56 + 8 * N_cs + (static_cast<int32_t>(i) - 4) * 8;
+#else
+                return 24 + 8 * N_cs + (static_cast<int32_t>(i) - 6) * 8;
+#endif
+            };
+            /* Carga el arg i en SCRATCH_A (rax). */
+            auto cb_load_arg_to_rax = [&](uint32_t i) {
+                if (i < cb_n_reg_args) {
+                    if (cb_use_call) {
+                        mf.blocks[prologue].instrs.push_back(
+                            MInstr::make_unary(MOp::MOV, MOperand::make_reg(SCRATCH_A),
+                                MOperand::make_mem(MReg::RBP, cb_spill_off(i))));
+                    } else {
+                        mf.blocks[prologue].instrs.push_back(
+                            MInstr::make_unary(MOp::MOV, MOperand::make_reg(SCRATCH_A),
+                                MOperand::make_reg(CB_ARG_REGS[i])));
+                    }
+                } else {
+                    mf.blocks[prologue].instrs.push_back(
+                        MInstr::make_unary(MOp::MOV, MOperand::make_reg(SCRATCH_A),
+                            MOperand::make_mem(MReg::RBP, cb_caller_arg_off(i))));
+                }
+            };
+
+            /* SAFE: salvar proc->registers[0..15] al save area (rax scratch). */
+            if (cb_save_all) {
+                for (uint32_t r = 0; r < 16; ++r) {
+                    const int32_t reg_off =
+                        VESTA_PROC_REGISTERS_OFFSET + static_cast<int32_t>(r) * VESTA_REGISTER_SIZE;
+                    mf.blocks[prologue].instrs.push_back(
+                        MInstr::make_unary(MOp::MOV, MOperand::make_reg(SCRATCH_A),
+                            MOperand::make_mem(MReg::RBX, reg_off)));
+                    mf.blocks[prologue].instrs.push_back(
+                        MInstr::make_unary(MOp::MOV,
+                            MOperand::make_mem(MReg::RBP, cb_save_off(r)),
+                            MOperand::make_reg(SCRATCH_A)));
+                }
+            }
+
+            /* Mover args -> homes de params (+ proc->regs en modo safe). */
+            for (uint32_t i = 0; i < cb_argc; ++i) {
+                cb_load_arg_to_rax(i);
+                if (cb_save_all) {
+                    const int32_t reg_off = VESTA_PROC_REGISTERS_OFFSET
+                        + static_cast<int32_t>(i + 1) * VESTA_REGISTER_SIZE;
+                    mf.blocks[prologue].instrs.push_back(
+                        MInstr::make_unary(MOp::MOV,
+                            MOperand::make_mem(MReg::RBX, reg_off),
+                            MOperand::make_reg(SCRATCH_A)));
+                }
+                store_op(mf, ir_fn.params[i], SCRATCH_A);
+                mark_slot_as_gc_if_needed(ir_fn.params[i], ir::IrType::VOID);
+            }
+
+            /* SAFE: proc->registers[R15] = argc. */
+            if (cb_save_all) {
+                mf.blocks[prologue].instrs.push_back(
+                    MInstr::make_unary(MOp::MOV, MOperand::make_reg(SCRATCH_A),
+                        MOperand::make_imm32(static_cast<int32_t>(cb_argc))));
+                const int32_t r15_off =
+                    VESTA_PROC_REGISTERS_OFFSET + 15 * VESTA_REGISTER_SIZE;
+                mf.blocks[prologue].instrs.push_back(
+                    MInstr::make_unary(MOp::MOV,
+                        MOperand::make_mem(MReg::RBX, r15_off),
+                        MOperand::make_reg(SCRATCH_A)));
+            }
         } else {
             /* VM_ABI: los args bytecode viven en proc->registers.regs[1..N].
              * Cargar cada uno desde @c [rbx + REGISTERS_OFFSET + i*8] al
@@ -984,10 +1367,16 @@ namespace jit {
             }
         }
 
-        /* Jump al primer IR block (entry). */
-        if (!ir_fn.blocks.empty()) {
-            mf.blocks[prologue].instrs.push_back(MInstr::make_jmp(block_labels[0]));
-        }
+        /* Jump al primer IR block (entry).
+         *
+         * Optimizacion: el bloque entry (block_labels[0]) se crea SIEMPRE
+         * justo despues del prologo (es @c mf.blocks[prologue+1]), asi que el
+         * encoder lo emite contiguo -> el salto es un fall-through y el
+         * `jmp` es redundante (5 bytes + 1 branch por invocacion).  Lo
+         * omitimos; el prologo cae directo al primer bloque.  El label del
+         * entry sigue definido, asi que cualquier back-edge que salte a el
+         * (loop header) sigue resolviendo.  Aplica a todos los modos. */
+        (void)block_labels;
 
         /* Lower cada IR block. */
         for (size_t bi = 0; bi < ir_fn.blocks.size(); ++bi) {
@@ -2061,6 +2450,22 @@ namespace jit {
                                         MOperand::make_reg(MReg::RAX),
                                         MOperand::make_mem(MReg::RBX,
                                             VESTA_PROC_REGISTERS_OFFSET)));
+                                /* callback-ABI safe: restaurar el banco VM
+                                 * salvado en el prologo (re-entrancia).  RAX
+                                 * (return) intacto; usamos SCRATCH_B. */
+                                if (cb_entry && cb_save_all) {
+                                    for (uint32_t r = 0; r < 16; ++r) {
+                                        const int32_t reg_off = VESTA_PROC_REGISTERS_OFFSET
+                                            + static_cast<int32_t>(r) * VESTA_REGISTER_SIZE;
+                                        mf.blocks.back().instrs.push_back(
+                                            MInstr::make_unary(MOp::MOV, MOperand::make_reg(SCRATCH_B),
+                                                MOperand::make_mem(MReg::RBP, cb_save_off(r))));
+                                        mf.blocks.back().instrs.push_back(
+                                            MInstr::make_unary(MOp::MOV,
+                                                MOperand::make_mem(MReg::RBX, reg_off),
+                                                MOperand::make_reg(SCRATCH_B)));
+                                    }
+                                }
                                 /* Restaurar VM-RSP si modificamos vm_stack. */
                                 if (fn_has_alloca) {
                                     mf.blocks.back().instrs.push_back(
@@ -2920,6 +3325,36 @@ namespace jit {
                                 MOperand::make_reg(MReg::RAX),
                                 MOperand::make_imm64_idx(fn_pool_idx)));
 
+                        /* Win64 shadow space (home space) en call sites de
+                         * funciones con host-ALLOCAs.
+                         *
+                         * El callee nativo puede spillar sus args registrados a
+                         * los 32 bytes de "home space" en [rsp, rsp+32).  El
+                         * prologo reserva esos 32 bytes al fondo del frame, PERO
+                         * un ALLOCA host (`sub rsp, N`) mueve rsp por debajo de
+                         * ese fondo, dejando el home space del callee SOLAPADO
+                         * con los datos del ALLOCA -> el spill los corrompe.
+                         * (Sintoma: el array de qsort sobrescrito con punteros/
+                         *  PCs cuando el callback compile -- C++ pesado -- spillaba
+                         *  fn_pc al home space que pisaba el array.)
+                         *
+                         * Fix: reservar 32 bytes frescos justo antes del call y
+                         * liberarlos despues, SOLO cuando la fn tiene host-ALLOCAs
+                         * (sino el home del prologo es valido).  0x20 = multiplo
+                         * de 16 -> preserva el alignment del rsp.  SysV no tiene
+                         * home space, asi que es no-op fuera de Win64. */
+#if defined(_WIN32)
+                        const bool cn_need_shadow = fn_has_alloca;
+                        if (cn_need_shadow) {
+                            mf.blocks.back().instrs.push_back(
+                                MInstr::make_unary(MOp::SUB,
+                                    MOperand::make_reg(MReg::RSP),
+                                    MOperand::make_imm32(0x20)));
+                        }
+#else
+                        const bool cn_need_shadow = false;
+#endif
+
                         /* CALL rax + stackmap (el plugin nativo podria
                          * triggear GC indirectamente). */
                         MInstr call_instr;
@@ -2927,6 +3362,13 @@ namespace jit {
                         call_instr.src1 = MOperand::make_reg(MReg::RAX);
                         emit_stackmap_for_safepoint(call_instr);
                         mf.blocks.back().instrs.push_back(call_instr);
+
+                        if (cn_need_shadow) {
+                            mf.blocks.back().instrs.push_back(
+                                MInstr::make_unary(MOp::ADD,
+                                    MOperand::make_reg(MReg::RSP),
+                                    MOperand::make_imm32(0x20)));
+                        }
 
                         /* Resultado en RAX -> slot del dst. */
                         if (ins.dst != ir::IR_NO_VALUE) {
@@ -3038,7 +3480,7 @@ namespace jit {
                          */
                         uint64_t ic_slot_addr = 0;
                         if (opts_.reserve_ic_slot) {
-                            ic_slot_addr = opts_.reserve_ic_slot();
+                            ic_slot_addr = opts_.reserve_ic_slot(next_ic_key());
                         }
                         if (ic_slot_addr != 0 && opts_.runtime
                          && opts_.runtime->callvirt_ic) {
@@ -3337,15 +3779,65 @@ namespace jit {
                                 MOperand::make_mem(MReg::RBX, regs_base + 15 * 8),
                                 MOperand::make_imm32(static_cast<int32_t>(nargs + 1))));
 
+                        /* INLINE CALLM DISPATCH (Phase D.8): el metodo ya esta
+                         * RESUELTO en operands[1] (por un FINDMETHOD previo) ->
+                         * no hay vtable walk como en CALLVIRT.  En vez de llamar
+                         * a vrt_callm (que re-setea regs[1] + on-demand-compile +
+                         * enter_jit por iteracion -- ~150ns en pic_real, 115x vs
+                         * C++), inline: cargar method->jit_code; si != null y sin
+                         * advice -> CALL DIRECTO (los args ya estan en
+                         * proc->registers, staged arriba); si no -> fallback a
+                         * vrt_callm.  Mismo patron que el inline de CALLVIRT. */
+                        const MLabelId cm_fallback = mf.new_label();
+                        const MLabelId cm_continue = mf.new_label();
+                        /* mov rcx, method (operands[1]) */
+                        load_op_rematerializable(mf, ir_fn, ins.operands[1], MReg::RCX);
+                        /* test rcx; jz fallback (method null) */
+                        mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::TEST,
+                            MOperand::make_reg(MReg::RCX),
+                            MOperand::make_reg(MReg::RCX)));
+                        mf.blocks.back().instrs.push_back(
+                            MInstr::make_jcc(MCond::E, cm_fallback));
+                        /* mov rax, [rcx + ADVICE_CHAIN_OFFSET]; test rax; jnz fallback
+                         * (AOP: si el metodo tiene advices, el fast path inline no
+                         * los aplica -> caer al slow path vrt_callm). */
+                        mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                            MOperand::make_reg(MReg::RAX),
+                            MOperand::make_mem(MReg::RCX, VESTA_METHODINFO_ADVICE_CHAIN_OFFSET)));
+                        mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::TEST,
+                            MOperand::make_reg(MReg::RAX),
+                            MOperand::make_reg(MReg::RAX)));
+                        mf.blocks.back().instrs.push_back(
+                            MInstr::make_jcc(MCond::NE, cm_fallback));
+                        /* mov rax, [rcx + JIT_CODE_OFFSET]; test rax; jz fallback */
+                        mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                            MOperand::make_reg(MReg::RAX),
+                            MOperand::make_mem(MReg::RCX, VESTA_METHODINFO_JIT_CODE_OFFSET)));
+                        mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::TEST,
+                            MOperand::make_reg(MReg::RAX),
+                            MOperand::make_reg(MReg::RAX)));
+                        mf.blocks.back().instrs.push_back(
+                            MInstr::make_jcc(MCond::E, cm_fallback));
+                        /* FAST PATH: mov rcx, rbx (proc); call rax (jit_code).
+                         * Los args ya estan en proc->registers (staged arriba);
+                         * el metodo VM_ABI los lee. */
+                        mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                            MOperand::make_reg(MReg::RCX),
+                            MOperand::make_reg(MReg::RBX)));
+                        {
+                            MInstr fast_call;
+                            fast_call.op = MOp::CALL;
+                            fast_call.src1 = MOperand::make_reg(MReg::RAX);
+                            emit_stackmap_for_safepoint(fast_call);
+                            mf.blocks.back().instrs.push_back(fast_call);
+                        }
+                        mf.blocks.back().instrs.push_back(MInstr::make_jmp(cm_continue));
+
+                        /* fallback: vrt_callm(proc, obj, method). */
+                        mf.blocks.back().instrs.push_back(MInstr::make_label_def(cm_fallback));
                         /* Native ABI: arg0=proc(rbx), arg1=obj_payload, arg2=method_ptr.
-                         *
-                         * BUG FIX 2026-05-16: usar R10/R11 (caller-saved, no
-                         * arg regs) como temporales para evitar clobber.  El
-                         * codigo anterior usaba SCRATCH_C=RDX que ES cm_arg1
-                         * (Win64) o cm_arg2 (SysV) -- al mov-ear arg1 desde
-                         * RAX, sobrescribia RDX (method) antes de pasarlo
-                         * como arg2.  Resultado: vrt_callm(proc, obj, obj)
-                         * en vez de (proc, obj, method) -> retornaba 0. */
+                         * R10/R11 (caller-saved, no arg regs) como temporales para
+                         * evitar clobber (RDX es cm_arg1 Win64 / cm_arg2 SysV). */
                         load_op_rematerializable(mf, ir_fn, ins.operands[0], MReg::R10);  /* obj host_ptr */
                         load_op_rematerializable(mf, ir_fn, ins.operands[1], MReg::R11);  /* method ptr */
 #if defined(_WIN32)
@@ -3381,6 +3873,9 @@ namespace jit {
                         cm_call.src1 = MOperand::make_reg(MReg::RAX);
                         emit_stackmap_for_safepoint(cm_call);
                         mf.blocks.back().instrs.push_back(cm_call);
+
+                        /* continue: ambos paths convergen con resultado en RAX. */
+                        mf.blocks.back().instrs.push_back(MInstr::make_label_def(cm_continue));
                         if (ins.dst != ir::IR_NO_VALUE) {
                             store_op(mf, ins.dst, MReg::RAX);
                         }
@@ -3649,8 +4144,37 @@ namespace jit {
                         }
                         /* VM_ABI: ademas escribir RAX a proc->registers.regs[0]
                          * para que el caller bytecode/interprete vea el return.
-                         * NATIVE_ABI: nada extra, return en RAX como convencion C. */
-                        if (opts_.mode == SelectorMode::VM_ABI) {
+                         * NATIVE_ABI: nada extra, return en RAX como convencion C.
+                         * callback-ABI: el return va en RAX (convencion C) y NO
+                         * se escribe proc->regs[R0]; en su lugar se restaura el
+                         * banco VM salvado (re-entrancia).  Todo con SCRATCH_B
+                         * (rcx) para preservar RAX. */
+                        if (cb_entry) {
+                            /* SAFE: restaurar proc->registers[0..15] del save area. */
+                            if (cb_save_all) {
+                                for (uint32_t r = 0; r < 16; ++r) {
+                                    const int32_t reg_off = VESTA_PROC_REGISTERS_OFFSET
+                                        + static_cast<int32_t>(r) * VESTA_REGISTER_SIZE;
+                                    mf.blocks.back().instrs.push_back(
+                                        MInstr::make_unary(MOp::MOV, MOperand::make_reg(SCRATCH_B),
+                                            MOperand::make_mem(MReg::RBP, cb_save_off(r))));
+                                    mf.blocks.back().instrs.push_back(
+                                        MInstr::make_unary(MOp::MOV,
+                                            MOperand::make_mem(MReg::RBX, reg_off),
+                                            MOperand::make_reg(SCRATCH_B)));
+                                }
+                            }
+                            /* Restaurar VM-RSP si la fn uso ALLOCAs. */
+                            if (fn_has_alloca) {
+                                mf.blocks.back().instrs.push_back(
+                                    MInstr::make_unary(MOp::MOV, MOperand::make_reg(SCRATCH_B),
+                                        MOperand::make_mem(MReg::RBP, vm_rsp_save_off)));
+                                mf.blocks.back().instrs.push_back(
+                                    MInstr::make_unary(MOp::MOV,
+                                        MOperand::make_mem(MReg::RBX, VESTA_PROC_STACK_POINTER_OFFSET),
+                                        MOperand::make_reg(SCRATCH_B)));
+                            }
+                        } else if (opts_.mode == SelectorMode::VM_ABI) {
                             mf.blocks.back().instrs.push_back(
                                 MInstr::make_unary(MOp::MOV,
                                     MOperand::make_mem(MReg::RBX,
@@ -5160,7 +5684,7 @@ namespace jit {
                                                             /* Inline cache: reservar 8 bytes en
                                                              * code cache, init a 0.  Primera vez
                                                              * popula via vm_read_u64; despues hot path. */
-                                                            const uint64_t ic = opts_.reserve_ic_slot();
+                                                            const uint64_t ic = opts_.reserve_ic_slot(0);
                                                             if (ic) {
                                                                 /* mov r10, ic_slot_addr */
                                                                 staged.push_back(MInstr::make_unary(MOp::MOV,
@@ -5846,6 +6370,21 @@ namespace jit {
                                  * con el exc handle).  4-7 instrucciones segun
                                  * regalloc.callee_saved_used + modo VM_ABI. */
                                 auto stage_function_epilogue = [&]() {
+                                    /* callback-ABI safe: restaurar el banco VM
+                                     * salvado antes de desmontar el frame (rbx
+                                     * y rbp aun validos aqui).  SCRATCH_B=rcx. */
+                                    if (cb_entry && cb_save_all) {
+                                        for (uint32_t r = 0; r < 16; ++r) {
+                                            const int32_t reg_off = VESTA_PROC_REGISTERS_OFFSET
+                                                + static_cast<int32_t>(r) * VESTA_REGISTER_SIZE;
+                                            staged.push_back(MInstr::make_unary(MOp::MOV,
+                                                MOperand::make_reg(SCRATCH_B),
+                                                MOperand::make_mem(MReg::RBP, cb_save_off(r))));
+                                            staged.push_back(MInstr::make_unary(MOp::MOV,
+                                                MOperand::make_mem(MReg::RBX, reg_off),
+                                                MOperand::make_reg(SCRATCH_B)));
+                                        }
+                                    }
                                     /* mov rsp, rbp */
                                     staged.push_back(MInstr::make_unary(MOp::MOV,
                                         MOperand::make_reg(MReg::RSP),
@@ -6272,48 +6811,26 @@ namespace jit {
                         break;
                     }
 
-                    /* PANIC: lanza FatalError(USER_ABORT, msg).  CALL
-                     * vrt_panic_str(proc, msg_vaddr, msg_len).  Mismo path
-                     * que el opcode bytecode panic. */
+                    /* PANIC: lanza FatalError(USER_ABORT, msg).
+                     *
+                     * BugFix JIT-exc (2026-06-06): se BAILA a interp.  El path
+                     * JIT de panic (CALL vrt_panic_str -> throw_fatal) requiere
+                     * desenrollar el frame JIT-eado durante el unwind hacia el
+                     * catch del caller; cuando el caller es interp (o cruza la
+                     * frontera JIT<->interp) ese unwind tiene un crash flaky
+                     * (~20% de runs, no determinista) por limpieza incorrecta
+                     * del frame.  panic() es un error path (NUNCA hot), asi que
+                     * forzar la funcion a interp -- donde el unwind via
+                     * setjmp/longjmp es robusto -- no cuesta performance y
+                     * elimina el crash.  El unwind nativo de frames JIT-eados
+                     * es trabajo de Phase G (.pdata/.eh_frame); hasta entonces
+                     * las funciones que lanzan se quedan en interp. */
                     case ir::IrOp::PANIC: {
-                        if (ins.operands.size() < 2) {
-                            warn_unsupported(ins.op, ins.source_line,
-                                "PANIC: requiere 2 operandos (msg_addr, msg_len)");
-                            unsupported = true;
-                            mf.blocks.back().instrs.push_back(
-                                {MOp::INT3, 0, 0, 0, {}, {}, {}});
-                            break;
-                        }
-                        const uint64_t fn_addr = opts_.runtime
-                            ? reinterpret_cast<uint64_t>(opts_.runtime->panic_str) : 0;
-                        if (fn_addr == 0) {
-                            warn_unsupported(ins.op, ins.source_line,
-                                "runtime->panic_str no resuelto");
-                            unsupported = true;
-                            mf.blocks.back().instrs.push_back(
-                                {MOp::INT3, 0, 0, 0, {}, {}, {}});
-                            break;
-                        }
-                    #if defined(_WIN32)
-                        const MReg arg0 = MReg::RCX, arg1 = MReg::RDX, arg2 = MReg::R8;
-                    #else
-                        const MReg arg0 = MReg::RDI, arg1 = MReg::RSI, arg2 = MReg::RDX;
-                    #endif
-                        load_op_rematerializable(mf, ir_fn, ins.operands[0], arg1);  /* msg_vaddr */
-                        load_op_rematerializable(mf, ir_fn, ins.operands[1], arg2);  /* msg_len */
-                        mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
-                            MOperand::make_reg(arg0), MOperand::make_reg(MReg::RBX)));
-                        const uint32_t fn_idx = mf.intern_imm64(fn_addr);
-                        mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
-                            MOperand::make_reg(MReg::RAX),
-                            MOperand::make_imm64_idx(fn_idx)));
-                        {
-                            MInstr ic;
-                            ic.op = MOp::CALL;
-                            ic.src1 = MOperand::make_reg(MReg::RAX);
-                            emit_stackmap_for_safepoint(ic);
-                            mf.blocks.back().instrs.push_back(ic);
-                        }
+                        warn_unsupported(ins.op, ins.source_line,
+                            "PANIC: bail a interp (unwind JIT->catch no robusto)");
+                        unsupported = true;
+                        mf.blocks.back().instrs.push_back(
+                            {MOp::INT3, 0, 0, 0, {}, {}, {}});
                         break;
                     }
 
@@ -6330,9 +6847,15 @@ namespace jit {
                                 {MOp::INT3, 0, 0, 0, {}, {}, {}});
                             break;
                         }
-                        const uint64_t fn_addr = (ins.op == ir::IrOp::GC_ALLOC)
-                            ? (opts_.runtime ? reinterpret_cast<uint64_t>(opts_.runtime->gc_alloc) : 0)
-                            : (opts_.runtime ? reinterpret_cast<uint64_t>(opts_.runtime->gc_alloc_payload) : 0);
+                        /* BUG FIX (2026-06-05): GC_ALLOC y GC_ALLOCP bajan AMBOS
+                         * a `gcallocp` en el ir_emitter -> host_ptr al PAYLOAD.
+                         * El mapeo previo GC_ALLOC->gc_alloc devolvia un HANDLE
+                         * (uint32) que el IR usaba como host_ptr -> store a un
+                         * valor pequeno (1,2,..) = segfault (64_curry/102/167).
+                         * Ambos deben usar gc_alloc_payload. */
+                        const uint64_t fn_addr = opts_.runtime
+                            ? reinterpret_cast<uint64_t>(opts_.runtime->gc_alloc_payload)
+                            : 0;
                         if (fn_addr == 0) {
                             warn_unsupported(ins.op, ins.source_line,
                                 "runtime->gc_alloc[/_payload] no resuelto");
@@ -6542,7 +7065,7 @@ namespace jit {
                         uint64_t str_ic_slot = 0;
                         MLabelId ic_hit_label = 0, ic_miss_label = 0, ic_done_label = 0;
                         if (use_ic) {
-                            str_ic_slot = opts_.reserve_ic_slot();
+                            str_ic_slot = opts_.reserve_ic_slot(0);
                             use_ic = (str_ic_slot != 0);
                         }
                         if (use_ic) {
@@ -7735,6 +8258,171 @@ namespace jit {
                     out.push_back(cur);
                 }
                 block.instrs = std::move(out);
+            }
+        }
+
+        /* ===== Peephole: copy coalescing (Intel front-end: reducir mov chains) =====
+         *
+         * El template C1 enruta casi todo por un scratch (RAX/RCX/RDX): un
+         * valor se carga al scratch y luego se mueve a su destino.  Tras el
+         * regalloc rewrite eso deja cadenas `mov SCRATCH, X ; mov Y, SCRATCH`
+         * (reg->scratch->reg).  Si SCRATCH esta MUERTO tras el segundo mov (lo
+         * habitual: la siguiente op lo reescribe), colapsamos a `mov Y, X`.
+         * Cada mov eliminado es 1 uop menos en el front-end (decode + rename),
+         * sin tocar el regalloc.  Es el patron que el comparator de qsort
+         * repetia ~5 veces.
+         *
+         * Seguridad (liveness local conservadora del scratch):
+         *   - cur  = `mov SCRATCH, SRC`, SCRATCH in {RAX,RCX,RDX}, ancho == nxt.
+         *   - nxt  = `mov DST, SCRATCH` (src1 == SCRATCH).
+         *   - SCRATCH muerto tras nxt: escaneo forward; el primer toque debe
+         *     ser una RE-DEFINICION pura (un MOV cuyo dst es SCRATCH y que no
+         *     lee SCRATCH).  Cualquier LECTURA de SCRATCH, un dst==SCRATCH de
+         *     una op RMW (lee+escribe), o un borde (CALL/JMP/JCC/RET/LABEL/
+         *     SAFEPOINT/LOAD_PROC/IDIV/CQO) o fin de bloque antes del re-def
+         *     -> conservador: NO colapsar.
+         *   - No `mov mem, mem` (si SRC es MEM y DST es MEM, saltar). */
+        {
+            auto cc_is_scratch = [](uint8_t r) -> bool {
+                return r == static_cast<uint8_t>(MReg::RAX)
+                    || r == static_cast<uint8_t>(MReg::RCX)
+                    || r == static_cast<uint8_t>(MReg::RDX);
+            };
+            auto cc_reads = [](const MOperand &o, uint8_t r) -> bool {
+                if (o.kind == MOperandKind::REG) return o.reg == r;
+                if (o.kind == MOperandKind::MEM)
+                    return o.mem_base() == static_cast<MReg>(r)
+                        || o.mem_index() == static_cast<MReg>(r);
+                return false;
+            };
+            for (auto &block : mf.blocks) {
+                std::vector<MInstr> out;
+                out.reserve(block.instrs.size());
+                const size_t n = block.instrs.size();
+                for (size_t i = 0; i < n; ++i) {
+                    if (i + 1 < n) {
+                        const MInstr &cur = block.instrs[i];
+                        const MInstr &nxt = block.instrs[i + 1];
+                        /* nxt.dst, si es MEM, NO debe usar SCRATCH en su
+                         * direccion (base/index): `mov [scr+off], scr` usa scr
+                         * como direccion Y como valor; al eliminar el def de
+                         * scr la direccion quedaria rota. */
+                        const bool nxt_dst_uses_scr =
+                            nxt.dst.kind == MOperandKind::MEM
+                            && (nxt.dst.mem_base() == static_cast<MReg>(cur.dst.reg)
+                             || nxt.dst.mem_index() == static_cast<MReg>(cur.dst.reg));
+                        /* Combos INVALIDOS al destino MEM: x86 no tiene
+                         * `mov mem, mem` ni `mov mem, imm64`.  Solo se permite
+                         * mov [mem] desde REG o IMM32. */
+                        const bool nxt_dst_mem_bad =
+                            nxt.dst.kind == MOperandKind::MEM
+                            && (cur.src1.kind == MOperandKind::MEM
+                             || cur.src1.kind == MOperandKind::IMM64_IDX);
+                        const bool shape =
+                            cur.op == MOp::MOV
+                            && cur.dst.kind == MOperandKind::REG
+                            && cc_is_scratch(cur.dst.reg)
+                            && nxt.op == MOp::MOV
+                            && nxt.src1.kind == MOperandKind::REG
+                            && nxt.src1.reg == cur.dst.reg
+                            && cur.dst.width == nxt.src1.width
+                            && !nxt_dst_uses_scr
+                            && !nxt_dst_mem_bad;
+                        if (shape) {
+                            const uint8_t scr = cur.dst.reg;
+                            bool dead = false;
+                            for (size_t j = i + 2; j < n; ++j) {
+                                const MInstr &L = block.instrs[j];
+                                bool reads = cc_reads(L.src1, scr)
+                                          || cc_reads(L.src2, scr);
+                                if (L.dst.kind == MOperandKind::MEM
+                                 && cc_reads(L.dst, scr)) reads = true;
+                                const bool pure_write =
+                                    L.op == MOp::MOV
+                                    && L.dst.kind == MOperandKind::REG
+                                    && L.dst.reg == scr
+                                    && !reads;
+                                /* dst==scr de una op no-MOV (RMW) -> lee scr. */
+                                if (L.dst.kind == MOperandKind::REG
+                                 && L.dst.reg == scr && !pure_write) reads = true;
+                                if (reads) { dead = false; break; }
+                                if (pure_write) { dead = true; break; }
+                                if (L.op == MOp::CALL || L.op == MOp::CALL_ABS
+                                 || L.op == MOp::JMP || L.op == MOp::JCC
+                                 || L.op == MOp::RET || L.op == MOp::LABEL_DEF
+                                 || L.op == MOp::SAFEPOINT || L.op == MOp::LOAD_PROC
+                                 || L.op == MOp::IDIV || L.op == MOp::CQO) {
+                                    dead = false; break;
+                                }
+                            }
+                            if (dead) {
+                                MInstr c;
+                                c.op = MOp::MOV;
+                                c.dst = nxt.dst;
+                                c.dst.width = nxt.dst.width;
+                                c.src1 = cur.src1;
+                                c.source_pc = nxt.source_pc;
+                                out.push_back(c);
+                                ++i;  /* consume cur + nxt */
+                                continue;
+                            }
+                        }
+                    }
+                    out.push_back(block.instrs[i]);
+                }
+                block.instrs = std::move(out);
+            }
+        }
+
+        /* ===== callback-ABI win: elidir LOAD_PROC muerto =====
+         *
+         * En un callback hoja (fast mode), el prologo carga @c ProcessVM* en
+         * RBX via @c LOAD_PROC (una lectura TLS gs:[disp]).  Pero si el cuerpo
+         * NUNCA usa RBX -- p.ej. un comparator de qsort que solo hace loads
+         * NATIVOS sobre sus args -- esa lectura es codigo muerto.
+         *
+         * La eliminamos escaneando el codigo FINAL (post-regalloc; el regalloc
+         * nunca asigna RBX, reservado para proc) en busca de cualquier
+         * referencia a RBX que NO sea el setup (push rbx / LOAD_PROC / pop rbx).
+         * Si no hay ninguna, borramos el @c LOAD_PROC del prologo.  El
+         * @c push rbx / @c pop rbx se MANTIENEN (preservan el alignment del
+         * frame y dejan RBX intacto = valor del caller).  Ahorra una lectura
+         * TLS por invocacion (~5 ciclos x millones de llamadas en qsort/
+         * wndproc).  Si el cuerpo SI usa RBX (LOAD/STORE de VM-addr, ALLOCA,
+         * GETPROC, safepoint en un back-edge, GETFIELD...), el scan lo detecta
+         * y conserva el LOAD_PROC -> correcto. */
+        if (cb_entry && !cb_save_all) {
+            auto uses_rbx = [](const MOperand &o) -> bool {
+                if (o.kind == MOperandKind::REG)
+                    return o.reg == static_cast<uint8_t>(MReg::RBX);
+                if (o.kind == MOperandKind::MEM)
+                    return o.mem_base() == MReg::RBX || o.mem_index() == MReg::RBX;
+                return false;
+            };
+            bool rbx_used = false;
+            for (const auto &blk : mf.blocks) {
+                for (const auto &mi : blk.instrs) {
+                    if (mi.op == MOp::LOAD_PROC) continue;       /* el def que evaluamos */
+                    if (mi.op == MOp::PUSH && mi.src1.kind == MOperandKind::REG
+                        && mi.src1.reg == static_cast<uint8_t>(MReg::RBX)) continue;
+                    if (mi.op == MOp::POP && mi.dst.kind == MOperandKind::REG
+                        && mi.dst.reg == static_cast<uint8_t>(MReg::RBX)) continue;
+                    if (uses_rbx(mi.dst) || uses_rbx(mi.src1) || uses_rbx(mi.src2)) {
+                        rbx_used = true;
+                        break;
+                    }
+                }
+                if (rbx_used) break;
+            }
+            if (!rbx_used) {
+                std::vector<MInstr> kept;
+                auto &pb = mf.blocks[prologue].instrs;
+                kept.reserve(pb.size());
+                for (auto &mi : pb) {
+                    if (mi.op == MOp::LOAD_PROC) continue;       /* elidir */
+                    kept.push_back(mi);
+                }
+                pb = std::move(kept);
             }
         }
 

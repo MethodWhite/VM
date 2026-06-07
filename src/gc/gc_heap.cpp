@@ -339,13 +339,61 @@ namespace gc {
         GcHandle local = ptr_to_handle_.find(host_payload_ptr);
         if (local != GC_NULL_HANDLE) return local;
 
-        // Phase Z.6: si no esta en el mapa local, puede ser un objeto
-        // del @c SharedHeap.  Su handle (con bit 31 set) se guarda en
-        // @c ObjectHeader.hash_code al alocar (exec_instr_newobjs).
-        // Leer el handle directo desde el header del objeto.
-        // El cast aqui es legal porque @c host_payload_ptr apunta al
-        // inicio del @c ObjectHeader por construccion (mismo offset
-        // que devolveria @c SharedHandleTable::lookup).
+        // BugFix C (2026-06-04): el lookup secundario en SharedHeap
+        // dereferencia @c host_payload_ptr como @c ObjectHeader*.  Si el
+        // ptr no es memoria GC valida (e.g. el bytecode emite gchandle
+        // sobre un i32 value reusado en el mismo reg por el regalloc,
+        // patron del bug C del editor), ese deref es SEGV.  Hay que
+        // validar PRIMERO que el ptr cae dentro del rango de algun bloque
+        // del SharedHeap antes de dereferenciar.  Si no esta en ningun
+        // bloque GC conocido, retornar GC_NULL_HANDLE sin tocar memoria.
+        //
+        // Defensa adicional: verificar alineamiento minimo (host_ptr GC
+        // siempre alineado a 8 bytes via alloc).  Un value que aparenta
+        // ser ptr pero no esta alineado nunca puede ser un payload valido.
+        const uintptr_t ptr_addr = reinterpret_cast<uintptr_t>(host_payload_ptr);
+        if ((ptr_addr & 7) != 0) return GC_NULL_HANDLE;  // no-alineado: no es GC
+
+        // Verificar que el ptr esta dentro de algun bloque GC conocido
+        // (Nursery o cualquier old_block).  Sin esto, deref de basura.
+        bool in_gc = false;
+        if (host_payload_ptr >= nursery_base_
+         && host_payload_ptr < nursery_end_) {
+            in_gc = true;
+        } else {
+            for (const auto &block : old_blocks_) {
+                const uint8_t *block_end = block.ptr + block.bump_offset;
+                if (host_payload_ptr >= block.ptr
+                 && host_payload_ptr < block_end) {
+                    in_gc = true;
+                    break;
+                }
+            }
+        }
+        // Phase Z (fix 2026-06-05): un objeto del @c SharedHeap (cross-process)
+        // tiene su host_ptr en los chunks del SharedHeap, NO en el heap local
+        // (nursery/old_blocks).  Si @c contains() confirma que el ptr cae en el
+        // SharedHeap, permitir el deref + resolucion del handle shared abajo.
+        //
+        // Sin esto, el save/restore de registros vivos a traves de un CALL
+        // (gchandle %p -> handle; ...; gcderef handle -> %p) sobre un host_ptr
+        // SHARED devolvia GC_NULL_HANDLE (el ptr no esta en el heap local) ->
+        // el restore hacia gcderef(NULL_HANDLE=0xFFFFFFFF) -> shared lookup de
+        // 0xFFFFFFFF -> nullptr -> el host_ptr quedaba a 0 -> store a [0+offset]
+        // = SEGV.  Reproducible con 2+ objetos shared vivos a traves de un call
+        // y luego escritura a sus fields (a.v=10; b.v=20).
+        if (!in_gc && owner_proc_ != nullptr
+         && owner_proc_->scheduler.vm_reference
+                .shared_heap.contains(host_payload_ptr)) {
+            in_gc = true;
+        }
+        if (!in_gc) return GC_NULL_HANDLE;
+
+        // Phase Z.6: si no esta en el mapa local pero SI esta en un
+        // bloque GC (local o SharedHeap), puede ser un objeto del
+        // @c SharedHeap cuyo @c ObjectHeader.hash_code lleva bit 31 set.
+        // Ahora es seguro hacer el deref porque sabemos que el ptr es
+        // memoria GC valida.
         const auto *hdr = reinterpret_cast<const loader::ObjectHeader *>(
             host_payload_ptr);
         const uint32_t maybe_shared = hdr->hash_code;

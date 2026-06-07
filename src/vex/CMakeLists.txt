@@ -27,6 +27,7 @@ add_library(vex_lib STATIC
     compiler_project.cpp
     mermaid_diagrams.cpp
     graphviz_diagrams.cpp
+    html_diagrams.cpp
     comptime_introspect.cpp
     # Sistema de modulos.
     module_resolver.cpp

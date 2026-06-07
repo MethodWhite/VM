@@ -28,6 +28,20 @@ public class SnapshotStack {
         this.count    = 0;
     }
 
+    // Libera todos los `data` activos + el array de slots al destruir
+    // la pila.  Sin esto, cerrar el editor con undos pendientes deja
+    // bytes huerfanos en el heap raw del proceso.
+    public ~SnapshotStack() {
+        if (this.slots != null) {
+            i32 i = 0;
+            while (i < this.count) {
+                if (this.slots[i].data != null) free(this.slots[i].data);
+                i = i + 1;
+            }
+            free(this.slots);
+        }
+    }
+
     public i32 size() { return this.count; }
     public i32 empty() {
         if (this.count == 0) return 1;

@@ -95,6 +95,36 @@ namespace jit {
      * selector.  MachineIR es agnostico; aqui solo definimos
      * el espacio de regs disponibles.
      */
+    /**
+     * @enum RegClass
+     * @brief Clase de un registro (virtual o fisico).  Phase D.7.
+     *
+     * El register allocator asigna cada clase de forma INDEPENDIENTE: un
+     * vreg GP solo puede ir a un fisico GP, un vreg FP solo a un fisico FP.
+     * Esto deja preparado el banco de coma flotante/vector (XMM en x86,
+     * NEON en ARM) sin reescribir el core: anyadir floats = registrar la
+     * clase FP con sus fisicos.  En D.7 v1 solo se asignan registros GP;
+     * los valores float siguen con memory-roundtrip hasta la fase XMM.
+     */
+    enum class RegClass : uint8_t {
+        GP    = 0,  ///< proposito general: enteros y punteros (RAX..R15 / X0..X30 / ...)
+        FP    = 1,  ///< coma flotante / vector (XMM / NEON / ...) -- reservado en v1
+        COUNT = 2   ///< numero de clases (para dimensionar tablas del TargetRegInfo)
+    };
+
+    /**
+     * @enum AbiKind
+     * @brief Convencion con la que se genera el prologue/epilogue y el paso de
+     *        argumentos de una funcion JIT (Phase D.7).
+     */
+    enum class AbiKind : uint8_t {
+        HOST_LEAF = 0,  ///< funcion hoja host: args en arg_regs, return en RAX
+                        ///< (tests aislados).
+        VM        = 1   ///< VM_ABI: @c ProcessVM* en RCX(Win64)/RDI(SysV), args
+                        ///< en @c proc->registers.regs[1..N], return en regs[0].
+                        ///< RBX = @c ProcessVM* durante toda la funcion.
+    };
+
     enum class MReg : uint8_t {
         /* GP 64-bit */
         RAX = 0, RCX = 1, RDX = 2, RBX = 3,
@@ -166,7 +196,8 @@ namespace jit {
         IMM64_IDX = 3,  ///< imm64 via indice a @c MFunction::imm64_pool
         MEM       = 4,  ///< memoria: base + index*scale + disp32
         LABEL     = 5,  ///< label_id (para JMP/JCC/CALL relativos)
-        REL_RT    = 6   ///< runtime entry slot (puntero resuelto en link)
+        REL_RT    = 6,  ///< runtime entry slot (puntero resuelto en link)
+        VREG      = 7   ///< registro VIRTUAL (Phase D.7): id en @c value, clase en @c flags
     };
 
     /**
@@ -237,6 +268,34 @@ namespace jit {
             MOperand o; o.kind = MOperandKind::LABEL;
             o.value = static_cast<int32_t>(label_id);
             return o;
+        }
+
+        /**
+         * @brief Construye un operando de registro VIRTUAL (Phase D.7).
+         *
+         * El id del vreg vive en @c value (no en @c reg, que es u8 y se
+         * reserva para fisicos 0..63).  La clase (GP/FP) se guarda en el
+         * bit0 de @c flags.  @c width es el ancho del operando en bytes.
+         *
+         * @param vid    Id del registro virtual (denso 0..vreg_count-1).
+         * @param cls    Clase del registro (GP/FP).
+         * @param w      Ancho en bytes (1/2/4/8).
+         */
+        static MOperand make_vreg(uint32_t vid, RegClass cls, uint8_t w = 8) noexcept {
+            MOperand o;
+            o.kind  = MOperandKind::VREG;
+            o.value = static_cast<int32_t>(vid);
+            o.flags = static_cast<uint8_t>(cls);
+            o.width = w;
+            return o;
+        }
+
+        /* Accessors VREG */
+        bool     is_vreg() const noexcept { return kind == MOperandKind::VREG; }
+        bool     is_reg()  const noexcept { return kind == MOperandKind::REG; }
+        uint32_t vreg_id() const noexcept { return static_cast<uint32_t>(value); }
+        RegClass vreg_class() const noexcept {
+            return static_cast<RegClass>(flags & 0x1);
         }
 
         /* Accessors MEM */
@@ -318,6 +377,18 @@ namespace jit {
         SAFEPOINT   = 51,   ///< polling check: cmp byte [rbx], 0 + jne handler
         COMMENT     = 52,   ///< no-op con texto debug (skipped en release)
         CALL_ABS    = 53,   ///< CALL a direccion absoluta (via mov rax, imm64 + call rax)
+        ARG         = 54,   ///< pseudo (D.7): marca un argumento de la siguiente CALL.
+                            ///< variant = indice del arg; src1 = vreg.  No emite bytes;
+                            ///< el rewrite recolecta los ARG y hace el parallel-move a
+                            ///< los arg_regs justo antes del CALL.
+        LOAD        = 55,   ///< pseudo (D.7 commit 7): dst = [addr_vreg] (disp 0).
+                            ///< dst = dst_vreg, src1 = addr_vreg; flags = (width<<1)|signed.
+                            ///< El rewrite lo baja a MOV/MOVZX/MOVSX con [reg].
+        STORE       = 56,   ///< pseudo (D.7 commit 7): [addr_vreg] = val_vreg (disp 0).
+                            ///< src1 = addr_vreg, src2 = val_vreg; flags = width.
+        ALLOCA      = 57,   ///< pseudo (D.7 commit 8): dst = host_ptr a @c value
+                            ///< bytes reservados en el frame JIT.  dst = dst_vreg,
+                            ///< value = size.  El rewrite lo baja a LEA [rbp-off].
 
         /* Bit ops adicionales (Math-IR-promote v2.2a, continuacion). */
         BSWAP       = 60,   ///< BSWAP dst (0F C8+rd REX.W) -- byte swap full register
@@ -348,7 +419,29 @@ namespace jit {
         CVTSS2SD    = 77,   ///< CVTSS2SD xmm, xmm (F3 0F 5A /r) -- f32 -> f64 (widen)
         CVTSD2SS    = 78,   ///< CVTSD2SS xmm, xmm (F2 0F 5A /r) -- f64 -> f32 (narrow)
 
-        COUNT       = 80
+        /* Pseudo D.7 perf (2026-06-06): division/modulo entero en vregs.
+         * dst = src1 / src2 (variant 0 = DIV, 1 = MOD).  El rewrite lo
+         * expande a la secuencia x86 RAX:RDX-fija usando R11 (scratch
+         * reservado) para el divisor, evitando el aliasing operando<->RAX/RDX
+         * sin necesitar fixed intervals en el regalloc.  Se marca como
+         * call-position (clobber RAX/RDX -> live-across van a callee-saved). */
+        DIVMOD_V    = 79,
+
+        /* Pseudo (callback-ABI 2026-06-06): carga el @c ProcessVM* del
+         * proceso actual en @c dst.reg (siempre RBX).  Encapsula la
+         * decision TLS-direct-vs-call que el thunk hacia a mano:
+         *   - src1.value != -1: @c mov dst, gs:[src1.value]  (TLS-direct
+         *     Win64; src1.value = 0x1480 + tls_idx*8).
+         *   - src1.value == -1: @c mov rax, imm64(get_proc) ; call rax ;
+         *     mov dst, rax  (fallback portable; la direccion de
+         *     @c get_current_executing_process vive en
+         *     @c imm64_pool[src2.value]).
+         * El selector resuelve TLS/addr (puede llamar al runtime) y los
+         * hornea aqui; el encoder solo emite bytes -> sin dependencia
+         * del runtime en el encoder. */
+        LOAD_PROC   = 80,
+
+        COUNT       = 81
     };
 
     /* ===================================================================== */
@@ -407,6 +500,58 @@ namespace jit {
         static MInstr make_call_label(uint32_t label_id) noexcept {
             MInstr i; i.op = MOp::CALL;
             i.src1 = MOperand::make_label(label_id);
+            return i;
+        }
+
+        /** @brief Pseudo ARG: argumento @p idx de la siguiente CALL (D.7). */
+        static MInstr make_arg(uint8_t idx, MOperand src) noexcept {
+            MInstr i; i.op = MOp::ARG; i.variant = idx; i.src1 = src; return i;
+        }
+
+        /** @brief CALL a direccion absoluta (en @c imm64_pool[@p imm64_idx]). */
+        static MInstr make_call_abs(uint32_t imm64_idx) noexcept {
+            MInstr i; i.op = MOp::CALL_ABS;
+            i.src1 = MOperand::make_imm64_idx(imm64_idx);
+            return i;
+        }
+
+        /**
+         * @brief Pseudo LOAD_PROC: carga @c ProcessVM* en @p dst (RBX).
+         * @param dst            Registro destino (RBX por convencion).
+         * @param tls_gs_disp    Desplazamiento @c gs:[disp] para TLS-direct
+         *                       (Win64), o -1 para usar el fallback por call.
+         * @param getproc_pool_idx  Indice en @c imm64_pool de la direccion de
+         *                       @c get_current_executing_process (usado solo
+         *                       en el fallback).
+         */
+        static MInstr make_load_proc(MReg dst, int32_t tls_gs_disp,
+                                     uint32_t getproc_pool_idx) noexcept {
+            MInstr i; i.op = MOp::LOAD_PROC;
+            i.dst  = MOperand::make_reg(dst);
+            i.src1 = MOperand::make_imm32(tls_gs_disp);
+            i.src2 = MOperand::make_imm64_idx(getproc_pool_idx);
+            return i;
+        }
+
+        /** @brief LOAD: @p dst = [@p addr] (host memory, disp 0).  @p width =
+         *  1/2/4/8 bytes; @p sgn = sign-extend (i*) vs zero-extend (u*). */
+        static MInstr make_load(MOperand dst, MOperand addr,
+                                uint8_t width, bool sgn) noexcept {
+            MInstr i; i.op = MOp::LOAD; i.dst = dst; i.src1 = addr;
+            i.flags = static_cast<uint16_t>((width << 1) | (sgn ? 1u : 0u));
+            return i;
+        }
+        /** @brief STORE: [@p addr] = @p val (host memory, disp 0). */
+        static MInstr make_store(MOperand addr, MOperand val,
+                                 uint8_t width) noexcept {
+            MInstr i; i.op = MOp::STORE; i.src1 = addr; i.src2 = val;
+            i.flags = width;
+            return i;
+        }
+        /** @brief ALLOCA: @p dst = host_ptr a @p size bytes del frame JIT. */
+        static MInstr make_alloca(MOperand dst, uint32_t size) noexcept {
+            MInstr i; i.op = MOp::ALLOCA; i.dst = dst;
+            i.src1 = MOperand::make_imm32(static_cast<int32_t>(size));
             return i;
         }
 
@@ -588,6 +733,32 @@ namespace jit {
         /// el encoder.
         std::vector<size_t>        self_ref_byte_offsets;
 
+        /// Phase D.7 (regalloc por vregs): numero de registros virtuales
+        /// reservados en esta funcion.  Los ids son densos 0..vreg_count-1.
+        /// Solo se usa en el path VREG (flag @c VESTA_JIT_VREGS); el path de
+        /// slots lo deja en 0.
+        uint32_t                   vreg_count = 0;
+        /// OSR (Phase D.8): numero de valores IR originales (== fn.values.size()
+        /// al compilar).  Los vregs [0, ir_value_count) corresponden 1:1 a IR
+        /// value ids (mapeo identidad en @c vr()); los vregs >= ir_value_count
+        /// son temporales internos del selector (intra-instruccion, nunca vivos
+        /// a traves de un bloque).  El state-transfer del OSR (buffer-por-VID)
+        /// SOLO captura vregs < ir_value_count: esos ids son ESTABLES entre C1 y
+        /// C2 (el clon C2 preserva los IR VIDs), garantizando que C1 escribe y
+        /// C2 lee la misma celda del buffer para el mismo valor logico.
+        uint32_t                   ir_value_count = 0;
+        /// Phase D.7: clase (GP/FP) de cada registro virtual, indexado por
+        /// vreg id.  @c vreg_class.size() == @c vreg_count.  El register
+        /// allocator la consulta para asignar del pool fisico correcto.
+        std::vector<RegClass>      vreg_class;
+        /// Phase D.7 commit 5f: 1 si el vreg contiene un valor GESTIONADO por
+        /// el GC (handle/host_ptr a objeto GC).  Lo poblea el selector desde
+        /// @c IrValue::is_gc_object.  El pipeline lo usa para rechazar (sin
+        /// stackmaps todavia) funciones donde un valor GC esta VIVO a traves
+        /// de un call -> el GC no veria esa raiz si esta en un registro.
+        /// @c vreg_is_gc.size() == @c vreg_count cuando esta poblado.
+        std::vector<uint8_t>       vreg_is_gc;
+
         /** @brief Reserva un nuevo label_id (zero overhead). */
         MLabelId new_label() {
             const uint32_t id = next_label_id++;
@@ -614,6 +785,23 @@ namespace jit {
             }
             imm64_pool.push_back(value);
             return static_cast<uint32_t>(imm64_pool.size() - 1);
+        }
+
+        /**
+         * @brief Reserva un nuevo registro virtual de la clase dada (D.7).
+         *
+         * Devuelve el operando @c VREG listo para usar como dst/src de una
+         * MInstr.  Los temporales que introduce el selector (no derivados
+         * directamente de un SSA value) se piden por aqui.
+         *
+         * @param cls    Clase del registro (GP/FP).
+         * @param width  Ancho en bytes (1/2/4/8).  Default 8.
+         * @return       Operando VREG con el id recien reservado.
+         */
+        MOperand new_vreg(RegClass cls, uint8_t width = 8) {
+            const uint32_t id = vreg_count++;
+            vreg_class.push_back(cls);
+            return MOperand::make_vreg(id, cls, width);
         }
     };
 

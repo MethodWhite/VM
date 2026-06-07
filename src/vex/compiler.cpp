@@ -25,6 +25,7 @@
 #include "vex/lowering.h"
 #include "vex/mermaid_diagrams.h"
 #include "vex/graphviz_diagrams.h"
+#include "vex/html_diagrams.h"
 #include "vex/namespace_flatten.h"
 #include "vex/parser.h"
 #include "vex/type_checker.h"
@@ -138,6 +139,12 @@ namespace vex {
         if (opts.dump_graphviz_ast) {
             res.graphviz_ast = graphviz_from_ast(*mod);
         }
+        // Variante HTML interactiva del AST.  Reutiliza el generador
+        // Graphviz internamente (paridad de info); produce un .html
+        // autocontenido con pan/zoom + panel de detalle.
+        if (opts.dump_html_ast) {
+            res.html_ast = html_from_ast(*mod);
+        }
 
         // 3. Lowering: AST -> ir::IrModule.  Pasamos el TypeChecker para
         // que el lowering pueda consultar StructLayout (offsets/tamanos)
@@ -197,6 +204,10 @@ namespace vex {
             res.graphviz_ir_pre = graphviz_from_ir_module(
                 irmod, "Diagrama IR pre-optimizacion (frontend output)");
         }
+        if (opts.dump_html_ir_pre) {
+            res.html_ir_pre = html_from_ir_module(
+                irmod, "SSA IR pre-optimizacion (frontend output)");
+        }
         // Si CUALQUIERA de las opciones pide informacion post-opt
         // (ir_text dump, mermaid_post o graphviz_post, port target),
         // generamos UNA copia optimizada y la reusamos para todos los
@@ -205,6 +216,7 @@ namespace vex {
         const bool need_post_opt = opts.dump_ir
                                 || opts.dump_mermaid_ir_post
                                 || opts.dump_graphviz_ir_post
+                                || opts.dump_html_ir_post
                                 || !opts.port_target.empty();
         if (need_post_opt) {
             ir::IrModule irmod_opt = irmod;
@@ -228,6 +240,9 @@ namespace vex {
             }
             if (opts.dump_graphviz_ir_post) {
                 res.graphviz_ir_post = graphviz_from_ir_module(irmod_opt, title);
+            }
+            if (opts.dump_html_ir_post) {
+                res.html_ir_post = html_from_ir_module(irmod_opt, title);
             }
 
             // Port transpiler: convierte el IR optimizado a codigo fuente
@@ -318,6 +333,9 @@ namespace vex {
         }
         if (opts.dump_graphviz_vel) {
             res.graphviz_vel = graphviz_from_vel_text(res.vel_text);
+        }
+        if (opts.dump_html_vel) {
+            res.html_vel = html_from_vel_text(res.vel_text);
         }
 
         res.ok       = !res.diagnostics.has_errors();

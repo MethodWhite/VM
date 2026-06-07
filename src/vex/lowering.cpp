@@ -1269,6 +1269,17 @@ namespace vex {
         if (sret) {
             v_retbuf                     = fn.new_value(ir::IrType::PTR, "%__retbuf");
             fn.values[v_retbuf].is_param = true;
+            // BugFix sret-cross-mem (2026-06-04): SOLO marcar host_ptr para
+            // SRET de Optional/Result/enum (donde el caller aloca host).
+            // Para FUNCTION/smart-ptr el callee tiene su propio manejo y
+            // marcarlo host rompe el copia in-place.
+            const bool sret_optres_like =
+                (sem_ret.kind == PrimitiveKind::OPTIONAL
+              || sem_ret.kind == PrimitiveKind::RESULT
+              || sret_enum);
+            if (sret_optres_like) {
+                fn.values[v_retbuf].is_host_ptr = true;
+            }
             fn.params.push_back(v_retbuf);
         }
         for (auto &p: fd->params) {
@@ -1298,6 +1309,16 @@ namespace vex {
                 if ((sem.kind == PrimitiveKind::PTR
                         || sem.kind == PrimitiveKind::ARRAY)
                     && !sem.is_virtual) {
+                    param_is_host_ptr = true;
+                }
+                // BugFix sret-cross-mem (2026-06-04): los parametros de
+                // tipo Optional<T>/Result<V,E> son PTRs al buffer SRET
+                // alocado por el caller (que ahora siempre es host_alloca).
+                // Sin marcar is_host_ptr=true, isOk/value/error en el callee
+                // emiten LOAD con `mov` (VM mem) en lugar de `movh` (host)
+                // -> Result llega zeroed al usar dentro del callee.
+                if (sem.kind == PrimitiveKind::OPTIONAL
+                    || sem.kind == PrimitiveKind::RESULT) {
                     param_is_host_ptr = true;
                 }
                 // Limitacion conocida (Phase A): `T[]` como tipo de
@@ -3875,6 +3896,23 @@ namespace vex {
                 // retbuf del caller.  No hace falta copia final; saltamos
                 // al RET directamente.
                 emit_cleanups_all();
+                // Instrumentacion: emitir vex_trace:leave antes del RET
+                // tambien en este path SRET (mismo filtro que lower_return
+                // del path normal).  Sin esto, fns que retornan
+                // unique<T>/shared<T> NO cierran el trace y producen un
+                // arbol descuadrado.
+                if (instrument_mode_ != "none" && instrument_mode_ != ""
+                    && fn_ != nullptr) {
+                    const std::string &fname = fn_->name;
+                    const bool is_helper = fname == "__module_init"
+                        || fname.compare(0, 6, "__new_") == 0
+                        || fname.compare(0, 8, "__async_") == 0
+                        || fname.compare(0, 9, "__lambda_") == 0
+                        || fname.compare(0, 8, "__spawn_") == 0;
+                    if (!is_helper) {
+                        emit_instrument_exit(fname, sret_retbuf_, s->loc.line);
+                    }
+                }
                 ir::IrInstr ret{};
                 ret.op          = ir::IrOp::RET;
                 ret.type        = ir::IrType::VOID;
@@ -3924,6 +3962,15 @@ namespace vex {
                         add.source_line = s->loc.line;
                         fn_->append(current_block_, std::move(add));
                     }
+                    // BugFix sret-cross-mem (2026-06-04): propagar
+                    // is_host_ptr de sret_retbuf_ al v_dst_at para que el
+                    // STORE downstream emita `movh` (host) en lugar de
+                    // `mov` (VM mem).  El retbuf SIEMPRE vive en host
+                    // memory (ALLOCA del caller); sin esta propagacion
+                    // el STORE escribe a vm_mem mientras el caller lee
+                    // host -> Result tag/value/error siempre en cero.
+                    fn_->values[v_dst_at].is_host_ptr =
+                        fn_->values[sret_retbuf_].is_host_ptr;
                     // STORE i64 [dst+off] = tmp
                     {
                         ir::IrInstr st{};
@@ -3940,6 +3987,21 @@ namespace vex {
             // se completaron arriba; los cleanups solo modifican estado
             // global (mailboxes, monitores) sin tocar el retbuf.
             emit_cleanups_all();
+            // Instrumentacion: emitir vex_trace:leave antes del RET sret.
+            // Sin esto, fns que retornan Optional<T>/Result<V,E> NO cierran
+            // el trace y producen un arbol descuadrado en la salida.
+            if (instrument_mode_ != "none" && instrument_mode_ != ""
+                && fn_ != nullptr) {
+                const std::string &fname = fn_->name;
+                const bool is_helper = fname == "__module_init"
+                    || fname.compare(0, 6, "__new_") == 0
+                    || fname.compare(0, 8, "__async_") == 0
+                    || fname.compare(0, 9, "__lambda_") == 0
+                    || fname.compare(0, 8, "__spawn_") == 0;
+                if (!is_helper) {
+                    emit_instrument_exit(fname, sret_retbuf_, s->loc.line);
+                }
+            }
             ir::IrInstr ret{};
             ret.op          = ir::IrOp::RET;
             ret.type        = ir::IrType::VOID;
@@ -10404,7 +10466,21 @@ namespace vex {
             al.dst         = v_call_retbuf;
             al.imm         = buf_bytes;
             al.source_line = e->loc.line;
+            // BugFix sret-cross-mem (2026-06-04): forzar host_alloca SOLO
+            // para retbuf de Optional/Result/enum (donde el bug cross-mem
+            // se manifiesta).  NO para FUNCTION/smart-ptr cuyo lowering
+            // tiene su propio manejo de memoria (env_addr=heap GC, ctrl_ptr).
+            const bool is_optres_retbuf =
+                (callee_kind == PrimitiveKind::OPTIONAL
+              || callee_kind == PrimitiveKind::RESULT
+              || callee_is_enum_sret);
+            if (is_optres_retbuf) {
+                al.host_alloca = true;
+            }
             fn_->append(current_block_, std::move(al));
+            if (is_optres_retbuf) {
+                fn_->values[v_call_retbuf].is_host_ptr = true;
+            }
         }
 
         // Bajar argumentos.  Si es sret, el retbuf va PRIMERO (convencion
@@ -10856,6 +10932,11 @@ namespace vex {
                     add.source_line = src_line;
                     fn_->append(current_block_, std::move(add));
                 }
+                // BugFix 163 (2026-06-05): propagar is_host_ptr de v_buf al LOAD
+                // side (igual que el STORE side abajo).  Sin esto el LOAD del
+                // Err a copiar usaba `mov` (VM) en vez de `movh` (host) y leia
+                // basura -> error(r) != el valor real (path de error de `?`).
+                fn_->values[v_src_at].is_host_ptr = fn_->values[v_buf].is_host_ptr;
                 const ir::IrValueId v_tmp = fn_->new_value(ir::IrType::I64); {
                     ir::IrInstr ld{};
                     ld.op          = ir::IrOp::LOAD;
@@ -10875,6 +10956,9 @@ namespace vex {
                     add.source_line = src_line;
                     fn_->append(current_block_, std::move(add));
                 }
+                // BugFix sret-cross-mem (2026-06-04): propagar is_host_ptr.
+                fn_->values[v_dst_at].is_host_ptr =
+                    fn_->values[sret_retbuf_].is_host_ptr;
                 {
                     ir::IrInstr st{};
                     st.op          = ir::IrOp::STORE;
@@ -10915,6 +10999,12 @@ namespace vex {
             add.source_line = src_line;
             fn_->append(current_block_, std::move(add));
         }
+        // BugFix 163 (2026-06-05): propagar is_host_ptr de v_buf a v_at8.  El
+        // buffer del Result temporal del operando es un host_ptr; sin esta
+        // marca, el LOAD de V emitia `mov` (VM mem) en vez de `movh` (host) y
+        // leia 0/basura.  La rama err ya lo propagaba (de ahi que err funcione
+        // y ok no).  Aplica al value extraction de la rama ok.
+        fn_->values[v_at8].is_host_ptr = fn_->values[v_buf].is_host_ptr;
         const ir::IrValueId v_dst = fn_->new_value(payload_t); {
             ir::IrInstr ld{};
             ld.op          = ir::IrOp::LOAD;
@@ -15265,7 +15355,12 @@ namespace vex {
         // (sret-style ABI) ANTES de que el callee desaparezca.  Asi
         // evitamos heap allocation y leaks: el lifecycle es estrictamente
         // tied al stack frame que lo creo.
-        auto stack_alloc_buf = [&](uint64_t bytes, uint32_t line) -> ir::IrValueId {
+        // BugFix sret-cross-mem (2026-06-04): el flag `for_optres` activa
+        // host_alloca SOLO para Optional/Result (no para smart-ptr).  Asi
+        // los buffers de Some/Ok/Err viven en host mem consistente con los
+        // retbuf SRET del caller, sin afectar el lowering de unique<T>.
+        auto stack_alloc_buf = [&](uint64_t bytes, uint32_t line,
+                                    bool for_optres = false) -> ir::IrValueId {
             const ir::IrValueId v_buf = fn_->new_value(ir::IrType::PTR);
             ir::IrInstr         al{};
             al.op          = ir::IrOp::ALLOCA;
@@ -15273,9 +15368,13 @@ namespace vex {
             al.imm         = bytes;
             al.dst         = v_buf;
             al.source_line = line;
+            if (for_optres) {
+                al.host_alloca = true;
+            }
             fn_->append(current_block_, std::move(al));
-            // ALLOCA devuelve direccion de memoria VM (subsp + readcur);
-            // no es host_ptr.  Las STORE/LOAD subsiguientes usaran `mov`.
+            if (for_optres) {
+                fn_->values[v_buf].is_host_ptr = true;
+            }
             return v_buf;
         };
 
@@ -15292,7 +15391,7 @@ namespace vex {
                 out_value = ir::IR_NO_VALUE;
                 return true;
             }
-            const ir::IrValueId v_buf = stack_alloc_buf(16, e->loc.line);
+            const ir::IrValueId v_buf = stack_alloc_buf(16, e->loc.line, /*for_optres=*/true);
             // Store flag = 1 at +0.
             const ir::IrValueId v_one = emit_const(ir::IrType::I64, 1, e->loc.line);
             ir::IrInstr         st0{};
@@ -15323,7 +15422,7 @@ namespace vex {
         }
         // ----- None() -----  Optional vacio (flag=0) en stack.
         if (is_None) {
-            const ir::IrValueId v_buf  = stack_alloc_buf(16, e->loc.line);
+            const ir::IrValueId v_buf  = stack_alloc_buf(16, e->loc.line, /*for_optres=*/true);
             const ir::IrValueId v_zero = emit_const(ir::IrType::I64, 0, e->loc.line);
             ir::IrInstr         st0{};
             st0.op          = ir::IrOp::STORE;
@@ -15370,7 +15469,7 @@ namespace vex {
                 out_value = ir::IR_NO_VALUE;
                 return true;
             }
-            const ir::IrValueId v_buf = stack_alloc_buf(24, e->loc.line);
+            const ir::IrValueId v_buf = stack_alloc_buf(24, e->loc.line, /*for_optres=*/true);
             // Tag.
             const ir::IrValueId v_tag = emit_const(ir::IrType::I64,
                                                    is_Ok ? 1 : 0, e->loc.line);
@@ -15391,6 +15490,8 @@ namespace vex {
             add.operands    = {v_buf, v_off};
             add.source_line = e->loc.line;
             fn_->append(current_block_, std::move(add));
+            // BugFix sret-cross-mem (2026-06-04): propagar is_host_ptr.
+            fn_->values[v_at].is_host_ptr = fn_->values[v_buf].is_host_ptr;
             const ir::IrType payload_t = fn_->values[v_payload].type;
             ir::IrInstr      st1{};
             st1.op          = ir::IrOp::STORE;
@@ -15452,6 +15553,9 @@ namespace vex {
             add.operands    = {v_buf, v_off};
             add.source_line = e->loc.line;
             fn_->append(current_block_, std::move(add));
+            // BugFix sret-cross-mem (2026-06-04): propagar is_host_ptr de
+            // v_buf al v_at para que el LOAD downstream emita `movh`/`loadzh`.
+            fn_->values[v_at].is_host_ptr = fn_->values[v_buf].is_host_ptr;
             const ir::IrValueId v_dst = fn_->new_value(payload_t);
             ir::IrInstr         ld{};
             ld.op          = ir::IrOp::LOAD;
@@ -17212,6 +17316,14 @@ namespace vex {
             if (method_sret) {
                 v_method_retbuf = fn.new_value(ir::IrType::PTR, "%__retbuf");
                 fn.values[v_method_retbuf].is_param = true;
+                // BugFix sret-cross-mem (2026-06-04): metodos de clase con
+                // SRET tambien reciben retbuf como host_ptr (caller hace
+                // ALLOCA en host memory).  Sin esta marca el callee escribe
+                // al retbuf con `mov` (VM mem) en lugar de `movh` (host)
+                // -> el Result llega siempre en ceros al caller.  Caso
+                // observado: file_io.FileReader.read_all retornaba con
+                // tag=0, error=0 aunque el archivo se hubiera leido OK.
+                fn.values[v_method_retbuf].is_host_ptr = true;
                 fn.params.push_back(v_method_retbuf);
             }
 
@@ -19087,7 +19199,12 @@ namespace vex {
             al.imm         = buf_bytes;
             al.dst         = v_method_call_retbuf;
             al.source_line = e->loc.line;
+            // BugFix sret-cross-mem (2026-06-04): forzar host_alloca para
+            // el retbuf de metodos Optional/Result.  Asi el callee escribe
+            // con `movh` y el caller lee con `movh` consistentemente.
+            al.host_alloca = true;
             fn_->append(current_block_, std::move(al));
+            fn_->values[v_method_call_retbuf].is_host_ptr = true;
         }
         const ir::IrType ret_ir = method_call_sret ? ir::IrType::VOID : ret_ir_decl;
 

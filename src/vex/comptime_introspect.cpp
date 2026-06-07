@@ -178,6 +178,11 @@ namespace vex {
     }
 
     std::string comptime_type_name(const TypeChecker &tc, const Type &t) {
+        // Newtype (typedef T name new): es NOMINALMENTE distinto del underlying.
+        // Devolver su nombre propio para que is_same<user_id, group_id> sea false
+        // aunque ambos compartan representacion u64 (bug 168/169).  nominal_id>0
+        // identifica univocamente al newtype.
+        if (t.nominal_id != 0 && !t.nominal_name.empty()) return t.nominal_name;
         switch (t.kind) {
             case PrimitiveKind::VOID:   return "void";
             case PrimitiveKind::BOOL:   return "bool";

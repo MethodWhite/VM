@@ -1,0 +1,47 @@
+// Benchmark: objeto GC mutable NO-escapante con varios campos, leido y escrito
+// intensamente en un loop con ramas condicionales.
+//
+// Estresa el escape analysis / SROA / mem2reg: el objeto `Stats` no escapa
+// (solo se accede a sus campos), se crea una vez y se muta 20M veces.  Sus 4
+// campos (sum/cnt/mn/mx) son loop-carried y dos de ellos se escriben
+// condicionalmente (min/max) -> cross-block.
+//
+// Con escape analysis OFF: 4 campos en GC heap -> load/store por iteracion.
+// Con SROA/mem2reg (VESTA_ESCAPE_MEM2REG=1): los 4 campos se promueven a SSA
+// (PHIs loop-carried + PHIs de los merges condicionales).  En el interprete
+// (16 registros VM) esto puede AUMENTAR la presion de registros -> spilling;
+// es donde se ve el tradeoff "trafico de memoria vs presion de registros".
+//
+// Equivalentes en C (gcc -O3 SROA-ea a registros), C++ (idem), Java (escape
+// analysis del C2 promueve el objeto) y Python (sin optimizacion).
+//
+// Ejecuta: vm --run obj_accum.velb --stats [-m jit]
+
+class Stats {
+    public i64 sum;
+    public i64 cnt;
+    public i64 mn;
+    public i64 mx;
+    public Stats() {
+        this.sum = 0;
+        this.cnt = 0;
+        this.mn = 2000000000;
+        this.mx = -2000000000;
+    }
+}
+
+i64 main() {
+    Stats s = new Stats();
+    i64 seed = 12345;
+    i64 i = 0;
+    while (i < 20000000) {
+        seed = (seed * 1103515245 + 12345) & 2147483647;   // LCG deterministico
+        i64 v = seed % 1000;
+        s.sum = s.sum + v;
+        s.cnt = s.cnt + 1;
+        if (v < s.mn) { s.mn = v; }      // escritura condicional del campo (cross-block)
+        if (v > s.mx) { s.mx = v; }      // escritura condicional del campo (cross-block)
+        i = i + 1;
+    }
+    return (s.sum + s.cnt + s.mn + s.mx) % 1000000;
+}

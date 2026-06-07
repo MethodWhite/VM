@@ -233,6 +233,16 @@ namespace asm_multi_process {
         vesta::scout() << "\n[Tiempo total] " << global.us() << " us "
                 << global.ms() << " ms\n";
 
+        // Defensa-en-profundidad MC.12: si el linker reporta errores
+        // (tipicamente relocations sin resolver), eliminar el .velb
+        // emitido y retornar fallo.  Sin esto, el .velb queda con
+        // direcciones a cero y crashea silenciosamente en runtime al
+        // ejecutar el primer CALLVM/MOV con la relocacion huerfana.
+        if (!report.errors.empty()) {
+            std::remove(opts.output_path.c_str());
+            return EXIT_FAILURE;
+        }
+
         struct WorkerTimes {
             long parser_us;
             long assembler_us;

@@ -194,6 +194,33 @@ bool ir_pass_promote_local_allocas(IrFunction &fn);
 bool ir_pass_promote_local_raw_alloc(IrFunction &fn);
 
 /**
+ * @brief Phase C2.13: DETECCION (log-only) de objetos GC no-escapantes.
+ *
+ * Analiza los `call @__new_X(...)` de @p fn y determina cuales NO escapan
+ * del frame (su host_ptr solo se usa para leer/escribir campos locales).
+ * Si la env var VESTA_ESCAPE_DEBUG esta activa, loguea cada sitio con su
+ * veredicto.  NO transforma el IR (siempre devuelve false); existe para
+ * validar el analisis de escape con cero riesgo antes de habilitar el
+ * scalar replacement.
+ *
+ * @return siempre false (no modifica el IR).
+ */
+bool ir_pass_escape_detect_gc(IrFunction &fn);
+
+/**
+ * @brief Phase C2.13: Scalar Replacement de objetos GC no-escapantes.
+ *
+ * Para cada `new X()` (call @__new_X) que no escapa del frame y cuyo ctor es
+ * un inicializador trivial de campos, elimina el alloc GC y reemplaza los
+ * field-reads por los valores de construccion (args del new o constantes).
+ * Conservador: solo transforma sitios donde TODAS las precondiciones de
+ * seguridad se cumplen.  Necesita el @p mod para resolver los ctores.
+ *
+ * @return true si se transformo algun sitio.
+ */
+bool ir_pass_scalar_replace_gc(IrFunction &fn, const IrModule &mod);
+
+/**
  * @brief Pase de simplificacion algebraica + folding de cast constantes
  *        + simplificacion de phis triviales.
  *
@@ -275,9 +302,15 @@ bool ir_pass_reassoc(IrFunction &fn);
  *   - port-C: codigo destino mas legible (menos funciones helper).
  *
  * @param mod Modulo a optimizar (mutado).
+ * @param threshold Tamano maximo (en instrs del body) del callee inlineable.
+ *        Default 12 (balance code-size en O2).  El C2/OSR sube este valor para
+ *        inlinear agresivamente las CALLs de un loop CALIENTE (donde el code-size
+ *        no importa porque el loop domina el tiempo): elimina el CALL + el
+ *        marshalling VM_ABI de args por memoria, que O2 dejo por su heuristica
+ *        conservadora.
  * @return true si inline al menos una CALL.
  */
-bool ir_pass_inline(IrModule &mod);
+bool ir_pass_inline(IrModule &mod, size_t threshold = 12);
 
 /**
  * @brief Loop-Invariant Code Motion.
@@ -318,6 +351,40 @@ bool ir_pass_licm(IrFunction &fn);
  * @return true si convirtio al menos un CALLVIRT.
  */
 bool ir_pass_devirt_monomorphic(IrModule &mod);
+
+/**
+ * @brief Devirtualizacion ESPECULATIVA guiada por perfil/IC (C2).
+ *
+ * A diferencia de @c ir_pass_devirt_monomorphic (estatico, closed-world, sin
+ * guard), este pase toma la clase OBSERVADA en runtime en cada call site (de
+ * los IC slots del PIC durante el tier-up C1->C2) y emite un dispatch GUARDADO:
+ *
+ *     cls = load [obj]              ; class_ptr (offset 0, obj es host_ptr)
+ *     if (cls == T_const) {         ; T = clase observada (ClassInfo* como CONST)
+ *         r_fast = call @callee     ; CALL directo -> ir_pass_inline lo inlinea
+ *     } else {
+ *         r_slow = callvirt obj ... ; dispatch dinamico original (fallback)
+ *     }
+ *     r = phi [r_fast, r_slow]
+ *
+ * CORRECTO POR CONSTRUCCION: si la clase observada deja de cumplirse, el guard
+ * cae al CALLVIRT original -> mismo resultado.  No necesita deopt (esa es la
+ * capa agresiva posterior, C2.7).
+ *
+ * Cada site identifica su CALLVIRT por @c callvirt_dst (el dst SSA, unico) para
+ * poder localizarlo de forma estable aunque se transformen varios sites.
+ *
+ * @param fn    Funcion (clonada) a transformar.
+ * @param sites Lista de sites monomorficos a especular.
+ * @return true si transformo al menos un site.
+ */
+struct SpecDevirtSite {
+    IrValueId   callvirt_dst;    ///< dst SSA del CALLVIRT objetivo (unico)
+    uint64_t    class_ptr;        ///< ClassInfo* observado (embebido como CONST)
+    std::string callee_ir_name;   ///< ir_fn_name del metodo resuelto (a inlinar)
+};
+bool ir_pass_speculative_devirt(IrFunction &fn,
+                                const std::vector<SpecDevirtSite> &sites);
 
 /**
  * @brief Pase de propagacion de copias.

@@ -525,47 +525,56 @@ VESTA_PLUGIN_EXPORT uint64_t vio_print(uint64_t proc_ptr,
  * digitos = 18 caracteres).
  * ----------------------------------------------------------------------- */
 
+/* NOTA (fix interp host_alloca): tras MMM/NNN del runtime, el ALLOCA de
+ * destino se promueve a heap host (RAW_ALLOC) cuando su ptr fluye a un
+ * CALLN.  Por eso el 2do arg de estas funciones ya NO es un vm_addr sino
+ * un host_ptr crudo.  Escribimos directo con memcpy en lugar de pasar por
+ * vm_write_bytes (que retraduciria el ptr como VM virtual y escribiria
+ * en otra parte del vm_mem). */
 VESTA_PLUGIN_EXPORT uint64_t vio_int_to_vmbuf(uint64_t proc_ptr,
-                                               uint64_t vm_addr,
+                                               uint64_t dst_host,
                                                uint64_t value) {
+    (void) proc_ptr;
     char   tmp[32];
     size_t k = vio_i64_to_str((int64_t) value, tmp);
-    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, k);
+    memcpy((void *) (uintptr_t) dst_host, tmp, k);
     return (uint64_t) k;
 }
 
 VESTA_PLUGIN_EXPORT uint64_t vio_uint_to_vmbuf(uint64_t proc_ptr,
-                                                uint64_t vm_addr,
+                                                uint64_t dst_host,
                                                 uint64_t value) {
+    (void) proc_ptr;
     char   tmp[32];
     size_t k = vio_u64_to_str(value, tmp);
-    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, k);
+    memcpy((void *) (uintptr_t) dst_host, tmp, k);
     return (uint64_t) k;
 }
 
 VESTA_PLUGIN_EXPORT uint64_t vio_hex_to_vmbuf(uint64_t proc_ptr,
-                                               uint64_t vm_addr,
+                                               uint64_t dst_host,
                                                uint64_t value) {
+    (void) proc_ptr;
     char   tmp[32];
     size_t k = vio_u64_to_hex(value, tmp);
-    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, k);
+    memcpy((void *) (uintptr_t) dst_host, tmp, k);
     return (uint64_t) k;
 }
 
 VESTA_PLUGIN_EXPORT uint64_t vio_bool_to_vmbuf(uint64_t proc_ptr,
-                                                uint64_t vm_addr,
+                                                uint64_t dst_host,
                                                 uint64_t value) {
-    /* "true" (4) o "false" (5). */
+    (void) proc_ptr;
     const char *s = value ? "true" : "false";
     size_t      k = value ? 4u : 5u;
-    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, s, k);
+    memcpy((void *) (uintptr_t) dst_host, s, k);
     return (uint64_t) k;
 }
 
 VESTA_PLUGIN_EXPORT uint64_t vio_char_to_vmbuf(uint64_t proc_ptr,
-                                                uint64_t vm_addr,
+                                                uint64_t dst_host,
                                                 uint64_t codepoint) {
-    /* Codifica el codepoint en UTF-8 (1-4 bytes). */
+    (void) proc_ptr;
     char   tmp[8];
     size_t k = 0;
     uint32_t cp = (uint32_t) codepoint;
@@ -584,7 +593,7 @@ VESTA_PLUGIN_EXPORT uint64_t vio_char_to_vmbuf(uint64_t proc_ptr,
         tmp[k++] = (char) (0x80 | ((cp >> 6) & 0x3F));
         tmp[k++] = (char) (0x80 | (cp & 0x3F));
     }
-    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, k);
+    memcpy((void *) (uintptr_t) dst_host, tmp, k);
     return (uint64_t) k;
 }
 
@@ -593,15 +602,16 @@ VESTA_PLUGIN_EXPORT uint64_t vio_char_to_vmbuf(uint64_t proc_ptr,
  * Format: hasta 6 digitos significativos (similar a %g).
  */
 VESTA_PLUGIN_EXPORT uint64_t vio_float_to_vmbuf(uint64_t proc_ptr,
-                                                 uint64_t vm_addr,
+                                                 uint64_t dst_host,
                                                  uint64_t bits) {
+    (void) proc_ptr;
     double d;
     memcpy(&d, &bits, sizeof(d));
     char   tmp[64];
     int    n = snprintf(tmp, sizeof(tmp), "%g", d);
     if (n < 0) n = 0;
     if ((size_t) n >= sizeof(tmp)) n = (int) sizeof(tmp) - 1;
-    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, (size_t) n);
+    memcpy((void *) (uintptr_t) dst_host, tmp, (size_t) n);
     return (uint64_t) n;
 }
 
@@ -609,14 +619,15 @@ VESTA_PLUGIN_EXPORT uint64_t vio_float_to_vmbuf(uint64_t proc_ptr,
  * Para uso en interpolacion ${class_var} en contexto STRING.
  */
 VESTA_PLUGIN_EXPORT uint64_t vio_gchandle_to_vmbuf(uint64_t proc_ptr,
-                                                    uint64_t vm_addr,
+                                                    uint64_t dst_host,
                                                     uint64_t handle) {
+    (void) proc_ptr;
     char   tmp[32];
     int    n = snprintf(tmp, sizeof(tmp), "<gc:%llu>",
                         (unsigned long long) handle);
     if (n < 0) n = 0;
     if ((size_t) n >= sizeof(tmp)) n = (int) sizeof(tmp) - 1;
-    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, (size_t) n);
+    memcpy((void *) (uintptr_t) dst_host, tmp, (size_t) n);
     return (uint64_t) n;
 }
 
@@ -656,18 +667,18 @@ VESTA_PLUGIN_EXPORT uint64_t vio_gensym(void) {
  * IMPORTANT: `src_host` es un puntero HOST (resultado de STRRAW); se
  * castea directamente a `const char*`.  `dst_addr` es VM address. */
 VESTA_PLUGIN_EXPORT uint64_t vstr_repeat_to_vmbuf(uint64_t proc_ptr,
-                                                   uint64_t dst_addr,
+                                                   uint64_t dst_host,
                                                    uint64_t src_host,
                                                    uint64_t src_len,
                                                    uint64_t n) {
+    (void) proc_ptr;
     if (src_len == 0 || n == 0) return 0;
     if (n > 0 && src_len > (16u << 20) / n) return 0;
     const char *src = (const char *) (uintptr_t) src_host;
-    /* Escribir N copias directamente desde host_ptr. */
+    char *dst = (char *) (uintptr_t) dst_host;
     uint64_t total = 0;
     for (uint64_t i = 0; i < n; ++i) {
-        g_api->vm_write_bytes((void *) proc_ptr,
-                               dst_addr + total, src, (size_t) src_len);
+        memcpy(dst + total, src, (size_t) src_len);
         total += src_len;
     }
     return total;
@@ -696,18 +707,19 @@ VESTA_PLUGIN_EXPORT uint64_t vstr_contains(uint64_t proc_ptr,
  * ocurrencias de `from` con `to`, escribe el resultado en VM addr
  * `dst_addr`.  Retorna la longitud total escrita (o 0 si error). */
 VESTA_PLUGIN_EXPORT uint64_t vstr_replace_to_vmbuf(uint64_t proc_ptr,
-                                                    uint64_t dst_addr,
+                                                    uint64_t dst_host,
                                                     uint64_t src_host,
                                                     uint64_t src_len,
                                                     uint64_t from_host,
                                                     uint64_t from_len,
                                                     uint64_t to_host,
                                                     uint64_t to_len) {
+    (void) proc_ptr;
     const char *src  = (const char *) (uintptr_t) src_host;
+    char *dst_h = (char *) (uintptr_t) dst_host;
     if (from_len == 0) {
-        /* No-op: copia src tal cual. */
         if (src_len > 0) {
-            g_api->vm_write_bytes((void *) proc_ptr, dst_addr, src, (size_t) src_len);
+            memcpy(dst_h, src, (size_t) src_len);
         }
         return src_len;
     }
@@ -746,14 +758,14 @@ VESTA_PLUGIN_EXPORT uint64_t vstr_replace_to_vmbuf(uint64_t proc_ptr,
             out_buf[out_n++] = src[i++];
         }
     }
-    g_api->vm_write_bytes((void *) proc_ptr, dst_addr, out_buf, out_n);
+    memcpy(dst_h, out_buf, out_n);
     return (uint64_t) out_n;
 }
 
 VESTA_PLUGIN_EXPORT uint64_t vio_ptr_to_vmbuf(uint64_t proc_ptr,
-                                               uint64_t vm_addr,
+                                               uint64_t dst_host,
                                                uint64_t addr) {
-    /* Compacto: "0x" + minimos digitos hex (max 18 caracteres). */
+    (void) proc_ptr;
     char     tmp[32];
     size_t   k    = 0;
     tmp[k++]      = '0';
@@ -770,7 +782,7 @@ VESTA_PLUGIN_EXPORT uint64_t vio_ptr_to_vmbuf(uint64_t proc_ptr,
         }
         while (r > 0) tmp[k++] = rev[--r];
     }
-    g_api->vm_write_bytes((void *) proc_ptr, vm_addr, tmp, k);
+    memcpy((void *) (uintptr_t) dst_host, tmp, k);
     return (uint64_t) k;
 }
 

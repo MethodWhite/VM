@@ -203,6 +203,30 @@ namespace jit {
         // cache.  Cero overhead para el caso comun (funciones pequenas).
         if (size > chunk_bytes_) return nullptr;
 
+        // Reclaim C2: intentar reusar una region del free-list ANTES de
+        // hacer bump.  First-fit: la primera region cuyo inicio alineado
+        // + size cabe dentro de ella.  El hueco por alineacion (head) se
+        // descarta (pequeno); el remanente, si es util (>= 64 B), se
+        // reinserta al free-list.  Las regiones del free-list ya son RWX
+        // (fueron committed antes); el caller las re-escribe + commit.
+        for (size_t i = 0; i < free_list_.size(); ++i) {
+            uint8_t *fb = free_list_[i].ptr;
+            const size_t cap = free_list_[i].size;
+            const uintptr_t a       = reinterpret_cast<uintptr_t>(fb);
+            const uintptr_t aligned = round_up(a, align);
+            const size_t head = static_cast<size_t>(aligned - a);
+            if (head + size <= cap) {
+                uint8_t *ret = reinterpret_cast<uint8_t *>(aligned);
+                const size_t remainder = cap - head - size;
+                free_list_.erase(free_list_.begin()
+                                 + static_cast<std::ptrdiff_t>(i));
+                if (remainder >= 64u) {
+                    free_list_.push_back({ret + size, remainder});
+                }
+                return ret;
+            }
+        }
+
         // Maximo 2 intentos: primer try en el chunk actual; si no cabe,
         // reservar uno nuevo y reintentar.  No iteramos mas porque el
         // limite es chunk_bytes_, asi que tras reservar fresh DEBE caber
@@ -274,6 +298,22 @@ namespace jit {
         // Tras escribir, flush icache: el CPU podria tener cacheados los
         // bytes viejos y ejecutarlos por mucho tiempo sin este flush.
         flush_icache(ptr, size);
+    }
+
+    /**
+     * @brief Devuelve una region al free-list para reuso (reclaim C2 tier-up).
+     *
+     * Envenena la region con 0xCC (INT3) como defensa: si una referencia
+     * perdida la ejecuta antes de reusarse, trapea en vez de correr basura.
+     * No devuelve memoria al SO (las regiones son sub-alocaciones de chunks);
+     * @c alloc la reciclara.  Serializacion responsabilidad del caller.
+     */
+    void CodeCache::free_region(uint8_t *ptr, size_t size) noexcept {
+        if (!ptr || size == 0) return;
+        if (!contains(ptr)) return;  // defensa: solo regiones nuestras
+        std::memset(ptr, 0xCC, size);
+        flush_icache(ptr, size);
+        free_list_.push_back({ptr, size});
     }
 
     /**

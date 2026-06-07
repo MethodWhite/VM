@@ -1807,6 +1807,32 @@ namespace vex {
                     emit_edge(os, src, dst, mn, EdgeKind::Dashed);
                 }
             }
+
+            // Fall-through: si el bloque NO termina en un terminador
+            // INCONDICIONAL (jmp / ret / hlt / fulfillhlt / tailcall), la
+            // ejecucion CAE al siguiente bloque secuencial.  Esto cubre:
+            //   - labels de 0 instrucciones (p.ej. `factorial:`) que caen al
+            //     `_entry_0` siguiente,
+            //   - saltos CONDICIONALES (cmpjmp.cc / cmpjmpu.cc / jmp.cc /
+            //     decjnz) cuya rama NO-tomada continua al bloque siguiente,
+            //   - bloques que terminan en call/mov/etc (continuan tras la
+            //     instruccion).
+            // Sin esto el grafo del .vel queda desconectado y no refleja el
+            // flujo real que ejecuta la VM.
+            if (bi + 1 < blocks.size()) {
+                bool falls = true;
+                if (!b.instrs.empty()) {
+                    const std::string last_mn = get_mnemonic(b.instrs.back());
+                    if (last_mn == "jmp" || last_mn == "ret" || last_mn == "hlt"
+                     || last_mn == "fulfillhlt" || last_mn == "tailcall") {
+                        falls = false;  // terminador incondicional: sin caida
+                    }
+                }
+                if (falls) {
+                    const std::string dst = "vb" + std::to_string(bi + 1);
+                    emit_edge(os, src, dst, "fall", EdgeKind::Solid, "#475569");
+                }
+            }
         }
 
         os << "}\n";

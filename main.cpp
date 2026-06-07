@@ -289,23 +289,27 @@ int main(int argc, char *argv[]) {
             // sandbox.h para tabla completa de caps + sintaxis.
             ("vex-caps",          "Phase M.sandbox: restringe caps del modulo principal. Sintaxis: 'fs:read,net,ffi:call=kernel32.dll;user32.dll'. Vacio = ALL granted (default). 'none' = sandbox total.",
                 cxxopts::value<std::string>()->default_value(""))
-            // Diagramas para debug y traceo del pipeline Vex.  Soportan dos
-            // formatos seleccionables via --diagram-format:
+            // Diagramas para debug y traceo del pipeline Vex.  Tres formatos
+            // seleccionables via --diagram-format:
             //   mermaid (default): escribe .mmd con bloque ```mermaid```;
             //                      listo para VS Code / GitHub / mermaid.live.
             //   graphviz:          escribe .dot con `digraph G { ... }`;
             //                      listo para `dot -Tsvg foo.dot -o foo.svg`.
-            //   both:              escribe AMBOS formatos.
+            //   html:              escribe .html interactivo AUTOCONTENIDO
+            //                      (CSS+JS embebidos, sin CDN): pan/zoom, panel
+            //                      de detalle por nodo, busqueda, filtros de
+            //                      aristas.  Se abre directo en el navegador.
+            //   both:              mermaid + graphviz.   all: los tres.
             // El contenido es paralelo entre formatos: misma topologia, misma
-            // info por nodo (Graphviz lleva extra via tooltips/atributos DOT).
-            // --diagram-all genera los 4 diagramas (AST, IR pre, IR post, VEL)
+            // info por nodo (Graphviz/HTML llevan extra via tooltips/detalle).
+            // --diagram-all genera las 4 vistas (AST, IR pre, IR post, VEL)
             // en el formato escogido.
             ("diagram-vex",     "Generar diagrama del AST Vex post type-check (.ast.<ext>)")
             ("diagram-ir",      "Generar diagrama del SSA IR pre-optimizacion (.ir.pre.<ext>)")
             ("diagram-ir-opt",  "Generar diagrama del SSA IR post-optimizacion (.ir.post.<ext>)")
             ("diagram-vel",     "Generar diagrama del bytecode .vel final (.vel.<ext>)")
-            ("diagram-all",     "Generar los 4 diagramas (vex, ir pre, ir post, vel) con sufijos correspondientes")
-            ("diagram-format",  "Formato de salida: mermaid | graphviz | both (default: mermaid). graphviz produce .dot listo para Graphviz; mermaid produce .mmd.",
+            ("diagram-all",     "Generar las 4 vistas (vex, ir pre, ir post, vel) con sufijos correspondientes")
+            ("diagram-format",  "Formato: mermaid | graphviz | html | both | all (default: mermaid). html produce paginas interactivas autocontenidas (.html); both=mermaid+graphviz; all=los tres.",
                 cxxopts::value<std::string>()->default_value("mermaid"))
             ("gc-debug",        "Activar trazas de debug del Garbage Collector a stderr (minor_gc, major_gc, sweep, release_handle, evacuate). Util para diagnosticar use-after-free o objetos colectados prematuramente. Alt: env VESTA_GC_DEBUG=1.")
             ("gc-debug-buffered","Activar modo BUFFERED del GC debug: ~100x mas rapido (buffer thread-local de 64KB) pero pierde las ultimas trazas en crash. Implica --gc-debug. Alt: env VESTA_GC_DEBUG_BUFFERED=1.")
@@ -1049,11 +1053,14 @@ int main(int argc, char *argv[]) {
                                 ? result["diagram-format"].as<std::string>()
                                 : std::string("mermaid");
         for (auto &c : diag_fmt) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        bool emit_mermaid  = (diag_fmt == "mermaid"  || diag_fmt == "both");
-        bool emit_graphviz = (diag_fmt == "graphviz" || diag_fmt == "dot" || diag_fmt == "both");
-        if (!emit_mermaid && !emit_graphviz) {
+        // Formatos: mermaid | graphviz/dot | html | both (=mermaid+graphviz) |
+        // all (=los tres).  "html" produce paginas interactivas autocontenidas.
+        bool emit_mermaid  = (diag_fmt == "mermaid"  || diag_fmt == "both" || diag_fmt == "all");
+        bool emit_graphviz = (diag_fmt == "graphviz" || diag_fmt == "dot"  || diag_fmt == "both" || diag_fmt == "all");
+        bool emit_html     = (diag_fmt == "html"     || diag_fmt == "all");
+        if (!emit_mermaid && !emit_graphviz && !emit_html) {
             std::cerr << "[diagram] Formato desconocido: '" << diag_fmt
-                      << "' (usar mermaid | graphviz | both). Defaulting a mermaid.\n";
+                      << "' (usar mermaid | graphviz | html | both | all). Defaulting a mermaid.\n";
             emit_mermaid = true;
         }
 
@@ -1166,6 +1173,10 @@ int main(int argc, char *argv[]) {
         copts.dump_graphviz_ir_pre   = emit_graphviz && diag_ir_pre;
         copts.dump_graphviz_ir_post  = emit_graphviz && diag_ir_post;
         copts.dump_graphviz_vel      = emit_graphviz && diag_vel;
+        copts.dump_html_ast          = emit_html     && diag_vex;
+        copts.dump_html_ir_pre       = emit_html     && diag_ir_pre;
+        copts.dump_html_ir_post      = emit_html     && diag_ir_post;
+        copts.dump_html_vel          = emit_html     && diag_vel;
 
         // Flag --port=<lang>: si presente, configurar el transpiler IR -> codigo.
         // El frontend Vex llama al port::Transpiler tras la fase de optimizacion
@@ -1487,7 +1498,16 @@ int main(int argc, char *argv[]) {
         const std::string pc_dir   = vex::default_project_cache_dir();
         const std::string pc_path  = vex::project_cache_path(canonical_root, pc_dir);
 
-        if (project_cache_enabled && has_imports) {
+        // Artefactos que SOLO se producen recorriendo el pipeline completo
+        // (no estan en el .velb cacheado): diagramas (mmd/dot/html), dump de
+        // IR (--vex-emit-ir) y transpile (--port).  Si el usuario los pide,
+        // saltamos el hit del project-cache para forzar la compilacion y que
+        // se generen; de lo contrario el cache hit los omitiria en silencio.
+        const bool wants_pipeline_artifacts =
+            diag_vex || diag_ir_pre || diag_ir_post || diag_vel
+            || emit_ir || !copts.port_target.empty();
+
+        if (project_cache_enabled && has_imports && !wants_pipeline_artifacts) {
             uint32_t cached_opts_hash = 0;
             std::vector<vex::ProjectCacheDep> cached_deps;
             std::vector<uint8_t>              cached_velb;
@@ -1842,6 +1862,13 @@ int main(int argc, char *argv[]) {
             if (diag_ir_post && !write_diagram(cr.graphviz_ir_post, ".ir.post.dot")) return EXIT_FAILURE;
             if (diag_vel     && !write_diagram(cr.graphviz_vel,     ".vel.dot"))     return EXIT_FAILURE;
         }
+        if (emit_html) {
+            // Paginas HTML interactivas autocontenidas: abrir en el navegador.
+            if (diag_vex     && !write_diagram(cr.html_ast,      ".ast.html"))     return EXIT_FAILURE;
+            if (diag_ir_pre  && !write_diagram(cr.html_ir_pre,   ".ir.pre.html"))  return EXIT_FAILURE;
+            if (diag_ir_post && !write_diagram(cr.html_ir_post,  ".ir.post.html")) return EXIT_FAILURE;
+            if (diag_vel     && !write_diagram(cr.html_vel,      ".vel.html"))     return EXIT_FAILURE;
+        }
 
         // Si --vex-emit-ir esta activo, escribir el dump del SSA IR
         // (pre y post optimizacion) en <out>.ir y salir.  Util para
@@ -2163,6 +2190,20 @@ int main(int argc, char *argv[]) {
                             result.count("dist-node-id")     > 0;
             if (has_dist) apply_dist_config(vm, result);
 
+            // Phase M.sandbox (orden critico): pre-activar `sandbox_active`
+            // ANTES de load_executable si las caps seran restringidas.
+            // load_executable hace el eager-compile de main, cuyo guard de
+            // seguridad consulta sandbox_active; si el flag se seteara solo
+            // DESPUES (al aplicar exe.caps mas abajo), el eager-compile veria
+            // sandbox_active=false -> JIT-compilaria main saltandose el check
+            // de capabilities -> bypass del sandbox bajo JIT.
+            if (result.count("vex-caps")) {
+                const std::string cs = result["vex-caps"].as<std::string>();
+                if (!cs.empty() && !::loader::parse_caps(cs).unrestricted()) {
+                    mgr.loader.sandbox_active = true;
+                }
+            }
+
             Timer t_load;
             runtime::ProcessVM *proc = mgr.loader.load_executable(*vm, velb_path);
             if (!proc) {
@@ -2176,6 +2217,12 @@ int main(int argc, char *argv[]) {
                 if (!caps_str.empty()) {
                     auto &exe = *mgr.loader.executables.front();
                     exe.caps = ::loader::parse_caps(caps_str);
+                    // Activar el sandbox solo si las caps son restringidas;
+                    // asi check_cap_at_pc paga overhead unicamente cuando hay
+                    // un sandbox real en juego.
+                    if (!exe.caps.unrestricted()) {
+                        mgr.loader.sandbox_active = true;
+                    }
                     std::cerr << "[sandbox] modulo principal con caps: "
                               << ::loader::caps_to_string(exe.caps) << "\n";
                 }

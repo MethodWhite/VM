@@ -45,28 +45,17 @@ comptime i32 SB_MAX_ENTRIES = 1024;
 comptime i32 SB_NAME_MAX    = 260;
 comptime i32 FINDDATA_BYTES = 320;
 
-// =============================================================================
-// DEBUG LOG / WORKAROUND DE BUG LATENTE DEL COMPILADOR
-// =============================================================================
-// `DEBUG_LOG = 1` ademas de diagnosticar, ENMASCARA un bug latente del
-// compilador donde `render_line_hl` (con syntax highlighter activo) crashea
-// silenciosamente en buffers grandes (>50KB) cuando se ejecuta el row loop
-// SIN llamadas intermedias a funciones que provoquen save_live_regs (efecto
-// regalloc).  El bug se reproduce abriendo `main.vex` del propio editor
-// (~62KB) sin diag_log: el editor sale en LOOP iter=K tras la primera
-// renderizacion exitosa.  Con diag_log=1, las llamadas a fopen/fwrite/
-// fclose en cada iter alteran el patron de save/restore-live-regs y el
-// crash desaparece.
+// Volcado opcional de diagnostico a `vexed_diag.log` (linea por evento).
+// Util para depurar regresiones; se mantiene a 0 en builds normales para
+// que el optimizador elimine el cuerpo de la funcion de log.  El sink
+// global `g_diag_sink` (definido junto a `diag_log`) mantiene los
+// argumentos string vivos hasta el call site para evitar relocations
+// huerfanas tras el DCE cuando esta a 0.
 //
-// Causa raiz (presunta): regalloc + GC interaction en render_line_hl.  Hay
-// algun reg/spill que se corrompe entre iteraciones del row loop cuando
-// no hay calls que fuercen save/restore.  Es un LANG bug, no del editor.
-// Documentado para fix futuro al nivel del compilador.
-//
-// Cambiar a 0 + rebuild para re-disable diag (PROVOCARA el bug en buffers
-// grandes hasta que se arregle al nivel compilador).
-// =============================================================================
-comptime i32 DEBUG_LOG = 1;
+// Activar a 1 + rebuild para recopilar trazas en `vexed_diag.log`
+// (append).  Util para diagnosticar bugs en entornos donde no hay
+// debugger interactivo conectado.
+comptime i32 DEBUG_LOG = 0;
 
 // F8: Configuracion del editor (toggleable en runtime).
 //   show_line_numbers -> Ctrl-E
@@ -107,11 +96,11 @@ EditorSettings settings_load() {
     file_io.FileReader fr = new file_io.FileReader();
     Result<i64, i32> rload = fr.read_all(".vexed.json");
     if (!isOk(rload)) {
-        diag_log("settings_load .vexed.json not found, using defaults");
+        diag_log("settings_load no se encontro .vexed.json, usando defaults");
         return s;
     }
     i64 n = value(rload);
-    diag_log("settings_load read ${n} bytes from .vexed.json");
+    diag_log("settings_load leidos ${n} bytes de .vexed.json");
     // Parser ad-hoc: busca substrings "line_numbers=N", "whitespace=N",
     // "sidebar=N".  Lee el digito justo despues del `=`.
     i32 i = 0;
@@ -401,7 +390,7 @@ class Sidebar {
 
     public i32 entry_is_dir(i32 i) {
         if (i < 0 || i >= this.count) return 0;
-        return this.is_dirs[i];
+        return (i32) this.is_dirs[i];
     }
 
     // Construye el path absoluto cwd + "\\" + entry_name(i).
@@ -410,7 +399,8 @@ class Sidebar {
         i32 cwd_n = (i32) str_bytes(this.cwd);
         i32 en    = this.lens[i];
         u8* cwd_c = str_cstr(this.cwd);
-        u8* buf   = malloc(cwd_n + en + 2);
+        u64 total = (u64)(cwd_n + en + 2);
+        u8* buf   = malloc(total);
         i32 k = 0;
         while (k < cwd_n) { buf[k] = cwd_c[k]; k = k + 1; }
         buf[cwd_n] = (u8) 92; // '\'
@@ -418,7 +408,7 @@ class Sidebar {
         k = 0;
         while (k < en) { buf[cwd_n + 1 + k] = nm[k]; k = k + 1; }
         buf[cwd_n + 1 + en] = 0;
-        string s = str_make(buf, cwd_n + 1 + en);
+        string s = str_make(buf, (u64)(cwd_n + 1 + en));
         free(buf);
         return s;
     }
@@ -434,9 +424,13 @@ class Sidebar {
 // activa resaltada con INVERT).  Como Vex no soporta `class == class`
 // hoy, identificamos la activa por `id`.
 void render_tab_bar(tabs.Workspace ws, screen.Screen sc) {
+    diag_log("RTB:0 enter");
     sc.move_cursor(1, 1);
+    diag_log("RTB:1 post-move");
     tabs.EditorTab active = ws.active;
+    diag_log("RTB:2 got-active");
     if (active == null) {
+        diag_log("RTB:2a null-active");
         print(screen.ATTR_INVERT);
         print(" sin pestanas ");
         print(screen.ATTR_RESET);
@@ -444,6 +438,7 @@ void render_tab_bar(tabs.Workspace ws, screen.Screen sc) {
         return;
     }
     i32 active_id = active.id;
+    diag_log("RTB:3 active_id=${active_id}");
     // Busca el head (count-1 retrocesos desde la activa).
     tabs.EditorTab head = active;
     i32 back = 0;
@@ -451,25 +446,36 @@ void render_tab_bar(tabs.Workspace ws, screen.Screen sc) {
         head = head.prev;
         back = back + 1;
     }
+    diag_log("RTB:4 head-found");
     tabs.EditorTab cur = head;
     i32 idx = 1;
     i32 max_col = sc.cols;
     i32 col_used = 0;
     while (idx <= ws.count) {
+        diag_log("RTB:5 iter idx=${idx}");
         string mark = "";
         if (cur.buf.dirty == 1) mark = "*";
+        diag_log("RTB:6 pre-label cur_id=${cur.id}");
         string label = " ${idx} ${cur.title}${mark} ";
+        diag_log("RTB:7 post-label");
         i32 lblen = (i32) str_bytes(label);
         if (col_used + lblen > max_col) break;
         if (cur.id == active_id) print(screen.ATTR_INVERT);
         else                     print(screen.ATTR_DIM);
+        diag_log("RTB:8 pre-print-label");
         print(label);
+        diag_log("RTB:9 post-print-label");
         print(screen.ATTR_RESET);
+        diag_log("RTB:10 post-reset");
         col_used = col_used + lblen;
+        diag_log("RTB:11 pre-cur-next");
         cur = cur.next;
+        diag_log("RTB:12 post-cur-next");
         idx = idx + 1;
     }
+    diag_log("RTB:13 LOOP_END");
     sc.clear_eol();
+    diag_log("RTB:14 exit");
 }
 
 // Renderiza la sidebar en las primeras `sb.width` columnas.  Cada
@@ -501,13 +507,34 @@ void render_sidebar(Sidebar sb, screen.Screen sc) {
         sc.move_cursor(body_top + r, 1);
         i32 idx = sb.scroll + r;
         if (idx < sb.count) {
+            // Cursor sidebar visible SIEMPRE en la fila activa.
+            //   is_sel == 2 : sel + focused -> INVERT completo (fila resaltada).
+            //   is_sel == 1 : sel sin focus -> prefijo '>' + dim (fila marcada
+            //                  pero sin focus; permite ver donde esta el
+            //                  navegador aun cuando Ctrl-B no esta activo).
+            //   is_sel == 0 : otra fila -> sin estilo.
             i32 is_sel = 0;
-            if (idx == sb.sel && sb.focused == 1) is_sel = 1;
-            if (is_sel == 1) print(screen.ATTR_INVERT);
+            if (idx == sb.sel) {
+                if (sb.focused == 1) is_sel = 2;
+                else                  is_sel = 1;
+            }
+            // Cursor SIEMPRE con prefijo ASCII inequivoco:
+            //   is_sel == 2 (sel + focused) -> ">" + ATTR_INVERT (resaltado fuerte)
+            //   is_sel == 1 (sel sin focus) -> ">" + FG_GRAY (visible pero subtle)
+            //   is_sel == 0 (otra fila)     -> " " (sin marca)
+            // Sin INVERT, terminales que no soportan reverse video aun ven ">".
             // F3: indent segun depth (2 spaces por nivel).
             i32 depth = sb.depths[idx];
             i32 indent_used = 0;
-            print(" ");
+            if (is_sel == 2) {
+                print(screen.ATTR_INVERT);
+                print(">");
+            } else if (is_sel == 1) {
+                print(screen.FG_GRAY);
+                print(">");
+            } else {
+                print(" ");
+            }
             indent_used = indent_used + 1;
             i32 ii = 0;
             while (ii < depth) {
@@ -583,11 +610,12 @@ void render_sidebar(Sidebar sb, screen.Screen sc) {
             }
             // Resetear color tras el nombre.
             print(screen.ATTR_RESET);
-            if (is_sel == 1) print(screen.ATTR_INVERT);
+            if (is_sel == 2) print(screen.ATTR_INVERT);
+            else if (is_sel == 1) print(screen.FG_GRAY);
             // Padding hasta width-1 (cuenta indent del depth).
             i32 used = indent_used + 2 + nlen;
             while (used < sb.width - 1) { print(" "); used = used + 1; }
-            if (is_sel == 1) print(screen.ATTR_RESET);
+            if (is_sel != 0) print(screen.ATTR_RESET);
         } else {
             i32 fill = 0;
             while (fill < sb.width - 1) { print(" "); fill = fill + 1; }
@@ -610,7 +638,6 @@ void draw_full(tabs.Workspace ws, Sidebar sb, screen.Screen sc, i32 view_rows,
     tabs.EditorTab t = ws.active;
     buffer.Buffer b = t.buf;
     i32 row_top = t.row_top;
-    diag_log("draw_full ENTRY title='${t.title}' b.length=${b.length} line_count=${b.line_count()} row_top=${row_top}");
 
     i32 base_left = 1;
     if (sb.visible == 1) base_left = sb.width + 1;
@@ -626,10 +653,13 @@ void draw_full(tabs.Workspace ws, Sidebar sb, screen.Screen sc, i32 view_rows,
     i32 editor_left = base_left + gutter_w;
 
     // 1. Tab bar arriba (toda la anchura).
+    diag_log("DF:1 pre-tab-bar");
     render_tab_bar(ws, sc);
+    diag_log("DF:2 post-tab-bar");
 
     // 2. Sidebar (si visible).
     render_sidebar(sb, sc);
+    diag_log("DF:3 post-sidebar");
 
     // 3. Cuerpo del editor (filas 2..sc.rows-1, cols editor_left..cols).
     // Sintaxis Vex se aplica al render de TODAS las lineas visibles.
@@ -661,20 +691,15 @@ void draw_full(tabs.Workspace ws, Sidebar sb, screen.Screen sc, i32 view_rows,
     string col_lnum_cur  = "\x1b[38;2;241;250;140m";   // yellow para linea actual
     string col_gutter_br = "\x1b[38;2;68;71;90m";      // current-line subtle
 
+    diag_log("DF:4 pre-body-loop view_rows=${view_rows}");
     i32 r = 0;
     while (r < view_rows) {
+        diag_log("DF:5 body row=${r}");
         i32 file_line = row_top + r;
-        // WORKAROUND latent bug: diag_log UNCONDITIONAL (incluso buffer vacio).
-        // Necesitamos calls que dispersen save_live_regs en el row loop.
-        // Sin esto, el bug crashea silenciosamente en cualquier momento.
-        diag_log("rl ${r}");
-        // F8: gutter de line numbers a la izquierda del editor body.
+        // Gutter de numeros de linea (lateral izquierdo del editor).
         if (gutter_w > 0) {
-            diag_log("rl ${r} g1 move_cursor");
             sc.move_cursor(body_top + r, base_left);
-            diag_log("rl ${r} g2 line_count_check");
             if (file_line < b.line_count()) {
-                diag_log("rl ${r} g3 num=${file_line + 1}");
                 if (file_line == cur_row) print(col_lnum_cur);
                 else                       print(col_lnum_norm);
                 // Imprimir el numero (1-based) right-aligned en gutter_w-2 cols.
@@ -687,15 +712,12 @@ void draw_full(tabs.Workspace ws, Sidebar sb, screen.Screen sc, i32 view_rows,
                 i32 pad = num_w - dig;
                 i32 pi = 0;
                 while (pi < pad) { print(" "); pi = pi + 1; }
-                diag_log("rl ${r} g4 pre_print_int");
                 print_int(num);
-                diag_log("rl ${r} g5 post_print_int");
                 print(" ");
                 print(col_gutter_br);
                 print("|");
                 print(" ");
                 print(screen.ATTR_RESET);
-                diag_log("rl ${r} g6 gutter_done");
             } else {
                 // Gutter vacio para lineas inexistentes.
                 i32 gi = 0;
@@ -706,14 +728,14 @@ void draw_full(tabs.Workspace ws, Sidebar sb, screen.Screen sc, i32 view_rows,
             }
         }
         if (file_line < b.line_count()) {
+            diag_log("DF:6 render-line r=${r} file_line=${file_line}");
             i32 byte_start = b.line_offset(file_line);
-            if (b.length > 0) diag_log("rl ${r} pre_render bs=${byte_start}");
             if (settings.show_whitespace == 1) {
                 sc.render_line_with_ws(b, byte_start, body_top + r, editor_left);
             } else {
                 sc.render_line_hl(b, byte_start, body_top + r, editor_left, hl);
             }
-            if (b.length > 0) diag_log("rl ${r} post_render");
+            diag_log("DF:7 post-render-line r=${r}");
         } else {
             sc.move_cursor(body_top + r, editor_left);
             print(screen.FG_GRAY);
@@ -723,6 +745,7 @@ void draw_full(tabs.Workspace ws, Sidebar sb, screen.Screen sc, i32 view_rows,
         }
         r = r + 1;
     }
+    diag_log("DF:8 post-body-loop");
 
     // 4. Status bar (ultima fila).
     sc.move_cursor(sc.rows, 1);
@@ -873,7 +896,6 @@ void show_help_render_entry(i32 row, i32 left, i32 inner_w, HelpEntry e,
 }
 
 void show_help_overlay(screen.Screen sc) {
-    diag_log("show_help_overlay ENTRY");   // WORKAROUND latent bug
     i32 box_w = 70;
     if (box_w > sc.cols - 4) box_w = sc.cols - 4;
     if (box_w < 40) box_w = 40;
@@ -892,7 +914,6 @@ void show_help_overlay(screen.Screen sc) {
     // Construir contenido scrollable: lista de HelpEntry.  El total puede
     // exceder la altura visible; navegamos con Up/Down/PgUp/PgDn.
     HelpEntry[64] entries;
-    diag_log("help array allocated");   // WORKAROUND latent bug
     i32 n = 0;
     entries[n] = he_make(1, "Movimiento", "");                                       n = n + 1;
     entries[n] = he_make(0, "Flechas",                "mover el cursor");            n = n + 1;
@@ -902,7 +923,6 @@ void show_help_overlay(screen.Screen sc) {
     entries[n] = he_make(0, "Ctrl-Home / End",        "doc inicio / fin");           n = n + 1;
     entries[n] = he_make(0, "Shift + movimiento",     "extender seleccion");         n = n + 1;
     entries[n] = he_make(2, "", "");                                                  n = n + 1;
-    diag_log("help mov done");
     entries[n] = he_make(1, "Edicion", "");                                           n = n + 1;
     entries[n] = he_make(0, "Enter",                  "nueva linea + auto-indent");  n = n + 1;
     entries[n] = he_make(0, "Backspace / Delete",     "borrar caracter / seleccion");n = n + 1;
@@ -913,7 +933,6 @@ void show_help_overlay(screen.Screen sc) {
     entries[n] = he_make(0, "F4",                     "toggle comentario //");       n = n + 1;
     entries[n] = he_make(0, "Ctrl-Z / Ctrl-Y",        "undo / redo");                n = n + 1;
     entries[n] = he_make(2, "", "");                                                  n = n + 1;
-    diag_log("help edit done");
     entries[n] = he_make(1, "Archivo y busqueda", "");                                n = n + 1;
     entries[n] = he_make(0, "Ctrl-S",                 "guardar fichero actual");     n = n + 1;
     entries[n] = he_make(0, "Ctrl-O",                 "guardar como (prompt)");      n = n + 1;
@@ -921,7 +940,6 @@ void show_help_overlay(screen.Screen sc) {
     entries[n] = he_make(0, "F3",                     "buscar siguiente");           n = n + 1;
     entries[n] = he_make(0, "Ctrl-G",                 "ir a linea N");               n = n + 1;
     entries[n] = he_make(2, "", "");                                                  n = n + 1;
-    diag_log("help arc done");
     entries[n] = he_make(1, "Vista y toggles", "");                                   n = n + 1;
     entries[n] = he_make(0, "Ctrl-B",                 "toggle sidebar");             n = n + 1;
     entries[n] = he_make(0, "Ctrl-E",                 "toggle line numbers");        n = n + 1;
@@ -929,20 +947,17 @@ void show_help_overlay(screen.Screen sc) {
     entries[n] = he_make(0, "F6",                     "ciclar pestanas activa");     n = n + 1;
     entries[n] = he_make(0, "Sidebar: Enter",         "expand / collapse dir");      n = n + 1;
     entries[n] = he_make(2, "", "");                                                  n = n + 1;
-    diag_log("help vista done");
     entries[n] = he_make(1, "Navegacion y edicion avanzada", "");                     n = n + 1;
     entries[n] = he_make(0, "Ctrl-P",                 "fuzzy file picker");          n = n + 1;
     entries[n] = he_make(0, "Ctrl-Up / Ctrl-Down",    "agregar multicursor");        n = n + 1;
     entries[n] = he_make(0, "F5",                     "autocomplete popup");         n = n + 1;
     entries[n] = he_make(0, "Tab (en popup)",         "aceptar sugerencia");         n = n + 1;
     entries[n] = he_make(2, "", "");                                                  n = n + 1;
-    diag_log("help nav done");
     entries[n] = he_make(1, "Pestanas", "");                                          n = n + 1;
     entries[n] = he_make(0, "Ctrl-N",                 "nueva pestana");              n = n + 1;
     entries[n] = he_make(0, "Ctrl-W",                 "cerrar pestana actual");      n = n + 1;
     entries[n] = he_make(0, "Ctrl-PgUp / PgDn",       "pestana prev / sig");         n = n + 1;
     entries[n] = he_make(2, "", "");                                                  n = n + 1;
-    diag_log("help pest done");
     entries[n] = he_make(1, "Salir", "");                                             n = n + 1;
     entries[n] = he_make(0, "Ctrl-Q",                 "salir del editor");           n = n + 1;
     entries[n] = he_make(0, "Esc",                    "cancelar seleccion / prompt");n = n + 1;
@@ -957,7 +972,6 @@ void show_help_overlay(screen.Screen sc) {
     i32 scroll_off = 0;
     i32 closing = 0;
     while (closing == 0) {
-        diag_log("help_overlay iter");   // WORKAROUND latent bug
         // Borde superior con titulo centrado.
         print("\x1b[${top};${left}H");
         print(col_bord);
@@ -1062,11 +1076,25 @@ void show_help(screen.Screen sc) {
 i64 make_tab_last_status = 0;
 i64 make_tab_last_err    = 0;
 
+// =============================================================================
+// Sink global para diag_log: cada llamada lee el tamano del mensaje y lo
+// guarda en `g_diag_sink`.  Esto fuerza al optimizador a MANTENER los
+// string literals pasados a `diag_log` vivos hasta el call site, incluso
+// cuando `DEBUG_LOG == 0` y el cuerpo del log queda inalcanzable.  Sin
+// este sink, el DCE podia eliminar los STR_LIT_ADDR pero dejaba
+// referencias `code.s_<N>` huerfanas que rompian la fase de relocation
+// del linker.
+// =============================================================================
+i32 g_diag_sink = 0;
+
 // Escribe un mensaje en vexed_diag.log (append) si DEBUG_LOG == 1.
-// Si esta a 0 (default), no-op completo: no abre fichero, no escribe.
-// Para activar: cambiar `comptime i32 DEBUG_LOG = 0;` -> `... = 1;` y rebuild.
+// Cuando DEBUG_LOG == 0 (default release), retorna sin abrir el fichero;
+// el toque previo a `g_diag_sink` impide DCE huerfana de los literales.
+// Para activar: cambiar `comptime i32 DEBUG_LOG = 0;` -> `... = 1;`.
 void diag_log(string msg) {
-    if (DEBUG_LOG == 0) return;
+    // DIAGNOSTICO FORZADO (bug C): siempre escribe + flush para que el log
+    // tenga el ultimo entry antes del crash.  Sin el gate DEBUG_LOG.
+    g_diag_sink = (i32) str_bytes(msg);
     Result<i64, i32> rfp = file_io.open_file("vexed_diag.log", "ab");
     if (!isOk(rfp)) return;
     i64 fp = value(rfp);
@@ -1084,21 +1112,17 @@ tabs.EditorTab make_tab(string path, string display_title) {
     if (str_bytes(path) <= 0) {
         make_tab_last_status = -1;
         make_tab_last_err    = 0;
-        diag_log("make_tab EARLY_RETURN empty path");
+        diag_log("make_tab EARLY_RETURN path vacio");
         return t;
     }
-    diag_log("make_tab CREATING FileReader");
     file_io.FileReader fr = new file_io.FileReader();
-    diag_log("make_tab CALLING read_all");
     Result<i64, i32> rload = fr.read_all(path);
-    diag_log("make_tab read_all returned, checking isOk");
     if (isOk(rload)) {
         i64 n = value(rload);
         make_tab_last_status = n;
         make_tab_last_err    = 0;
-        diag_log("make_tab read OK n=${n}");
+        diag_log("make_tab leidos ${n} bytes de '${display_title}'");
         t.buf.ensure_capacity((i32) n + 64);
-        diag_log("make_tab ensure_capacity done");
         i32 i = 0;
         while (i < (i32) n) {
             t.buf.data[i] = fr.data[i];
@@ -1107,13 +1131,12 @@ tabs.EditorTab make_tab(string path, string display_title) {
         t.buf.length = (i32) n;
         t.buf.cursor = 0;
         t.buf.dirty  = 0;
-        diag_log("make_tab buf populated");
     } else {
         make_tab_last_status = -2;
         make_tab_last_err    = (i64) error(rload);
-        diag_log("make_tab read FAIL err=${error(rload)}");
+        diag_log("make_tab FALLO al leer err=${(i32) error(rload)}");
     }
-    diag_log("make_tab EXIT");
+    diag_log("make_tab EXIT status=${make_tab_last_status}");
     return t;
 }
 
@@ -1257,6 +1280,11 @@ i32 main() {
     // FILE/NEW deja sb.visible=0 default.
     if (lr.mode == launcher.LR_PROJECT) {
         sb.visible = settings.show_sidebar;
+        // Si el sidebar esta visible en project mode, arrancar con foco
+        // en el para que las flechas naveguen entries y Enter abra el
+        // archivo seleccionado.  Sin esto, las teclas iban al editor
+        // (untitled-1) y el sidebar no respondia hasta pulsar F6.
+        if (sb.visible == 1) sb.focused = 1;
     }
 
     i32 view_rows = sc.rows - 2;
@@ -1271,8 +1299,8 @@ i32 main() {
     while (quit == 0) {
         tabs.EditorTab tab = ws.active;
         buffer.Buffer b = tab.buf;
-        diag_log("LOOP iter=${loop_iter} title='${tab.title}' buf.length=${b.length} line_count=${b.line_count()}");
         loop_iter = loop_iter + 1;
+        diag_log("LOOP iter=${loop_iter} title='${tab.title}' length=${b.length} lines=${b.line_count()}");
         history.SnapshotStack st = tab.undo;
         history.SnapshotStack rd = tab.redo;
         i32 row_top = tab.row_top;
@@ -1353,19 +1381,12 @@ i32 main() {
                             }
                         }
                     } else {
-                        diag_log("sidebar file branch begin");   // WORKAROUND
                         string p = sb.entry_path(sb.sel);
-                        diag_log("entry_path done");
                         string nm = sb.entry_name(sb.sel);
-                        diag_log("entry_name done");
                         i32 plen = (i32) str_bytes(p);
-                        diag_log("sidebar ENTER path_bytes=${plen}");
                         tabs.EditorTab new_t = make_tab(p, nm);
-                        diag_log("post make_tab, new_t.buf.length=${new_t.buf.length} line_count=${new_t.buf.line_count()}");
                         ws.open_tab(new_t);
-                        diag_log("post open_tab, ws.count=${ws.count}");
                         tabs.EditorTab chk = ws.active;
-                        diag_log("ws.active.buf.length=${chk.buf.length} line_count=${chk.buf.line_count()} title='${chk.title}'");
                         sb.focused = 0;
                         sc.clear();
                         if (make_tab_last_status > 0) {
@@ -1454,7 +1475,6 @@ i32 main() {
                 i32 anchor_col = cur_col + sb_off;
                 i32 ac_done = 0;
                 while (ac_done == 0) {
-                    diag_log("ac iter");        // WORKAROUND latent bug
                     ac.render_popup(sc, anchor_row, anchor_col);
                     flush();
                     i32 ak = input.read_key_blocking();
@@ -1753,7 +1773,6 @@ i32 main() {
             sc.hide_cursor();
             i32 fp_done = 0;
             while (fp_done == 0) {
-                diag_log("file_picker iter");   // WORKAROUND latent bug
                 fp.render(sc);
                 i32 fk = input.read_key_blocking();
                 i32 act = fp.handle_key(fk);

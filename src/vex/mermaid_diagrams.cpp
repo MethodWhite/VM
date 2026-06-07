@@ -1876,6 +1876,25 @@ namespace vex {
                     }
                 }
             }
+
+            // Fall-through: el bloque CAE al siguiente bloque secuencial si su
+            // ultima instruccion NO es un terminador incondicional
+            // (jmp / ret / hlt / fulfillhlt / tailcall).  Cubre labels de 0
+            // instrs (caen al _entry) y saltos condicionales (rama no-tomada).
+            if (bi + 1 < blocks.size()) {
+                bool falls = true;
+                if (!b.instrs.empty()) {
+                    const std::string last_mn = get_mnemonic(b.instrs.back());
+                    if (last_mn == "jmp" || last_mn == "ret" || last_mn == "hlt"
+                     || last_mn == "fulfillhlt" || last_mn == "tailcall") {
+                        falls = false;
+                    }
+                }
+                if (falls) {
+                    const std::string dst = "vb" + std::to_string(bi + 1);
+                    os << "    " << src << " -->|fall| " << dst << "\n";
+                }
+            }
         }
 
         os << "```\n";

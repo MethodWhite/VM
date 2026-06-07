@@ -1,0 +1,49 @@
+// Regresion C2.13: escape analysis + scalar replacement de objetos GC.
+//
+// Ejercita los patrones que el pase `ir_pass_scalar_replace_gc` debe manejar
+// correctamente (transformar o bailar) sin cambiar la semantica:
+//   1. Read-only scalar replacement: `f = new Foo(i); return f.x` -> return i.
+//   2. Field versioning (objeto mutable single-block): store-to-load forwarding.
+//   3. PHI de objetos: `r = cond ? a : b` -- el pase DEBE bailar (no eliminar
+//      el alloc dejando el PHI colgando).  Regresion de bug69_phi_class.
+//
+// Resultado esperado: 5 + 7 + 10 + 20 = 42.
+
+class Foo     { public i32 x; public Foo(i32 v) { this.x = v; } }
+class Counter { public i32 x; public Counter(i32 v) { this.x = v; } }
+class Item    { public i32 v; public Item(i32 x) { this.v = x; } }
+
+// (1) Read-only: el objeto solo se lee -> scalar-replaced a `return i`.
+i32 read_only(i32 i) {
+    Foo f = new Foo(i);
+    return f.x;
+}
+
+// (2) Mutable single-block: c.x escrito tras el ctor -> field versioning.
+//     c.x = v; c.x = c.x * 2 + 1  ->  2*v + 1.
+i32 mutable(i32 v) {
+    Counter c = new Counter(v);
+    c.x = c.x * 2;
+    c.x = c.x + 1;
+    return c.x;
+}
+
+// (3) PHI de objetos: r es a o b segun cond.  El pase NO puede materializar
+//     el campo a traves del merge -> debe bailar y dejar el alloc intacto.
+Item pick(i32 cond) {
+    Item a = new Item(10);
+    Item b = new Item(20);
+    Item r;
+    if (cond == 0) { r = a; } else { r = b; }
+    return r;
+}
+
+i32 main() {
+    i32 a = read_only(5);        // 5
+    i32 b = mutable(3);          // 2*3 + 1 = 7
+    Item x = pick(0);            // Item(10)
+    Item y = pick(1);            // Item(20)
+    i32 c = x.v;                 // 10
+    i32 d = y.v;                 // 20
+    return a + b + c + d;        // 5 + 7 + 10 + 20 = 42
+}

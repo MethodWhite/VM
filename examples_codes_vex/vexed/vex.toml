@@ -14,10 +14,32 @@ declared = ["fs:read", "fs:write", "ffi:call=msvcrt.dll"]
 
 [scripts]
 # Compila el proyecto a vexed.velb listo para ejecutar.
-build = "vm --vex src/main.vex -o vexed"
+build = "vesta --vex src/main.vex -o vexed"
 
 # Ejecuta el binario compilado en modo interactivo (lee de stdin).
-run   = "vm --run vexed.velb"
+run   = "vesta --run vexed.velb"
 
 # Ejecuta y muestra estadisticas (instrucciones, MIPS, GC stats).
-stats = "vm --run vexed.velb --stats"
+stats = "vesta --run vexed.velb --stats"
+
+# Tests unitarios.  Compila + ejecuta cada caso en tests/cases/.  Un
+# unico comando: el `&&` encadena compilacion y ejecucion sin necesidad
+# de dos fases.  Para localizar bugs en aislamiento del editor (sin
+# necesidad de TTY interactivo).
+#
+# Uso:
+#   vesta pkg run tests       # compila + ejecuta, reporta PASS/FAIL
+tests = "vesta --vex tests/run_all.vex -o tests/run_all && vesta --run tests/run_all.velb"
+
+# Genera diagramas Mermaid (.mmd) y Graphviz (.dot) del pipeline de
+# compilacion para el editor.  Util para inspeccionar AST/IR/bytecode
+# visualmente.  Genera:
+#   - vexed.ast.mmd     AST Vex post type-check
+#   - vexed.ir.pre.mmd  SSA IR pre-optimizacion
+#   - vexed.ir.post.mmd SSA IR post-optimizacion
+#   - vexed.vel.mmd     bytecode .vel final
+#   - vexed.dot         AST en formato Graphviz (lo abre `dot -Tsvg`)
+#
+# Uso:
+#   vesta pkg run diagrams
+diagrams = "vesta --vex src/main.vex -o vexed --diagram-all --diagram-format all"

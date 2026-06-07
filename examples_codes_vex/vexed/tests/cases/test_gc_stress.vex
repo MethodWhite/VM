@@ -1,0 +1,46 @@
+// =============================================================================
+// test_gc_stress.vex - stress del GC con muchas allocs cortas tras un
+// CALLN bloqueante (patron del editor: read_key + draw_full + allocs).
+// =============================================================================
+
+public class Node {
+    public i32 v;
+    public Node next;
+    public Node(i32 x) { this.v = x; this.next = null; }
+}
+
+i32 helper_strings(i32 n) {
+    // Forza muchos strings intermedios via interpolacion.
+    string a = "value-${n}";
+    string b = "${n}-other";
+    return (i32) (str_bytes(a) + str_bytes(b));
+}
+
+public i32 run() {
+    // Crear 100 Nodes en cadena, luego iterar leyendo el field.
+    Node head = new Node(0);
+    Node cur = head;
+    i32 i = 1;
+    while (i < 100) {
+        Node n = new Node(i);
+        cur.next = n;
+        cur = n;
+        // Forzar interpolacion + str_bytes (creates StringObjects que pueden
+        // disparar GC).
+        i32 dummy = helper_strings(i);
+        if (dummy <= 0) return 1;
+        i = i + 1;
+    }
+    // Iterar de vuelta sumando.
+    i32 sum = 0;
+    Node walk = head;
+    i32 count = 0;
+    while (walk != null && count < 100) {
+        sum = sum + walk.v;
+        walk = walk.next;
+        count = count + 1;
+    }
+    // 0+1+2+...+99 = 4950
+    if (sum != 4950) return 2;
+    return 0;
+}

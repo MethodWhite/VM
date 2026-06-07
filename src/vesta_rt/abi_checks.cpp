@@ -57,6 +57,10 @@ namespace vesta_rt {
     /// Offset de @c cached_page_host dentro de @c vm::VirtualMemory.
     extern const int32_t kVmMemCachedPageHostOffset =
         static_cast<int32_t>(offsetof(vm::VirtualMemory, cached_page_host));
+
+    /* Phase D.7 perf inline-alloc: offset de @c raw_alloc en @c ProcessVM. */
+    extern const int32_t kProcRawAllocOffset =
+        static_cast<int32_t>(offsetof(runtime::ProcessVM, raw_alloc));
 }
 
 /* ========================================================================= */
@@ -183,6 +187,22 @@ static_assert(offsetof(runtime::ProcessVM, registers)
               + offsetof(runtime::context_registers_vm, base_pointer)
               == VESTA_PROC_BASE_POINTER_OFFSET,
               "ABI drift: base_pointer no esta en VESTA_PROC_BASE_POINTER_OFFSET");
+
+/* Validacion del puntero cacheado a la HandleTable (Phase D.7).  El JIT
+ * inline-a @c deref con @c mov base, [rbx + VESTA_PROC_JIT_HANDLE_TABLE_OFFSET].
+ * Si el layout de ProcessVM cambia, leer el nuevo offset con @c offsetof y
+ * actualizar la constante en @c abi.h. */
+static_assert(offsetof(runtime::ProcessVM, jit_handle_table)
+              == VESTA_PROC_JIT_HANDLE_TABLE_OFFSET,
+              "ABI drift: jit_handle_table no esta en VESTA_PROC_JIT_HANDLE_TABLE_OFFSET");
+
+/* OSR (Phase D.8): el JIT escribe/lee el buffer del state-transfer con
+ * @c mov rax, [rbx + VESTA_PROC_OSR_BUFFER_OFFSET].  Si el layout de
+ * ProcessVM cambia, leer el nuevo offset con @c offsetof y actualizar la
+ * constante en @c abi.h. */
+static_assert(offsetof(runtime::ProcessVM, osr_buffer)
+              == VESTA_PROC_OSR_BUFFER_OFFSET,
+              "ABI drift: osr_buffer no esta en VESTA_PROC_OSR_BUFFER_OFFSET");
 
 /* ========================================================================= */
 /* ClassInfo + MethodInfo offsets (inline CALLVIRT dispatch)    */

@@ -117,12 +117,20 @@ namespace jit {
         /// @c resolve_native_symbol.
         std::function<uint64_t(const std::string &)> resolve_native_fn{};
 
-        /// Callback para reservar un slot de Inline Cache (16 bytes:
-        /// cached_class_ptr + cached_jit_code, inicial 0).  Retorna la
-        /// addr HOST del slot.  El selector embebe esa addr en el codigo
-        /// emitido para CALLVIRT IC pattern.  Si es null, el selector
-        /// emite el inline dispatch tradicional (sin IC).
-        std::function<uint64_t()> reserve_ic_slot{};
+        /// Callback para reservar un slot de Inline Cache (PIC de 4 entradas
+        /// x 16 bytes = 64 bytes: [class_ptr][jit_code] por entrada, inicial
+        /// 0).  Retorna la addr HOST del slot.  El selector embebe esa addr
+        /// en el codigo emitido para el CALLVIRT IC pattern.  Si es null, el
+        /// selector emite el inline dispatch tradicional (sin IC).
+        ///
+        /// C2-cimiento (2026-06-07): el parametro @p callsite_key identifica
+        /// el call site (clave = (fn_pc << 8) | ordinal-de-IC-en-la-fn) para
+        /// que el slot sea DIRECCIONABLE: el mismo call site reusa el mismo
+        /// slot entre recompilaciones, y el pase C2 puede encontrarlo y leer
+        /// su estado (clases observadas) para especular.  @p callsite_key==0
+        /// significa "sin clave" (e.g. NATIVE_ABI / tests): se aloca un slot
+        /// fresco no-direccionable, como antes.
+        std::function<uint64_t(uint64_t /*callsite_key*/)> reserve_ic_slot{};
 
         /// Callback para leer un qword (u64) de @c vm_mem en compile-time.
         /// Usado por el peephole de inlining: cuando el JIT ve
@@ -171,6 +179,26 @@ namespace jit {
         /// Si es 0, el JIT cae al runtime call @c vrt_tryleave (correcto pero ~5x mas lento).
         int32_t exc_frame_stack_offset = 0;
 
+        /// callback-ABI (2026-06-06): cuando @c mode==VM_ABI y este flag es
+        /// true, la funcion se compila con ENTRY de ABI C nativo (callable
+        /// directamente por qsort/Win32) en vez del entry VM_ABI estandar.
+        /// El cuerpo se lowerea identico a VM_ABI (RBX=proc), pero el prologo
+        /// lee @c ProcessVM* via @c LOAD_PROC (no de un arg), mueve los args
+        /// nativos a los slots de los params, y -- solo si el cuerpo puede
+        /// ensuciar @c proc->registers (tiene CALL/raw_asm/etc.) -- salva y
+        /// restaura el banco de registros VM para la re-entrancia del
+        /// callback.  Funciones hoja puras NO salvan nada (save-set vacio).
+        /// Reemplaza el thunk hand-emitted de @c native_callback.cpp.
+        bool callback_entry = false;
+        /// Direccion de @c runtime::get_current_executing_process (fallback
+        /// del @c LOAD_PROC cuando no hay TLS-direct).  Solo usado si
+        /// @c callback_entry.
+        uint64_t callback_get_proc_addr = 0;
+        /// Desplazamiento @c gs:[disp] para leer @c ProcessVM* en TLS-direct
+        /// (Win64).  -1 = usar el fallback por call.  Solo usado si
+        /// @c callback_entry.
+        int32_t callback_tls_gs_disp = -1;
+
         /// Direccion absoluta de @c proc->scheduler.profiler_jit_instr_counter.
         /// Si != 0, el JIT emite al inicio de cada metodo:
         ///   @c mov rax, imm64  (counter_addr)
@@ -201,6 +229,33 @@ namespace jit {
         /// de 176 bytes/try -> 0.  El siguiente tryenter (runtime call)
         /// pop-ea del free list en lugar de hacer new.
         int32_t exc_free_list_offset = 0;
+
+        /* ================= C2 tier-up (recompile-and-swap) ================= */
+        /// C2 (2026-06-07): si != 0, el Selector emite en el prologo un
+        /// contador on-entry + check; cuando el contador cruza
+        /// @c tier_up_threshold (exactamente), llama a esta direccion con
+        /// ABI C nativo: @c void handler(ProcessVM* proc, uint64_t fn_pc).
+        /// El handler recompila la funcion con el pipeline C2 y hace swap
+        /// atomico de su codigo (pc-map + method->jit_code).  0 = no emitir
+        /// contador (cero overhead; comportamiento C1 puro).
+        ///
+        /// Modelo HotSpot: el contador cuenta INVOCACIONES (entradas a la
+        /// funcion), no iteraciones de loop.  Captura las llamadas JIT->JIT
+        /// e interp->JIT (a diferencia de los contadores del interprete, que
+        /// se congelan tras C1).  Una funcion con su hotness en un loop de
+        /// entrada-unica (e.g. main) no sube de tier con esto -> requiere
+        /// backedge-counter + OSR (futuro).
+        uint64_t tier_up_handler_addr = 0;
+        /// Umbral de invocaciones (post-C1) que dispara el recompile C2.
+        uint32_t tier_up_threshold = 0;
+        /// Si true, emite el contador en TODA funcion compilada; si false
+        /// (default), solo en funciones con >=1 CALLVIRT (candidato real a
+        /// especulacion).  Configurable para A/B (VESTA_C2_TIER_ALL).
+        bool tier_up_all_fns = false;
+        /// Callback para reservar el contador de 8 bytes (zero-init) keyed
+        /// por @c fn_pc (mismo contador entre recompilaciones del call site).
+        /// Retorna la addr HOST del contador, 0 si no disponible.
+        std::function<uint64_t(uint64_t /*fn_pc*/)> reserve_tier_counter{};
     };
 
     /**

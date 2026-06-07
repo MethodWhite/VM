@@ -32,6 +32,14 @@
 #include <string>
 #include <unordered_set>
 #include <utility>
+#include <cctype>
+#include <cstdint>
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#  include <cpuid.h>
+#endif
+#if defined(_MSC_VER)
+#  include <intrin.h>
+#endif
 
 namespace vex {
 
@@ -113,42 +121,204 @@ namespace vex {
         }
     }
 
-    // Phase M.L24: evalua un spec de @Target("k:v") contra los build
-    // tags del binario actual.  Tags soportados:
-    //   os:windows / os:linux / os:macos / os:posix
-    //   arch:x86_64 / arch:arm64 / arch:x86
-    // Match exacto; si el spec usa ! como prefijo, se niega.
+    // Phase M.condcomp: evaluador completo de @Target.  Soporta una
+    // expresion booleana sobre atomos de build:
+    //   - os:windows / os:linux / os:macos / os:posix
+    //   - arch:x86_64 / arch:arm64 / arch:x86
+    //   - cpu:sse2 / cpu:sse / cpu:avx / cpu:avx2 / cpu:avx512f / cpu:neon
+    //   - compiler OP M.m   (OP en >= > <= < == =) -> version del compilador
+    //   - vm OP M.m         -> version de la VM
+    //   - mode:auto / mode:jit / mode:vm / mode:jit-required
+    // Operadores: ! (NOT), && (AND), || (OR), parentesis.  Precedencia
+    // estandar: ! > && > ||.  Mapea directo a `#if defined(...)` (C),
+    // `#[cfg(...)]` (Rust), `static if (...)` (D).
+
+    // Version del compilador / VM expuesta a @Target (M.m).  Bump al
+    // publicar releases con semver.  El test M.condcomp espera
+    // compiler>=1.0 y vm>=1.0 -> true; compiler>=99.0 -> false.
+    static constexpr double VEX_TARGET_COMPILER_VERSION = 1.0;
+    static constexpr double VEX_TARGET_VM_VERSION       = 1.0;
+
+    // Deteccion de features de CPU.  En x86 usa cpuid; en arm64 NEON es
+    // baseline.  SSE/SSE2 son baseline garantizado del ABI x86_64.
+    static bool target_cpu_has_(const std::string &feat) noexcept {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        if (feat == "sse" || feat == "sse2") return true;  // baseline x86_64
+        uint32_t a = 0, b = 0, c = 0, d = 0;
+        auto cpuid_count = [](uint32_t leaf, uint32_t sub,
+                              uint32_t &ea, uint32_t &eb,
+                              uint32_t &ec, uint32_t &ed) noexcept {
+#if defined(_MSC_VER)
+            int regs[4]; __cpuidex(regs, (int)leaf, (int)sub);
+            ea = (uint32_t)regs[0]; eb = (uint32_t)regs[1];
+            ec = (uint32_t)regs[2]; ed = (uint32_t)regs[3];
+#elif defined(__GNUC__)
+            __cpuid_count(leaf, sub, ea, eb, ec, ed);
+#else
+            ea = eb = ec = ed = 0;
+#endif
+        };
+        if (feat == "avx")     { cpuid_count(1, 0, a, b, c, d); return (c & (1u << 28)) != 0; }
+        if (feat == "avx2")    { cpuid_count(7, 0, a, b, c, d); return (b & (1u << 5))  != 0; }
+        if (feat == "avx512f") { cpuid_count(7, 0, a, b, c, d); return (b & (1u << 16)) != 0; }
+        if (feat == "neon")    return false;  // no aplica en x86
+        return false;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+        if (feat == "neon") return true;       // NEON baseline en arm64
+        return false;
+#else
+        (void)feat; return false;
+#endif
+    }
+
+    // Compara la version `have` (M.m) contra `want` segun el operador.
+    static bool target_ver_cmp_(double have, const std::string &op,
+                                double want) noexcept {
+        if (op == ">=") return have >= want;
+        if (op == ">")  return have >  want;
+        if (op == "<=") return have <= want;
+        if (op == "<")  return have <  want;
+        if (op == "==" || op == "=") return have == want;
+        return false;
+    }
+
+    // Evalua un atomo simple (sin operadores logicos).  Reconoce las
+    // formas `k:v` y `k OP version`.
+    static bool target_atom_eval_(const std::string &atom) noexcept {
+        if (atom.empty()) return true;
+        // Forma `clave OP version` (compiler / vm).  Buscar el operador
+        // de comparacion.
+        static const char *OPS[] = {">=", "<=", "==", ">", "<", "="};
+        for (const char *opc : OPS) {
+            const size_t pos = atom.find(opc);
+            if (pos != std::string::npos) {
+                std::string key = atom.substr(0, pos);
+                std::string op  = opc;
+                std::string ver = atom.substr(pos + op.size());
+                // trim espacios
+                auto trim = [](std::string &s) {
+                    while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(0, 1);
+                    while (!s.empty() && std::isspace((unsigned char)s.back()))  s.pop_back();
+                };
+                trim(key); trim(ver);
+                double want = 0.0;
+                try { want = std::stod(ver); } catch (...) { return false; }
+                if (key == "compiler") return target_ver_cmp_(VEX_TARGET_COMPILER_VERSION, op, want);
+                if (key == "vm")       return target_ver_cmp_(VEX_TARGET_VM_VERSION, op, want);
+                return false;
+            }
+        }
+        // Forma `clave:valor`.
+        const size_t colon = atom.find(':');
+        if (colon == std::string::npos) return false;
+        std::string key = atom.substr(0, colon);
+        std::string val = atom.substr(colon + 1);
+        if (key == "os") {
+#if defined(_WIN32)
+            return val == "windows";
+#elif defined(__APPLE__)
+            return val == "macos" || val == "posix";
+#elif defined(__linux__)
+            return val == "linux" || val == "posix";
+#else
+            return false;
+#endif
+        }
+        if (key == "arch") {
+#if defined(__x86_64__) || defined(_M_X64)
+            return val == "x86_64";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+            return val == "arm64";
+#elif defined(__i386__) || defined(_M_IX86)
+            return val == "x86";
+#else
+            return false;
+#endif
+        }
+        if (key == "cpu")  return target_cpu_has_(val);
+        if (key == "mode") {
+            // Durante la compilacion (--vex) el modo de ejecucion es
+            // indeterminado: el JIT decide en runtime.  Por eso `auto`
+            // (default) es true y `jit-required` (exige JIT) es false.
+            // `jit`/`vm` quedan false: no se puede garantizar el modo en
+            // compile time (usar `auto` para codigo agnostico).
+            return val == "auto";
+        }
+        return false;
+    }
+
+    // Parser recursivo-descendente de la expresion @Target.  Gramatica:
+    //   or   := and ('||' and)*
+    //   and  := not ('&&' not)*
+    //   not  := '!' not | primary
+    //   primary := '(' or ')' | atom
+    struct TargetExprParser {
+        const std::string &s;
+        size_t i = 0;
+        explicit TargetExprParser(const std::string &str) : s(str) {}
+
+        void skip_ws() { while (i < s.size() && std::isspace((unsigned char)s[i])) ++i; }
+
+        bool parse_or() {
+            bool v = parse_and();
+            for (;;) {
+                skip_ws();
+                if (i + 1 < s.size() && s[i] == '|' && s[i + 1] == '|') {
+                    i += 2;
+                    bool r = parse_and();
+                    v = v || r;
+                } else break;
+            }
+            return v;
+        }
+        bool parse_and() {
+            bool v = parse_not();
+            for (;;) {
+                skip_ws();
+                if (i + 1 < s.size() && s[i] == '&' && s[i + 1] == '&') {
+                    i += 2;
+                    bool r = parse_not();
+                    v = v && r;
+                } else break;
+            }
+            return v;
+        }
+        bool parse_not() {
+            skip_ws();
+            if (i < s.size() && s[i] == '!') { ++i; return !parse_not(); }
+            return parse_primary();
+        }
+        bool parse_primary() {
+            skip_ws();
+            if (i < s.size() && s[i] == '(') {
+                ++i;
+                bool v = parse_or();
+                skip_ws();
+                if (i < s.size() && s[i] == ')') ++i;  // consumir ')'
+                return v;
+            }
+            // Atomo: leer hasta el siguiente operador logico o parentesis.
+            const size_t start = i;
+            while (i < s.size()) {
+                char c = s[i];
+                if (c == '(' || c == ')') break;
+                if (c == '|' && i + 1 < s.size() && s[i + 1] == '|') break;
+                if (c == '&' && i + 1 < s.size() && s[i + 1] == '&') break;
+                if (c == '!') break;
+                ++i;
+            }
+            std::string atom = s.substr(start, i - start);
+            // trim
+            while (!atom.empty() && std::isspace((unsigned char)atom.front())) atom.erase(0, 1);
+            while (!atom.empty() && std::isspace((unsigned char)atom.back()))  atom.pop_back();
+            return target_atom_eval_(atom);
+        }
+    };
+
     static bool target_matches_(const std::string &spec_in) noexcept {
         if (spec_in.empty()) return true;
-        std::string spec = spec_in;
-        bool negate = false;
-        if (spec[0] == '!') {
-            negate = true;
-            spec.erase(0, 1);
-        }
-        // Tags compilados desde macros del compilador host.
-        std::vector<std::string> tags;
-#if defined(_WIN32)
-        tags.push_back("os:windows");
-#elif defined(__APPLE__)
-        tags.push_back("os:macos");
-        tags.push_back("os:posix");
-#elif defined(__linux__)
-        tags.push_back("os:linux");
-        tags.push_back("os:posix");
-#endif
-#if defined(__x86_64__) || defined(_M_X64)
-        tags.push_back("arch:x86_64");
-#elif defined(__aarch64__) || defined(_M_ARM64)
-        tags.push_back("arch:arm64");
-#elif defined(__i386__) || defined(_M_IX86)
-        tags.push_back("arch:x86");
-#endif
-        bool match = false;
-        for (const auto &t : tags) {
-            if (t == spec) { match = true; break; }
-        }
-        return negate ? !match : match;
+        TargetExprParser p(spec_in);
+        return p.parse_or();
     }
 
     // Phase M6.a L.3: aplica @c pending_visibility_ al nodo si soporta
@@ -634,6 +804,21 @@ namespace vex {
             return nullptr;
         }
         last_decl_was_target_skip_ = false;
+        // Phase M.condcomp: @Target sobre un `import`.  El path normal
+        // maneja import ANTES del loop de annotations, pero cuando hay
+        // `@Target("...") import "..."` el @Target ya se consumio aqui;
+        // si la condicion matcheo (top_target_skip == false), parseamos
+        // el import en este punto.  Si NO matcheo, el bloque top_target_skip
+        // de arriba ya lo descarto via skip_target_skipped_decl (que salta
+        // hasta el `;`).
+        if (current_.kind == TokenKind::KW_IMPORT) {
+            return parse_import_decl(/*is_public_reexport=*/false);
+        }
+        if (current_.kind == TokenKind::KW_PUBLIC
+         && lex_.peek_at(0).kind == TokenKind::KW_IMPORT) {
+            (void)consume();  // 'public'
+            return parse_import_decl(/*is_public_reexport=*/true);
+        }
         // L.24: si las annotations consumieron tokens y el siguiente
         // token es `public`/`private` (caso `@Target("..") public i32 fn`),
         // re-chequear visibilidad aqui.  El bloque de KW_PUBLIC original
@@ -2780,6 +2965,30 @@ namespace vex {
                     return vd;
                 }
                 auto vd = parse_var_decl_stmt(false);
+                if (vd && vd->kind == ast::NodeKind::VarDeclStmt) {
+                    auto *v = static_cast<ast::VarDeclStmt *>(vd.get());
+                    v->is_comptime = true;
+                }
+                return vd;
+            }
+            // v4 canonico (hard-break): `comptime T NAME = expr;` local con
+            // tipo EXPLICITO (sin `const`).  El parser top-level ya lo soporta;
+            // parse_statement faltaba -> `comptime i64 X = fact(6);` dentro de
+            // una funcion fallaba con "se esperaba ';'" (bug 138/148).  Las
+            // formas const/var/auto/sugar-NAME=/{/for ya se descartaron arriba
+            // o lo haran abajo (excluimos `{` y `for` del peek).
+            if (current_.lexeme == "comptime"
+             && mut_lex.peek_at(0).kind != TokenKind::LBRACE
+             && mut_lex.peek_at(0).kind != TokenKind::KW_FOR
+             && mut_lex.peek_at(0).kind != TokenKind::KW_IF) {
+                (void)consume();                   // 'comptime'
+                if (!starts_type()) {
+                    error_here("se esperaba un tipo tras 'comptime' "
+                               "(comptime T NAME = expr;)");
+                    synchronize();
+                    return nullptr;
+                }
+                auto vd = parse_var_decl_stmt(true);   // comptime implica const
                 if (vd && vd->kind == ast::NodeKind::VarDeclStmt) {
                     auto *v = static_cast<ast::VarDeclStmt *>(vd.get());
                     v->is_comptime = true;

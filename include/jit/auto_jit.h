@@ -187,7 +187,15 @@ namespace jit {
         std::function<uint64_t(uint64_t)> read_vmem_u64 = nullptr,
         int32_t exc_frame_stack_offset = 0,
         int32_t exc_free_list_offset = 0,
-        uint64_t jit_instr_counter_addr = 0);
+        uint64_t jit_instr_counter_addr = 0,
+        /* callback-ABI (2026-06-06): si @p callback_entry es true, el
+         * TOP-LEVEL @p ir_fn se compila con entry de ABI C nativo (callable
+         * por qsort/Win32) en vez de VM_ABI.  Sus callees siguen siendo
+         * VM_ABI (resolver normal).  El top-level NO se registra en el
+         * pc-map ni en @c g_eager_cache (su ABI difiere del VM_ABI). */
+        bool callback_entry = false,
+        uint64_t callback_get_proc_addr = 0,
+        int32_t callback_tls_gs_disp = -1);
 
     /* ===================================================================== */
     /* Sprint D.5-callvm-hook: dispatch interp -> JIT en CALLVM                */
@@ -267,14 +275,35 @@ namespace jit {
     void maybe_compile_callvm_target(runtime::ProcessVM *vm,
                                      uint64_t target_pc) noexcept;
 
+    /**
+     * @brief Compila la funcion cuyo bytecode empieza en @p vex_fn_pc con
+     *        un ENTRY de ABI C nativo (callback) y devuelve su direccion
+     *        host, callable directamente por qsort/Win32/etc.
+     *
+     * Reemplaza el thunk hand-emitted de @c native_callback.cpp: en vez de
+     * generar un wrapper que adapta C-ABI -> VM-ABI -> jit_fn, compila la
+     * funcion DIRECTAMENTE con el entry nativo (modo callback del selector).
+     * El cuerpo se lowerea como VM_ABI (RBX=proc), pero el prologo lee
+     * @c ProcessVM* via TLS/call y mueve los args nativos a los params; solo
+     * salva/restaura el banco de registros VM si el cuerpo puede ensuciarlo.
+     *
+     * Cachea por @p vex_fn_pc (cache propia, separada del pc-map VM_ABI: la
+     * misma funcion puede tener una version VM_ABI y una callback-ABI).
+     *
+     * @param vm         Proceso virtual actual (para acceder al Loader).
+     * @param vex_fn_pc  Direccion VM del primer byte del bytecode de la fn.
+     * @return Direccion host del codigo callback, o 0 si no se pudo compilar.
+     */
+    uint64_t compile_native_callback(runtime::ProcessVM *vm,
+                                     uint64_t vex_fn_pc) noexcept;
+
     class CodeCache;  // fwd decl
     /**
      * @brief Acceso al CodeCache global del JIT subsystem.
      *
      * Inicializa el subsistema JIT (lazy via @c std::call_once) si aun no
      * existe.  Util para clientes externos al JIT que necesitan alocar
-     * codigo nativo (e.g. @c runtime::get_or_generate_native_thunk para
-     * callbacks Vex -> C, Sprint B.1).
+     * codigo nativo en el code cache compartido.
      *
      * Thread-safe.  Retorna un puntero no-nulo.
      */

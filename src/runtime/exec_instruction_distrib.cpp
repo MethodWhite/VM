@@ -175,6 +175,13 @@ void exec_instr_loadmod(ProcessVM *vm, const DecodedInstr &instr) {
     vm->registers.rip.qword(init_pc);
     vm->decoded_ptr->flags_info.did_jump = true;
     vm->registers.regs[0].qword(init_pc); // success indicator (puede ser sobrescrito)
+    // BugFix M.dyn (2026-06-05): guardar init_pc en la pila de retorno.  El
+    // __module_init del plugin clobbea R0 (su ultimo op deja un valor
+    // arbitrario; en un reload, el defclass idempotente sobre una clase ya
+    // registrada NO necesariamente deja un non-zero en R0).  Restauramos R0
+    // = init_pc cuando el HLT del plugin se intercepta como RET, para que
+    // `loadmodule` devuelva un indicador de exito FIABLE.
+    vm->loadmod_r0_stack.push_back(init_pc);
     // Incrementar contador para que el HLT del main del plugin se trate
     // como RET (ver exec_instr_hlt + ProcessVM::loadmod_call_depth).
     // Esto reemplaza el viejo `patch_first_hlt_to_ret` que escaneaba bytes

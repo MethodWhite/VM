@@ -15,7 +15,7 @@ Sprint bench-multilang (2026-06-02):
   Vex sin carpeta) ejecutando solo en Vex interp + JIT.
 
 Modos de ejecucion del Vex:
-- @b interp: VESTA_JIT_THRESHOLD=UINT32_MAX (default), 100% interp.
+- @b interp: VESTA_JIT_THRESHOLD=UINT32_MAX (forzado; el default del vm es 1500), 100% interp.
 - @b jit: VESTA_JIT_THRESHOLD=1, fuerza JIT en el primer call.
 
 Output:
@@ -1840,10 +1840,15 @@ def main() -> int:
                 continue
             cmd, cwd, factor = compiled
 
-            # Env: JIT solo para vex_jit.
+            # Env: forzar el threshold explicito por modo.  El DEFAULT del vm
+            # ahora es JIT (threshold=1500), asi que vex_interp debe forzar
+            # UINT32_MAX para medir interp puro (sin esto la columna interp
+            # seria JIT-para-metodos-hot y la comparacion no tendria sentido).
             env = os.environ.copy()
             if ln == "vex_jit":
                 env["VESTA_JIT_THRESHOLD"] = "1"
+            elif ln == "vex_interp":
+                env["VESTA_JIT_THRESHOLD"] = "4294967295"
 
             # Run + capturar TODOS los runs individuales (no solo mediana).
             warm = args.warmup

@@ -84,8 +84,27 @@ namespace jit {
      * publico (rompe el include order). */
     extern "C" void runtime_set_current_executing_process_c(vrt_proc *proc);
 
+    /* C2 reclaim (quiescencia): @c g_jit_reclaim_active es true SOLO cuando el
+     * C2 tier-up esta habilitado (VESTA_C2_THRESHOLD>0); en el default es
+     * false -> @c enter_jit no paga nada.  Cuando esta activo, @c jit_frame_enter
+     * / @c jit_frame_exit llevan la cuenta de profundidad de frames JIT en la
+     * pila nativa (los JIT->JIT directos quedan anidados dentro de un
+     * @c enter_jit, asi que cuando la cuenta llega a 0 NO hay ningun frame JIT
+     * en ninguna pila -> es seguro liberar el codigo C1 viejo de las funciones
+     * tieradas).  @c jit_frame_exit drena el free-list pendiente al tocar 0.
+     * Definidos en auto_jit.cpp. */
+    extern bool g_jit_reclaim_active;
+    void jit_frame_enter() noexcept;
+    void jit_frame_exit()  noexcept;
+
     inline uint64_t enter_jit(JitFn fn, vrt_proc *proc) {
         runtime_set_current_executing_process_c(proc);
+        if (g_jit_reclaim_active) {
+            jit_frame_enter();
+            const uint64_t r = fn(proc);
+            jit_frame_exit();
+            return r;
+        }
         return fn(proc);
     }
 

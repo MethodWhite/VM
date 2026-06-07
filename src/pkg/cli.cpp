@@ -684,13 +684,14 @@ namespace pkg::cli {
             }
             return 1;
         }
-        // Seguridad: el comando debe empezar con "vm " (whitelist).
-        // Sin esto cualquier paquete podria ejecutar @c rm / @c curl /
-        // @c powershell con permisos del usuario.
-        if (cmdline.size() < 3 || cmdline.compare(0, 3, "vm ") != 0) {
-            ui::error("scripts solo pueden invocar 'vm <args>'; recibido: " + cmdline);
-            return 1;
-        }
+        // Soporte multi-comando via `&&`: scripts pueden encadenar
+        // varios `vm ...` separados por ` && `.  Util para tests que
+        // necesitan compilar + ejecutar en un solo comando.  Cada
+        // sub-comando se valida individualmente con la misma whitelist
+        // (debe empezar con "vm ").  Si cualquier sub-comando falla
+        // (exit != 0), abortamos sin ejecutar los siguientes (semantica
+        // shell estandar de @c && ).
+        //
         // Resolver path absoluto del binario @c vm que esta ejecutando
         // ahora.  Asi @c vm pkg run build invoca al mismo binario sin
         // depender del PATH.
@@ -702,28 +703,72 @@ namespace pkg::cli {
             if (n > 0 && n < sizeof(buf)) vm_exe = std::string(buf, n);
         }
         #else
-        // Para POSIX: argv[0] del proceso (suficiente para la mayoria
-        // de casos; instalaciones bien hechas tienen vm en PATH).
         vm_exe = "vm";
         #endif
         if (vm_exe.empty()) vm_exe = "vm";
-        // Construir comando final: <vm_exe> <args_del_script_post_"vm ">
-        std::string args_str = cmdline.substr(3);
-        // Quoting para Windows: si vm_exe tiene espacios, envolver.
-        std::string full;
-        bool need_quote = vm_exe.find(' ') != std::string::npos;
-        if (need_quote) full = "\"" + vm_exe + "\"";
-        else            full = vm_exe;
-        full += " ";
-        full += args_str;
-        // Agregar args extra del usuario tras el script name.
-        for (size_t i = 1; i < args.size(); ++i) {
-            full += " ";
-            full += args[i];
+        const bool need_quote = vm_exe.find(' ') != std::string::npos;
+
+        // Helper: dividir cmdline en sub-comandos por " && ".  El delimitador
+        // tiene espacios alrededor para no partir argumentos con "&&" interno.
+        std::vector<std::string> sub_cmds;
+        {
+            std::string buf;
+            size_t pos = 0;
+            while (pos < cmdline.size()) {
+                size_t found = cmdline.find(" && ", pos);
+                if (found == std::string::npos) {
+                    sub_cmds.push_back(cmdline.substr(pos));
+                    break;
+                }
+                sub_cmds.push_back(cmdline.substr(pos, found - pos));
+                pos = found + 4;
+            }
         }
-        ui::info("ejecutando: " + full);
-        int rc = std::system(full.c_str());
-        return rc == 0 ? 0 : (rc & 0xFF);
+
+        // Args extra del usuario aplican solo al ULTIMO sub-comando
+        // (semantica intuitiva: `vesta pkg run tests -v` -> el -v va al
+        // comando final que es el que produce output).
+        std::string extra_args;
+        for (size_t i = 1; i < args.size(); ++i) {
+            extra_args += " ";
+            extra_args += args[i];
+        }
+
+        for (size_t si = 0; si < sub_cmds.size(); ++si) {
+            std::string sub = sub_cmds[si];
+            // Trim leading/trailing whitespace.
+            while (!sub.empty() && (sub.front() == ' ' || sub.front() == '\t'))
+                sub.erase(sub.begin());
+            while (!sub.empty() && (sub.back() == ' ' || sub.back() == '\t'))
+                sub.pop_back();
+            // Seguridad: cada sub-comando debe empezar con "vm " o "vesta "
+            // (la VM puede instalarse como cualquiera de los dos nombres).
+            // Sin esto cualquier paquete podria ejecutar @c rm/curl/etc.
+            size_t off = 0;
+            if (sub.size() >= 3 && sub.compare(0, 3, "vm ") == 0) {
+                off = 3;
+            } else if (sub.size() >= 6 && sub.compare(0, 6, "vesta ") == 0) {
+                off = 6;
+            } else {
+                ui::error("scripts solo pueden invocar 'vm <args>' o 'vesta <args>'; recibido: " + sub);
+                return 1;
+            }
+            std::string args_str = sub.substr(off);
+            std::string full;
+            if (need_quote) full = "\"" + vm_exe + "\"";
+            else            full = vm_exe;
+            full += " ";
+            full += args_str;
+            // Solo el ULTIMO sub-comando recibe los args extra del CLI.
+            if (si + 1 == sub_cmds.size()) full += extra_args;
+            ui::info("ejecutando: " + full);
+            int rc = std::system(full.c_str());
+            if (rc != 0) {
+                ui::error("sub-comando fallo (rc=" + std::to_string(rc) + "): " + full);
+                return rc == 0 ? 1 : (rc & 0xFF);
+            }
+        }
+        return 0;
     }
 
     // ------------------------------------------------------------------

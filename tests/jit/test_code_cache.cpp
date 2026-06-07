@@ -173,6 +173,40 @@ namespace {
         CHECK(c == nullptr, "tercer alloc retorna NULL (OOM)");
     }
 
+    /** @brief Test 7: free_region + reuso por alloc (reclaim C2 tier-up).
+     *
+     * Verifica que una region devuelta al free-list se reutiliza en un alloc
+     * posterior (sin crecer el chunk), que se envenena con 0xCC, y que el
+     * remanente vuelve al free-list. */
+    void test_free_region_reuse() {
+        jit::CodeCache cache;
+        uint8_t *a = cache.alloc(256, 16);
+        CHECK(a != nullptr, "alloc inicial 256B");
+        CHECK(cache.free_region_count() == 0, "free-list vacio al inicio");
+        std::memcpy(a, kCodeReturn42, sizeof(kCodeReturn42));
+        cache.commit(a, sizeof(kCodeReturn42));
+
+        /* Devolver la region al free-list. */
+        cache.free_region(a, 256);
+        CHECK(cache.free_region_count() == 1, "1 region en free-list tras free");
+        CHECK(a[0] == 0xCC, "free_region envenena con 0xCC");
+
+        /* Un alloc que cabe debe REUSAR la region (mismo puntero base) sin
+         * tocar el bump del chunk. */
+        const size_t used_before = cache.used_bytes();
+        uint8_t *b = cache.alloc(64, 16);
+        CHECK(b == a, "alloc reusa la region liberada (mismo ptr)");
+        CHECK(cache.used_bytes() == used_before, "reuso no incrementa used_bytes");
+        /* 256 - 0(head, ya alineado) - 64 = 192 >= 64 -> remanente reinsertado. */
+        CHECK(cache.free_region_count() == 1, "remanente (192B) vuelve al free-list");
+
+        /* El remanente (192B @ a+64) se reusa; con 140B el nuevo remanente
+         * (52B < 64) es demasiado pequeno -> se descarta (no reinsertado). */
+        uint8_t *c = cache.alloc(140, 16);
+        CHECK(c == a + 64, "segundo reuso toma el remanente");
+        CHECK(cache.free_region_count() == 0, "remanente 52B (<64) descartado");
+    }
+
 } // namespace anonymous
 
 int main() {
@@ -182,6 +216,7 @@ int main() {
     test_invalidate();
     test_multi_chunk();
     test_oom();
+    test_free_region_reuse();
 
     std::printf("test_code_cache: %d pass, %d fail\n", pass_count, fail_count);
     return fail_count == 0 ? 0 : 1;

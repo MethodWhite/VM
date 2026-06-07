@@ -1,0 +1,7 @@
+// =============================================================================
+// strings_lib.vex - exporta comptime strings cross-module (test fixture)
+// =============================================================================
+
+@cold public comptime string MARKER_A = "\x1b[0m";
+@cold public comptime string MARKER_B = "\x1b[7m";
+@cold public comptime string MARKER_C = "\x1b[2m";

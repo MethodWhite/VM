@@ -360,7 +360,7 @@ el valor del JIT.
 ### Conclusiones
 
 Vex JIT C1 (sin asignador de registros real ni inliner) **compite
-directamente con Java HotSpot** — una JVM con 30 anios de optimizacion —
+directamente con Java HotSpot** — una JVM con 30 años de optimizacion —
 en hot loops aritmeticos. Esto valida la arquitectura:
 
 1. **Hot paths puros**: Vex JIT esta dentro de 1.5-2× de C nativo,
@@ -420,12 +420,12 @@ medidos en benches sinteticos (variables segun el bench):
 | LuaJIT (JIT mode)             | ~1000-3000        | tracing JIT muy maduro                 |
 | Ruby YARV                     | ~30-100           | interp + JIT YJIT experimental         |
 | OpenJDK Java (interp)         | ~50-150           | template interpreter                   |
-| OpenJDK Java (C2 JIT)         | ~2000-10000+      | JIT optimizing maduro 20+ anios        |
+| OpenJDK Java (C2 JIT)         | ~2000-10000+      | JIT optimizing maduro 20+ años        |
 | V8 JavaScript (Ignition+JIT)  | ~1000-5000+       | tiered JIT + speculative opt           |
 | **VestaVM** (JIT C1)          | ~3000-5000        | template JIT, compilable metodos       |
 
 VestaVM esta en el rango de **LuaJIT en modo interp**, lo cual es bueno
-considerando que LuaJIT tiene 15+ anios de optimizacion specifica. El JIT C1
+considerando que LuaJIT tiene 15+ años de optimizacion specifica. El JIT C1
 de VestaVM es comparable a un Tier 1 de HotSpot, y en hot loops puros
 **alcanza o supera a HotSpot C2** en 4 de los 8 benchmarks multi-lenguaje
 medidos (ver seccion 5.5). El C2 optimizing JIT planeado cerrara el gap

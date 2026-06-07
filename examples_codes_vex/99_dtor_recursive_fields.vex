@@ -1,0 +1,87 @@
+// 99_dtor_recursive_fields.vex
+//
+// A.32 - Relax de la regla de escape + sintesis automatica de un destructor
+// recursivo cuando una clase (Holder) contiene un field de tipo destructible
+// (Resource con ~Resource()).
+//
+// El test 96 valida que asignar una instancia con destructor a un field es
+// ERROR (el dtor RAII nunca correria).  A.32 RELAJA esa regla para el caso
+// concreto de COMPOSICION: si un Holder contiene un Resource como field, el
+// compilador SINTETIZA ~Holder() automaticamente; ese dtor recursivo destruye
+// this.res cuando el Holder muere.  Asi la composicion de objetos con recursos
+// (RAII jerarquico estilo C++/Rust) funciona sin escribir el dtor a mano.
+//
+// Valida:
+//   - Holder con un field Resource destructible (antes ERROR, ahora legal).
+//   - El dtor sintetizado de Holder invoca recursivamente ~Resource().
+//   - Composicion en dos niveles (Outer -> Holder -> Resource): la cadena de
+//     destruccion baja recursivamente por todos los fields destructibles.
+//
+// Esperado: R00 == 42.
+
+class DtorCounter {
+    public static i32 count = 0;
+}
+
+// Hoja: posee un "recurso" (aqui modelado como un contador que se incrementa
+// en el destructor, simulando la liberacion deterministica de un recurso).
+class Resource {
+    public i32 value;
+    public Resource(i32 v) { this.value = v; }
+    public ~Resource() {
+        DtorCounter.count = DtorCounter.count + 1;
+    }
+}
+
+// Nivel 1: contiene un Resource como field.  A.32 sintetiza ~Holder() que
+// destruye this.res recursivamente.
+class Holder {
+    public Resource res;
+    public i32       tag;
+    public Holder(i32 v, i32 t) {
+        this.res = new Resource(v);
+        this.tag = t;
+    }
+}
+
+// Nivel 2: contiene un Holder (que a su vez contiene un Resource).  La cadena
+// de destruccion debe bajar Outer -> Holder -> Resource.
+class Outer {
+    public Holder inner;
+    public Outer(i32 v) {
+        this.inner = new Holder(v, 0);
+    }
+}
+
+// El Holder local muere al salir de la funcion -> ~Holder() sintetizado corre
+// -> ~Resource() recursivo incrementa DtorCounter.count.
+i32 use_holder() {
+    Holder h = new Holder(10, 7);
+    return h.res.value + h.tag;   // 10 + 7 = 17
+}
+
+// Composicion de dos niveles: al salir, ~Outer() -> ~Holder() -> ~Resource().
+i32 use_outer() {
+    Outer o = new Outer(5);
+    return o.inner.res.value;     // 5
+}
+
+i32 main() {
+    DtorCounter.count = 0;
+
+    // Caso 1: Holder con Resource field -> dtor recursivo de un nivel.
+    i32 v1 = use_holder();        // dtor recursivo corre -> count = 1
+    if (v1 != 17) return 11;
+    if (DtorCounter.count != 1) return 12;
+
+    // Caso 2: Outer con Holder con Resource -> dtor recursivo de dos niveles.
+    i32 v2 = use_outer();         // dtor recursivo corre -> count = 2
+    if (v2 != 5) return 13;
+    if (DtorCounter.count != 2) return 14;
+
+    // 20 + 22 = 42 si ambas cadenas de destruccion corrieron exactamente una vez.
+    i32 acc = 0;
+    if (DtorCounter.count == 2) { acc = acc + 20; }
+    if (v1 + v2 == 22)          { acc = acc + 22; }
+    return acc;
+}

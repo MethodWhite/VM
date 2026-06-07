@@ -558,4 +558,126 @@ namespace ir {
         return true;
     }
 
+    /* ===================================================================== */
+    /* emit_ir_module_cache / parse_ir_module_cache  (.vexir)                 */
+    /* ===================================================================== */
+
+    /**
+     * @brief Serializa una @c StaticDataStore verbatim (pool + entries + meta).
+     *
+     * Se persiste el pool de bytes y los @c byte_offset/@c byte_len tal cual
+     * para que la reconstruccion sea byte-exacta (el merge cross-module
+     * depende de offsets estables dentro del pool del dep).
+     */
+    static void serialize_static_data(const IrModule::StaticDataStore &sd,
+                                      std::vector<uint8_t> &out) {
+        write_u8(out, sd.alignment_default);
+        // Pool de bytes contiguo.
+        write_u32(out, static_cast<uint32_t>(sd.bytes.size()));
+        out.insert(out.end(), sd.bytes.begin(), sd.bytes.end());
+        // Entries (rangos + meta).
+        write_u32(out, static_cast<uint32_t>(sd.entries.size()));
+        for (const auto &e : sd.entries) {
+            write_u32(out, e.byte_offset);
+            write_u32(out, e.byte_len);
+            write_u64(out, e.meta.content_hash);
+            write_u16(out, e.meta.alignment);
+            write_u8 (out, e.meta.flags);
+            write_u16(out, e.meta.source_module_idx);
+            write_str(out, e.meta.section_name);
+        }
+    }
+
+    static bool deserialize_static_data(const std::vector<uint8_t> &in,
+                                        size_t &off,
+                                        IrModule::StaticDataStore &sd) {
+        sd.clear();
+        if (!read_u8(in, off, sd.alignment_default)) return false;
+        uint32_t pool_len = 0;
+        if (!read_u32(in, off, pool_len)) return false;
+        if (off + pool_len > in.size()) return false;
+        sd.bytes.assign(in.begin() + off, in.begin() + off + pool_len);
+        off += pool_len;
+        uint32_t entry_count = 0;
+        if (!read_u32(in, off, entry_count)) return false;
+        // Cap defensivo: un dep real tiene a lo sumo unos pocos miles de slots.
+        if (entry_count > 2000000u) return false;
+        sd.entries.reserve(entry_count);
+        for (uint32_t i = 0; i < entry_count; ++i) {
+            IrModule::StaticDataStore::Entry e{};
+            if (!read_u32(in, off, e.byte_offset)) return false;
+            if (!read_u32(in, off, e.byte_len))    return false;
+            if (!read_u64(in, off, e.meta.content_hash)) return false;
+            if (!read_u16(in, off, e.meta.alignment))    return false;
+            if (!read_u8 (in, off, e.meta.flags))        return false;
+            if (!read_u16(in, off, e.meta.source_module_idx)) return false;
+            if (!read_str(in, off, e.meta.section_name)) return false;
+            // Validar que el rango cae dentro del pool.
+            if (static_cast<uint64_t>(e.byte_offset) + e.byte_len > sd.bytes.size())
+                return false;
+            sd.entries.push_back(std::move(e));
+        }
+        return true;
+    }
+
+    std::vector<uint8_t> emit_ir_module_cache(const IrModule &mod) {
+        std::vector<uint8_t> out;
+        write_u32(out, IR_MODULE_CACHE_MAGIC);
+        write_u16(out, IR_MODULE_CACHE_VERSION);
+        write_u16(out, 0); // reserved
+
+        // 1) Funciones: reusa el formato @ir (con su header VEIR propio).
+        //    Guardamos su longitud para poder delimitar la sub-seccion al leer.
+        std::vector<uint8_t> fn_bytes = emit_ir_section(mod.functions);
+        write_u32(out, static_cast<uint32_t>(fn_bytes.size()));
+        out.insert(out.end(), fn_bytes.begin(), fn_bytes.end());
+
+        // 2) static_data (lo que faltaba: la causa del bug code.s_* colgante).
+        serialize_static_data(mod.static_data, out);
+
+        // 3) globals (nombre -> IrValueId).
+        write_u32(out, static_cast<uint32_t>(mod.globals.size()));
+        for (const auto &g : mod.globals) {
+            write_str(out, g.first);
+            write_u32(out, static_cast<uint32_t>(g.second));
+        }
+        return out;
+    }
+
+    bool parse_ir_module_cache(const std::vector<uint8_t> &data,
+                               IrModule &out) {
+        size_t off = 0;
+        uint32_t magic = 0;
+        if (!read_u32(data, off, magic)) return false;
+        if (magic != IR_MODULE_CACHE_MAGIC) return false; // formato viejo -> recompilar
+        uint16_t version = 0, reserved = 0;
+        if (!read_u16(data, off, version)) return false;
+        if (!read_u16(data, off, reserved)) return false;
+        if (version != IR_MODULE_CACHE_VERSION) return false;
+
+        // 1) Funciones.
+        uint32_t fn_len = 0;
+        if (!read_u32(data, off, fn_len)) return false;
+        if (off + fn_len > data.size()) return false;
+        if (!parse_ir_section(data, off, fn_len, out.functions)) return false;
+        off += fn_len;
+
+        // 2) static_data.
+        if (!deserialize_static_data(data, off, out.static_data)) return false;
+
+        // 3) globals.
+        out.globals.clear();
+        uint32_t gcount = 0;
+        if (!read_u32(data, off, gcount)) return false;
+        if (gcount > 2000000u) return false;
+        for (uint32_t i = 0; i < gcount; ++i) {
+            std::string name;
+            uint32_t vid = 0;
+            if (!read_str(data, off, name)) return false;
+            if (!read_u32(data, off, vid)) return false;
+            out.globals.emplace(std::move(name), static_cast<IrValueId>(vid));
+        }
+        return true;
+    }
+
 } // namespace ir

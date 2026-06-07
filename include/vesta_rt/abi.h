@@ -199,6 +199,31 @@ extern "C" {
 /// Offset de @c proc->registers.base_pointer (similar al anterior).
 #define VESTA_PROC_BASE_POINTER_OFFSET     72
 
+/// Offset del puntero @c jit_handle_table dentro de ProcessVM (Phase D.7).
+/// Es un campo POD (void*) colocado antes de los miembros no-POD (atomics,
+/// vectores, GcHeap), por lo que su offset es estable dentro de un mismo
+/// build del toolchain.  El JIT inline-a @c deref leyendo la HandleTable
+/// con @c mov base, [rbx + VESTA_PROC_JIT_HANDLE_TABLE_OFFSET].  Verificado
+/// en compile-time por @c abi_checks.cpp: si la struct cambia, el build
+/// aborta hasta actualizar este valor.
+#define VESTA_PROC_JIT_HANDLE_TABLE_OFFSET 1304
+
+/// Offset del puntero @c osr_buffer dentro de ProcessVM (OSR, Phase D.8).
+/// Buffer-por-VID del state-transfer C1->C2: un array de uint64 (1 celda por
+/// IR VID) en el que el codigo C1, al disparar el tier-up por back-edge,
+/// escribe los valores vivos del loop header (buffer[vid]); el OSR-entry de C2
+/// los lee.  Alocado lazy en el ctor de ProcessVM SOLO cuando VESTA_OSR_COUNT
+/// esta activo (nullptr por defecto -> cero coste).  El JIT lo lee con
+/// @c mov rax, [rbx + VESTA_PROC_OSR_BUFFER_OFFSET] (rbx = ProcessVM*).
+/// Verificado en compile-time por @c abi_checks.cpp.
+#define VESTA_PROC_OSR_BUFFER_OFFSET       1312
+
+/// Numero de celdas (uint64) del @c osr_buffer.  Cota superior del numero de
+/// IR values de una funcion OSR-able; si una funcion excede esto, el JIT
+/// ABORTA el OSR de ese loop (sin capturar).  64 KB por proceso cuando OSR
+/// activo (off por defecto).
+#define VESTA_OSR_BUFFER_N                 8192
+
 /// El offset de @c exc_frame_stack dentro de @c ProcessVM NO es estable
 /// cross-build porque la struct tiene miembros no-POD antes (atomicos,
 /// vectores, GcHeap).  En lugar de un #define, se computa en runtime
@@ -213,6 +238,13 @@ namespace vesta_rt {
     extern const int32_t kProcVmMemOffset;
     extern const int32_t kVmMemCachedPageVaddrOffset;
     extern const int32_t kVmMemCachedPageHostOffset;
+
+    /* Phase D.7 perf inline-alloc (2026-06-06): offset del miembro
+     * @c raw_alloc (gc::RawAllocator) dentro de @c runtime::ProcessVM.
+     * El JIT inline-a el fast-path del slab leyendo @c raw_alloc.slab_free_list_
+     * y @c total_bytes_ (sus offsets internos via gc::RawAllocator::jit_*).
+     * Resuelto en runtime (member non-POD impide #define). */
+    extern const int32_t kProcRawAllocOffset;
 }
 #endif
 

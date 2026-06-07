@@ -734,7 +734,13 @@ namespace loader {
         // Si el JIT main compila exitosamente, se ejecuta nativo via
         // enter_jit en el scheduler.  Si falla parcialmente (algun raw_asm
         // complejo no soportado), unsupported=true y caemos a interp.
-        if (jit::g_jit_threshold != UINT32_MAX && !executables.empty()) {
+        // SEGURIDAD (sandbox bajo JIT): no eager-compile main si hay un sandbox
+        // activo -- el JIT-eated main emitiria CALLN/spawn/etc. sin el check de
+        // capabilities (check_cap_at_pc).  El interp enforcea el sandbox.  Cero
+        // overhead default (sandbox_active = false).  Mismo guard que
+        // maybe_compile_method.
+        if (jit::g_jit_threshold != UINT32_MAX && !executables.empty()
+         && !sandbox_active) {
             auto &last_exe = executables.back();
             /* AOP fix 2026-05-16: si el programa tiene CUALQUIER metodo con
              * advice_chain != null (i.e. usa @Before/@After/@Around), no
@@ -1075,6 +1081,22 @@ namespace loader {
                 if (conflict) break;
             }
 
+            // Phase M.dyn fix (2026-06-05): ademas del overlap contra las
+            // secciones de modulos ya cargados, forzar rebase si el orig_base
+            // cae en la region RESERVADA [0, next_dyn_base).  Esa region baja
+            // contiene el codigo (VA 0), el stack (stack_base = 0x10000000 +
+            // local_pid*...) y el heap del programa principal y sus procesos.
+            // Los modulos dinamicos SIEMPRE deben vivir en la region dinamica
+            // alta [next_dyn_base=0x80000000, ...).  Sin esto, un plugin
+            // compilado con `--vex-base 0x10000000` (== stack_base del main)
+            // se copiaba ENCIMA del stack de main y lo corrompia -> el segundo
+            // loadmodule del hot-reload devolvia basura (M.dyn -> -4).  La
+            // deteccion por secciones no lo cubre porque el code section de
+            // main esta en VA 0, no en su stack_base.
+            if (!conflict && orig_base < next_dyn_base) {
+                conflict = true;
+            }
+
             if (conflict) {
                 // solapamiento detectado.  Si el .velb tiene tabla de
                 // relocations (formato VERSION_VELB >= 2), podemos hacer
@@ -1256,6 +1278,48 @@ namespace loader {
             }
         }
         return false;
+    }
+
+    bool Loader::check_cap_at_pc(uint64_t pc, uint32_t required) const noexcept {
+        // Fast path zero-overhead: si ningun modulo tiene sandbox activo
+        // (caso default), permitir sin iterar.  1 branch predicho not-taken.
+        if (__builtin_expect(!sandbox_active, 1)) return true;
+        // Recorrer los modulos cargados.  Solo los que tienen un sandbox
+        // activo (caps restringidas) pueden denegar; el resto se saltan con
+        // un branch predicho (unrestricted() == true en el caso default).
+        for (const auto &exe : executables) {
+            if (!exe) continue;
+            if (exe->caps.unrestricted()) continue;  // sin sandbox -> permitir
+            // Localizar la seccion cuyo rango VA contiene @c pc.  Mismo
+            // razonamiento de tamano efectivo que load_module_dynamic
+            // (size_real puede ser 0 con el formato actual; derivar del
+            // bytecode hasta la primera tabla reloc/imports).
+            uint64_t bc_end = exe->bytecode.size();
+            if (exe->header.offset_reloc_table != 0
+             && exe->header.offset_reloc_table < bc_end) {
+                bc_end = exe->header.offset_reloc_table;
+            }
+            if (exe->header.offset_import_table != 0
+             && exe->header.size_import_table > 0
+             && exe->header.offset_import_table < bc_end) {
+                bc_end = exe->header.offset_import_table;
+            }
+            for (const auto *sec : exe->sections) {
+                if (!sec) continue;
+                const uint64_t start = sec->memory.address_init;
+                const uint64_t size_eff = sec->size_real
+                    ? sec->size_real
+                    : (sec->file_offset < bc_end ? (bc_end - sec->file_offset) : 0);
+                if (size_eff == 0) continue;
+                if (pc >= start && pc < start + size_eff) {
+                    // @c pc pertenece a este modulo sandboxed: decidir por
+                    // sus caps.
+                    return exe->caps.has(required);
+                }
+            }
+        }
+        // @c pc no pertenece a ningun modulo sandboxed -> permitir.
+        return true;
     }
 
     void Loader::copy_executables_to(runtime::ProcessVM &dest,

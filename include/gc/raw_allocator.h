@@ -293,6 +293,31 @@ namespace gc {
          */
         const RawStats &stats() const { return stats_; }
 
+        // ---------------------------------------------------------------------
+        // Soporte para el inline-alloc del JIT (Phase D.7 perf, 2026-06-06).
+        //
+        // El JIT inline-a el fast-path del slab (pop del free list por size
+        // class) sin CALL al runtime.  Necesita los offsets de los miembros
+        // privados @c slab_free_list_ y @c total_bytes_ (offsetof sobre
+        // miembros propios es legal aqui, dentro de la clase) y las constantes
+        // del slab (SLAB_SIZES, slab_class_for).  El selector emite el pop +
+        // zero-init + stat, con fallback CALL @c alloc cuando el free list de
+        // esa clase esta vacio (grow).  Ver vreg_select.cpp::RAW_ALLOC.
+        // ---------------------------------------------------------------------
+        static size_t jit_slab_free_list_offset() noexcept {
+            return offsetof(RawAllocator, slab_free_list_);
+        }
+        static size_t jit_total_bytes_offset() noexcept {
+            return offsetof(RawAllocator, total_bytes_);
+        }
+        static constexpr size_t jit_slab_classes() noexcept { return SLAB_CLASSES; }
+        static constexpr size_t jit_slab_size(size_t i) noexcept {
+            return (i < SLAB_CLASSES) ? SLAB_SIZES[i] : 0;
+        }
+        static constexpr size_t jit_slab_class_for(size_t n) noexcept {
+            return slab_class_for(n);
+        }
+
     private:
 
         // ---------------------------------------------------------------------
@@ -402,7 +427,7 @@ namespace gc {
         // ---------------------------------------------------------------------
         /// @brief Encuentra el indice de size class apropiado para @p size.
         /// @return indice valido o SIZE_MAX si size > SLAB_SIZES[ultimo].
-        static size_t slab_class_for(size_t size) noexcept {
+        static constexpr size_t slab_class_for(size_t size) noexcept {
             for (size_t i = 0; i < SLAB_CLASSES; ++i) {
                 if (size <= SLAB_SIZES[i]) return i;
             }

@@ -3651,13 +3651,26 @@ namespace vex {
             params_set.insert("super");
             for (auto &p : m->params) params_set.insert(p->name);
             /* Rewrite inline las stmts del body.  m->body es
-             * unique_ptr<BlockStmt> con vector body de unique_ptr<Stmt>. */
-            std::vector<std::unordered_set<std::string>> ls;
-            for (auto &child : m->body->body) {
-                /* visit es interno de rewrite_implicit_this; lo recreamos aqui
-                 * a nivel BlockStmt iterando children y delegando. */
-                rewrite_implicit_this(child, field_names, params_set);
-            }
+             * unique_ptr<BlockStmt> con vector body de unique_ptr<Stmt>.
+             *
+             * BugFix (2026-06-04): antes iterabamos los children uno a uno
+             * llamando @c rewrite_implicit_this(child, ...) , pero esa
+             * funcion crea su PROPIO @c locals_stack vacio internamente, lo
+             * que provocaba que las var locals declaradas en un statement
+             * (e.g. `i64 fp = ffi_call(...)`) NO se vieran como shadowed en
+             * el siguiente statement (e.g. `if (fp == 0)`).  Resultado: el
+             * `fp` se reescribia a `this.fp` cuando el ident colisionaba
+             * con un field, leyendo basura.  Caso real cerrado: file_io
+             * `read_all` con variable local `fp` colisionando con field
+             * `this.fp`.
+             *
+             * Fix: tratar el body como UN SOLO BlockStmt, lo que comparte
+             * el @c locals_stack interno entre todos los statements del body.
+             */
+            std::unique_ptr<ast::Stmt> body_as_stmt(m->body.release());
+            rewrite_implicit_this(body_as_stmt, field_names, params_set);
+            // Re-inyectar el BlockStmt al field body (el rewrite no lo movio).
+            m->body.reset(static_cast<ast::BlockStmt *>(body_as_stmt.release()));
         }
         // Tipo de retorno: VOID para constructores; el declarado para los demas.
         const Type fn_ret = m->is_constructor
@@ -6822,6 +6835,14 @@ namespace vex {
                 auto *idb = static_cast<ast::IdentExpr *>(fa->base.get());
                 const Symbol *ns_sym = lookup(idb->name);
                 if (ns_sym && ns_sym->kind == SymbolKind::Namespace) {
+                    // L.26 fix (2026-06-04): marcar el namespace como
+                    // referenciado para que el linter de "import no se
+                    // usa" no genere falsos positivos en namespace calls
+                    // (`ns.fn()`).  Sin esto, los warnings spurios
+                    // aparecen aunque el usuario claramente usa el
+                    // import via call.  Mismo patron que check_field_access
+                    // ya hacia para namespace field access.
+                    referenced_names_.insert(idb->name);
                     if (ns_sym->ns_index < imported_namespaces_.size()) {
                         const auto &ns = imported_namespaces_[ns_sym->ns_index];
                         auto its = ns.by_name.find(fa->field_name);

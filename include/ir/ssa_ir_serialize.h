@@ -142,6 +142,50 @@ namespace ir {
                           size_t section_size,
                           std::vector<IrFunction> &functions);
 
+    /* ===================================================================== */
+    /* Cache de IR por modulo (.vexir)                                       */
+    /* ===================================================================== */
+
+    /**
+     * @brief Magic "VXMC" del cache de IR por modulo (`.vexir`).
+     *        DISTINTO de @c IR_SECTION_MAGIC ("VEIR") a proposito: un
+     *        `.vexir` viejo (formato solo-funciones, magic "VEIR") falla
+     *        el check de magic en @c parse_ir_module_cache y fuerza
+     *        recompilar el dep (auto-invalidacion del cache obsoleto).
+     */
+    static constexpr uint32_t IR_MODULE_CACHE_MAGIC = 0x434D5856U; /* 'V''X''M''C' */
+    static constexpr uint16_t IR_MODULE_CACHE_VERSION = 1;
+
+    /**
+     * @brief Serializa el IR de UN modulo COMPLETO para el cache `.vexir`.
+     *
+     * A diferencia de @c emit_ir_section (que solo guarda @c functions y
+     * sirve para la seccion @c @ir del `.velb` consumida por el JIT), este
+     * formato persiste TODO lo que el merge cross-module necesita del dep:
+     *   - functions    (via @c emit_ir_section, con su header VEIR).
+     *   - static_data  (pool + entries + meta).  CRITICO: sin esto, un dep
+     *                  cache-hit aporta sus `code.s_N` refs pero no sus
+     *                  slots -> relocaciones colgadas en el `.velb`.
+     *   - globals      (map nombre -> IrValueId).
+     *
+     * @param mod  IrModule del dep a cachear.
+     * @return     bytes listos para escribir al `.vexir`.
+     */
+    std::vector<uint8_t> emit_ir_module_cache(const IrModule &mod);
+
+    /**
+     * @brief Reconstruye un @c IrModule completo desde un buffer `.vexir`
+     *        producido por @c emit_ir_module_cache.
+     *
+     * Rellena @c out.functions, @c out.static_data y @c out.globals.
+     *
+     * @return @c true si el parseo fue exitoso; @c false si magic/version
+     *         no coinciden (p.ej. un `.vexir` del formato viejo) o el
+     *         buffer esta truncado.  En false, el caller debe recompilar.
+     */
+    bool parse_ir_module_cache(const std::vector<uint8_t> &data,
+                               IrModule &out);
+
     /* Helpers expuestos para tests / linker (escritura en buffer). */
     inline void write_u8(std::vector<uint8_t> &o, uint8_t v) {
         o.push_back(v);

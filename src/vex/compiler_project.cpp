@@ -37,6 +37,14 @@
 #include "vex/module_interop.h"
 #include "vex/module_resolver.h"
 #include "vex/parser.h"
+// IMPORTANTE: incluir los headers de diagramas DESPUES de parser.h / lowering.h
+// para que la fwd decl @c namespace ast { struct ModuleNode; } del header
+// resuelva correctamente al tipo @c vex::ast::ModuleNode ya conocido en
+// este punto.  De otra forma el compilador interpreta @c ast::ModuleNode
+// como @c ::ast::ModuleNode (global), causando mismatch de tipos.
+#include "vex/graphviz_diagrams.h"
+#include "vex/html_diagrams.h"
+#include "vex/mermaid_diagrams.h"
 #include "vex/type_checker.h"
 #include "vex/vexi_format.h"
 
@@ -670,7 +678,18 @@ CompileResult compile_vex_project(const std::string &root_path,
             std::cerr << ln.str();
         }
 
-        const uint64_t source_hash = vexi_fnv1a(pm.source);
+        // Mezclamos opts.instrument_mode (y cualquier flag futuro que
+        // afecte la emision IR/bytecode) en el source_hash para que el
+        // cache se invalide automaticamente al cambiar entre "trace"/"none".
+        // Sin esto, builds con cache de un modo distinto producen
+        // `.vel` con relocations sin resolver -> SEGV silente en runtime
+        // (limitacion MC.12 documentada).
+        uint64_t source_hash = vexi_fnv1a(pm.source);
+        if (!opts.instrument_mode.empty() && opts.instrument_mode != "none") {
+            const uint64_t instrument_hash = vexi_fnv1a(opts.instrument_mode);
+            source_hash ^= instrument_hash + 0x9E3779B97F4A7C15ULL
+                         + (source_hash << 6) + (source_hash >> 2);
+        }
 
         // ---- M4: cache hit path ----
         // Solo se aplica a DEPS, no al root.  Verifica:
@@ -724,11 +743,18 @@ CompileResult compile_vex_project(const std::string &root_path,
                         // Hash match -> intentar cargar tambien el .vexir.
                         std::vector<uint8_t> ibytes;
                         if (read_file_bytes_(ip, ibytes) && !ibytes.empty()) {
-                            std::vector<ir::IrFunction> fns;
-                            if (ir::parse_ir_section(ibytes, 0,
-                                                      ibytes.size(), fns)) {
+                            // BugFix M.vexir-sd: cargar el modulo COMPLETO
+                            // (functions + static_data + globals).  El formato
+                            // viejo (solo functions) perdia el static_data del
+                            // dep -> relocaciones `code.s_*` colgantes en el
+                            // `.velb` con cache caliente.  Un `.vexir` viejo
+                            // falla el magic y cae a recompilar.
+                            ir::IrModule dep_mod;
+                            if (ir::parse_ir_module_cache(ibytes, dep_mod)) {
                                 pm.vexi = std::move(pr.module_);
-                                pm.ir.functions = std::move(fns);
+                                pm.ir.functions  = std::move(dep_mod.functions);
+                                pm.ir.static_data = std::move(dep_mod.static_data);
+                                pm.ir.globals    = std::move(dep_mod.globals);
                                 pm.ok = true;
                                 if (verbose_cache) {
                                     std::ostringstream tmp; tmp << "[vex-cache] hit: "
@@ -968,7 +994,11 @@ CompileResult compile_vex_project(const std::string &root_path,
             }
             // Phase M5.A L.17: escritura atomica (rename temp file).
             (void)write_file_atomic_(vp, vbytes);
-            auto ibytes = ir::emit_ir_section(pm.ir.functions);
+            // BugFix M.vexir-sd: persistir el modulo COMPLETO (functions +
+            // static_data + globals) para que un dep cache-hit aporte sus
+            // slots `code.s_*` al merge.  emit_ir_section (solo functions)
+            // los perdia.
+            auto ibytes = ir::emit_ir_module_cache(pm.ir);
             (void)write_file_atomic_(ip, ibytes);
             // Phase M5.C L.18: ademas del .vexi (interfaz) + .vexir (IR
             // serializado), emitir el .vel del dep solo (sin merge) para
@@ -1010,10 +1040,24 @@ CompileResult compile_vex_project(const std::string &root_path,
     // solapan: el barrier garantiza que los deps esten finalizados antes
     // de que un consumer empiece.
     int parallel_threads = 0;
+    bool env_present = false;
     if (const char *p = std::getenv("VEX_PARALLEL_COMPILE")) {
+        env_present = true;
         try { parallel_threads = std::stoi(p); }
         catch (...) { parallel_threads = 0; }
         if (parallel_threads < 0) parallel_threads = 0;
+    }
+    // Phase M8 AUTO (2026-06-05): sin env var (o =0) el compile usa
+    // hardware_concurrency() limitado a max 8 threads (cap para evitar
+    // oversubscription: >8 da diminishing returns por contention en cache
+    // writes + mutex verbose).  VEX_PARALLEL_COMPILE=1 fuerza SECUENCIAL
+    // (diagnostico / output determinista); >=2 fija N exacto.  Proyectos
+    // triviales (1 modulo por nivel) NO pagan overhead: el dispatch
+    // paralelo solo crea threads cuando un nivel tiene >=2 modulos.
+    if (!env_present || parallel_threads == 0) {
+        unsigned hc = std::thread::hardware_concurrency();
+        if (hc < 1) hc = 1;
+        parallel_threads = (hc > 8u) ? 8 : static_cast<int>(hc);
     }
     if (parallel_threads <= 1) {
         // Path secuencial: identico al comportamiento pre-M8.
@@ -1445,6 +1489,52 @@ CompileResult compile_vex_project(const std::string &root_path,
     res.vel_text          = std::move(eres.vel_text);
     res.ir_section_bytes  = ir::emit_ir_section(merged.functions);
     res.ok                = !res.diagnostics.has_errors();
+
+    // Diagramas (Mermaid / Graphviz) del AST del root + IR mergeado +
+    // .vel final.  En el path project compile (multi-fichero) el AST
+    // que se diagrama es el root (work.back() en topo order).  Los IR
+    // pre y post-opt se diagraman desde @c merged (sin distincion de
+    // pre vs post porque @c ir_optimize ya corrio sobre merged; el
+    // diagrama "pre" es identico al "post" en project compile -- esto
+    // es una limitacion documentada del modelo merge IR).
+    const auto &root_pm = work.back();
+    if (root_pm.ast) {
+        if (opts.dump_mermaid_ast) {
+            res.mermaid_ast = mermaid_from_ast(*root_pm.ast);
+        }
+        if (opts.dump_graphviz_ast) {
+            res.graphviz_ast = graphviz_from_ast(*root_pm.ast);
+        }
+        if (opts.dump_html_ast) {
+            res.html_ast = html_from_ast(*root_pm.ast);
+        }
+    }
+    if (opts.dump_mermaid_ir_pre || opts.dump_mermaid_ir_post) {
+        std::string ir_text = mermaid_from_ir_module(merged, "IR (merged + optimized)");
+        if (opts.dump_mermaid_ir_pre)  res.mermaid_ir_pre  = ir_text;
+        if (opts.dump_mermaid_ir_post) res.mermaid_ir_post = ir_text;
+    }
+    if (opts.dump_graphviz_ir_pre || opts.dump_graphviz_ir_post) {
+        std::string ir_text = graphviz_from_ir_module(merged, "IR (merged + optimized)");
+        if (opts.dump_graphviz_ir_pre)  res.graphviz_ir_pre  = ir_text;
+        if (opts.dump_graphviz_ir_post) res.graphviz_ir_post = ir_text;
+    }
+    if (opts.dump_html_ir_pre || opts.dump_html_ir_post) {
+        // Proyecto multi-fichero: el IR ya esta merged + optimizado, asi que
+        // pre y post comparten el mismo grafo (igual que Mermaid/Graphviz).
+        std::string html = html_from_ir_module(merged, "SSA IR (merged + optimized)");
+        if (opts.dump_html_ir_pre)  res.html_ir_pre  = html;
+        if (opts.dump_html_ir_post) res.html_ir_post = html;
+    }
+    if (opts.dump_mermaid_vel) {
+        res.mermaid_vel = mermaid_from_vel_text(res.vel_text);
+    }
+    if (opts.dump_graphviz_vel) {
+        res.graphviz_vel = graphviz_from_vel_text(res.vel_text);
+    }
+    if (opts.dump_html_vel) {
+        res.html_vel = html_from_vel_text(res.vel_text);
+    }
 
     // Phase M5.B: poblar dep_paths con los paths canonicos de TODOS los
     // modulos compilados (incluido root).  main.cpp persistira el project

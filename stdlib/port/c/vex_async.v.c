@@ -62,7 +62,7 @@ typedef pthread_t            vex_thread_t;
 #endif
 
 #include <stdatomic.h>  /* C11 atomics; GCC y Clang los soportan desde
-                          hace anios.  En MSVC requiere /std:c11 o C17. */
+                          hace años.  En MSVC requiere /std:c11 o C17. */
 
 /* ----- Future con state atomico ----- */
 typedef struct VexFuture {

@@ -1082,13 +1082,39 @@ void *vrt_findmethod(vrt_proc *proc, uint64_t params_vaddr) {
     Params pr{};
     read_params_unified(p, params_vaddr, &pr, sizeof(pr));
     if (!pr.class_ptr || pr.name_len == 0 || pr.name_len > 4096) return nullptr;
+
+    /* CACHE (Phase D.8): el dispatch de interfaz (shape.area()) llama a este
+     * findmethod POR ITERACION, y resolverlo cuesta 2 lecturas de vm_mem (params
+     * + nombre) + copia del nombre + hash lookup -- pero (class_ptr, name_addr)
+     * casi siempre se repite (el nombre es constante; la clase rota entre pocos
+     * tipos).  Un cache thread_local pequeno (8 entradas, LRU-ish por reemplazo
+     * del mas viejo) keyed por (class_ptr, name_addr) salta TODO el trabajo caro
+     * en hit, dejando solo la lectura de params (24 B) para la key.  Esto cierra
+     * el grueso del 115x de pic_real sin tocar el codegen.  thread_local =
+     * seguro sin locks (el resultado find_method es verdad global, no por-proc).
+     * Las (class_ptr, name_addr) son estables durante el run; defmethod en
+     * runtime (raro, solo en __module_init que corre antes del hot path) podria
+     * stalear una entrada -> aceptable (el cache se llena tras __module_init). */
+    struct FmEntry { uint64_t cls; uint64_t name_addr; void *method; };
+    static thread_local FmEntry g_fm_cache[8] = {};
+    static thread_local unsigned g_fm_next = 0;
+    for (const FmEntry &e : g_fm_cache) {
+        if (e.cls == pr.class_ptr && e.name_addr == pr.name_addr && e.method)
+            return e.method;
+    }
+
     char buf[4097];
     /* name_addr sigue siendo VM vaddr (static_data del .velb). */
     p->vm_mem.read_bytes(pr.name_addr, buf, pr.name_len);
     buf[pr.name_len] = '\0';
     auto &reg = p->scheduler.vm_reference.loader_public.class_registry();
     auto *ci = reinterpret_cast<loader::ClassInfo *>(pr.class_ptr);
-    return reg.find_method(ci, buf);
+    void *m = reg.find_method(ci, buf);
+    if (m) {  /* cachear (reemplazo round-robin del slot mas viejo). */
+        g_fm_cache[g_fm_next & 7u] = FmEntry{pr.class_ptr, pr.name_addr, m};
+        ++g_fm_next;
+    }
+    return m;
 }
 
 void *vrt_findfield(vrt_proc *proc, uint64_t params_vaddr) {

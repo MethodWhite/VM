@@ -1,0 +1,826 @@
+// c_parser.vex - C header parser for vexbindgen
+// Parses function declarations, structs, typedefs, enums, and #define macros
+
+namespace vexbindgen.c_parser {
+
+    // -----------------------------------------------------------------
+    //  Types
+    // -----------------------------------------------------------------
+
+    type Param = struct {
+        type_name: string
+        name:      string
+    }
+
+    type FunctionDecl = struct {
+        return_type: string
+        name:        string
+        params:      Param[]
+        line:        i32
+    }
+
+    type StructField = struct {
+        type_name: string
+        name:      string
+        type_kind: i32   // 0=basic, 1=pointer, 2=array, 3=function_ptr
+        array_len: string
+    }
+
+    type StructDecl = struct {
+        name:   string
+        fields: StructField[]
+        line:   i32
+    }
+
+    type MacroDef = struct {
+        name:  string
+        value: string
+        line:  i32
+    }
+
+    type EnumConst = struct {
+        name:  string
+        value: string
+        line:  i32
+    }
+
+    type TypedefDef = struct {
+        name:    string
+        aliased: string
+        line:    i32
+    }
+
+    type ParseResult = struct {
+        functions:  FunctionDecl[]
+        structs:    StructDecl[]
+        macros:     MacroDef[]
+        enums:      EnumConst[]
+        typedefs:   TypedefDef[]
+        errors:     string[]
+    }
+
+    // -----------------------------------------------------------------
+    //  Constants
+    // -----------------------------------------------------------------
+
+    const TK_IDENT     : i32 = 0
+    const TK_LPAREN    : i32 = 1
+    const TK_RPAREN    : i32 = 2
+    const TK_LBRACE    : i32 = 3
+    const TK_RBRACE    : i32 = 4
+    const TK_SEMI      : i32 = 5
+    const TK_STAR      : i32 = 6
+    const TK_COMMA     : i32 = 7
+    const TK_LBRACKET  : i32 = 8
+    const TK_RBRACKET  : i32 = 9
+    const TK_NUMBER    : i32 = 10
+    const TK_STRING    : i32 = 11
+    const TK_EQ        : i32 = 12
+    const TK_EOF       : i32 = 13
+    const TK_ELLIPSIS  : i32 = 14
+    const TK_COLON     : i32 = 15
+
+    const KIND_BASIC      : i32 = 0
+    const KIND_POINTER    : i32 = 1
+    const KIND_ARRAY      : i32 = 2
+    const KIND_FUNC_PTR   : i32 = 3
+
+    // -----------------------------------------------------------------
+    //  Whitespace / character helpers
+    // -----------------------------------------------------------------
+
+    fn is_ws(c: string) -> bool {
+        return c == " " || c == "\t" || c == "\n" || c == "\r"
+    }
+
+    fn is_alpha(c: string) -> bool {
+        if c >= "a" && c <= "z" { return true }
+        if c >= "A" && c <= "Z" { return true }
+        return c == "_"
+    }
+
+    fn is_digit(c: string) -> bool {
+        return c >= "0" && c <= "9"
+    }
+
+    fn is_alnum(c: string) -> bool {
+        return is_alpha(c) || is_digit(c)
+    }
+
+    fn is_hex(c: string) -> bool {
+        return is_digit(c) || (c >= "a" && c <= "f") || (c >= "A" && c <= "F")
+    }
+
+    // -----------------------------------------------------------------
+    //  Tokenizer
+    // -----------------------------------------------------------------
+
+    type Token = struct {
+        kind:  i32
+        value: string
+        line:  i32
+    }
+
+    fn tokenize(source: string) -> Token[] {
+        let mut tokens: Token[] = []
+        let mut i: i32 = 0
+        let mut line: i32 = 1
+        let len = source.size()
+
+        while i < len {
+            let c = source[i]
+
+            if c == "\n" {
+                line = line + 1
+                i = i + 1
+                continue
+            }
+            if c == " " || c == "\t" || c == "\r" {
+                i = i + 1
+                continue
+            }
+
+            if c == "/" && i + 1 < len && source[i + 1] == "/" {
+                while i < len && source[i] != "\n" { i = i + 1 }
+                continue
+            }
+
+            if c == "/" && i + 1 < len && source[i + 1] == "*" {
+                i = i + 2
+                while i + 1 < len {
+                    if source[i] == "\n" { line = line + 1 }
+                    if source[i] == "*" && source[i + 1] == "/" {
+                        i = i + 2
+                        break
+                    }
+                    i = i + 1
+                }
+                continue
+            }
+
+            if c == "#" {
+                while i < len && source[i] != "\n" { i = i + 1 }
+                continue
+            }
+
+            if c == "\"" {
+                let mut s = "\""
+                i = i + 1
+                while i < len && source[i] != "\"" {
+                    if source[i] == "\\" && i + 1 < len {
+                        s = s ++ source[i]
+                        i = i + 1
+                    }
+                    s = s ++ source[i]
+                    i = i + 1
+                }
+                if i < len { s = s ++ source[i]; i = i + 1 }
+                tokens = tokens ++ [Token { kind = TK_STRING, value = s, line = line }]
+                continue
+            }
+
+            if c == "\'" {
+                i = i + 1
+                while i < len && source[i] != "\'" {
+                    if source[i] == "\\" && i + 1 < len { i = i + 1 }
+                    i = i + 1
+                }
+                if i < len { i = i + 1 }
+                continue
+            }
+
+            if is_digit(c) {
+                let mut num = ""
+                if c == "0" && i + 1 < len && (source[i + 1] == "x" || source[i + 1] == "X") {
+                    num = "0x"
+                    i = i + 2
+                    while i < len && is_hex(source[i]) {
+                        num = num ++ source[i]
+                        i = i + 1
+                    }
+                } else {
+                    while i < len && is_digit(source[i]) {
+                        num = num ++ source[i]
+                        i = i + 1
+                    }
+                }
+                while i < len && (source[i] == "u" || source[i] == "U"
+                    || source[i] == "l" || source[i] == "L"
+                    || source[i] == "f" || source[i] == "F") {
+                    num = num ++ source[i]
+                    i = i + 1
+                }
+                tokens = tokens ++ [Token { kind = TK_NUMBER, value = num, line = line }]
+                continue
+            }
+
+            if is_alpha(c) {
+                let mut ident = ""
+                while i < len && (is_alnum(source[i]) || source[i] == '_') {
+                    ident = ident ++ source[i]
+                    i = i + 1
+                }
+                tokens = tokens ++ [Token { kind = TK_IDENT, value = ident, line = line }]
+                continue
+            }
+
+            if c == "." && i + 1 < len && source[i + 1] == "." && i + 2 < len && source[i + 2] == "." {
+                tokens = tokens ++ [Token { kind = TK_ELLIPSIS, value = "...", line = line }]
+                i = i + 3
+                continue
+            }
+
+            if c == "(" { tokens = tokens ++ [Token { kind = TK_LPAREN, value = "(", line = line }]; i = i + 1; continue }
+            if c == ")" { tokens = tokens ++ [Token { kind = TK_RPAREN, value = ")", line = line }]; i = i + 1; continue }
+            if c == "{" { tokens = tokens ++ [Token { kind = TK_LBRACE, value = "{", line = line }]; i = i + 1; continue }
+            if c == "}" { tokens = tokens ++ [Token { kind = TK_RBRACE, value = "}", line = line }]; i = i + 1; continue }
+            if c == ";" { tokens = tokens ++ [Token { kind = TK_SEMI, value = ";", line = line }]; i = i + 1; continue }
+            if c == "*" { tokens = tokens ++ [Token { kind = TK_STAR, value = "*", line = line }]; i = i + 1; continue }
+            if c == "," { tokens = tokens ++ [Token { kind = TK_COMMA, value = ",", line = line }]; i = i + 1; continue }
+            if c == "[" { tokens = tokens ++ [Token { kind = TK_LBRACKET, value = "[", line = line }]; i = i + 1; continue }
+            if c == "]" { tokens = tokens ++ [Token { kind = TK_RBRACKET, value = "]", line = line }]; i = i + 1; continue }
+            if c == "=" { tokens = tokens ++ [Token { kind = TK_EQ, value = "=", line = line }]; i = i + 1; continue }
+            if c == ":" { tokens = tokens ++ [Token { kind = TK_COLON, value = ":", line = line }]; i = i + 1; continue }
+
+            i = i + 1
+        }
+
+        tokens = tokens ++ [Token { kind = TK_EOF, value = "", line = line }]
+        return tokens
+    }
+
+    // -----------------------------------------------------------------
+    //  C type name normalization
+    // -----------------------------------------------------------------
+
+    fn normalize_type(raw: string[]) -> string {
+        let mut result = ""
+        let mut i: i32 = 0
+        let mut is_unsigned = false
+
+        while i < raw.size() {
+            let tok = raw[i]
+            if tok == "unsigned" { is_unsigned = true }
+            else if tok == "signed" {}
+            else if tok == "const" {}
+            else if tok == "volatile" {}
+            else if tok == "extern" || tok == "static" || tok == "inline" {}
+            else {
+                if result != "" { result = result ++ " " }
+                result = result ++ tok
+            }
+            i = i + 1
+        }
+
+        if is_unsigned && result != "" {
+            if result == "char" { result = "u8" }
+            else if result == "int" { result = "u32" }
+            else if result == "short" { result = "u16" }
+            else if result == "long" { result = "u64" }
+            else { result = "unsigned " ++ result }
+        }
+
+        if result == "size_t" || result == "uintptr_t" { result = "u64" }
+        else if result == "ssize_t" || result == "intptr_t" { result = "i64" }
+        else if result == "int8_t" { result = "i8" }
+        else if result == "uint8_t" { result = "u8" }
+        else if result == "int16_t" { result = "i16" }
+        else if result == "uint16_t" { result = "u16" }
+        else if result == "int32_t" { result = "i32" }
+        else if result == "uint32_t" { result = "u32" }
+        else if result == "int64_t" { result = "i64" }
+        else if result == "uint64_t" { result = "u64" }
+        else if result == "float" { result = "f32" }
+        else if result == "double" { result = "f64" }
+        else if result == "void" { result = "void" }
+        else if result == "char" { result = "char" }
+        else if result == "int" { result = "i32" }
+        else if result == "short" { result = "i16" }
+        else if result == "long" { result = "i64" }
+        else if result == "long long" { result = "i64" }
+
+        return result
+    }
+
+    // -----------------------------------------------------------------
+    //  Parse function parameters
+    // -----------------------------------------------------------------
+
+    fn parse_params(tokens: Token[], start: i32, end: i32) -> Param[] {
+        let mut params: Param[] = []
+
+        if start >= end { return params }
+
+        let mut i = start
+
+        if i < end && tokens[i].kind == TK_IDENT && tokens[i].value == "void" {
+            return params
+        }
+
+        while i < end {
+            let mut type_parts: string[] = []
+
+            while i < end {
+                let t = tokens[i]
+                if t.kind == TK_COMMA || t.kind == TK_RPAREN { break }
+                if t.kind == TK_IDENT || t.kind == TK_STAR || t.kind == TK_LPAREN {
+                    if t.kind == TK_IDENT && type_parts.size() > 0 {
+                        let mut next_is_end = false
+                        if i + 1 < end {
+                            let n = tokens[i + 1]
+                            if n.kind == TK_RPAREN || n.kind == TK_COMMA || n.kind == TK_EQ {
+                                next_is_end = true
+                            }
+                        }
+                        if next_is_end {
+                            let ptype = normalize_type(type_parts)
+                            params = params ++ [Param { type_name = ptype, name = t.value }]
+                            i = i + 1
+                            if i < end && tokens[i].kind == TK_COMMA { i = i + 1 }
+                            type_parts = []
+                            break
+                        }
+                    }
+                    if t.kind == TK_LPAREN && type_parts.size() > 0
+                        && i + 1 < end && tokens[i + 1].kind == TK_STAR {
+                        type_parts = type_parts ++ ["("]
+                        i = i + 1
+                        continue
+                    }
+                    type_parts = type_parts ++ [t.value]
+                } else if t.kind == TK_ELLIPSIS {
+                    params = params ++ [Param { type_name = "...", name = "" }]
+                    i = i + 1
+                    if i < end && tokens[i].kind == TK_COMMA { i = i + 1 }
+                    type_parts = []
+                    break
+                }
+                i = i + 1
+            }
+
+            if type_parts.size() > 0 {
+                let ptype = normalize_type(type_parts)
+                if ptype != "void" {
+                    params = params ++ [Param { type_name = ptype, name = "" }]
+                }
+                type_parts = []
+            }
+
+            if i < end && tokens[i].kind == TK_COMMA { i = i + 1 }
+            if i < end && tokens[i].kind == TK_RPAREN { break }
+        }
+
+        return params
+    }
+
+    // -----------------------------------------------------------------
+    //  Parse function declaration
+    // -----------------------------------------------------------------
+
+    fn parse_function(tokens: Token[], start: i32) -> FunctionDecl {
+        let mut return_parts: string[] = []
+        let mut i = start
+        let line = tokens[start].line
+
+        while i < tokens.size() {
+            let t = tokens[i]
+
+            if t.kind == TK_IDENT && t.value == "struct" {
+                return_parts = return_parts ++ [t.value]
+                i = i + 1
+                if i < tokens.size() && tokens[i].kind == TK_IDENT {
+                    return_parts = return_parts ++ [tokens[i].value]
+                    i = i + 1
+                }
+                continue
+            }
+            if t.kind == TK_LPAREN {
+                return_parts = return_parts ++ ["("]
+                i = i + 1
+                continue
+            }
+            if t.kind == TK_RPAREN {
+                return_parts = return_parts ++ [")"]
+                i = i + 1
+                continue
+            }
+            if t.kind == TK_STAR {
+                return_parts = return_parts ++ ["*"]
+                i = i + 1
+                continue
+            }
+            if t.kind == TK_IDENT {
+                if i + 1 < tokens.size() && tokens[i + 1].kind == TK_LPAREN {
+                    let fn_name = t.value
+                    let paren_start = i + 2
+                    let mut depth: i32 = 1
+                    let mut paren_end = paren_start
+                    while paren_end < tokens.size() && depth > 0 {
+                        let pt = tokens[paren_end]
+                        if pt.kind == TK_LPAREN { depth = depth + 1 }
+                        else if pt.kind == TK_RPAREN { depth = depth - 1 }
+                        paren_end = paren_end + 1
+                    }
+                    paren_end = paren_end - 1
+
+                    let params = parse_params(tokens, paren_start, paren_end - 1)
+                    let rtype = normalize_type(return_parts)
+
+                    return FunctionDecl {
+                        return_type = rtype,
+                        name = fn_name,
+                        params = params,
+                        line = line
+                    }
+                }
+                return_parts = return_parts ++ [t.value]
+            }
+            i = i + 1
+        }
+
+        return FunctionDecl {
+            return_type = "void",
+            name = "unknown",
+            params = [],
+            line = line
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Parse struct fields
+    // -----------------------------------------------------------------
+
+    fn parse_struct_fields(tokens: Token[], start: i32, end: i32) -> StructField[] {
+        let mut fields: StructField[] = []
+        let mut i = start
+
+        while i < end {
+            let t = tokens[i]
+
+            if t.kind == TK_IDENT && (t.value == "struct" || t.value == "union") {
+                i = i + 1
+                if i < end && tokens[i].kind == TK_IDENT {
+                    i = i + 1
+                }
+                continue
+            }
+
+            if t.kind == TK_SEMI {
+                i = i + 1
+                continue
+            }
+
+            let mut type_toks: string[] = []
+            let mut field_name = ""
+            let mut field_kind = KIND_BASIC
+            let mut array_len = ""
+
+            while i < end {
+                let ct = tokens[i]
+                if ct.kind == TK_SEMI { break }
+
+                if ct.kind == TK_IDENT && ct.value == "struct" {
+                    type_toks = type_toks ++ ["struct"]
+                    i = i + 1
+                    if i < end && tokens[i].kind == TK_IDENT {
+                        type_toks = type_toks ++ [tokens[i].value]
+                        i = i + 1
+                    }
+                    continue
+                }
+
+                if ct.kind == TK_IDENT && ct.value == "union" {
+                    type_toks = type_toks ++ ["union"]
+                    i = i + 1
+                    if i < end && tokens[i].kind == TK_IDENT {
+                        type_toks = type_toks ++ [tokens[i].value]
+                        i = i + 1
+                    }
+                    continue
+                }
+
+                if ct.kind == TK_STAR {
+                    type_toks = type_toks ++ ["*"]
+                    i = i + 1
+                    field_kind = KIND_POINTER
+                    continue
+                }
+
+                if ct.kind == TK_IDENT {
+                    if type_toks.size() > 0 {
+                        let mut next_is_end = false
+                        let mut next_is_array = false
+                        if i + 1 < end {
+                            let n = tokens[i + 1]
+                            if n.kind == TK_SEMI { next_is_end = true }
+                            if n.kind == TK_LBRACKET { next_is_array = true }
+                        }
+                        if next_is_end || next_is_array {
+                            field_name = ct.value
+                            i = i + 1
+                            if next_is_array && i < end && tokens[i].kind == TK_LBRACKET {
+                                field_kind = KIND_ARRAY
+                                i = i + 1
+                                while i < end && tokens[i].kind != TK_RBRACKET {
+                                    if tokens[i].kind == TK_NUMBER || tokens[i].kind == TK_IDENT {
+                                        array_len = tokens[i].value
+                                    }
+                                    i = i + 1
+                                }
+                                if i < end { i = i + 1 }
+                            }
+                            break
+                        }
+                    }
+                    type_toks = type_toks ++ [ct.value]
+                    i = i + 1
+                    continue
+                }
+
+                if ct.kind == TK_NUMBER {
+                    type_toks = type_toks ++ [ct.value]
+                    i = i + 1
+                    continue
+                }
+
+                i = i + 1
+            }
+
+            if field_name != "" && type_toks.size() > 0 {
+                let ftype = normalize_type(type_toks)
+                fields = fields ++ [StructField {
+                    type_name = ftype,
+                    name = field_name,
+                    type_kind = field_kind,
+                    array_len = array_len
+                }]
+            }
+
+            if i < end && tokens[i].kind == TK_SEMI { i = i + 1 }
+        }
+
+        return fields
+    }
+
+    // -----------------------------------------------------------------
+    //  Parse a struct/union definition
+    // -----------------------------------------------------------------
+
+    fn parse_struct(tokens: Token[], start: i32) -> StructDecl {
+        let line = tokens[start].line
+        let mut i = start
+
+        if tokens[i].kind == TK_IDENT {
+            i = i + 1
+        }
+
+        let mut name = ""
+        if i < tokens.size() && tokens[i].kind == TK_IDENT {
+            name = tokens[i].value
+            i = i + 1
+        }
+
+        while i < tokens.size() && tokens[i].kind != TK_LBRACE {
+            i = i + 1
+        }
+
+        if i >= tokens.size() {
+            return StructDecl { name = name, fields = [], line = line }
+        }
+
+        let brace_start = i + 1
+        let mut depth: i32 = 1
+        let mut brace_end = brace_start
+        while brace_end < tokens.size() && depth > 0 {
+            let t = tokens[brace_end]
+            if t.kind == TK_LBRACE { depth = depth + 1 }
+            else if t.kind == TK_RBRACE { depth = depth - 1 }
+            brace_end = brace_end + 1
+        }
+        brace_end = brace_end - 1
+
+        let fields = parse_struct_fields(tokens, brace_start, brace_end - 1)
+
+        return StructDecl {
+            name = name,
+            fields = fields,
+            line = line
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Parse typedef
+    // -----------------------------------------------------------------
+
+    fn parse_typedef(tokens: Token[], start: i32) -> TypedefDef {
+        let line = tokens[start].line
+        let mut i = start
+
+        let mut last_ident = ""
+        while i < tokens.size() {
+            let t = tokens[i]
+            if t.kind == TK_SEMI { break }
+            if t.kind == TK_IDENT && t.value != "typedef" {
+                last_ident = t.value
+            }
+            i = i + 1
+        }
+
+        let mut alias_parts: string[] = []
+        i = start + 1
+        while i < tokens.size() {
+            let t = tokens[i]
+            if t.kind == TK_SEMI { break }
+            if t.kind == TK_IDENT && t.value == last_ident {
+                break
+            }
+            alias_parts = alias_parts ++ [t.value]
+            i = i + 1
+        }
+
+        let aliased = normalize_type(alias_parts)
+
+        return TypedefDef {
+            name = last_ident,
+            aliased = aliased,
+            line = line
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Parse enum
+    // -----------------------------------------------------------------
+
+    fn parse_enum(tokens: Token[], start: i32) -> EnumConst[] {
+        let mut consts: EnumConst[] = []
+        let mut i = start
+
+        if tokens[i].kind == TK_IDENT && tokens[i].value == "enum" {
+            i = i + 1
+        }
+
+        if i < tokens.size() && tokens[i].kind == TK_IDENT
+            && i + 1 < tokens.size() && tokens[i + 1].kind != TK_LBRACE {
+            i = i + 1
+        }
+
+        while i < tokens.size() && tokens[i].kind != TK_LBRACE { i = i + 1 }
+        if i >= tokens.size() { return consts }
+
+        i = i + 1
+        let mut depth: i32 = 1
+        let mut prev_ident = ""
+        let mut prev_value = ""
+
+        while i < tokens.size() && depth > 0 {
+            let t = tokens[i]
+            if t.kind == TK_LBRACE { depth = depth + 1; i = i + 1; continue }
+            if t.kind == TK_RBRACE { depth = depth - 1; i = i + 1; continue }
+
+            if t.kind == TK_IDENT {
+                prev_ident = t.value
+                prev_value = ""
+                if i + 1 < tokens.size() && tokens[i + 1].kind == TK_EQ {
+                    i = i + 2
+                    let mut val_expr = ""
+                    while i < tokens.size() {
+                        let nt = tokens[i]
+                        if nt.kind == TK_COMMA || nt.kind == TK_RBRACE { break }
+                        if nt.kind == TK_NUMBER || nt.kind == TK_IDENT {
+                            val_expr = val_expr ++ nt.value
+                        }
+                        i = i + 1
+                    }
+                    prev_value = val_expr
+                    consts = consts ++ [EnumConst {
+                        name = prev_ident,
+                        value = prev_value,
+                        line = t.line
+                    }]
+                    continue
+                } else {
+                    consts = consts ++ [EnumConst {
+                        name = prev_ident,
+                        value = prev_value,
+                        line = t.line
+                    }]
+                }
+            }
+
+            if t.kind == TK_COMMA {
+                prev_ident = ""
+                prev_value = ""
+            }
+
+            i = i + 1
+        }
+
+        return consts
+    }
+
+    // -----------------------------------------------------------------
+    //  Main entry: parse a complete C header
+    // -----------------------------------------------------------------
+
+    fn parse_header(source: string) -> ParseResult {
+        let mut result = ParseResult {
+            functions = [],
+            structs = [],
+            macros = [],
+            enums = [],
+            typedefs = [],
+            errors = []
+        }
+
+        let tokens = tokenize(source)
+        let mut i: i32 = 0
+        let len = tokens.size()
+
+        while i < len {
+            let t = tokens[i]
+            if t.kind == TK_EOF { break }
+
+            if t.kind == TK_IDENT {
+                let val = t.value
+
+                if val == "struct" || val == "union" {
+                    let mut j = i + 1
+                    if j < len && tokens[j].kind == TK_IDENT { j = j + 1 }
+                    if j < len && tokens[j].kind == TK_LBRACE {
+                        let sd = parse_struct(tokens, i)
+                        if sd.name != "" {
+                            result.structs = result.structs ++ [sd]
+                        }
+                        let mut depth: i32 = 1
+                        let mut skip = j + 1
+                        while skip < len && depth > 0 {
+                            if tokens[skip].kind == TK_LBRACE { depth = depth + 1 }
+                            else if tokens[skip].kind == TK_RBRACE { depth = depth - 1 }
+                            skip = skip + 1
+                        }
+                        while skip < len && tokens[skip].kind != TK_SEMI
+                            && tokens[skip].kind != TK_EOF {
+                            skip = skip + 1
+                        }
+                        i = skip + 1
+                        continue
+                    }
+                }
+
+                if val == "enum" {
+                    let ec = parse_enum(tokens, i)
+                    if ec.size() > 0 {
+                        result.enums = result.enums ++ ec
+                    }
+                    let mut depth: i32 = 0
+                    let mut found_brace = false
+                    let mut skip = i
+                    while skip < len {
+                        if tokens[skip].kind == TK_LBRACE {
+                            depth = depth + 1
+                            found_brace = true
+                        } else if tokens[skip].kind == TK_RBRACE {
+                            depth = depth - 1
+                            if found_brace && depth == 0 {
+                                skip = skip + 1
+                                break
+                            }
+                        } else if tokens[skip].kind == TK_SEMI && !found_brace {
+                            break
+                        }
+                        skip = skip + 1
+                    }
+                    while skip < len && tokens[skip].kind != TK_SEMI
+                        && tokens[skip].kind != TK_EOF {
+                        skip = skip + 1
+                    }
+                    i = skip + 1
+                    continue
+                }
+
+                if val == "typedef" {
+                    let td = parse_typedef(tokens, i)
+                    if td.name != "" {
+                        result.typedefs = result.typedefs ++ [td]
+                    }
+                    while i < len && tokens[i].kind != TK_SEMI { i = i + 1 }
+                    i = i + 1
+                    continue
+                }
+
+                if i + 2 < len && tokens[i + 1].kind == TK_IDENT
+                    && tokens[i + 2].kind == TK_LPAREN {
+                    let fd = parse_function(tokens, i)
+                    if fd.name != "unknown" && fd.name != "" {
+                        result.functions = result.functions ++ [fd]
+                    }
+                }
+            }
+
+            i = i + 1
+        }
+
+        return result
+    }
+
+} // namespace vexbindgen.c_parser

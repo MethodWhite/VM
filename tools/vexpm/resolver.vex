@@ -1,0 +1,296 @@
+// =============================================================================
+// resolver.vex - Dependency resolver with semantic versioning
+// Part of vexpm - Vex Package Manager
+// =============================================================================
+
+namespace vexpm.resolver {
+
+    // =========================================================================
+    // Semantic versioning
+    // =========================================================================
+
+    type Semver = struct {
+        major: i32
+        minor: i32
+        patch: i32
+        prerelease: string
+    }
+
+    fn semver_parse(v: string) -> Semver {
+        let result = Semver { major: 0, minor: 0, patch: 0, prerelease: "" }
+        let mut i: i32 = 0
+        let mut part: i32 = 0
+        let mut acc: i32 = 0
+        let mut in_prerelease: bool = false
+        while i < v.size() {
+            let c = v[i]
+            if c == '-' {
+                in_prerelease = true
+                if part == 0 { result.major = acc }
+                elif part == 1 { result.minor = acc }
+                elif part == 2 { result.patch = acc }
+                part = part + 1
+                acc = 0
+            } elif c == '.' && !in_prerelease {
+                if part == 0 { result.major = acc }
+                elif part == 1 { result.minor = acc }
+                part = part + 1
+                acc = 0
+            } elif c >= '0' && c <= '9' {
+                acc = acc * 10 + i32(c - '0')
+            }
+            i = i + 1
+        }
+        if !in_prerelease {
+            if part == 0 { result.major = acc }
+            elif part == 1 { result.minor = acc }
+            elif part == 2 { result.patch = acc }
+        } else {
+            if part == 1 { result.major = acc }
+        }
+        return result
+    }
+
+    fn semver_to_string(s: Semver) -> string {
+        let r = i32_to_str(s.major) ++ "." ++ i32_to_str(s.minor) ++ "." ++ i32_to_str(s.patch)
+        if s.prerelease != "" {
+            r = r ++ "-" ++ s.prerelease
+        }
+        return r
+    }
+
+    fn semver_cmp(a: Semver, b: Semver) -> i32 {
+        if a.major != b.major { return a.major - b.major }
+        if a.minor != b.minor { return a.minor - b.minor }
+        if a.patch != b.patch { return a.patch - b.patch }
+        return 0
+    }
+
+    // =========================================================================
+    // Constraint types
+    // =========================================================================
+
+    type Constraint = struct {
+        kind:     i32   // 0=exact, 1=caret (^), 2=tilde (~), 3=wildcard (*), 4=gte (>=)
+        major:    i32
+        minor:    i32
+        patch:    i32
+    }
+
+    fn constraint_parse(raw: string) -> Constraint {
+        let c = Constraint { kind: 0, major: 0, minor: 0, patch: 0 }
+        let mut i: i32 = 0
+        if raw.size() == 0 { return c }
+        if raw[i] == '^' { c.kind = 1; i = i + 1 }
+        elif raw[i] == '~' { c.kind = 2; i = i + 1 }
+        elif raw[i] == '*' { c.kind = 3; return c }
+        elif raw[i] == '>' && raw.size() > i + 1 && raw[i+1] == '=' { c.kind = 4; i = i + 2 }
+
+        let mut part: i32 = 0
+        let mut acc: i32 = 0
+        while i < raw.size() {
+            let ch = raw[i]
+            if ch == '.' {
+                if part == 0 { c.major = acc }
+                elif part == 1 { c.minor = acc }
+                part = part + 1
+                acc = 0
+            } elif ch >= '0' && ch <= '9' {
+                acc = acc * 10 + i32(ch - '0')
+            } else {
+                // Stop at non-numeric (prerelease, build metadata)
+                i = raw.size()
+            }
+            i = i + 1
+        }
+        if part == 0 { c.major = acc }
+        elif part == 1 { c.minor = acc }
+        elif part >= 2 { c.patch = acc }
+        return c
+    }
+
+    fn constraint_matches(c: Constraint, version: string) -> bool {
+        let v = semver_parse(version)
+        if c.kind == 0 {
+            return v.major == c.major && v.minor == c.minor && v.patch == c.patch
+        }
+        if c.kind == 1 {
+            if c.major != v.major { return false }
+            if c.major != 0 { return true }
+            if c.minor != v.minor { return false }
+            if c.minor != 0 { return true }
+            return v.patch >= c.patch
+        }
+        if c.kind == 2 {
+            if c.major != v.major { return false }
+            if c.minor != v.minor { return false }
+            return true
+        }
+        if c.kind == 3 { return true }
+        if c.kind == 4 {
+            if v.major < c.major { return false }
+            if v.major > c.major { return true }
+            if v.minor < c.minor { return false }
+            if v.minor > c.minor { return true }
+            return v.patch >= c.patch
+        }
+        return false
+    }
+
+    fn constraint_to_string(c: Constraint) -> string {
+        if c.kind == 3 { return "*" }
+        let prefix: string = ""
+        if c.kind == 1 { prefix = "^" }
+        elif c.kind == 2 { prefix = "~" }
+        elif c.kind == 4 { prefix = ">=" }
+        return prefix ++ i32_to_str(c.major) ++ "." ++ i32_to_str(c.minor) ++ "." ++ i32_to_str(c.patch)
+    }
+
+    // =========================================================================
+    // Dependency graph
+    // =========================================================================
+
+    comptime MAX_DEPS: i32 = 256
+    comptime MAX_EDGES: i32 = 16
+
+    type DepNode = struct {
+        name:       string
+        version:    string
+        constraint: string
+        resolved:   bool
+        dep_ids:    i32[]
+    }
+
+    type DepGraph = struct {
+        nodes: DepNode[]
+    }
+
+    fn graph_new() -> DepGraph {
+        return DepGraph { nodes: [] }
+    }
+
+    fn graph_add_node(g: &mut DepGraph, name: string, constraint: string) -> i32 {
+        if g.nodes.size() >= MAX_DEPS { return -1 }
+        let idx = g.nodes.size()
+        let node = DepNode {
+            name: name, version: "",
+            constraint: constraint,
+            resolved: false, dep_ids: []
+        }
+        g.nodes = g.nodes ++ [node]
+        return idx
+    }
+
+    fn graph_find_node(g: DepGraph, name: string) -> i32 {
+        let mut i: i32 = 0
+        while i < g.nodes.size() {
+            if g.nodes[i].name == name { return i }
+            i = i + 1
+        }
+        return -1
+    }
+
+    fn graph_add_edge(g: &mut DepGraph, from_id: i32, to_id: i32) {
+        if from_id < 0 || from_id >= g.nodes.size() { return }
+        if to_id < 0 || to_id >= g.nodes.size() { return }
+        let deps = g.nodes[from_id].dep_ids
+        if deps.size() >= MAX_EDGES { return }
+        g.nodes[from_id].dep_ids = deps ++ [to_id]
+    }
+
+    fn graph_set_version(g: &mut DepGraph, idx: i32, ver: string) {
+        if idx >= 0 && idx < g.nodes.size() {
+            g.nodes[idx].version = ver
+            g.nodes[idx].resolved = true
+        }
+    }
+
+    fn graph_detect_conflicts(g: DepGraph) -> i32 {
+        let mut i: i32 = 0
+        while i < g.nodes.size() {
+            let n = g.nodes[i]
+            if n.resolved && n.version != "" {
+                let c = constraint_parse(n.constraint)
+                if !constraint_matches(c, n.version) {
+                    return i
+                }
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    fn graph_has_cycle(g: DepGraph) -> bool {
+        let mut visited: bool[MAX_DEPS] = false
+        let mut in_stack: bool[MAX_DEPS] = false
+        let mut i: i32 = 0
+        while i < g.nodes.size() {
+            if !visited[i] {
+                if graph_dfs_cycle(g, i, &mut visited, &mut in_stack) {
+                    return true
+                }
+            }
+            i = i + 1
+        }
+        return false
+    }
+
+    fn graph_dfs_cycle(g: DepGraph, idx: i32, visited: &mut bool[], in_stack: &mut bool[]) -> bool {
+        visited[idx] = true
+        in_stack[idx] = true
+        let deps = g.nodes[idx].dep_ids
+        let mut i: i32 = 0
+        while i < deps.size() {
+            let next = deps[i]
+            if !visited[next] {
+                if graph_dfs_cycle(g, next, visited, in_stack) {
+                    return true
+                }
+            } elif in_stack[next] {
+                return true
+            }
+            i = i + 1
+        }
+        in_stack[idx] = false
+        return false
+    }
+
+    // =========================================================================
+    // Lockfile
+    // =========================================================================
+
+    fn lockfile_generate(g: DepGraph) -> string {
+        let mut content: string = ""
+        let mut i: i32 = 0
+        while i < g.nodes.size() {
+            let n = g.nodes[i]
+            content = content ++ n.name ++ "@" ++ n.version ++ "\n"
+            i = i + 1
+        }
+        return content
+    }
+
+    fn lockfile_write_to_disk(g: DepGraph) -> bool {
+        let content = lockfile_generate(g)
+        std.io.write("vex.lock", content)
+        return true
+    }
+
+    fn lockfile_read_from_disk() -> DepGraph {
+        let g = graph_new()
+        if !std.io.exists("vex.lock") { return g }
+        let content = std.io.read_all("vex.lock")
+        let lines = split(content, "\n")
+        for line in lines {
+            let at_pos = line.find("@")
+            if at_pos > 0 {
+                let name = line.substr(0, at_pos)
+                let ver = line.substr(at_pos + 1, line.size())
+                let idx = graph_add_node(&mut g, name, "=" ++ ver)
+                graph_set_version(&mut g, idx, ver)
+            }
+        }
+        return g
+    }
+
+} // namespace vexpm.resolver

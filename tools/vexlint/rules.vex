@@ -1,0 +1,798 @@
+// tools/vexlint/rules.vex
+// Lint rules definitions for vexlint.
+// Each rule is a data structure with metadata and a check function.
+
+enum LintSeverity {
+    Error,
+    Warning,
+    Info,
+    Hint
+}
+
+enum LintRuleCategory {
+    Correctness,
+    Style,
+    Performance,
+    Naming,
+    Safety
+}
+
+struct LintRule {
+    string name;
+    LintSeverity severity;
+    LintRuleCategory category;
+    string description;
+    string message_template;
+    bool auto_fixable;
+}
+
+struct LintDiagnostic {
+    string rule_name;
+    LintSeverity severity;
+    string message;
+    i32 line;
+    i32 column;
+    i32 end_line;
+    i32 end_column;
+    string suggestion;
+    bool has_fix;
+}
+
+struct LintResult {
+    LintDiagnostic[] diagnostics;
+    i32 error_count;
+    i32 warning_count;
+    i32 info_count;
+    bool success;
+}
+
+// Symbol tracking for lint analysis.
+struct SymbolInfo {
+    string name;
+    string kind;
+    i32 decl_line;
+    i32 decl_col;
+    bool is_used;
+    bool is_mutable;
+    bool is_global;
+    bool is_public;
+    i32 use_count;
+}
+
+struct ScopeInfo {
+    string name;
+    ScopeInfo parent;
+    ScopeInfo[] children;
+    SymbolInfo[] symbols;
+    i32 depth;
+}
+
+// --- Built-in rule definitions ---
+
+fn LintRule[] builtin_lint_rules() {
+    LintRule[] rules;
+    rules.resize(8);
+
+    rules[0].name = "unused_variable";
+    rules[0].severity = LintSeverity.Warning;
+    rules[0].category = LintRuleCategory.Correctness;
+    rules[0].description = "Warns on unused let bindings";
+    rules[0].message_template = "unused variable '{name}'";
+    rules[0].auto_fixable = false;
+
+    rules[1].name = "unused_function";
+    rules[1].severity = LintSeverity.Warning;
+    rules[1].category = LintRuleCategory.Correctness;
+    rules[1].description = "Warns on private functions never called";
+    rules[1].message_template = "unused private function '{name}'";
+    rules[1].auto_fixable = false;
+
+    rules[2].name = "shadowing";
+    rules[2].severity = LintSeverity.Warning;
+    rules[2].category = LintRuleCategory.Style;
+    rules[2].description = "Warns on variable shadowing";
+    rules[2].message_template = "variable '{name}' shadows previous declaration at line {prev_line}";
+    rules[2].auto_fixable = false;
+
+    rules[3].name = "naming_convention";
+    rules[3].severity = LintSeverity.Warning;
+    rules[3].category = LintRuleCategory.Naming;
+    rules[3].description = "snake_case for functions/vars, PascalCase for types";
+    rules[3].message_template = "'{name}' should be in {expected_case}";
+    rules[3].auto_fixable = true;
+
+    rules[4].name = "no_global_mutable";
+    rules[4].severity = LintSeverity.Error;
+    rules[4].category = LintRuleCategory.Safety;
+    rules[4].description = "Error on mutable globals";
+    rules[4].message_template = "mutable global variable '{name}' is not allowed";
+    rules[4].auto_fixable = false;
+
+    rules[5].name = "no_unused_import";
+    rules[5].severity = LintSeverity.Warning;
+    rules[5].category = LintRuleCategory.Correctness;
+    rules[5].description = "Warns on unused imports";
+    rules[5].message_template = "unused import '{name}'";
+    rules[5].auto_fixable = false;
+
+    rules[6].name = "prefer_const";
+    rules[6].severity = LintSeverity.Info;
+    rules[6].category = LintRuleCategory.Style;
+    rules[6].description = "Suggests const over let for immutable bindings";
+    rules[6].message_template = "variable '{name}' is never mutated; prefer 'const' over 'let'";
+    rules[6].auto_fixable = true;
+
+    rules[7].name = "prefer_const";
+    rules[7].severity = LintSeverity.Info;
+    rules[7].category = LintRuleCategory.Style;
+    rules[7].description = "No unnecessary allocation";
+    rules[7].message_template = "unnecessary allocation";
+    rules[7].auto_fixable = false;
+
+    return rules;
+}
+
+// --- Naming convention checks ---
+
+fn bool is_snake_case(string name) {
+    if (str_bytes(name) == 0) return false;
+    i32 i = 0;
+    while (i < str_bytes(name)) {
+        i32 c = str_get_char(name, i);
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+            i = i + 1;
+            continue;
+        }
+        return false;
+    }
+    // Must contain at least one letter.
+    i = 0;
+    while (i < str_bytes(name)) {
+        i32 c = str_get_char(name, i);
+        if ((c >= 'a' && c <= 'z')) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn bool is_pascal_case(string name) {
+    if (str_bytes(name) == 0) return false;
+    i32 first = str_get_char(name, 0);
+    if (!(first >= 'A' && first <= 'Z')) return false;
+    i32 i = 1;
+    while (i < str_bytes(name)) {
+        i32 c = str_get_char(name, i);
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9')) {
+            i = i + 1;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+// Check if a name follows the snake_case convention for functions/vars.
+fn bool check_function_name(string name) {
+    return is_snake_case(name);
+}
+
+// Check if a name follows the PascalCase convention for types.
+fn bool check_type_name(string name) {
+    return is_pascal_case(name);
+}
+
+// --- Variable usage tracking ---
+
+// Track all symbols in a scope tree.
+fn ScopeInfo build_scope_tree(string source) {
+    // Simplified scope builder.
+    // In a real implementation, this would parse the AST and build
+    // proper scope and symbol tables.
+
+    ScopeInfo global_scope;
+    global_scope.name = "<global>";
+    global_scope.depth = 0;
+
+    // Parse top-level declarations.
+    string[] lines = str_split_lines(source);
+    i32 i = 0;
+    while (i < lines.size()) {
+        string line = str_trim(lines[i]);
+        if (line == "" || (str_bytes(line) >= 2
+            && str_get_char(line, 0) == '/' && str_get_char(line, 1) == '/')) {
+            i = i + 1;
+            continue;
+        }
+
+        // Detect function declarations: return_type name ( params ) ...
+        i32 paren_pos = find_char(line, '(');
+        i32 space_pos = find_char(line, ' ');
+        if (paren_pos > 0 && space_pos > 0 && space_pos < paren_pos) {
+            string ret_type = str_substring(line, 0, space_pos);
+            string fn_name_part = str_trim(str_substring(line, space_pos + 1,
+                                               paren_pos - space_pos - 1));
+            if (fn_name_part != "" && fn_name_part != "if"
+                && fn_name_part != "while" && fn_name_part != "for") {
+                SymbolInfo sym;
+                sym.name = fn_name_part;
+                sym.kind = "function";
+                sym.decl_line = i + 1;
+                sym.is_used = false;
+                sym.is_mutable = false;
+                sym.is_global = false;
+                sym.is_public = true;
+                sym.use_count = 0;
+                global_scope.symbols.push(sym);
+            }
+        }
+
+        // Detect variable declarations.
+        // Pattern: Type name = ... or Type name;
+        if (paren_pos < 0) {
+            string[] type_keywords = {"i32", "i64", "u32", "u64", "f32", "f64",
+                                       "string", "bool", "void", "comptime"};
+            i32 j = 0;
+            bool is_type = false;
+            while (j < 10) {
+                if (find_substring(line, type_keywords[j]) == 0
+                    || (find_substring(line, " " + type_keywords[j]) >= 0)) {
+                    is_type = true;
+                    break;
+                }
+                j = j + 1;
+            }
+            if (is_type && find_char(line, '=') > 0) {
+                // Extract variable name (simplified).
+                i32 eq_pos = find_char(line, '=');
+                string before_eq = str_trim(str_substring(line, 0, eq_pos));
+                i32 last_space = 0;
+                i32 k = 0;
+                string var_name = before_eq;
+                while (k < str_bytes(before_eq)) {
+                    if (str_get_char(before_eq, k) == ' ') {
+                        last_space = k;
+                    }
+                    k = k + 1;
+                }
+                if (last_space > 0) {
+                    var_name = str_substring(before_eq, last_space + 1);
+                }
+
+                SymbolInfo sym;
+                sym.name = var_name;
+                sym.kind = "variable";
+                sym.decl_line = i + 1;
+                sym.is_used = false;
+                sym.is_mutable = true; // let by default
+                sym.is_global = false;
+                sym.is_public = false;
+                sym.use_count = 0;
+
+                // Check if marked as mutable.
+                if (find_substring(line, "var ") >= 0) {
+                    sym.is_mutable = true;
+                }
+
+                global_scope.symbols.push(sym);
+            }
+        }
+
+        i = i + 1;
+    }
+
+    return global_scope;
+}
+
+fn i32 find_char(string s, i32 ch) {
+    i32 i = 0;
+    while (i < str_bytes(s)) {
+        if (str_get_char(s, i) == ch) return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn i32 find_substring(string haystack, string needle) {
+    i32 i = 0;
+    i32 hl = str_bytes(haystack);
+    i32 nl = str_bytes(needle);
+    while (i <= hl - nl) {
+        string part = str_substring(haystack, i, nl);
+        if (part == needle) return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn i32 find_char_from(string s, i32 ch, i32 start) {
+    i32 i = start;
+    while (i < str_bytes(s)) {
+        if (str_get_char(s, i) == ch) return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+// --- Rule checkers ---
+
+// Check for unused variables.
+fn void check_unused_variables(ScopeInfo scope, LintResult/ref result,
+                               LintRule rule) {
+    i32 i = 0;
+    while (i < scope.symbols.size()) {
+        SymbolInfo sym = scope.symbols[i];
+        if (sym.kind == "variable" && !sym.is_used && !sym.is_global) {
+            LintDiagnostic diag;
+            diag.rule_name = rule.name;
+            diag.severity = rule.severity;
+            diag.message = str_replace(rule.message_template, "{name}", sym.name);
+            diag.line = sym.decl_line;
+            diag.column = 1;
+            diag.end_line = sym.decl_line;
+            diag.end_column = str_bytes(sym.name);
+            diag.has_fix = false;
+            result.diagnostics.push(diag);
+            if (rule.severity == LintSeverity.Error) {
+                result.error_count = result.error_count + 1;
+            } else if (rule.severity == LintSeverity.Warning) {
+                result.warning_count = result.warning_count + 1;
+            } else {
+                result.info_count = result.info_count + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// Check for unused private functions.
+fn void check_unused_functions(ScopeInfo scope, LintResult/ref result,
+                               LintRule rule) {
+    i32 i = 0;
+    while (i < scope.symbols.size()) {
+        SymbolInfo sym = scope.symbols[i];
+        if (sym.kind == "function" && !sym.is_public && !sym.is_used) {
+            LintDiagnostic diag;
+            diag.rule_name = rule.name;
+            diag.severity = rule.severity;
+            diag.message = str_replace(rule.message_template, "{name}", sym.name);
+            diag.line = sym.decl_line;
+            diag.column = 1;
+            diag.end_line = sym.decl_line;
+            diag.end_column = str_bytes(sym.name);
+            diag.has_fix = false;
+            result.diagnostics.push(diag);
+            if (rule.severity == LintSeverity.Error) {
+                result.error_count = result.error_count + 1;
+            } else if (rule.severity == LintSeverity.Warning) {
+                result.warning_count = result.warning_count + 1;
+            } else {
+                result.info_count = result.info_count + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// Check naming conventions.
+fn void check_naming_conventions(string source, LintResult/ref result,
+                                 LintRule rule) {
+    string[] lines = str_split_lines(source);
+    i32 i = 0;
+    while (i < lines.size()) {
+        string line = str_trim(lines[i]);
+
+        // Skip comments.
+        if (str_bytes(line) >= 2 && str_get_char(line, 0) == '/'
+            && str_get_char(line, 1) == '/') {
+            i = i + 1;
+            continue;
+        }
+
+        // Check function declarations: look for pattern "type name("
+        i32 paren = find_char(line, '(');
+        if (paren > 0) {
+            i32 space = find_char(line, ' ');
+            if (space > 0 && space < paren) {
+                // Potential function name.
+                string name_candidate = str_trim(str_substring(line, space + 1,
+                                                   paren - space - 1));
+                if (name_candidate != "" && name_candidate != "if"
+                    && name_candidate != "while" && name_candidate != "for"
+                    && name_candidate != "switch" && name_candidate != "catch") {
+
+                    // Check if it's a type keyword before the name.
+                    string before_name = str_trim(str_substring(line, 0, space));
+                    string[] type_kws = {"i32", "i64", "u32", "u64", "f32",
+                                          "f64", "string", "bool", "void",
+                                          "comptime"};
+                    i32 k = 0;
+                    bool is_type = false;
+                    while (k < 10) {
+                        if (before_name == type_kws[k]) {
+                            is_type = true;
+                            break;
+                        }
+                        k = k + 1;
+                    }
+
+                    if (is_type && !is_snake_case(name_candidate)) {
+                        LintDiagnostic diag;
+                        diag.rule_name = rule.name;
+                        diag.severity = rule.severity;
+                        diag.message = str_replace(
+                            str_replace(rule.message_template,
+                                        "{name}", name_candidate),
+                            "{expected_case}", "snake_case");
+                        diag.line = i + 1;
+                        diag.column = space + 2;
+                        diag.end_line = i + 1;
+                        diag.end_column = paren;
+                        diag.has_fix = true;
+                        diag.suggestion = to_snake_case(name_candidate);
+                        result.diagnostics.push(diag);
+                        if (rule.severity == LintSeverity.Error) {
+                            result.error_count = result.error_count + 1;
+                        } else if (rule.severity == LintSeverity.Warning) {
+                            result.warning_count = result.warning_count + 1;
+                        } else {
+                            result.info_count = result.info_count + 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check type declarations (struct, class, enum names).
+        string[] type_decl_keywords = {"struct ", "class ", "enum "};
+        i32 k = 0;
+        while (k < 3) {
+            i32 kw_pos = find_substring(line, type_decl_keywords[k]);
+            if (kw_pos >= 0) {
+                string rest = str_trim(str_substring(line, kw_pos + str_bytes(type_decl_keywords[k])));
+                i32 brace_pos = find_char(rest, '{');
+                i32 space_pos = find_char(rest, ' ');
+                string type_name;
+                if (brace_pos >= 0 && (space_pos < 0 || brace_pos < space_pos)) {
+                    type_name = str_trim(str_substring(rest, 0, brace_pos));
+                } else if (space_pos >= 0) {
+                    type_name = str_trim(str_substring(rest, 0, space_pos));
+                } else {
+                    type_name = str_trim(rest);
+                }
+
+                // Handle generics: Box<T> -> check "Box" only.
+                i32 lt_pos = find_char(type_name, '<');
+                if (lt_pos >= 0) {
+                    type_name = str_trim(str_substring(type_name, 0, lt_pos));
+                }
+
+                if (type_name != "" && !is_pascal_case(type_name)) {
+                    LintDiagnostic diag;
+                    diag.rule_name = rule.name;
+                    diag.severity = rule.severity;
+                    diag.message = str_replace(
+                        str_replace(rule.message_template,
+                                    "{name}", type_name),
+                        "{expected_case}", "PascalCase");
+                    diag.line = i + 1;
+                    diag.column = kw_pos + 1;
+                    diag.end_line = i + 1;
+                    diag.end_column = kw_pos + str_bytes(type_name);
+                    diag.has_fix = true;
+                    diag.suggestion = to_pascal_case(type_name);
+                    result.diagnostics.push(diag);
+                    if (rule.severity == LintSeverity.Error) {
+                        result.error_count = result.error_count + 1;
+                    } else if (rule.severity == LintSeverity.Warning) {
+                        result.warning_count = result.warning_count + 1;
+                    } else {
+                        result.info_count = result.info_count + 1;
+                    }
+                }
+            }
+            k = k + 1;
+        }
+
+        i = i + 1;
+    }
+}
+
+// Check for mutable globals.
+fn void check_global_mutable(string source, LintResult/ref result,
+                             LintRule rule) {
+    string[] lines = str_split_lines(source);
+    i32 i = 0;
+    while (i < lines.size()) {
+        string line = str_trim(lines[i]);
+        // Skip comments and function bodies.
+        if (str_bytes(line) >= 2 && str_get_char(line, 0) == '/'
+            && str_get_char(line, 1) == '/') {
+            i = i + 1;
+            continue;
+        }
+        // Skip lines inside function bodies (indented).
+        if (str_bytes(lines[i]) > 0 && str_get_char(lines[i], 0) == ' ') {
+            i = i + 1;
+            continue;
+        }
+
+        // Check for top-level mutable variables (simplified).
+        // Pattern: i32 name = ...  (without var keyword, let is implicit).
+        // For now, warn on any top-level non-const, non-comptime variable.
+        if (find_substring(line, "comptime") < 0) {
+            string[] type_kws = {"i32", "i64", "u32", "u64", "f32",
+                                  "f64", "string", "bool"};
+            i32 j = 0;
+            while (j < 8) {
+                i32 kw_pos = find_substring(line, type_kws[j]);
+                if (kw_pos == 0 && find_char(line, '=') > 0
+                    && find_char(line, '(') < 0) {
+                    // Extract variable name.
+                    i32 eq_pos = find_char(line, '=');
+                    string before_eq = str_trim(str_substring(line, type_kws[j].size(), eq_pos));
+                    string var_name = str_trim(before_eq);
+                    if (var_name != "" && find_char(var_name, ' ') < 0) {
+                        LintDiagnostic diag;
+                        diag.rule_name = rule.name;
+                        diag.severity = rule.severity;
+                        diag.message = str_replace(rule.message_template,
+                                                    "{name}", var_name);
+                        diag.line = i + 1;
+                        diag.column = kw_pos + 1;
+                        diag.end_line = i + 1;
+                        diag.end_column = kw_pos + str_bytes(var_name);
+                        diag.has_fix = false;
+                        result.diagnostics.push(diag);
+                        result.error_count = result.error_count + 1;
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// Check for unused imports (extern blocks that are never referenced).
+fn void check_unused_imports(string source, LintResult/ref result,
+                             LintRule rule) {
+    // Detect extern blocks and check if their functions are called.
+    string[] lines = str_split_lines(source);
+    bool in_extern = false;
+    string[] extern_fns;
+    i32 extern_line = 0;
+    i32 i = 0;
+    while (i < lines.size()) {
+        string line = str_trim(lines[i]);
+        if (find_substring(line, "extern ") == 0) {
+            in_extern = true;
+            extern_line = i + 1;
+            i = i + 1;
+            continue;
+        }
+        if (in_extern) {
+            if (find_char(line, '}') >= 0) {
+                in_extern = false;
+                // Check if any extern fn is used.
+                i32 j = 0;
+                while (j < extern_fns.size()) {
+                    string fn_name = extern_fns[j];
+                    bool used = false;
+                    i32 k = 0;
+                    while (k < lines.size()) {
+                        if (find_substring(lines[k], fn_name + "(") >= 0) {
+                            used = true;
+                            break;
+                        }
+                        k = k + 1;
+                    }
+                    if (!used) {
+                        LintDiagnostic diag;
+                        diag.rule_name = rule.name;
+                        diag.severity = rule.severity;
+                        diag.message = str_replace(rule.message_template,
+                                                    "{name}", fn_name);
+                        diag.line = extern_line;
+                        diag.column = 1;
+                        diag.end_line = i + 1;
+                        diag.end_column = str_bytes(fn_name);
+                        diag.has_fix = false;
+                        result.diagnostics.push(diag);
+                        result.warning_count = result.warning_count + 1;
+                    }
+                    j = j + 1;
+                }
+                extern_fns.resize(0);
+            } else if (find_substring(line, "fn ") >= 0) {
+                // Extract function name.
+                i32 fn_pos = find_substring(line, "fn ");
+                string rest = str_trim(str_substring(line, fn_pos + 3));
+                i32 paren_pos = find_char(rest, '(');
+                if (paren_pos > 0) {
+                    string fn_name = str_trim(str_substring(rest, 0, paren_pos));
+                    extern_fns.push(fn_name);
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// Check for prefer const over let.
+fn void check_prefer_const(string source, LintResult/ref result,
+                           LintRule rule) {
+    string[] lines = str_split_lines(source);
+    i32 i = 0;
+    while (i < lines.size()) {
+        string line = str_trim(lines[i]);
+        // Skip comments.
+        if (str_bytes(line) >= 2 && str_get_char(line, 0) == '/'
+            && str_get_char(line, 1) == '/') {
+            i = i + 1;
+            continue;
+        }
+
+        // Detect variables that are only assigned once.
+        // Pattern: type name = expr;
+        // For now, this is a simplified heuristic.
+        string[] type_kws = {"i32", "i64", "u32", "u64", "f32",
+                              "f64", "string", "bool"};
+        i32 j = 0;
+        while (j < 8) {
+            i32 kw_pos = find_substring(line, type_kws[j]);
+            if (kw_pos >= 0 && find_char(line, '=') > 0) {
+                i32 eq_pos = find_char(line, '=');
+                string before_eq = str_trim(str_substring(line, kw_pos + str_bytes(type_kws[j]), eq_pos));
+                string var_name = str_trim(before_eq);
+                if (var_name != "" && find_char(var_name, ' ') < 0) {
+                    // Check if variable is never reassigned.
+                    bool reassigned = false;
+                    i32 k = 0;
+                    while (k < lines.size()) {
+                        if (k != i) {
+                            string l = str_trim(lines[k]);
+                            if (find_substring(l, var_name + " =") >= 0
+                                || find_substring(l, var_name + "+=") >= 0
+                                || find_substring(l, var_name + "-=") >= 0) {
+                                reassigned = true;
+                                break;
+                            }
+                        }
+                        k = k + 1;
+                    }
+                    if (!reassigned) {
+                        LintDiagnostic diag;
+                        diag.rule_name = rule.name;
+                        diag.severity = rule.severity;
+                        diag.message = str_replace(rule.message_template,
+                                                    "{name}", var_name);
+                        diag.line = i + 1;
+                        diag.column = kw_pos + 1;
+                        diag.end_line = i + 1;
+                        diag.end_column = kw_pos + str_bytes(var_name);
+                        diag.has_fix = true;
+                        diag.suggestion = "const " + str_substring(line, kw_pos);
+                        result.diagnostics.push(diag);
+                        result.info_count = result.info_count + 1;
+                    }
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Check for variable shadowing.
+fn void check_shadowing(ScopeInfo scope, LintResult/ref result,
+                        LintRule rule, ScopeInfo[] ancestors) {
+    i32 i = 0;
+    while (i < scope.symbols.size()) {
+        SymbolInfo sym = scope.symbols[i];
+        i32 j = 0;
+        while (j < ancestors.size()) {
+            ScopeInfo parent = ancestors[j];
+            i32 k = 0;
+            while (k < parent.symbols.size()) {
+                SymbolInfo parent_sym = parent.symbols[k];
+                if (parent_sym.name == sym.name && parent_sym.kind == sym.kind) {
+                    LintDiagnostic diag;
+                    diag.rule_name = rule.name;
+                    diag.severity = rule.severity;
+                    diag.message = str_replace(
+                        str_replace(rule.message_template,
+                                    "{name}", sym.name),
+                        "{prev_line}", to_str(parent_sym.decl_line));
+                    diag.line = sym.decl_line;
+                    diag.column = 1;
+                    diag.end_line = sym.decl_line;
+                    diag.end_column = str_bytes(sym.name);
+                    diag.has_fix = false;
+                    result.diagnostics.push(diag);
+                    if (rule.severity == LintSeverity.Error) {
+                        result.error_count = result.error_count + 1;
+                    } else if (rule.severity == LintSeverity.Warning) {
+                        result.warning_count = result.warning_count + 1;
+                    } else {
+                        result.info_count = result.info_count + 1;
+                    }
+                }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// --- Helpers ---
+
+fn string to_snake_case(string name) {
+    string result = "";
+    i32 i = 0;
+    while (i < str_bytes(name)) {
+        i32 c = str_get_char(name, i);
+        if (c >= 'A' && c <= 'Z') {
+            if (i > 0) {
+                result = result + "_";
+            }
+            result = result + str_char(c + 32);
+        } else {
+            result = result + str_char(c);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn string to_pascal_case(string name) {
+    string result = "";
+    bool next_upper = true;
+    i32 i = 0;
+    while (i < str_bytes(name)) {
+        i32 c = str_get_char(name, i);
+        if (c == '_') {
+            next_upper = true;
+        } else if (next_upper) {
+            if (c >= 'a' && c <= 'z') {
+                result = result + str_char(c - 32);
+            } else {
+                result = result + str_char(c);
+            }
+            next_upper = false;
+        } else {
+            result = result + str_char(c);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn string str_replace(string s, string from, string to) {
+    i32 pos = find_substring(s, from);
+    if (pos < 0) return s;
+    string before = str_substring(s, 0, pos);
+    string after = str_substring(s, pos + str_bytes(from));
+    return before + to + after;
+}
+
+fn string to_str(i32 v) {
+    // Simplified integer to string conversion.
+    if (v == 0) return "0";
+    string result = "";
+    i32 n = v;
+    if (n < 0) {
+        result = "-";
+        n = -n;
+    }
+    string digits = "";
+    while (n > 0) {
+        i32 d = n % 10;
+        digits = str_char(48 + d) + digits;
+        n = n / 10;
+    }
+    return result + digits;
+}

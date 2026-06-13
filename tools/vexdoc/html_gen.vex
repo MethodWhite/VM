@@ -1,0 +1,465 @@
+// vexdoc.html_gen.vex - HTML documentation generator for Vex
+// Produces static HTML pages from extracted module documentation.
+
+namespace vexdoc.html_gen {
+
+    // -----------------------------------------------------------------
+    //  HTML generation utilities
+    // -----------------------------------------------------------------
+
+    /// Escape HTML special characters
+    fn escape_html(s: string) -> string {
+        let mut result: string = ""
+        let mut i: i32 = 0
+        while i < s.size() {
+            let c = s[i]
+            if c == '&' { result = result ++ "&amp;" }
+            elif c == '<' { result = result ++ "&lt;" }
+            elif c == '>' { result = result ++ "&gt;" }
+            elif c == '"' { result = result ++ "&quot;" }
+            elif c == '\'' { result = result ++ "&#39;" }
+            else { result = result ++ c }
+            i = i + 1
+        }
+        return result
+    }
+
+    /// Convert markdown inline formatting to HTML
+    fn markdown_to_html(text: string) -> string {
+        let mut result: string = ""
+        let mut i: i32 = 0
+        let mut in_code: bool = false
+        let mut in_bold: bool = false
+
+        while i < text.size() {
+            let c = text[i]
+            // Handle backtick code
+            if c == '`' {
+                if in_code {
+                    result = result ++ "</code>"
+                    in_code = false
+                } else {
+                    result = result ++ "<code>"
+                    in_code = true
+                }
+                i = i + 1
+                continue
+            }
+            // Handle bold **text**
+            if i + 1 < text.size() && c == '*' && text[i+1] == '*' {
+                if in_bold {
+                    result = result ++ "</strong>"
+                    in_bold = false
+                } else {
+                    result = result ++ "<strong>"
+                    in_bold = true
+                }
+                i = i + 2
+                continue
+            }
+            // Handle italic *text*
+            if c == '*' && !in_bold {
+                result = result ++ "<em>"
+                i = i + 1
+                // find closing *
+                let mut j: i32 = i
+                let mut found: bool = false
+                while j < text.size() {
+                    if text[j] == '*' { found = true; break }
+                    j = j + 1
+                }
+                if found {
+                    result = result ++ escape_html(text[i..j]) ++ "</em>"
+                    i = j + 1
+                } else {
+                    result = result ++ "*"
+                    i = i + 1
+                }
+                continue
+            }
+            if in_code {
+                result = result ++ escape_html(c)
+            } else {
+                result = result ++ escape_html(c)
+            }
+            i = i + 1
+        }
+        if in_code { result = result ++ "</code>" }
+        if in_bold { result = result ++ "</strong>" }
+        return result
+    }
+
+    /// Generate the navigation sidebar HTML
+    fn generate_sidebar(modules: string[], current: string) -> string {
+        let mut html: string = ""
+        html = html ++ "<nav id=\"sidebar\">\n"
+        html = html ++ "  <div class=\"sidebar-header\">\n"
+        html = html ++ "    <h2><a href=\"index.html\">VexDoc</a></h2>\n"
+        html = html ++ "  </div>\n"
+        html = html ++ "  <div class=\"sidebar-search\">\n"
+        html = html ++ "    <input type=\"text\" id=\"search-input\" placeholder=\"Search...\" oninput=\"searchDocs(this.value)\">\n"
+        html = html ++ "  </div>\n"
+        html = html ++ "  <ul class=\"sidebar-modules\">\n"
+
+        let mut i: i32 = 0
+        while i < modules.size() {
+            let mod = modules[i]
+            let active_class = if mod == current { " class=\"active\"" } else { "" }
+            let href = mod ++ ".html"
+            html = html ++ "    <li><a href=\"" ++ href ++ "\"" ++ active_class ++ ">" ++ escape_html(mod) ++ "</a></li>\n"
+            i = i + 1
+        }
+
+        html = html ++ "  </ul>\n"
+        html = html ++ "</nav>\n"
+        return html
+    }
+
+    /// Generate a single function documentation block
+    fn render_function(fn_doc: extract.FunctionDoc) -> string {
+        let mut html: string = ""
+        html = html ++ "<div class=\"doc-function\" id=\"fn-" ++ escape_html(fn_doc.name) ++ "\">\n"
+
+        // Attributes
+        if fn_doc.attributes.size() > 0 {
+            html = html ++ "  <div class=\"doc-attributes\">"
+            let mut i: i32 = 0
+            while i < fn_doc.attributes.size() {
+                let attr = fn_doc.attributes[i]
+                html = html ++ "<span class=\"attr-badge\">" ++ escape_html(attr) ++ "</span> "
+                i = i + 1
+            }
+            html = html ++ "</div>\n"
+        }
+
+        // Signature
+        html = html ++ "  <div class=\"doc-signature\">\n"
+        html = html ++ "    <code>" ++ escape_html(fn_doc.signature) ++ "</code>\n"
+        html = html ++ "  </div>\n"
+
+        // Description
+        if fn_doc.doc.text.size() > 0 {
+            html = html ++ "  <div class=\"doc-description\">\n"
+            html = html ++ "    <p>" ++ markdown_to_html(fn_doc.doc.text) ++ "</p>\n"
+            html = html ++ "  </div>\n"
+        }
+
+        // Parameters table
+        if fn_doc.params.size() > 0 {
+            html = html ++ "  <div class=\"doc-params\">\n"
+            html = html ++ "    <h4>Parameters</h4>\n"
+            html = html ++ "    <table>\n"
+            html = html ++ "      <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>\n"
+            html = html ++ "      <tbody>\n"
+            let mut i: i32 = 0
+            while i < fn_doc.params.size() {
+                let p = fn_doc.params[i]
+                // Find matching @param tag
+                let mut param_desc: string = ""
+                let mut j: i32 = 0
+                while j < fn_doc.doc.tags.size() {
+                    let tag = fn_doc.doc.tags[j]
+                    if tag.name == "param" && tag.key == p.name {
+                        param_desc = tag.value
+                    }
+                    j = j + 1
+                }
+                html = html ++ "        <tr>"
+                html = html ++ "<td><code>" ++ escape_html(p.name) ++ "</code></td>"
+                html = html ++ "<td><code>" ++ escape_html(p.type_name) ++ "</code></td>"
+                html = html ++ "<td>" ++ markdown_to_html(param_desc) ++ "</td>"
+                html = html ++ "</tr>\n"
+                i = i + 1
+            }
+            html = html ++ "      </tbody>\n"
+            html = html ++ "    </table>\n"
+            html = html ++ "  </div>\n"
+        }
+
+        // Return type
+        if fn_doc.return_type.size() > 0 {
+            html = html ++ "  <div class=\"doc-return\">\n"
+            html = html ++ "    <h4>Returns</h4>\n"
+            html = html ++ "    <p><code>" ++ escape_html(fn_doc.return_type) ++ "</code>"
+            // Find @return tag
+            let mut j: i32 = 0
+            while j < fn_doc.doc.tags.size() {
+                let tag = fn_doc.doc.tags[j]
+                if tag.name == "return" && tag.value.size() > 0 {
+                    html = html ++ " &mdash; " ++ markdown_to_html(tag.value)
+                }
+                j = j + 1
+            }
+            html = html ++ "</p>\n"
+            html = html ++ "  </div>\n"
+        }
+
+        // Doc tags
+        let mut j: i32 = 0
+        while j < fn_doc.doc.tags.size() {
+            let tag = fn_doc.doc.tags[j]
+            if tag.name == "example" {
+                html = html ++ "  <div class=\"doc-example\">\n"
+                html = html ++ "    <h4>Example</h4>\n"
+                html = html ++ "    <pre><code>" ++ escape_html(tag.value) ++ "</code></pre>\n"
+                html = html ++ "  </div>\n"
+            }
+            if tag.name == "see" {
+                html = html ++ "  <div class=\"doc-see\">\n"
+                html = html ++ "    <h4>See Also</h4>\n"
+                html = html ++ "    <p>" ++ markdown_to_html(tag.value) ++ "</p>\n"
+                html = html ++ "  </div>\n"
+            }
+            if tag.name == "deprecated" {
+                html = html ++ "  <div class=\"doc-deprecated\">\n"
+                let dep_msg = if tag.value.size() > 0 { tag.value } else { "This item is deprecated." }
+                html = html ++ "    <p><strong>Deprecated:</strong> " ++ markdown_to_html(dep_msg) ++ "</p>\n"
+                html = html ++ "  </div>\n"
+            }
+            j = j + 1
+        }
+
+        html = html ++ "</div>\n"
+        return html
+    }
+
+    /// Generate a type documentation block
+    fn render_type(type_doc: extract.TypeDoc) -> string {
+        let mut html: string = ""
+        html = html ++ "<div class=\"doc-type\" id=\"type-" ++ escape_html(type_doc.name) ++ "\">\n"
+
+        // Type kind badge
+        html = html ++ "  <div class=\"doc-type-kind\">"
+        html = html ++ "<span class=\"type-badge type-" ++ escape_html(type_doc.type_kind) ++ "\">"
+        html = html ++ escape_html(type_doc.type_kind) ++ "</span>"
+        html = html ++ "</div>\n"
+
+        // Type name
+        html = html ++ "  <div class=\"doc-type-name\">\n"
+        html = html ++ "    <code>" ++ escape_html(type_doc.name) ++ "</code>\n"
+        html = html ++ "  </div>\n"
+
+        // Description
+        if type_doc.doc.text.size() > 0 {
+            html = html ++ "  <div class=\"doc-description\">\n"
+            html = html ++ "    <p>" ++ markdown_to_html(type_doc.doc.text) ++ "</p>\n"
+            html = html ++ "  </div>\n"
+        }
+
+        // Fields table
+        if type_doc.fields.size() > 0 {
+            html = html ++ "  <div class=\"doc-fields\">\n"
+            html = html ++ "    <h4>Fields</h4>\n"
+            html = html ++ "    <table>\n"
+            html = html ++ "      <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>\n"
+            html = html ++ "      <tbody>\n"
+            let mut i: i32 = 0
+            while i < type_doc.fields.size() {
+                let f = type_doc.fields[i]
+                html = html ++ "        <tr>"
+                html = html ++ "<td><code>" ++ escape_html(f.name) ++ "</code></td>"
+                html = html ++ "<td><code>" ++ escape_html(f.type_name) ++ "</code></td>"
+                html = html ++ "<td>" ++ markdown_to_html(f.doc.text) ++ "</td>"
+                html = html ++ "</tr>\n"
+                i = i + 1
+            }
+            html = html ++ "      </tbody>\n"
+            html = html ++ "    </table>\n"
+            html = html ++ "  </div>\n"
+        }
+
+        html = html ++ "</div>\n"
+        return html
+    }
+
+    // -----------------------------------------------------------------
+    //  Page generation
+    // -----------------------------------------------------------------
+
+    /// Generate a complete HTML page for a module
+    fn generate_page(mod: extract.ModuleDoc, all_modules: string[]) -> string {
+        let mut content: string = ""
+
+        // Module header
+        content = content ++ "<main id=\"content\">\n"
+        content = content ++ "  <div class=\"module-header\">\n"
+        content = content ++ "    <h1>" ++ escape_html(mod.namespace) ++ "</h1>\n"
+        if mod.file_path.size() > 0 {
+            content = content ++ "    <span class=\"file-path\">" ++ escape_html(mod.file_path) ++ "</span>\n"
+        }
+        if mod.description.size() > 0 {
+            content = content ++ "    <p class=\"module-desc\">" ++ markdown_to_html(mod.description) ++ "</p>\n"
+        }
+        content = content ++ "  </div>\n"
+
+        // Types section
+        if mod.types.size() > 0 {
+            content = content ++ "  <section class=\"doc-section types-section\">\n"
+            content = content ++ "    <h2>Types</h2>\n"
+            let mut i: i32 = 0
+            while i < mod.types.size() {
+                content = content ++ render_type(mod.types[i])
+                i = i + 1
+            }
+            content = content ++ "  </section>\n"
+        }
+
+        // Functions section
+        if mod.functions.size() > 0 {
+            content = content ++ "  <section class=\"doc-section functions-section\">\n"
+            content = content ++ "    <h2>Functions</h2>\n"
+            let mut i: i32 = 0
+            while i < mod.functions.size() {
+                content = content ++ render_function(mod.functions[i])
+                i = i + 1
+            }
+            content = content ++ "  </section>\n"
+        }
+
+        // Constants section
+        if mod.constants.size() > 0 {
+            content = content ++ "  <section class=\"doc-section constants-section\">\n"
+            content = content ++ "    <h2>Constants</h2>\n"
+            content = content ++ "    <ul class=\"const-list\">\n"
+            let mut i: i32 = 0
+            while i < mod.constants.size() {
+                content = content ++ "      <li><code>" ++ escape_html(mod.constants[i]) ++ "</code></li>\n"
+                i = i + 1
+            }
+            content = content ++ "    </ul>\n"
+            content = content ++ "  </section>\n"
+        }
+
+        content = content ++ "</main>\n"
+
+        // Sidebar
+        let sidebar = generate_sidebar(all_modules, mod.namespace)
+
+        // Build full page from template
+        return render_template(mod.namespace, sidebar, content)
+    }
+
+    /// Generate the index page listing all modules
+    fn generate_index(modules: ModuleDoc[]) -> string {
+        let mut module_names: string[] = []
+        let mut module_descs: string[] = []
+        let mut i: i32 = 0
+        while i < modules.size() {
+            module_names = module_names ++ [modules[i].namespace]
+            module_descs = module_descs ++ [modules[i].description]
+            i = i + 1
+        }
+
+        let mut content: string = ""
+        content = content ++ "<main id=\"content\">\n"
+        content = content ++ "  <div class=\"module-header\">\n"
+        content = content ++ "    <h1>Vex Documentation</h1>\n"
+        content = content ++ "    <p class=\"module-desc\">Generated documentation for Vex source files.</p>\n"
+        content = content ++ "  </div>\n"
+        content = content ++ "  <section class=\"doc-section\">\n"
+        content = content ++ "    <h2>Modules</h2>\n"
+        content = content ++ "    <div class=\"module-grid\">\n"
+
+        i = 0
+        while i < modules.size() {
+            let mod = modules[i]
+            let fn_count = mod.functions.size()
+            let type_count = mod.types.size()
+            let fn_label = if fn_count == 1 { "1 function" } else { std.io.format(f64(fn_count), 0) ++ " functions" }
+            let type_label = if type_count == 1 { "1 type" } else { std.io.format(f64(type_count), 0) ++ " types" }
+
+            content = content ++ "      <a href=\"" ++ escape_html(mod.namespace) ++ ".html\" class=\"module-card\">\n"
+            content = content ++ "        <h3>" ++ escape_html(mod.namespace) ++ "</h3>\n"
+            content = content ++ "        <p>" ++ markdown_to_html(mod.description) ++ "</p>\n"
+            content = content ++ "        <span class=\"module-stats\">" ++ type_label ++ " | " ++ fn_label ++ "</span>\n"
+            content = content ++ "      </a>\n"
+            i = i + 1
+        }
+
+        content = content ++ "    </div>\n"
+        content = content ++ "  </section>\n"
+        content = content ++ "</main>\n"
+
+        let sidebar = generate_sidebar(module_names, "index")
+        return render_template("VexDoc", sidebar, content)
+    }
+
+    /// Wrap content in the full HTML template
+    fn render_template(title: string, sidebar: string, content: string) -> string {
+        let css = load_css()
+        let js = load_search_js()
+
+        let mut html: string = ""
+        html = html ++ "<!DOCTYPE html>\n"
+        html = html ++ "<html lang=\"en\">\n"
+        html = html ++ "<head>\n"
+        html = html ++ "  <meta charset=\"UTF-8\">\n"
+        html = html ++ "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
+        html = html ++ "  <title>" ++ escape_html(title) ++ " - VexDoc</title>\n"
+        html = html ++ "  <style>\n"
+        html = html ++ css
+        html = html ++ "  </style>\n"
+        html = html ++ "</head>\n"
+        html = html ++ "<body>\n"
+        html = html ++ "  <div class=\"container\">\n"
+        html = html ++ sidebar
+        html = html ++ content
+        html = html ++ "  </div>\n"
+        html = html ++ "  <div id=\"theme-toggle\" onclick=\"toggleTheme()\">\n"
+        html = html ++ "    <span id=\"theme-icon\">&#9790;</span>\n"
+        html = html ++ "  </div>\n"
+        html = html ++ "  <script>\n"
+        html = html ++ js
+        html = html ++ "  </script>\n"
+        html = html ++ "</body>\n"
+        html = html ++ "</html>\n"
+        return html
+    }
+
+    // -----------------------------------------------------------------
+    //  Embedded assets
+    // -----------------------------------------------------------------
+
+    fn load_css() -> string {
+        return std.io.read_all("/home/methodwhite/Proyectos/VM-fork/tools/vexdoc/templates/style.css")
+    }
+
+    fn load_search_js() -> string {
+        return std.io.read_all("/home/methodwhite/Proyectos/VM-fork/tools/vexdoc/templates/search.js")
+    }
+
+    // -----------------------------------------------------------------
+    //  File writing
+    // -----------------------------------------------------------------
+
+    /// Write a single HTML page to disk
+    fn write_page(modules: ModuleDoc[], mod_idx: i32, output_dir: string) {
+        let all_names: string[] = []
+        let mut i: i32 = 0
+        while i < modules.size() {
+            all_names = all_names ++ [modules[i].namespace]
+            i = i + 1
+        }
+
+        let mod = modules[mod_idx]
+        let html = generate_page(mod, all_names)
+        let file_name = mod.namespace ++ ".html"
+        let output_path = output_dir ++ "/" ++ file_name
+        std.io.write_all(output_path, html)
+    }
+
+    /// Write all HTML pages for all modules
+    fn write_all_pages(modules: ModuleDoc[], output_dir: string) {
+        // Write index page
+        let index_html = generate_index(modules)
+        std.io.write_all(output_dir ++ "/index.html", index_html)
+
+        // Write each module page
+        let mut i: i32 = 0
+        while i < modules.size() {
+            write_page(modules, i, output_dir)
+            i = i + 1
+        }
+    }
+
+} // namespace vexdoc.html_gen

@@ -1,0 +1,366 @@
+// vexbindgen.vex - Vex FFI binding generator
+//
+// Usage:
+//   vexbindgen header.h                    - Generate bindings to stdout
+//   vexbindgen header.h -o bindings.vex    - Output to file
+//   vexbindgen --module mylib include/ -o out/  - Process directory
+//
+// Reads C header files and generates Vex @Extern declarations automatically,
+// similar to cbindgen / rust-bindgen.
+
+// Import parser and generator modules
+use "c_parser.vex" as parser
+use "vx_gen.vex" as gen
+
+namespace vexbindgen {
+
+    // -----------------------------------------------------------------
+    //  Constants
+    // -----------------------------------------------------------------
+
+    const VERSION : string = "0.1.0"
+
+    // -----------------------------------------------------------------
+    //  Argument parsing types
+    // -----------------------------------------------------------------
+
+    type Args = struct {
+        input_paths:   string[]
+        output_path:   string
+        module_name:   string
+        use_hashes:    bool
+        gen_wrappers:  bool
+        gen_consts:    bool
+        gen_structs:   bool
+        search_dir:    bool
+        verbose:       bool
+    }
+
+    // -----------------------------------------------------------------
+    //  Default configuration
+    // -----------------------------------------------------------------
+
+    fn default_args() -> Args {
+        return Args {
+            input_paths = [],
+            output_path = "",
+            module_name = "ffi",
+            use_hashes = false,
+            gen_wrappers = true,
+            gen_consts = true,
+            gen_structs = true,
+            search_dir = false,
+            verbose = false
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Help text
+    // -----------------------------------------------------------------
+
+    fn print_help() {
+        print("vexbindgen v" ++ VERSION ++ " - Vex FFI Binding Generator")
+        print("")
+        print("Usage:")
+        print("  vexbindgen header.h                  Generate bindings to stdout")
+        print("  vexbindgen header.h -o bindings.vex  Output to file")
+        print("  vexbindgen --module mylib include/ -o src/bindings/  Process directory")
+        print("")
+        print("Options:")
+        print("  -o, --output FILE    Write output to FILE instead of stdout")
+        print("  -m, --module NAME    Set the library module name (default: ffi)")
+        print("  -d, --dir            Treat input as directory, process all .h files")
+        print("  --no-wrappers        Skip generating wrapper functions")
+        print("  --no-consts          Skip generating const declarations from macros")
+        print("  --no-structs         Skip generating struct type definitions")
+        print("  --hashes             Use fnv1a hash-based function naming")
+        print("  -v, --verbose        Verbose output")
+        print("  -h, --help           Show this help")
+    }
+
+    // -----------------------------------------------------------------
+    //  Parse command-line arguments
+    // -----------------------------------------------------------------
+
+    fn parse_args(argv: string[]) -> Args {
+        let mut args = default_args()
+        let mut i: i32 = 1  // skip program name
+
+        while i < argv.size() {
+            let a = argv[i]
+
+            if a == "-h" || a == "--help" {
+                print_help()
+                return args  // caller should exit
+            }
+
+            if a == "-o" || a == "--output" {
+                i = i + 1
+                if i < argv.size() {
+                    args.output_path = argv[i]
+                }
+            } else if a == "-m" || a == "--module" {
+                i = i + 1
+                if i < argv.size() {
+                    args.module_name = argv[i]
+                }
+            } else if a == "-d" || a == "--dir" {
+                args.search_dir = true
+            } else if a == "--no-wrappers" {
+                args.gen_wrappers = false
+            } else if a == "--no-consts" {
+                args.gen_consts = false
+            } else if a == "--no-structs" {
+                args.gen_structs = false
+            } else if a == "--hashes" {
+                args.use_hashes = true
+            } else if a == "-v" || a == "--verbose" {
+                args.verbose = true
+            } else if a[0] != "-" {
+                args.input_paths = args.input_paths ++ [a]
+            }
+
+            i = i + 1
+        }
+
+        return args
+    }
+
+    // -----------------------------------------------------------------
+    //  Check if path ends with .h
+    // -----------------------------------------------------------------
+
+    fn is_header_file(path: string) -> bool {
+        let len = path.size()
+        if len < 3 { return false }
+        return path[len - 2] == "." && path[len - 1] == "h"
+    }
+
+    // -----------------------------------------------------------------
+    //  Extract filename (last component after '/')
+    // -----------------------------------------------------------------
+
+    fn basename(path: string) -> string {
+        let mut last_slash: i32 = -1
+        let mut i: i32 = 0
+        while i < path.size() {
+            if path[i] == "/" { last_slash = i }
+            i = i + 1
+        }
+        if last_slash >= 0 {
+            let mut name = ""
+            let mut j = last_slash + 1
+            while j < path.size() {
+                name = name ++ path[j]
+                j = j + 1
+            }
+            return name
+        }
+        return path
+    }
+
+    // -----------------------------------------------------------------
+    //  Strip .h extension
+    // -----------------------------------------------------------------
+
+    fn strip_ext(filename: string) -> string {
+        let len = filename.size()
+        if len >= 2 && filename[len - 2] == "." && filename[len - 1] == "h" {
+            let mut name = ""
+            let mut i: i32 = 0
+            while i < len - 2 {
+                name = name ++ filename[i]
+                i = i + 1
+            }
+            return name
+        }
+        return filename
+    }
+
+    // -----------------------------------------------------------------
+    //  Process a single header file
+    // -----------------------------------------------------------------
+
+    fn process_file(input_path: string, args: Args) -> string {
+        if args.verbose {
+            print("  Reading: " ++ input_path)
+        }
+
+        // Read file content
+        let source = read_file(input_path)
+
+        if args.verbose {
+            let mut line_count: i32 = 0
+            let mut i: i32 = 0
+            while i < source.size() {
+                if source[i] == "\n" { line_count = line_count + 1 }
+                i = i + 1
+            }
+            print("  Parsing " ++ string(line_count) ++ " lines...")
+        }
+
+        // Parse the C header
+        let parse_result = parser.parse_header(source)
+
+        if args.verbose {
+            print("  Found: "
+                ++ string(parse_result.functions.size()) ++ " functions, "
+                ++ string(parse_result.structs.size()) ++ " structs, "
+                ++ string(parse_result.macros.size()) ++ " macros, "
+                ++ string(parse_result.enums.size()) ++ " enums, "
+                ++ string(parse_result.typedefs.size()) ++ " typedefs")
+        }
+
+        // Check for errors
+        if parse_result.errors.size() > 0 {
+            print("  Warnings/Errors:")
+            let mut ei: i32 = 0
+            while ei < parse_result.errors.size() {
+                print("    " ++ parse_result.errors[ei])
+                ei = ei + 1
+            }
+        }
+
+        // Configure generator
+        let config = gen.GenConfig {
+            module_name = args.module_name,
+            use_hash_names = args.use_hashes,
+            gen_wrappers = args.gen_wrappers,
+            gen_consts = args.gen_consts,
+            gen_structs = args.gen_structs
+        }
+
+        // Generate output
+        let output = gen.generate(parse_result, config)
+
+        return output
+    }
+
+    // -----------------------------------------------------------------
+    //  Read file content via FFI (provided by std.io)
+    // -----------------------------------------------------------------
+
+    @Extern("vesta_io:vfile_read_all")
+    fn read_file(path: string) -> string
+
+    // -----------------------------------------------------------------
+    //  Write file content via FFI
+    // -----------------------------------------------------------------
+
+    @Extern("vesta_io:vfile_write")
+    fn write_file(path: string, content: string) -> bool
+
+    // -----------------------------------------------------------------
+    //  Print to stdout
+    // -----------------------------------------------------------------
+
+    @Extern("vesta_io:vprint")
+    fn print(s: string)
+
+    // -----------------------------------------------------------------
+    //  Stub for list_dir if available
+    // -----------------------------------------------------------------
+
+    fn list_dir(path: string) -> string[] {
+        // Placeholder: would use std.system.list_dir
+        // For now return empty
+        return []
+    }
+
+    // -----------------------------------------------------------------
+    //  Main entry point
+    // -----------------------------------------------------------------
+
+    fn main() {
+        let argv = get_args()
+        let args = parse_args(argv)
+
+        // If no input paths specified, try to read from stdin or show help
+        if args.input_paths.size() == 0 {
+            print_help()
+            return
+        }
+
+        let mut combined_output = ""
+        let mut first = true
+        let mut i: i32 = 0
+
+        while i < args.input_paths.size() {
+            let input_path = args.input_paths[i]
+
+            if args.search_dir {
+                // Process directory
+                let files = list_dir(input_path)
+                if files.size() == 0 {
+                    print("Directory: " ++ input_path ++ " (scanning)")
+                    // Fall back to treating it as a single file path
+                    if is_header_file(input_path) {
+                        let output = process_file(input_path, args)
+                        if !first { combined_output = combined_output ++ "\n\n" }
+                        combined_output = combined_output ++ output
+                        first = false
+                    }
+                } else {
+                    let mut fi: i32 = 0
+                    while fi < files.size() {
+                        let full_path = input_path ++ "/" ++ files[fi]
+                        if is_header_file(full_path) {
+                            let module_save = args.module_name
+                            // Derive module name from filename
+                            let mod = Args {
+                                input_paths = args.input_paths,
+                                output_path = args.output_path,
+                                module_name = strip_ext(basename(full_path)),
+                                use_hashes = args.use_hashes,
+                                gen_wrappers = args.gen_wrappers,
+                                gen_consts = args.gen_consts,
+                                gen_structs = args.gen_structs,
+                                search_dir = args.search_dir,
+                                verbose = args.verbose
+                            }
+                            let output = process_file(full_path, mod)
+                            if !first { combined_output = combined_output ++ "\n\n" }
+                            combined_output = combined_output ++ output
+                            first = false
+                        }
+                        fi = fi + 1
+                    }
+                }
+            } else {
+                // Process single file
+                if is_header_file(input_path) {
+                    let output = process_file(input_path, args)
+                    if !first { combined_output = combined_output ++ "\n\n" }
+                    combined_output = combined_output ++ output
+                    first = false
+                } else {
+                    print("Skipping non-header file: " ++ input_path)
+                }
+            }
+
+            i = i + 1
+        }
+
+        // Write output
+        if args.output_path != "" {
+            if args.verbose {
+                print("Writing to: " ++ args.output_path)
+            }
+            let ok = write_file(args.output_path, combined_output)
+            if !ok {
+                print("Error: failed to write to " ++ args.output_path)
+            }
+        } else {
+            // Print to stdout
+            print(combined_output)
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  FFI: get command-line arguments
+    // -----------------------------------------------------------------
+
+    @Extern("vesta_io:vget_args")
+    fn get_args() -> string[]
+
+} // namespace vexbindgen

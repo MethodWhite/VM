@@ -1,0 +1,1353 @@
+// tools/vexfmt/vexfmt.vex
+// Vex Code Formatter - vexfmt
+// Usage:
+//   vexfmt file.vex              Format file in-place
+//   vexfmt --check file.vex      Check formatting (CI mode)
+//   vexfmt --recursive src/       Format all .vex in directory
+
+// AST node types for the formatter.
+enum AstNodeKind {
+    Module,
+    FunctionDecl,
+    StructDecl,
+    ClassDecl,
+    EnumDecl,
+    ExternBlock,
+    VariableDecl,
+    ConstDecl,
+    IfStmt,
+    WhileStmt,
+    ForStmt,
+    ReturnStmt,
+    MatchStmt,
+    TryStmt,
+    CatchClause,
+    ThrowStmt,
+    BlockStmt,
+    ExpressionStmt,
+    BinaryExpr,
+    UnaryExpr,
+    CallExpr,
+    MemberAccess,
+    Identifier,
+    IntLiteral,
+    FloatLiteral,
+    StringLiteral,
+    BoolLiteral,
+    LambdaExpr,
+    GenericInstantiation,
+    Annotation,
+    ComptimeBlock,
+    StaticAssert,
+    ImportDecl,
+    Parameter,
+    FieldDecl,
+    EnumVariant,
+    MatchArm,
+    NewExpr,
+    ThisExpr,
+    TypeAnnotation,
+    TernaryExpr,
+    CastExpr
+}
+
+struct AstNode {
+    AstNodeKind kind;
+    string text;
+    AstNode[] children;
+    i32 start_line;
+    i32 start_col;
+    i32 end_line;
+    i32 end_col;
+    map<string, string> attrs;
+}
+
+// Result of formatting.
+struct FormatResult {
+    bool success;
+    string output;
+    string[] errors;
+    i32 files_checked;
+    i32 files_modified;
+}
+
+// Parse source into AST nodes.
+// This is a simplified structural parser for formatting purposes.
+fn AstNode[] parse_ast(string source) {
+    AstNode[] nodes;
+    i32 pos = 0;
+    i32 len = str_bytes(source);
+    i32 line = 1;
+    i32 col = 1;
+
+    while (pos < len) {
+        i32 c = str_get_char(source, pos);
+        i32 next_c = 0;
+        if (pos + 1 < len) {
+            next_c = str_get_char(source, pos + 1);
+        }
+
+        // Skip whitespace.
+        if (c == ' ' || c == '\t' || c == '\r') {
+            pos = pos + 1;
+            col = col + 1;
+            continue;
+        }
+        if (c == '\n') {
+            pos = pos + 1;
+            line = line + 1;
+            col = 1;
+            continue;
+        }
+
+        // Single-line comments.
+        if (c == '/' && next_c == '/') {
+            i32 start_l = line;
+            i32 start_c = col;
+            i32 comment_start = pos;
+            while (pos < len && str_get_char(source, pos) != '\n') {
+                pos = pos + 1;
+            }
+            AstNode comment;
+            comment.kind = AstNodeKind.Annotation;
+            comment.text = str_substring(source, comment_start, pos);
+            comment.start_line = start_l;
+            comment.start_col = start_c;
+            comment.end_line = line;
+            comment.end_col = col;
+            nodes.push(comment);
+            continue;
+        }
+
+        // String literals.
+        if (c == '"') {
+            i32 start_l = line;
+            i32 start_c = col;
+            i32 str_start = pos;
+            pos = pos + 1;
+            col = col + 1;
+            while (pos < len && str_get_char(source, pos) != '"') {
+                if (str_get_char(source, pos) == '\\') {
+                    pos = pos + 1;
+                    col = col + 1;
+                }
+                if (pos < len && str_get_char(source, pos) == '\n') {
+                    line = line + 1;
+                    col = 1;
+                } else if (pos < len) {
+                    col = col + 1;
+                }
+                pos = pos + 1;
+            }
+            if (pos < len) {
+                pos = pos + 1;
+                col = col + 1;
+            }
+            AstNode node;
+            node.kind = AstNodeKind.StringLiteral;
+            node.text = str_substring(source, str_start, pos);
+            node.start_line = start_l;
+            node.start_col = start_c;
+            node.end_line = line;
+            node.end_col = col;
+            nodes.push(node);
+            continue;
+        }
+
+        // Numbers.
+        if (c >= '0' && c <= '9') {
+            i32 start_l = line;
+            i32 start_c = col;
+            i32 num_start = pos;
+            while (pos < len) {
+                i32 ch = str_get_char(source, pos);
+                if ((ch >= '0' && ch <= '9') || ch == '.' || ch == 'x'
+                    || ch == 'X' || ch == 'a' || ch == 'b' || ch == 'c'
+                    || ch == 'd' || ch == 'e' || ch == 'f'
+                    || ch == 'A' || ch == 'B' || ch == 'C' || ch == 'D'
+                    || ch == 'E' || ch == 'F') {
+                    pos = pos + 1;
+                    col = col + 1;
+                } else {
+                    break;
+                }
+            }
+            AstNode node;
+            node.text = str_substring(source, num_start, pos);
+            if (contains_char(node.text, '.')) {
+                node.kind = AstNodeKind.FloatLiteral;
+            } else {
+                node.kind = AstNodeKind.IntLiteral;
+            }
+            node.start_line = start_l;
+            node.start_col = start_c;
+            node.end_line = line;
+            node.end_col = col;
+            nodes.push(node);
+            continue;
+        }
+
+        // Identifiers and keywords.
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+            i32 start_l = line;
+            i32 start_c = col;
+            i32 id_start = pos;
+            while (pos < len) {
+                i32 ch = str_get_char(source, pos);
+                if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+                    || (ch >= '0' && ch <= '9') || ch == '_') {
+                    pos = pos + 1;
+                    col = col + 1;
+                } else {
+                    break;
+                }
+            }
+            string word = str_substring(source, id_start, pos);
+            AstNode node;
+            node.text = word;
+            node.start_line = start_l;
+            node.start_col = start_c;
+            node.end_line = line;
+            node.end_col = col;
+            node.kind = AstNodeKind.Identifier;
+            nodes.push(node);
+            continue;
+        }
+
+        // Operators and punctuation.
+        // Multi-char operators.
+        if (c == '=' && next_c == '=') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '!' && next_c == '=') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '<' && next_c == '=') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '>' && next_c == '=') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '&' && next_c == '&') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '|' && next_c == '|') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '<' && next_c == '<') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '>' && next_c == '>') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '+' && next_c == '+') {
+            emit_op(source, pos, 2, AstNodeKind.UnaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '-' && next_c == '-') {
+            emit_op(source, pos, 2, AstNodeKind.UnaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '+' && next_c == '=') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '-' && next_c == '=') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '*' && next_c == '=') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '/' && next_c == '=') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '%' && next_c == '=') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '&' && next_c == '=') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '|' && next_c == '=') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '^' && next_c == '=') {
+            emit_op(source, pos, 2, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+        if (c == '<' && next_c == '<' && pos + 2 < len
+            && str_get_char(source, pos + 2) == '=') {
+            emit_op(source, pos, 3, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 3;
+            col = col + 3;
+            continue;
+        }
+        if (c == '>' && next_c == '>' && pos + 2 < len
+            && str_get_char(source, pos + 2) == '=') {
+            emit_op(source, pos, 3, AstNodeKind.BinaryExpr, nodes, line, col);
+            pos = pos + 3;
+            col = col + 3;
+            continue;
+        }
+        if (c == '=' && next_c == '>') {
+            emit_op(source, pos, 2, AstNodeKind.LambdaExpr, nodes, line, col);
+            pos = pos + 2;
+            col = col + 2;
+            continue;
+        }
+
+        // Single-char punctuation/operators.
+        AstNodeKind pk = AstNodeKind.BinaryExpr;
+        if (c == '{') pk = AstNodeKind.BlockStmt;
+        else if (c == '}') pk = AstNodeKind.BlockStmt;
+        else if (c == '(') pk = AstNodeKind.CallExpr;
+        else if (c == ')') pk = AstNodeKind.CallExpr;
+        else if (c == '[') pk = AstNodeKind.GenericInstantiation;
+        else if (c == ']') pk = AstNodeKind.GenericInstantiation;
+        else if (c == ';') pk = AstNodeKind.ExpressionStmt;
+        else if (c == ',') pk = AstNodeKind.Identifier;
+        else if (c == '.') pk = AstNodeKind.MemberAccess;
+        else if (c == ':') pk = AstNodeKind.TypeAnnotation;
+        else if (c == '?') pk = AstNodeKind.TernaryExpr;
+
+        AstNode punc;
+        punc.text = str_substring(source, pos, pos + 1);
+        punc.kind = pk;
+        punc.start_line = line;
+        punc.start_col = col;
+        punc.end_line = line;
+        punc.end_col = col;
+        nodes.push(punc);
+        pos = pos + 1;
+        col = col + 1;
+    }
+
+    return nodes;
+}
+
+fn void emit_op(string source, i32 pos, i32 len, AstNodeKind kind,
+                AstNode[]/ref nodes, i32 line, i32 col) {
+    AstNode node;
+    node.text = str_substring(source, pos, pos + len);
+    node.kind = kind;
+    node.start_line = line;
+    node.start_col = col;
+    node.end_line = line;
+    node.end_col = col + len;
+    nodes.push(node);
+}
+
+fn bool contains_char(string s, i32 ch) {
+    i32 i = 0;
+    while (i < str_bytes(s)) {
+        if (str_get_char(s, i) == ch) return true;
+        i = i + 1;
+    }
+    return false;
+}
+
+// Build a higher-level AST structure from flat token list.
+// Groups tokens into structural nodes (functions, structs, classes, etc.).
+fn AstNode[] build_structure(AstNode[] tokens) {
+    AstNode[] nodes;
+    i32 i = 0;
+    while (i < tokens.size()) {
+        AstNode t = tokens[i];
+
+        // Function declaration: type name ( params ) { body }
+        // Detect function decl: identifier identifier ( ... ) { ... }
+        // Or: type identifier ( params ) { body }
+        if (i + 3 < tokens.size()
+            && tokens[i].kind == AstNodeKind.Identifier
+            && tokens[i + 1].kind == AstNodeKind.Identifier
+            && tokens[i + 2].kind == AstNodeKind.CallExpr
+            && tokens[i + 2].text == "(") {
+
+            // Check if next token after ( ... ) is {
+            i32 j = i + 3;
+            i32 depth = 1;
+            while (j < tokens.size() && depth > 0) {
+                if (tokens[j].text == "(") depth = depth + 1;
+                if (tokens[j].text == ")") depth = depth - 1;
+                j = j + 1;
+            }
+
+            if (j < tokens.size() && tokens[j].kind == AstNodeKind.BlockStmt
+                && tokens[j].text == "{") {
+                // This is a function declaration.
+                AstNode fn;
+                fn.kind = AstNodeKind.FunctionDecl;
+
+                // Collect all tokens until matching }.
+                i32 start = i;
+                i32 brace_depth = 0;
+                i32 k = i;
+                while (k < tokens.size()) {
+                    if (tokens[k].text == "{") brace_depth = brace_depth + 1;
+                    if (tokens[k].text == "}") {
+                        brace_depth = brace_depth - 1;
+                        if (brace_depth == 0) {
+                            k = k + 1;
+                            break;
+                        }
+                    }
+                    k = k + 1;
+                }
+
+                // Reconstruct text.
+                string fn_text = "";
+                i32 t_idx = start;
+                while (t_idx < k) {
+                    if (fn_text != "" && tokens[t_idx].start_col > 1) {
+                        fn_text = fn_text + " ";
+                    }
+                    fn_text = fn_text + tokens[t_idx].text;
+                    t_idx = t_idx + 1;
+                }
+                fn.text = fn_text;
+                fn.start_line = tokens[start].start_line;
+                fn.start_col = tokens[start].start_col;
+                if (k > 0) {
+                    fn.end_line = tokens[k - 1].end_line;
+                    fn.end_col = tokens[k - 1].end_col;
+                }
+                nodes.push(fn);
+                i = k;
+                continue;
+            }
+        }
+
+        // Struct / class / enum declarations.
+        if (t.kind == AstNodeKind.Identifier
+            && (t.text == "struct" || t.text == "class" || t.text == "enum")) {
+            AstNodeKind decl_kind;
+            if (t.text == "struct") decl_kind = AstNodeKind.StructDecl;
+            else if (t.text == "class") decl_kind = AstNodeKind.ClassDecl;
+            else decl_kind = AstNodeKind.EnumDecl;
+
+            // Find matching brace.
+            i32 start = i;
+            i32 j = i + 1;
+            i32 brace_depth = 0;
+            while (j < tokens.size()) {
+                if (tokens[j].text == "{") brace_depth = brace_depth + 1;
+                if (tokens[j].text == "}") {
+                    brace_depth = brace_depth - 1;
+                    if (brace_depth == 0) {
+                        j = j + 1;
+                        break;
+                    }
+                }
+                j = j + 1;
+            }
+
+            AstNode decl;
+            decl.kind = decl_kind;
+            string text = "";
+            i32 t_idx = start;
+            while (t_idx < j) {
+                if (text != "" && tokens[t_idx].start_col > 1) {
+                    text = text + " ";
+                }
+                text = text + tokens[t_idx].text;
+                t_idx = t_idx + 1;
+            }
+            decl.text = text;
+            decl.start_line = tokens[start].start_line;
+            decl.start_col = tokens[start].start_col;
+            if (j > 0) {
+                decl.end_line = tokens[j - 1].end_line;
+                decl.end_col = tokens[j - 1].end_col;
+            }
+            nodes.push(decl);
+            i = j;
+            continue;
+        }
+
+        // Extern blocks.
+        if (t.kind == AstNodeKind.Identifier && t.text == "extern") {
+            i32 start = i;
+            i32 j = i + 1;
+            i32 brace_depth = 0;
+            while (j < tokens.size()) {
+                if (tokens[j].text == "{") brace_depth = brace_depth + 1;
+                if (tokens[j].text == "}") {
+                    brace_depth = brace_depth - 1;
+                    if (brace_depth == 0) {
+                        j = j + 1;
+                        break;
+                    }
+                }
+                j = j + 1;
+            }
+            AstNode ext;
+            ext.kind = AstNodeKind.ExternBlock;
+            string text = "";
+            i32 t_idx = start;
+            while (t_idx < j) {
+                if (text != "" && tokens[t_idx].start_col > 1) {
+                    text = text + " ";
+                }
+                text = text + tokens[t_idx].text;
+                t_idx = t_idx + 1;
+            }
+            ext.text = text;
+            ext.start_line = tokens[start].start_line;
+            nodes.push(ext);
+            i = j;
+            continue;
+        }
+
+        // Comptime declarations.
+        if (t.kind == AstNodeKind.Identifier && t.text == "comptime") {
+            i32 start = i;
+            i32 j = i + 1;
+            // Find the end of the comptime declaration.
+            if (j < tokens.size() && tokens[j].text == "{") {
+                i32 brace_depth = 1;
+                j = j + 1;
+                while (j < tokens.size() && brace_depth > 0) {
+                    if (tokens[j].text == "{") brace_depth = brace_depth + 1;
+                    if (tokens[j].text == "}") brace_depth = brace_depth - 1;
+                    j = j + 1;
+                }
+            } else {
+                // comptime type name = expr; or comptime string name = ...
+                while (j < tokens.size() && tokens[j].text != ";") {
+                    j = j + 1;
+                }
+                if (j < tokens.size()) j = j + 1;
+            }
+            AstNode ct;
+            ct.kind = AstNodeKind.ComptimeBlock;
+            string text = "";
+            i32 t_idx = start;
+            while (t_idx < j) {
+                if (text != "" && tokens[t_idx].start_col > 1) {
+                    text = text + " ";
+                }
+                text = text + tokens[t_idx].text;
+                t_idx = t_idx + 1;
+            }
+            ct.text = text;
+            ct.start_line = tokens[start].start_line;
+            if (j > 0) ct.end_line = tokens[j - 1].end_line;
+            nodes.push(ct);
+            i = j;
+            continue;
+        }
+
+        // Static asserts.
+        if (t.kind == AstNodeKind.Identifier && t.text == "static_assert") {
+            i32 start = i;
+            i32 j = i + 1;
+            i32 paren_depth = 0;
+            if (j < tokens.size() && tokens[j].text == "(") {
+                paren_depth = 1;
+                j = j + 1;
+                while (j < tokens.size() && paren_depth > 0) {
+                    if (tokens[j].text == "(") paren_depth = paren_depth + 1;
+                    if (tokens[j].text == ")") paren_depth = paren_depth - 1;
+                    j = j + 1;
+                }
+            }
+            // Consume semicolon.
+            if (j < tokens.size() && tokens[j].text == ";") j = j + 1;
+
+            AstNode sa;
+            sa.kind = AstNodeKind.StaticAssert;
+            string text = "";
+            i32 t_idx = start;
+            while (t_idx < j) {
+                if (text != "" && tokens[t_idx].start_col > 1) {
+                    text = text + " ";
+                }
+                text = text + tokens[t_idx].text;
+                t_idx = t_idx + 1;
+            }
+            sa.text = text;
+            sa.start_line = tokens[start].start_line;
+            if (j > 0) sa.end_line = tokens[j - 1].end_line;
+            nodes.push(sa);
+            i = j;
+            continue;
+        }
+
+        // Annotations (@Macro, @Introspect).
+        if (t.kind == AstNodeKind.Identifier && str_get_char(t.text, 0) == '@') {
+            i32 start = i;
+            i32 j = i + 1;
+            // Check if followed by a declaration.
+            // Include the next declaration in the annotation.
+            if (j < tokens.size()) {
+                string[] decl_keywords = {"struct", "class", "enum", "fn", "comptime",
+                                          "i32", "i64", "u32", "u64", "f32", "f64",
+                                          "string", "bool", "void"};
+                string next_text = tokens[j].text;
+                i32 k = 0;
+                bool is_decl = false;
+                while (k < 14) {
+                    if (next_text == decl_keywords[k]) {
+                        is_decl = true;
+                        break;
+                    }
+                    k = k + 1;
+                }
+                if (is_decl || (j + 1 < tokens.size()
+                    && tokens[j + 1].text == "(")) {
+                    // Include the annotated declaration.
+                    // Find end at function/struct boundary.
+                    while (j < tokens.size()) {
+                        if (tokens[j].text == "{") {
+                            i32 bd = 1;
+                            j = j + 1;
+                            while (j < tokens.size() && bd > 0) {
+                                if (tokens[j].text == "{") bd = bd + 1;
+                                if (tokens[j].text == "}") bd = bd - 1;
+                                j = j + 1;
+                            }
+                            break;
+                        }
+                        if (tokens[j].text == ";") {
+                            j = j + 1;
+                            break;
+                        }
+                        j = j + 1;
+                    }
+                }
+            }
+
+            AstNode ann;
+            ann.kind = AstNodeKind.Annotation;
+            string text = "";
+            i32 t_idx = start;
+            while (t_idx < j) {
+                if (text != "" && tokens[t_idx].start_col > 1) {
+                    text = text + " ";
+                }
+                text = text + tokens[t_idx].text;
+                t_idx = t_idx + 1;
+            }
+            ann.text = text;
+            ann.start_line = tokens[start].start_line;
+            if (j > 0) ann.end_line = tokens[j - 1].end_line;
+            nodes.push(ann);
+            i = j;
+            continue;
+        }
+
+        // Generic top-level declarations (comptime var, const, etc.)
+        // Detect: comptime type name = ... ;
+        if (t.kind == AstNodeKind.Identifier && t.text == "comptime") {
+            i32 start = i;
+            i32 j = i + 1;
+            while (j < tokens.size() && tokens[j].text != ";") {
+                j = j + 1;
+            }
+            if (j < tokens.size()) j = j + 1;
+
+            AstNode decl;
+            decl.kind = AstNodeKind.VariableDecl;
+            string text = "";
+            i32 t_idx = start;
+            while (t_idx < j) {
+                if (text != "" && tokens[t_idx].start_col > 1) {
+                    text = text + " ";
+                }
+                text = text + tokens[t_idx].text;
+                t_idx = t_idx + 1;
+            }
+            decl.text = text;
+            decl.start_line = tokens[start].start_line;
+            if (j > 0) decl.end_line = tokens[j - 1].end_line;
+            nodes.push(decl);
+            i = j;
+            continue;
+        }
+
+        // Fallback: any standalone token or statement.
+        i32 start = i;
+        i32 j = i + 1;
+        // Group until semicolon or declaration boundary.
+        if (t.text == ";") {
+            // empty statement, just skip.
+            i = i + 1;
+            continue;
+        }
+
+        // Try to group to next ; or { or } or next top-level declaration.
+        AstNode stmt;
+        stmt.kind = AstNodeKind.ExpressionStmt;
+
+        // Determine extent: look ahead for semicolon or brace block.
+        if (t.text == "{") {
+            stmt.kind = AstNodeKind.BlockStmt;
+            i32 bd = 0;
+            while (j < tokens.size()) {
+                if (tokens[j].text == "{") bd = bd + 1;
+                if (tokens[j].text == "}") {
+                    if (bd == 0) {
+                        j = j + 1;
+                        break;
+                    }
+                    bd = bd - 1;
+                }
+                if (tokens[j].text == ";") {
+                    // Semicolon inside braces doesn't end the block.
+                }
+                j = j + 1;
+            }
+        } else {
+            while (j < tokens.size() && tokens[j].text != ";"
+                   && tokens[j].text != "{" && tokens[j].text != "}") {
+                j = j + 1;
+            }
+            if (j < tokens.size() && tokens[j].text == ";") {
+                j = j + 1;
+            }
+        }
+
+        string text = "";
+        i32 t_idx = start;
+        while (t_idx < j) {
+            if (text != "" && tokens[t_idx].start_col > 1) {
+                text = text + " ";
+            }
+            text = text + tokens[t_idx].text;
+            t_idx = t_idx + 1;
+        }
+        stmt.text = text;
+        stmt.start_line = tokens[start].start_line;
+        stmt.end_line = tokens[j - 1].end_line;
+        nodes.push(stmt);
+        i = j;
+    }
+
+    return nodes;
+}
+
+// Pretty-print an AST node tree as formatted Vex code.
+fn string pretty_print(AstNode[] nodes, VexfmtConfig cfg, i32 indent_level) {
+    string result = "";
+    i32 indent_size = cfg.indent.size;
+    string indent_str = str_repeat(" ", indent_level * indent_size);
+    i32 i = 0;
+    while (i < nodes.size()) {
+        AstNode node = nodes[i];
+
+        if (node.kind == AstNodeKind.FunctionDecl) {
+            result = result + format_function(node, cfg, indent_level);
+        } else if (node.kind == AstNodeKind.StructDecl) {
+            result = result + format_struct(node, cfg, indent_level);
+        } else if (node.kind == AstNodeKind.ClassDecl) {
+            result = result + format_class(node, cfg, indent_level);
+        } else if (node.kind == AstNodeKind.EnumDecl) {
+            result = result + format_enum(node, cfg, indent_level);
+        } else if (node.kind == AstNodeKind.ExternBlock) {
+            result = result + format_extern(node, cfg, indent_level);
+        } else if (node.kind == AstNodeKind.ComptimeBlock) {
+            result = result + format_comptime(node, cfg, indent_level);
+        } else if (node.kind == AstNodeKind.StaticAssert) {
+            result = result + indent_str + node.text + "\n";
+        } else if (node.kind == AstNodeKind.VariableDecl) {
+            result = result + indent_str + node.text + "\n";
+        } else if (node.kind == AstNodeKind.Annotation) {
+            result = result + format_annotation(node, cfg, indent_level);
+        } else if (node.kind == AstNodeKind.ExpressionStmt) {
+            result = result + indent_str + node.text + "\n";
+        } else if (node.kind == AstNodeKind.BlockStmt) {
+            result = result + format_block_text(node.text, cfg, indent_level);
+        } else if (node.kind == AstNodeKind.Identifier) {
+            result = result + indent_str + node.text + "\n";
+        } else {
+            result = result + indent_str + node.text + "\n";
+        }
+
+        // Add blank line between non-comment top-level nodes (if configured).
+        if (cfg.line_breaks.blank_line_between_fns) {
+            if (i + 1 < nodes.size()) {
+                AstNode next = nodes[i + 1];
+                // Don't add blank line before comments.
+                if (node.kind != AstNodeKind.Annotation
+                    && next.kind != AstNodeKind.Annotation
+                    && node.kind != AstNodeKind.ExpressionStmt) {
+                    result = result + "\n";
+                }
+            }
+        }
+
+        i = i + 1;
+    }
+    return result;
+}
+
+// Format a function declaration.
+fn string format_function(AstNode node, VexfmtConfig cfg, i32 indent_level) {
+    string result = "";
+    string text = node.text;
+
+    // Extract signature and body.
+    i32 brace_pos = find_brace(text, 0);
+    if (brace_pos < 0) {
+        // No body (declaration).
+        return str_repeat(" ", indent_level * cfg.indent.size) + text + ";\n";
+    }
+
+    string signature = str_substring(text, 0, brace_pos);
+    string body = str_substring(text, brace_pos);
+
+    // Ensure K&R style: opening brace on same line.
+    signature = str_trim_end(signature);
+    body = str_trim_start(body);
+
+    string indent_str = str_repeat(" ", indent_level * cfg.indent.size);
+
+    // Format signature with proper spacing.
+    string formatted_sig = format_signature(signature, cfg);
+
+    if (cfg.line_breaks.braces_same_line) {
+        result = result + indent_str + formatted_sig + " {";
+    } else {
+        result = result + indent_str + formatted_sig + "\n" + indent_str + "{";
+    }
+
+    // Format body with proper indentation.
+    string inner = extract_brace_content(body);
+    if (inner != "") {
+        result = result + "\n";
+        result = result + format_block_inner(inner, cfg, indent_level + 1);
+    }
+    result = result + indent_str + "}\n";
+
+    return result;
+}
+
+// Format a struct declaration.
+fn string format_struct(AstNode node, VexfmtConfig cfg, i32 indent_level) {
+    string indent_str = str_repeat(" ", indent_level * cfg.indent.size);
+    string text = node.text;
+
+    i32 brace_pos = find_brace(text, 0);
+    if (brace_pos < 0) {
+        return indent_str + text + "\n";
+    }
+
+    string header = str_trim_end(str_substring(text, 0, brace_pos));
+    string body = extract_brace_content(str_substring(text, brace_pos));
+
+    string result = indent_str + header + " {\n";
+    if (body != "") {
+        // Split body into lines and indent each.
+        string[] lines = str_split_lines(body);
+        i32 i = 0;
+        while (i < lines.size()) {
+            string line = str_trim(lines[i]);
+            if (line != "") {
+                result = result + str_repeat(" ", (indent_level + 1) * cfg.indent.size)
+                         + line + "\n";
+            }
+            i = i + 1;
+        }
+    }
+    result = result + indent_str + "}\n";
+    return result;
+}
+
+// Format a class declaration.
+fn string format_class(AstNode node, VexfmtConfig cfg, i32 indent_level) {
+    // Same as struct formatting for now.
+    return format_struct(node, cfg, indent_level);
+}
+
+// Format an enum declaration.
+fn string format_enum(AstNode node, VexfmtConfig cfg, i32 indent_level) {
+    string indent_str = str_repeat(" ", indent_level * cfg.indent.size);
+    string text = node.text;
+
+    i32 brace_pos = find_brace(text, 0);
+    if (brace_pos < 0) {
+        return indent_str + text + "\n";
+    }
+
+    string header = str_trim_end(str_substring(text, 0, brace_pos));
+    string body = extract_brace_content(str_substring(text, brace_pos));
+
+    string result = indent_str + header + " {\n";
+    if (body != "") {
+        string[] variants = str_split(body, ",");
+        i32 i = 0;
+        while (i < variants.size()) {
+            string v = str_trim(variants[i]);
+            if (v != "") {
+                result = result + str_repeat(" ", (indent_level + 1) * cfg.indent.size)
+                         + v;
+                if (i < variants.size() - 1) {
+                    result = result + ",";
+                }
+                result = result + "\n";
+            }
+            i = i + 1;
+        }
+    }
+    result = result + indent_str + "}\n";
+    return result;
+}
+
+// Format extern block.
+fn string format_extern(AstNode node, VexfmtConfig cfg, i32 indent_level) {
+    string indent_str = str_repeat(" ", indent_level * cfg.indent.size);
+    string text = node.text;
+
+    i32 brace_pos = find_brace(text, 0);
+    if (brace_pos < 0) {
+        return indent_str + text + "\n";
+    }
+
+    string header = str_trim_end(str_substring(text, 0, brace_pos));
+    string body = extract_brace_content(str_substring(text, brace_pos));
+
+    string result = indent_str + header + " {\n";
+    if (body != "") {
+        string[] lines = str_split_lines(body);
+        i32 i = 0;
+        while (i < lines.size()) {
+            string line = str_trim(lines[i]);
+            if (line != "") {
+                result = result + str_repeat(" ", (indent_level + 1) * cfg.indent.size)
+                         + line + "\n";
+            }
+            i = i + 1;
+        }
+    }
+    result = result + indent_str + "}\n";
+    return result;
+}
+
+// Format comptime block.
+fn string format_comptime(AstNode node, VexfmtConfig cfg, i32 indent_level) {
+    string indent_str = str_repeat(" ", indent_level * cfg.indent.size);
+    string text = node.text;
+    return indent_str + text + "\n";
+}
+
+// Format annotation.
+fn string format_annotation(AstNode node, VexfmtConfig cfg, i32 indent_level) {
+    string result = "";
+    string text = node.text;
+
+    // Check if annotation is multiline (has a declaration attached).
+    i32 brace_pos = find_brace(text, 0);
+    if (brace_pos >= 0) {
+        // Has a body - re-parse through appropriate formatter.
+        string[] lines = str_split_lines(text);
+        i32 i = 0;
+        while (i < lines.size()) {
+            string line = lines[i];
+            if (str_get_char(line, 0) == '@') {
+                result = result + line + "\n";
+            } else {
+                // This line is part of the declaration.
+                // Let the next iteration handle it.
+                // For now, just append with indent.
+                result = result + str_repeat(" ", indent_level * cfg.indent.size)
+                         + line + "\n";
+            }
+            i = i + 1;
+        }
+    } else {
+        result = result + text + "\n";
+    }
+
+    return result;
+}
+
+// Format the signature part of a function.
+fn string format_signature(string sig, VexfmtConfig cfg) {
+    string result = str_trim(sig);
+
+    // Ensure no space before parenthesis in function calls and declarations.
+    if (!cfg.spacing.before_parenthesis) {
+        // Remove space before (.
+        i32 paren_pos = find_char(result, '(');
+        while (paren_pos > 0) {
+            if (str_get_char(result, paren_pos - 1) == ' ') {
+                result = str_substring(result, 0, paren_pos - 1)
+                         + str_substring(result, paren_pos);
+                paren_pos = paren_pos - 1;
+            }
+            paren_pos = find_char_from(result, '(', paren_pos + 1);
+        }
+    }
+
+    // Ensure spaces around binary operators in signature (like arrow ->).
+    i32 arrow_pos = find_substring(result, "->");
+    if (arrow_pos >= 0) {
+        string before = str_trim_end(str_substring(result, 0, arrow_pos));
+        string after = str_trim_start(str_substring(result, arrow_pos + 2));
+        result = before + " -> " + after;
+    }
+
+    // Ensure space after commas in parameter list.
+    i32 paren_start = find_char(result, '(');
+    if (paren_start >= 0) {
+        i32 paren_end = find_matching_paren(result, paren_start);
+        if (paren_end > paren_start) {
+            string params = str_substring(result, paren_start + 1,
+                                          paren_end - paren_start - 1);
+            string formatted_params = format_param_list(params, cfg);
+            result = str_substring(result, 0, paren_start + 1)
+                     + formatted_params
+                     + str_substring(result, paren_end);
+        }
+    }
+
+    return result;
+}
+
+// Format parameter list.
+fn string format_param_list(string params, VexfmtConfig cfg) {
+    string result = str_trim(params);
+    if (result == "") return result;
+
+    // Split by comma and format each.
+    string[] parts = str_split(result, ",");
+    string formatted = "";
+    i32 i = 0;
+    while (i < parts.size()) {
+        if (formatted != "") {
+            if (cfg.spacing.after_comma) {
+                formatted = formatted + ", ";
+            } else {
+                formatted = formatted + ",";
+            }
+        }
+        formatted = formatted + str_trim(parts[i]);
+        i = i + 1;
+    }
+    return formatted;
+}
+
+// Extract content between braces (including inner text).
+fn string extract_brace_content(string text) {
+    i32 start = find_char(text, '{');
+    i32 end = find_matching_brace(text, start);
+    if (start < 0 || end <= start + 1) return "";
+    return str_substring(text, start + 1, end - start - 1);
+}
+
+// Format inner block content with proper indentation.
+fn string format_block_inner(string content, VexfmtConfig cfg, i32 indent_level) {
+    string result = "";
+    string[] lines = str_split_lines(content);
+    i32 i = 0;
+    while (i < lines.size()) {
+        string line = str_trim(lines[i]);
+        if (line != "") {
+            result = result + str_repeat(" ", indent_level * cfg.indent.size)
+                     + line + "\n";
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+// Format a block by its text representation.
+fn string format_block_text(string text, VexfmtConfig cfg, i32 indent_level) {
+    string indent_str = str_repeat(" ", indent_level * cfg.indent.size);
+    string body = extract_brace_content(text);
+    string result = indent_str + "{\n";
+    if (body != "") {
+        result = result + format_block_inner(body, cfg, indent_level + 1);
+    }
+    result = result + indent_str + "}\n";
+    return result;
+}
+
+// Find first occurrence of a character.
+fn i32 find_char(string s, i32 ch) {
+    i32 i = 0;
+    while (i < str_bytes(s)) {
+        if (str_get_char(s, i) == ch) return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Find character starting from position.
+fn i32 find_char_from(string s, i32 ch, i32 start) {
+    i32 i = start;
+    while (i < str_bytes(s)) {
+        if (str_get_char(s, i) == ch) return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Find matching closing parenthesis.
+fn i32 find_matching_paren(string s, i32 open_pos) {
+    if (open_pos < 0 || str_get_char(s, open_pos) != '(') return -1;
+    i32 depth = 1;
+    i32 i = open_pos + 1;
+    while (i < str_bytes(s) && depth > 0) {
+        i32 c = str_get_char(s, i);
+        if (c == '(') depth = depth + 1;
+        if (c == ')') depth = depth - 1;
+        i = i + 1;
+    }
+    if (depth == 0) return i - 1;
+    return -1;
+}
+
+// Find matching closing brace.
+fn i32 find_matching_brace(string s, i32 open_pos) {
+    if (open_pos < 0 || str_get_char(s, open_pos) != '{') return -1;
+    i32 depth = 1;
+    i32 i = open_pos + 1;
+    while (i < str_bytes(s) && depth > 0) {
+        i32 c = str_get_char(s, i);
+        if (c == '{') depth = depth + 1;
+        if (c == '}') depth = depth - 1;
+        i = i + 1;
+    }
+    if (depth == 0) return i - 1;
+    return -1;
+}
+
+// Find first occurrence of opening brace.
+fn i32 find_brace(string s, i32 start) {
+    i32 i = start;
+    while (i < str_bytes(s)) {
+        if (str_get_char(s, i) == '{') return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Find substring.
+fn i32 find_substring(string s, string sub) {
+    i32 i = 0;
+    i32 slen = str_bytes(s);
+    i32 sublen = str_bytes(sub);
+    while (i <= slen - sublen) {
+        string part = str_substring(s, i, sublen);
+        if (part == sub) return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Format a single file. Returns the formatted source.
+fn FormatResult format_file(string source, VexfmtConfig cfg) {
+    FormatResult res;
+    res.success = true;
+    res.files_checked = 1;
+
+    // Parse into tokens, build AST, pretty-print.
+    AstNode[] tokens = parse_ast(source);
+    AstNode[] structure = build_structure(tokens);
+    string formatted = pretty_print(structure, cfg, 0);
+
+    // Clean up trailing whitespace.
+    formatted = str_trim_end(formatted);
+    if (formatted != "") {
+        formatted = formatted + "\n";
+    }
+
+    res.output = formatted;
+    if (formatted == source) {
+        res.files_modified = 0;
+    } else {
+        res.files_modified = 1;
+    }
+
+    return res;
+}
+
+// Compare original and formatted source.
+fn bool check_formatting(string source, VexfmtConfig cfg) {
+    FormatResult res = format_file(source, cfg);
+    return res.output == source;
+}
+
+// CLI entry point.
+fn i32 main(i32 argc, string[] argv) {
+    bool check_mode = false;
+    bool recursive = false;
+    string target = "";
+    string config_path = "";
+
+    i32 i = 1;
+    while (i < argc) {
+        string arg = argv[i];
+        if (arg == "--check") {
+            check_mode = true;
+        } else if (arg == "--recursive") {
+            recursive = true;
+        } else if (arg == "--config") {
+            i = i + 1;
+            if (i < argc) {
+                config_path = argv[i];
+            }
+        } else if (str_get_char(arg, 0) == '-') {
+            println("vexfmt: unknown option: " + arg);
+            println("Usage: vexfmt [--check] [--recursive] [--config path] <file|dir>");
+            return 1;
+        } else {
+            target = arg;
+        }
+        i = i + 1;
+    }
+
+    if (target == "") {
+        println("vexfmt: no target specified");
+        println("Usage: vexfmt [--check] [--recursive] [--config path] <file|dir>");
+        return 1;
+    }
+
+    VexfmtConfig cfg = load_config(config_path);
+
+    i32 exit_code = 0;
+    i32 files_checked = 0;
+    i32 files_modified = 0;
+
+    if (recursive) {
+        // Recursive mode: scan directory for .vex files.
+        string[] entries = list_dir(target);
+        i32 j = 0;
+        while (j < entries.size()) {
+            string entry = entries[j];
+            // Check if .vex extension.
+            i32 ext_pos = find_substring(entry, ".vex");
+            if (ext_pos >= 0 && ext_pos == str_bytes(entry) - 4) {
+                string full_path;
+                if (str_get_char(target, str_bytes(target) - 1) == '/') {
+                    full_path = target + entry;
+                } else {
+                    full_path = target + "/" + entry;
+                }
+                files_checked = files_checked + 1;
+
+                i64 fh = open(full_path, O_READ);
+                if (fh == 0) {
+                    println("vexfmt: cannot open " + full_path);
+                    exit_code = 1;
+                    continue;
+                }
+                string source = read_all(fh);
+                close(fh);
+
+                FormatResult res = format_file(source, cfg);
+                if (!res.success) {
+                    println("vexfmt: error formatting " + full_path);
+                    exit_code = 1;
+                } else {
+                    if (check_mode) {
+                        if (res.output != source) {
+                            println("vexfmt: " + full_path + " - needs formatting");
+                            exit_code = 1;
+                        } else {
+                            println("vexfmt: " + full_path + " - ok");
+                        }
+                    } else {
+                        if (res.output != source) {
+                            i64 wfh = open(full_path, O_WRITE);
+                            write(wfh, res.output);
+                            close(wfh);
+                            files_modified = files_modified + 1;
+                            println("vexfmt: formatted " + full_path);
+                        } else {
+                            println("vexfmt: " + full_path + " - unchanged");
+                        }
+                    }
+                }
+            }
+            j = j + 1;
+        }
+    } else {
+        // Single file mode.
+        i64 fh = open(target, O_READ);
+        if (fh == 0) {
+            println("vexfmt: cannot open " + target);
+            return 1;
+        }
+        string source = read_all(fh);
+        close(fh);
+
+        FormatResult res = format_file(source, cfg);
+        if (!res.success) {
+            println("vexfmt: error formatting " + target);
+            return 1;
+        }
+
+        if (check_mode) {
+            if (res.output != source) {
+                println("vexfmt: " + target + " - needs formatting");
+                return 1;
+            }
+            println("vexfmt: " + target + " - ok");
+        } else {
+            i64 wfh = open(target, O_WRITE);
+            write(wfh, res.output);
+            close(wfh);
+            println("vexfmt: formatted " + target);
+        }
+    }
+
+    if (check_mode && files_checked > 0) {
+        println("vexfmt: checked " + to_str(files_checked) + " files");
+    }
+    if (!check_mode && files_modified > 0) {
+        println("vexfmt: modified " + to_str(files_modified) + " files");
+    }
+
+    return exit_code;
+}

@@ -1,0 +1,37 @@
+[
+  {
+    "name": "Hello World",
+    "description": "Basic program that prints a greeting",
+    "code": "i32 main() {\n    println(\"Hello, World!\");\n    return 0;\n}\n"
+  },
+  {
+    "name": "Fibonacci",
+    "description": "Recursive Fibonacci sequence calculation",
+    "code": "i64 fibonacci(i64 n) {\n    if (n <= 1) {\n        return n;\n    }\n    return fibonacci(n - 1) + fibonacci(n - 2);\n}\n\ni32 main() {\n    let n: i64 = 20;\n    println(\"Fibonacci(\" + i64_to_str(n) + \") = \" + i64_to_str(fibonacci(n)));\n    return 0;\n}\n"
+  },
+  {
+    "name": "FizzBuzz",
+    "description": "Classic FizzBuzz using loops and conditionals",
+    "code": "i32 main() {\n    for (i32 i = 1; i <= 100; i++) {\n        if (i % 15 == 0) {\n            println(\"FizzBuzz\");\n        } else if (i % 3 == 0) {\n            println(\"Fizz\");\n        } else if (i % 5 == 0) {\n            println(\"Buzz\");\n        } else {\n            println(i32_to_str(i));\n        }\n    }\n    return 0;\n}\n"
+  },
+  {
+    "name": "Vector Math",
+    "description": "Float3 vector operations using std.linalg",
+    "code": "import std.linalg.*\n\ni32 main() {\n    let a = float3(1.0, 2.0, 3.0);\n    let b = float3(4.0, 5.0, 6.0);\n    \n    let sum = a + b;\n    let dot = dot3(a, b);\n    let cross = cross3(a, b);\n    let len_a = length3(a);\n    let norm_a = normalize3(a);\n    \n    println(\"a = \" + float3_to_str(a));\n    println(\"b = \" + float3_to_str(b));\n    println(\"a + b = \" + float3_to_str(sum));\n    println(\"dot(a,b) = \" + f64_to_str(dot));\n    println(\"cross(a,b) = \" + float3_to_str(cross));\n    println(\"|a| = \" + f64_to_str(len_a));\n    println(\"a/|a| = \" + float3_to_str(norm_a));\n    return 0;\n}\n"
+  },
+  {
+    "name": "JSON Parse",
+    "description": "Parse and query JSON data with std.json",
+    "code": "import std.json.*\nimport std.string.*\n\ni32 main() {\n    let data: str = '{\n        \"name\": \"Vex\",\n        \"version\": \"1.0\",\n        \"features\": [\"static\", \"strong\", \"safe\"],\n        \"meta\": {\n            \"compiled\": true,\n            \"jvm\": false\n        }\n    }';\n    \n    let root = json_parse(data);\n    if json_is_null(root) {\n        println(\"ERROR: failed to parse JSON\");\n        return 1;\n    }\n    \n    let name = json_get_str(root, \"name\");\n    let ver = json_get_str(root, \"version\");\n    let feat = json_get_array(root, \"features\");\n    let compiled = json_get_bool(root, \"meta.compiled\");\n    \n    println(\"name: \" + name);\n    println(\"version: \" + ver);\n    println(\"features count: \" + i32_to_str(json_array_len(feat)));\n    println(\"compiled: \" + bool_to_str(compiled));\n    \n    json_free(root);\n    return 0;\n}\n"
+  },
+  {
+    "name": "DFT Signal",
+    "description": "Discrete Fourier Transform with std.signal",
+    "code": "import std.signal.*\nimport std.math.*\n\ni32 main() {\n    // Generate a sine wave\n    let n: i32 = 64;\n    let mut signal: f64[64];\n    for (i32 i = 0; i < n; i++) {\n        let t = f64(i) / f64(n);\n        signal[i] = sin(2.0 * 3.14159 * 4.0 * t) + 0.5 * sin(2.0 * 3.14159 * 12.0 * t);\n    }\n    \n    println(\"Generated composite signal (4Hz + 12Hz)\");\n    println(\"Running DFT...\");\n    \n    let mut spectrum: f64[64];\n    dft(signal, spectrum, n);\n    \n    println(\"Frequency spectrum (first 32 bins):\");\n    for (i32 i = 0; i < 32; i++) {\n        let bar: str = \"\";\n        let val = i32(f64(spectrum[i] * 20.0));\n        for (i32 j = 0; j < val && j < 40; j++) {\n            bar = bar + \"#\";\n        }\n        println(i32_to_str(i) + \": \" + f64_to_str(spectrum[i]) + \" \" + bar);\n    }\n    \n    return 0;\n}\n\ni32 dft(f64[] input, f64[] output, i32 n) {\n    for (i32 k = 0; k < n / 2; k++) {\n        let mut real: f64 = 0.0;\n        let mut imag: f64 = 0.0;\n        for (i32 t = 0; t < n; t++) {\n            let angle = 2.0 * 3.14159 * f64(k) * f64(t) / f64(n);\n            real = real + input[t] * cos(angle);\n            imag = imag + input[t] * sin(angle);\n        }\n        output[k] = sqrt(real * real + imag * imag) / f64(n);\n    }\n    return 0;\n}\n"
+  },
+  {
+    "name": "Rendering",
+    "description": "Std.graphics rendering pipeline demo (metadata)",
+    "code": "import std.graphics.*\nimport std.linalg.*\n\ni32 main() {\n    // Initialize renderer\n    let width: i32 = 800;\n    let height: i32 = 600;\n    let ctx = create_context(width, height, \"Vex Playground\");\n    \n    // Create a simple triangle mesh\n    let verts: float3[3] = [\n        float3(-0.5, -0.5, 0.0),\n        float3(0.5, -0.5, 0.0),\n        float3(0.0, 0.5, 0.0)\n    ];\n    \n    let colors: float3[3] = [\n        float3(1.0, 0.0, 0.0),\n        float3(0.0, 1.0, 0.0),\n        float3(0.0, 0.0, 1.0)\n    ];\n    \n    // Set up camera\n    let eye = float3(0.0, 0.0, 2.5);\n    let target = float3(0.0, 0.0, 0.0);\n    let up = float3(0.0, 1.0, 0.0);\n    let view = look_at(eye, target, up);\n    \n    let fov: f64 = 60.0;\n    let aspect = f64(width) / f64(height);\n    let proj = perspective(fov, aspect, 0.1, 100.0);\n    \n    // Render loop (single frame)\n    clear(ctx, float3(0.1, 0.1, 0.15));\n    \n    let model = identity4();\n    let mvp = proj * view * model;\n    \n    draw_triangles(ctx, verts, colors, 1, mvp);\n    \n    // Output\n    println(\"Rendered triangle to \" + i32_to_str(width) + \"x\" + i32_to_str(height));\n    println(\"Context: \" + ptr_to_str(ctx));\n    println(\"Vertices: 3, Colors: 3, Faces: 1\");\n    println(\"MVP matrix applied, camera at z=2.5\");\n    \n    // Present\n    present(ctx);\n    destroy_context(ctx);\n    \n    return 0;\n}\n"
+  }
+]

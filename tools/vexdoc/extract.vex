@@ -1,0 +1,618 @@
+// vexdoc.extract.vex - Doc comment extractor for Vex source files
+// Parses triple-slash doc comments and associates them with declarations.
+
+namespace vexdoc.extract {
+
+    // -----------------------------------------------------------------
+    //  Data structures
+    // -----------------------------------------------------------------
+
+    type DocTag = struct {
+        name:  string   // "param", "return", "example", "see", "deprecated"
+        key:   string   // for @param: the parameter name; for others: empty or value
+        value: string   // the tag content
+    }
+
+    type DocComment = struct {
+        text:   string    // full doc text (markdown)
+        tags:   DocTag[]  // extracted @-tags
+    }
+
+    type ParamInfo = struct {
+        name: string
+        type_name: string
+    }
+
+    type FunctionDoc = struct {
+        name:       string
+        signature:  string    // full signature line
+        params:     ParamInfo[]
+        return_type: string
+        is_public:  bool
+        attributes: string[]  // @Inline, @Extern, etc.
+        doc:        DocComment
+        line:       i32       // source line number
+    }
+
+    type FieldDoc = struct {
+        name:      string
+        type_name: string
+        doc:       DocComment
+        line:      i32
+    }
+
+    type TypeDoc = struct {
+        name:       string
+        type_kind:  string    // "struct", "class", "enum"
+        fields:     FieldDoc[]
+        doc:        DocComment
+        line:       i32
+    }
+
+    type ModuleDoc = struct {
+        namespace: string
+        file_path: string
+        description: string
+        functions:  FunctionDoc[]
+        types:      TypeDoc[]
+        constants:  string[]   // const declarations as text
+        line:       i32
+    }
+
+    // -----------------------------------------------------------------
+    //  Tag parsing
+    // -----------------------------------------------------------------
+
+    /// Parse a single doc tag line like "@param name description"
+    fn parse_tag(line: string) -> DocTag {
+        // Strip leading whitespace and @
+        let mut content: string = ""
+        let mut i: i32 = 0
+        // skip whitespace
+        while i < line.size() && line[i] == ' ' { i = i + 1 }
+        // skip @
+        if i < line.size() && line[i] == '@' { i = i + 1 }
+
+        // Read tag name
+        let mut tag_name: string = ""
+        while i < line.size() && line[i] != ' ' {
+            tag_name = tag_name ++ line[i]
+            i = i + 1
+        }
+
+        // Skip whitespace after tag name
+        while i < line.size() && line[i] == ' ' { i = i + 1 }
+
+        // For @param, read key (parameter name) and value
+        let mut key: string = ""
+        let mut value: string = ""
+
+        if tag_name == "param" {
+            while i < line.size() && line[i] != ' ' {
+                key = key ++ line[i]
+                i = i + 1
+            }
+            while i < line.size() && line[i] == ' ' { i = i + 1 }
+        }
+
+        // Rest is value
+        while i < line.size() {
+            value = value ++ line[i]
+            i = i + 1
+        }
+
+        return DocTag { name: tag_name, key: key, value: value }
+    }
+
+    /// Parse a complete doc comment block (lines without leading /// markers)
+    fn parse_doc_comment(lines: string[]) -> DocComment {
+        let mut text: string = ""
+        let mut tags: DocTag[] = []
+        let mut i: i32 = 0
+        while i < lines.size() {
+            let line = lines[i]
+            // Check if line is a tag
+            let mut first_non_space: i32 = 0
+            while first_non_space < line.size() && line[first_non_space] == ' ' {
+                first_non_space = first_non_space + 1
+            }
+            if first_non_space < line.size() && line[first_non_space] == '@' {
+                let tag = parse_tag(line)
+                tags = tags ++ [tag]
+            } else {
+                if text.size() > 0 { text = text ++ "\n" }
+                text = text ++ line
+            }
+            i = i + 1
+        }
+        return DocComment { text: text, tags: tags }
+    }
+
+    // -----------------------------------------------------------------
+    //  Declaration parsing
+    // -----------------------------------------------------------------
+
+    /// Check if line declares a function
+    fn is_function_decl(line: string) -> bool {
+        let mut i: i32 = 0
+        while i < line.size() && line[i] == ' ' { i = i + 1 }
+        if i + 1 < line.size() && line[i] == 'f' && line[i+1] == 'n' {
+            // must be followed by space or '_' (i.e. "fn ")
+            let j = i + 2
+            if j < line.size() && (line[j] == ' ' || line[j] == '_') {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Check if line declares a type
+    fn is_type_decl(line: string) -> bool {
+        let mut i: i32 = 0
+        while i < line.size() && line[i] == ' ' { i = i + 1 }
+        if i + 3 < line.size() {
+            if line[i] == 't' && line[i+1] == 'y' && line[i+2] == 'p' && line[i+3] == 'e' {
+                let j = i + 4
+                if j < line.size() && line[j] == ' ' {
+                    return true
+                }
+            }
+            // Also handle 'class' declarations
+            if line[i] == 'c' && line[i+1] == 'l' && line[i+2] == 'a' && line[i+3] == 's' {
+                let j = i + 4
+                if j < line.size() && line[j] == 's' {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// Check if line declares a constant
+    fn is_const_decl(line: string) -> bool {
+        let mut i: i32 = 0
+        while i < line.size() && line[i] == ' ' { i = i + 1 }
+        if i + 4 < line.size() {
+            if line[i] == 'c' && line[i+1] == 'o' && line[i+2] == 'n' && line[i+3] == 's' && line[i+4] == 't' {
+                let j = i + 5
+                if j < line.size() && line[j] == ' ' {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// Extract function name from declaration line
+    fn extract_fn_name(line: string) -> string {
+        let mut i: i32 = 0
+        while i < line.size() && line[i] == ' ' { i = i + 1 }
+        // skip "fn "
+        i = i + 3
+        while i < line.size() && line[i] == ' ' { i = i + 1 }
+        // Read function name
+        let mut name: string = ""
+        while i < line.size() && line[i] != '(' && line[i] != ' ' {
+            name = name ++ line[i]
+            i = i + 1
+        }
+        return name
+    }
+
+    /// Extract function signature (full first line)
+    fn extract_fn_signature(line: string, next_lines: string[]) -> string {
+        let mut sig: string = line
+        // Check if signature continues on next lines (multi-line decl)
+        // Count open parens
+        let mut open: i32 = 0
+        let mut j: i32 = 0
+        while j < sig.size() {
+            if sig[j] == '(' { open = open + 1 }
+            if sig[j] == ')' { open = open - 1 }
+            j = j + 1
+        }
+        let mut idx: i32 = 0
+        while open > 0 && idx < next_lines.size() {
+            let nl = next_lines[idx]
+            sig = sig ++ " " ++ std.string.trim_start(nl)
+            j = 0
+            while j < nl.size() {
+                if nl[j] == '(' { open = open + 1 }
+                if nl[j] == ')' { open = open - 1 }
+                j = j + 1
+            }
+            idx = idx + 1
+        }
+        return sig
+    }
+
+    /// Extract parameter info from signature
+    fn extract_params(sig: string) -> ParamInfo[] {
+        let mut params: ParamInfo[] = []
+        // Find the parameter list between ( and )
+        let mut start: i32 = -1
+        let mut i: i32 = 0
+        while i < sig.size() {
+            if sig[i] == '(' { start = i + 1; i = i + 1; break }
+            i = i + 1
+        }
+        if start < 0 { return params }
+        let mut depth: i32 = 1
+        let mut end: i32 = start
+        while end < sig.size() && depth > 0 {
+            if sig[end] == '(' { depth = depth + 1 }
+            if sig[end] == ')' { depth = depth - 1 }
+            if depth > 0 { end = end + 1 }
+        }
+        if end <= start { return params }
+        let param_str = sig[start..end]
+        // Split by comma
+        let mut current: string = ""
+        let mut pd: i32 = 0
+        i = 0
+        while i < param_str.size() {
+            let c = param_str[i]
+            if c == '(' { pd = pd + 1; current = current ++ c }
+            elif c == ')' { pd = pd - 1; current = current ++ c }
+            elif c == ',' && pd == 0 {
+                let trimmed = std.string.trim(current)
+                if trimmed.size() > 0 {
+                    // Split on ':' to get name and type
+                    let mut colon_pos: i32 = -1
+                    let mut j: i32 = 0
+                    while j < trimmed.size() {
+                        if trimmed[j] == ':' { colon_pos = j; break }
+                        j = j + 1
+                    }
+                    if colon_pos >= 0 {
+                        let pname = std.string.trim(trimmed[0..colon_pos])
+                        let ptype = std.string.trim(trimmed[colon_pos+1..])
+                        params = params ++ [ParamInfo { name: pname, type_name: ptype }]
+                    } else {
+                        params = params ++ [ParamInfo { name: trimmed, type_name: "" }]
+                    }
+                }
+                current = ""
+            } else {
+                current = current ++ c
+            }
+            i = i + 1
+        }
+        let trimmed = std.string.trim(current)
+        if trimmed.size() > 0 {
+            let mut colon_pos: i32 = -1
+            let mut j: i32 = 0
+            while j < trimmed.size() {
+                if trimmed[j] == ':' { colon_pos = j; break }
+                j = j + 1
+            }
+            if colon_pos >= 0 {
+                let pname = std.string.trim(trimmed[0..colon_pos])
+                let ptype = std.string.trim(trimmed[colon_pos+1..])
+                params = params ++ [ParamInfo { name: pname, type_name: ptype }]
+            } else {
+                params = params ++ [ParamInfo { name: trimmed, type_name: "" }]
+            }
+        }
+        return params
+    }
+
+    /// Extract return type from signature
+    fn extract_return_type(sig: string) -> string {
+        // Find "->" marker
+        let mut i: i32 = 0
+        while i + 1 < sig.size() {
+            if sig[i] == '-' && sig[i+1] == '>' {
+                i = i + 2
+                while i < sig.size() && sig[i] == ' ' { i = i + 1 }
+                let mut ret: string = ""
+                while i < sig.size() {
+                    ret = ret ++ sig[i]
+                    i = i + 1
+                }
+                // Remove trailing '{' if present
+                while ret.size() > 0 && (ret[ret.size()-1] == ' ' || ret[ret.size()-1] == '{') {
+                    ret = ret[0..ret.size()-1]
+                }
+                return std.string.trim(ret)
+            }
+            i = i + 1
+        }
+        return ""
+    }
+
+    /// Extract type name from declaration line
+    fn extract_type_name(line: string) -> string {
+        let mut i: i32 = 0
+        while i < line.size() && line[i] == ' ' { i = i + 1 }
+        // skip "type "
+        if line[i] == 't' { i = i + 5 } else { i = i + 6 } // "type " or "class"
+        while i < line.size() && line[i] == ' ' { i = i + 1 }
+        let mut name: string = ""
+        while i < line.size() && line[i] != ' ' && line[i] != '=' {
+            name = name ++ line[i]
+            i = i + 1
+        }
+        return name
+    }
+
+    /// Extract type kind from declaration
+    fn extract_type_kind(line: string) -> string {
+        let mut i: i32 = 0
+        while i < line.size() && line[i] == ' ' { i = i + 1 }
+        if line[i] == 'c' { return "class" }
+        // For type decls, look for = struct or = enum
+        let mut j: i32 = 0
+        while j < line.size() {
+            if line[j] == '=' {
+                let rest = line[j+1..]
+                let trimmed = std.string.trim(rest)
+                if trimmed.size() >= 6 && trimmed[0..6] == "struct" { return "struct" }
+                if trimmed.size() >= 4 && trimmed[0..4] == "enum"  { return "enum" }
+                return "alias"
+            }
+            j = j + 1
+        }
+        return "struct"
+    }
+
+    /// Extract struct fields from source lines starting at the struct body
+    fn extract_fields(lines: string[], start_idx: i32) -> (FieldDoc[], i32) {
+        let mut fields: FieldDoc[] = []
+        let mut i: i32 = start_idx
+        let mut brace_depth: i32 = 0
+        let mut current_doc: string[] = []
+
+        // Find opening brace
+        while i < lines.size() {
+            let line = lines[i]
+            let mut j: i32 = 0
+            while j < line.size() {
+                if line[j] == '{' { brace_depth = 1; break }
+                j = j + 1
+            }
+            if brace_depth > 0 { i = i + 1; break }
+            i = i + 1
+        }
+
+        while i < lines.size() && brace_depth > 0 {
+            let line = lines[i]
+            let trimmed = std.string.trim(line)
+
+            // Skip comments and blank lines
+            if trimmed.size() == 0 || (trimmed.size() >= 2 && trimmed[0..2] == "//") {
+                if trimmed.size() >= 3 && trimmed[0..3] == "///" {
+                    let doc_text = std.string.trim(trimmed[3..])
+                    current_doc = current_doc ++ [doc_text]
+                }
+                i = i + 1
+                continue
+            }
+
+            // Check for closing brace
+            let mut j: i32 = 0
+            while j < line.size() {
+                if line[j] == '{' { brace_depth = brace_depth + 1 }
+                if line[j] == '}' { brace_depth = brace_depth - 1 }
+                j = j + 1
+            }
+            if brace_depth <= 0 { break }
+
+            // Check for field declaration: "name: type" or "name: type = default"
+            let mut colon_pos: i32 = -1
+            j = 0
+            while j < trimmed.size() {
+                if trimmed[j] == ':' {
+                    colon_pos = j
+                    break
+                }
+                j = j + 1
+            }
+            if colon_pos > 0 {
+                let field_name = std.string.trim(trimmed[0..colon_pos])
+                // Skip whitespace-only field names
+                if field_name.size() > 0 {
+                    let rest = std.string.trim(trimmed[colon_pos+1..])
+                    // Remove trailing comma or default value for type
+                    let mut type_name: string = ""
+                    let mut k: i32 = 0
+                    while k < rest.size() && rest[k] != ',' && rest[k] != '=' {
+                        type_name = type_name ++ rest[k]
+                        k = k + 1
+                    }
+                    type_name = std.string.trim(type_name)
+                    let doc = parse_doc_comment(current_doc)
+                    fields = fields ++ [FieldDoc {
+                        name: field_name,
+                        type_name: type_name,
+                        doc: doc,
+                        line: i + 1
+                    }]
+                }
+            }
+            current_doc = []
+            i = i + 1
+        }
+        return (fields, i)
+    }
+
+    /// Extract attributes from a line (like @Inline, @Extern)
+    fn extract_attributes(line: string) -> string[] {
+        let mut attrs: string[] = []
+        // Attributes are on the line before the decl, starting with @
+        // We check the current or previous line
+        let mut i: i32 = 0
+        while i < line.size() {
+            if line[i] == '@' {
+                let mut attr: string = ""
+                while i < line.size() && line[i] != ' ' && line[i] != '(' {
+                    attr = attr ++ line[i]
+                    i = i + 1
+                }
+                if attr.size() > 0 { attrs = attrs ++ [attr] }
+                // Skip parenthesized content like @Extern("...")
+                if i < line.size() && line[i] == '(' {
+                    let mut depth: i32 = 1
+                    attr = attr ++ "("
+                    i = i + 1
+                    while i < line.size() && depth > 0 {
+                        if line[i] == '(' { depth = depth + 1 }
+                        if line[i] == ')' { depth = depth - 1 }
+                        if depth > 0 { attr = attr ++ line[i] }
+                        i = i + 1
+                    }
+                    attrs[attrs.size()-1] = attr ++ ")"
+                }
+            } else {
+                i = i + 1
+            }
+        }
+        return attrs
+    }
+
+    // -----------------------------------------------------------------
+    //  Main extraction
+    // -----------------------------------------------------------------
+
+    /// Extract documentation from a Vex source file
+    fn extract_file(file_path: string) -> ModuleDoc {
+        let source = std.io.read_all(file_path)
+        if source.size() == 0 {
+            return ModuleDoc {
+                namespace: "", file_path: file_path, description: "",
+                functions: [], types: [], constants: [], line: 0
+            }
+        }
+
+        let lines = std.string.split(source, "\n")
+        let mut i: i32 = 0
+        let mut current_doc_lines: string[] = []
+        let mut current_attrs: string[] = []
+        let mut result = ModuleDoc {
+            namespace: "", file_path: file_path, description: "",
+            functions: [], types: [], constants: [], line: 0
+        }
+
+        while i < lines.size() {
+            let line = lines[i]
+            let trimmed = std.string.trim(line)
+
+            // Check for namespace declaration
+            if trimmed.size() >= 9 && trimmed[0..9] == "namespace" {
+                // Extract namespace name
+                let rest = std.string.trim(trimmed[9..])
+                let mut ns: string = ""
+                let mut j: i32 = 0
+                while j < rest.size() && rest[j] != '{' && rest[j] != ' ' {
+                    ns = ns ++ rest[j]
+                    j = j + 1
+                }
+                result.namespace = std.string.trim(ns)
+            }
+
+            // Collect doc comments
+            if trimmed.size() >= 3 && trimmed[0..3] == "///" {
+                let doc_text = std.string.trim(trimmed[3..])
+                current_doc_lines = current_doc_lines ++ [doc_text]
+                i = i + 1
+                continue
+            }
+
+            // Collect attributes
+            let attrs = extract_attributes(trimmed)
+            if attrs.size() > 0 {
+                current_attrs = attrs
+            }
+
+            // Skip regular comments and blank lines
+            if trimmed.size() == 0 || (trimmed.size() >= 2 && trimmed[0..2] == "//") {
+                i = i + 1
+                continue
+            }
+
+            // Check for function declarations
+            if is_function_decl(trimmed) {
+                let fn_name = extract_fn_name(trimmed)
+                // Collect multi-line signature
+                let remaining = lines[(i+1)..]
+                let sig = extract_fn_signature(trimmed, remaining)
+                let params = extract_params(sig)
+                let ret_type = extract_return_type(sig)
+                let doc = parse_doc_comment(current_doc_lines)
+
+                result.functions = result.functions ++ [FunctionDoc {
+                    name: fn_name,
+                    signature: sig,
+                    params: params,
+                    return_type: ret_type,
+                    is_public: true,
+                    attributes: current_attrs,
+                    doc: doc,
+                    line: i + 1
+                }]
+                current_doc_lines = []
+                current_attrs = []
+                i = i + 1
+                continue
+            }
+
+            // Check for type declarations
+            if is_type_decl(trimmed) {
+                let type_name = extract_type_name(trimmed)
+                let type_kind = extract_type_kind(trimmed)
+                let doc = parse_doc_comment(current_doc_lines)
+
+                // For structs, try to extract fields
+                let mut fields: FieldDoc[] = []
+                if type_kind == "struct" || type_kind == "class" {
+                    let (f, _) = extract_fields(lines, i)
+                    fields = f
+                }
+
+                result.types = result.types ++ [TypeDoc {
+                    name: type_name,
+                    type_kind: type_kind,
+                    fields: fields,
+                    doc: doc,
+                    line: i + 1
+                }]
+                current_doc_lines = []
+                current_attrs = []
+                i = i + 1
+                continue
+            }
+
+            // Check for constant declarations
+            if is_const_decl(trimmed) {
+                result.constants = result.constants ++ [trimmed]
+                current_doc_lines = []
+                current_attrs = []
+                i = i + 1
+                continue
+            }
+
+            // If nothing matched, just move on but reset doc context
+            // (doc comments only apply to the immediately following declaration)
+            if trimmed.size() > 0 {
+                current_doc_lines = []
+                current_attrs = []
+            }
+            i = i + 1
+        }
+
+        // Set description from the first doc comment block found (before any decl)
+        // For now, use namespace as description if no explicit one is found
+        result.description = "Module: " ++ result.namespace
+
+        return result
+    }
+
+    /// Extract documentation from all .vex files in a directory tree
+    fn extract_project(project_dir: string) -> ModuleDoc[] {
+        // This would use filesystem listing. For now, we read the directory.
+        // We rely on the main driver to enumerate files.
+        // Return empty list as placeholder for individual file processing.
+        return []
+    }
+
+} // namespace vexdoc.extract

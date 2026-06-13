@@ -1,0 +1,69 @@
+{
+  "name": "vscode-vex",
+  "displayName": "Vex Language",
+  "description": "Vex programming language support - syntax highlighting, snippets, LSP client, and run/debug commands",
+  "version": "0.1.0",
+  "publisher": "vex-lang",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Snippets",
+    "Language Packs"
+  ],
+  "activationEvents": [
+    "onLanguage:vex"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "vex",
+        "aliases": ["Vex", "vex"],
+        "extensions": [".vex"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "vex",
+        "scopeName": "source.vex",
+        "path": "./syntaxes/vex.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "vex",
+        "path": "./snippets/vex.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "vex.run",
+        "title": "Vex: Compile and Run"
+      },
+      {
+        "command": "vex.build",
+        "title": "Vex: Compile"
+      },
+      {
+        "command": "vex.test",
+        "title": "Vex: Run Tests"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "tsc -p ./tsconfig.json",
+    "compile": "tsc -p ./tsconfig.json",
+    "watch": "tsc -w -p ./tsconfig.json"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.82.0",
+    "typescript": "^5.3.0"
+  }
+}

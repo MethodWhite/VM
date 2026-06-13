@@ -1,0 +1,465 @@
+// vx_gen.vex - Vex code generator for vexbindgen
+// Maps C types to Vex types and generates @Extern declarations
+
+namespace vexbindgen.vx_gen {
+
+    // -----------------------------------------------------------------
+    //  Types
+    // -----------------------------------------------------------------
+
+    type GenConfig = struct {
+        module_name:    string   // library name for @Extern("lib:func")
+        use_hash_names: bool     // use fnv1a hash for function names
+        gen_wrappers:   bool     // generate type-safe wrapper functions
+        gen_consts:     bool     // generate const declarations from macros
+        gen_structs:    bool     // generate struct type definitions
+    }
+
+    type GeneratedOutput = struct {
+        header:   string
+        externs:  string[]
+        structs:  string[]
+        wrappers: string[]
+        consts:   string[]
+        footer:   string
+    }
+
+    // -----------------------------------------------------------------
+    //  C type to Vex type mapping
+    // -----------------------------------------------------------------
+
+    fn c_type_to_vex(c_type: string, is_pointer: bool) -> string {
+        let base = c_type_to_vex_base(c_type)
+        if is_pointer {
+            if base == "char" { return "string" }
+            if base == "void" { return "u64" }
+            if base == "u8" || base == "i8" { return "u64" }
+            return "u64"
+        }
+        return base
+    }
+
+    fn c_type_to_vex_base(c_type: string) -> string {
+        if c_type == "void"        { return "()" }
+        if c_type == "char"        { return "i8" }
+        if c_type == "int"         { return "i32" }
+        if c_type == "short"       { return "i16" }
+        if c_type == "long"        { return "i64" }
+        if c_type == "long long"   { return "i64" }
+        if c_type == "float"       { return "f32" }
+        if c_type == "double"      { return "f64" }
+        if c_type == "size_t"      { return "u64" }
+        if c_type == "ssize_t"     { return "i64" }
+        if c_type == "int8_t"      { return "i8" }
+        if c_type == "uint8_t"     { return "u8" }
+        if c_type == "int16_t"     { return "i16" }
+        if c_type == "uint16_t"    { return "u16" }
+        if c_type == "int32_t"     { return "i32" }
+        if c_type == "uint32_t"    { return "u32" }
+        if c_type == "int64_t"     { return "i64" }
+        if c_type == "uint64_t"    { return "u64" }
+        if c_type == "intptr_t"    { return "i64" }
+        if c_type == "uintptr_t"   { return "u64" }
+        if c_type == "bool"        { return "bool" }
+        if c_type == "unsigned char"  { return "u8" }
+        if c_type == "unsigned int"   { return "u32" }
+        if c_type == "unsigned short" { return "u16" }
+        if c_type == "unsigned long"  { return "u64" }
+        if c_type == "unsigned long long" { return "u64" }
+
+        // If it starts with "struct ", strip it
+        let mut t = c_type
+        if t.size() >= 7 && t[0] == "s" && t[1] == "t" && t[2] == "r"
+            && t[3] == "u" && t[4] == "c" && t[5] == "t" && t[6] == " " {
+            t = ""
+            let mut ci: i32 = 7
+            while ci < c_type.size() {
+                t = t ++ c_type[ci]
+                ci = ci + 1
+            }
+            return trim(t)
+        }
+
+        // If it starts with "union ", strip it
+        if t.size() >= 6 && t[0] == "u" && t[1] == "n" && t[2] == "i"
+            && t[3] == "o" && t[4] == "n" && t[5] == " " {
+            t = ""
+            let mut ci: i32 = 6
+            while ci < c_type.size() {
+                t = t ++ c_type[ci]
+                ci = ci + 1
+            }
+            return trim(t)
+        }
+
+        return t
+    }
+
+    fn trim(s: string) -> string {
+        let mut i: i32 = 0
+        let mut j = s.size() - 1
+        while i <= j && (s[i] == " " || s[i] == "\t") { i = i + 1 }
+        while j >= i && (s[j] == " " || s[j] == "\t") { j = j - 1 }
+        let mut result = ""
+        let mut k: i32 = i
+        while k <= j {
+            result = result ++ s[k]
+            k = k + 1
+        }
+        return result
+    }
+
+    // -----------------------------------------------------------------
+    //  Param to Vex parameter string
+    // -----------------------------------------------------------------
+
+    fn param_to_vex(p: c_parser.Param) -> string {
+        if p.type_name == "..." { return "..." }
+        let vtype = c_type_to_vex(p.type_name, false)
+        if p.name != "" {
+            return p.name ++ ": " ++ vtype
+        }
+        return "_: " ++ vtype
+    }
+
+    fn c_type_has_pointer(c_type: string) -> bool {
+        let mut i: i32 = 0
+        while i < c_type.size() {
+            if c_type[i] == "*" { return true }
+            i = i + 1
+        }
+        return false
+    }
+
+    fn strip_pointer(c_type: string) -> string {
+        let mut result = ""
+        let mut i: i32 = 0
+        while i < c_type.size() {
+            if c_type[i] != "*" && c_type[i] != " " {
+                result = result ++ c_type[i]
+            }
+            i = i + 1
+        }
+        return trim(result)
+    }
+
+    // -----------------------------------------------------------------
+    //  Generate @Extern declaration for a function
+    // -----------------------------------------------------------------
+
+    fn gen_extern_func(config: GenConfig, fd: c_parser.FunctionDecl) -> string[] {
+        let mut lines: string[] = []
+
+        // Build the @Extern annotation
+        let lib = config.module_name
+        let fn_name = fd.name
+
+        if config.use_hash_names {
+            // We emit a comment indicating hash-based naming
+            lines = lines ++ ["    // @Extern(\"" ++ lib ++ ":" ++ fn_name ++ "\")  // fnv1a hash optional"]
+        }
+
+        // Return type
+        let ret_type = c_type_to_vex(fd.return_type, c_type_has_pointer(fd.return_type))
+
+        // Build parameter string
+        let mut param_strs: string[] = []
+        let mut i: i32 = 0
+        while i < fd.params.size() {
+            let p = fd.params[i]
+            let ptype = c_type_to_vex(p.type_name, c_type_has_pointer(p.type_name))
+            if p.name != "" {
+                param_strs = param_strs ++ [p.name ++ ": " ++ ptype]
+            } else {
+                param_strs = param_strs ++ ["_" ++ string(i) ++ ": " ++ ptype]
+            }
+            i = i + 1
+        }
+
+        // Join params
+        let mut param_str = ""
+        i = 0
+        while i < param_strs.size() {
+            if i > 0 { param_str = param_str ++ ", " }
+            param_str = param_str ++ param_strs[i]
+            i = i + 1
+        }
+
+        // Generate the extern declaration
+        let extern_attr = "@Extern(\"" ++ lib ++ ":" ++ fn_name ++ "\")"
+
+        // Only generate return arrow if not void
+        if ret_type == "()" {
+            lines = lines ++ ["    " ++ extern_attr]
+            lines = lines ++ ["    fn " ++ fn_name ++ "(" ++ param_str ++ ")"]
+        } else {
+            lines = lines ++ ["    " ++ extern_attr]
+            lines = lines ++ ["    fn " ++ fn_name ++ "(" ++ param_str ++ ") -> " ++ ret_type]
+        }
+
+        return lines
+    }
+
+    // -----------------------------------------------------------------
+    //  Generate wrapper function with type-safe signature
+    // -----------------------------------------------------------------
+
+    fn gen_wrapper(config: GenConfig, fd: c_parser.FunctionDecl) -> string[] {
+        let mut lines: string[] = []
+
+        let ret_type = c_type_to_vex(fd.return_type, c_type_has_pointer(fd.return_type))
+
+        let mut param_strs: string[] = []
+        let mut call_args: string[] = []
+        let mut i: i32 = 0
+        while i < fd.params.size() {
+            let p = fd.params[i]
+            let ptype = c_type_to_vex(p.type_name, c_type_has_pointer(p.type_name))
+            let pname = if p.name != "" { p.name } else { "_" ++ string(i) }
+            param_strs = param_strs ++ [pname ++ ": " ++ ptype]
+            call_args = call_args ++ [pname]
+            i = i + 1
+        }
+
+        let mut param_str = ""
+        i = 0
+        while i < param_strs.size() {
+            if i > 0 { param_str = param_str ++ ", " }
+            param_str = param_str ++ param_strs[i]
+            i = i + 1
+        }
+
+        let mut call_str = ""
+        i = 0
+        while i < call_args.size() {
+            if i > 0 { call_str = call_str ++ ", " }
+            call_str = call_str ++ call_args[i]
+            i = i + 1
+        }
+
+        lines = lines ++ ["    @Inline"]
+        if ret_type == "()" {
+            lines = lines ++ ["    fn " ++ fd.name ++ "(" ++ param_str ++ ") {"]
+            lines = lines ++ ["        " ++ fd.name ++ "_extern(" ++ call_str ++ ")"]
+            lines = lines ++ ["    }"]
+        } else {
+            lines = lines ++ ["    fn " ++ fd.name ++ "(" ++ param_str ++ ") -> " ++ ret_type ++ " {"]
+            lines = lines ++ ["        return " ++ fd.name ++ "_extern(" ++ call_str ++ ")"]
+            lines = lines ++ ["    }"]
+        }
+
+        return lines
+    }
+
+    // -----------------------------------------------------------------
+    //  Generate struct type definition
+    // -----------------------------------------------------------------
+
+    fn gen_struct(config: GenConfig, sd: c_parser.StructDecl) -> string[] {
+        let mut lines: string[] = []
+
+        lines = lines ++ ["    @Packed"]
+        lines = lines ++ ["    type " ++ sd.name ++ " = struct {"]
+
+        let mut i: i32 = 0
+        while i < sd.fields.size() {
+            let f = sd.fields[i]
+            let vtype: string
+
+            if f.type_kind == c_parser.KIND_POINTER {
+                vtype = "u64"
+            } else if f.type_kind == c_parser.KIND_ARRAY {
+                let base = c_type_to_vex_base(f.type_name)
+                vtype = base ++ "[" ++ f.array_len ++ "]"
+            } else {
+                vtype = c_type_to_vex_base(f.type_name)
+            }
+
+            lines = lines ++ ["        " ++ f.name ++ ": " ++ vtype]
+            i = i + 1
+        }
+
+        lines = lines ++ ["    }"]
+
+        return lines
+    }
+
+    // -----------------------------------------------------------------
+    //  Generate const declarations from macros
+    // -----------------------------------------------------------------
+
+    fn gen_const(config: GenConfig, md: c_parser.MacroDef) -> string[] {
+        let mut lines: string[] = []
+
+        // Try to determine type from value
+        let mut vtype = "i32"
+        let mut val = md.value
+
+        if val != "" {
+            // Check for hex
+            if val.size() >= 2 && val[0] == "0" && (val[1] == "x" || val[1] == "X") {
+                vtype = "u64"
+            }
+            // Check for float
+            let mut has_dot = false
+            let mut ii: i32 = 0
+            while ii < val.size() {
+                if val[ii] == "." { has_dot = true; break }
+                ii = ii + 1
+            }
+            if has_dot { vtype = "f64" }
+            // Check for string
+            if val[0] == "\"" { vtype = "string" }
+
+            lines = lines ++ ["    const " ++ md.name ++ " : " ++ vtype ++ " = " ++ val]
+        }
+
+        return lines
+    }
+
+    // -----------------------------------------------------------------
+    //  Generate enum const declarations
+    // -----------------------------------------------------------------
+
+    fn gen_enum_const(config: GenConfig, ec: c_parser.EnumConst) -> string[] {
+        let mut lines: string[] = []
+
+        if ec.value != "" {
+            lines = lines ++ ["    const " ++ ec.name ++ " : i32 = " ++ ec.value]
+        } else {
+            lines = lines ++ ["    const " ++ ec.name ++ " : i32 = 0  // sequential"]
+        }
+
+        return lines
+    }
+
+    // -----------------------------------------------------------------
+    //  Generate the complete output
+    // -----------------------------------------------------------------
+
+    fn generate(result: c_parser.ParseResult, config: GenConfig) -> string {
+        let mut out_lines: string[] = []
+
+        // Header comment
+        out_lines = out_lines ++ ["// Auto-generated by vexbindgen"]
+        out_lines = out_lines ++ ["// Library: " ++ config.module_name]
+        out_lines = out_lines ++ [""]
+
+        // Start namespace
+        out_lines = out_lines ++ ["namespace " ++ config.module_name ++ " {"]
+        out_lines = out_lines ++ [""]
+
+        // Generate struct definitions
+        if config.gen_structs && result.structs.size() > 0 {
+            out_lines = out_lines ++ ["    // ----------------------------------------"]
+            out_lines = out_lines ++ ["    //  Struct definitions"]
+            out_lines = out_lines ++ ["    // ----------------------------------------"]
+            out_lines = out_lines ++ [""]
+            let mut i: i32 = 0
+            while i < result.structs.size() {
+                let struct_lines = gen_struct(config, result.structs[i])
+                let mut li: i32 = 0
+                while li < struct_lines.size() {
+                    out_lines = out_lines ++ [struct_lines[li]]
+                    li = li + 1
+                }
+                out_lines = out_lines ++ [""]
+                i = i + 1
+            }
+        }
+
+        // Generate const declarations from enums
+        if result.enums.size() > 0 {
+            out_lines = out_lines ++ ["    // ----------------------------------------"]
+            out_lines = out_lines ++ ["    //  Enum constants"]
+            out_lines = out_lines ++ ["    // ----------------------------------------"]
+            out_lines = out_lines ++ [""]
+            let mut i: i32 = 0
+            while i < result.enums.size() {
+                let const_lines = gen_enum_const(config, result.enums[i])
+                let mut li: i32 = 0
+                while li < const_lines.size() {
+                    out_lines = out_lines ++ [const_lines[li]]
+                    li = li + 1
+                }
+                i = i + 1
+            }
+            out_lines = out_lines ++ [""]
+        }
+
+        // Generate const declarations from macros
+        if config.gen_consts && result.macros.size() > 0 {
+            out_lines = out_lines ++ ["    // ----------------------------------------"]
+            out_lines = out_lines ++ ["    //  Macro constants"]
+            out_lines = out_lines ++ ["    // ----------------------------------------"]
+            out_lines = out_lines ++ [""]
+            let mut i: i32 = 0
+            while i < result.macros.size() {
+                let const_lines = gen_const(config, result.macros[i])
+                let mut li: i32 = 0
+                while li < const_lines.size() {
+                    out_lines = out_lines ++ [const_lines[li]]
+                    li = li + 1
+                }
+                i = i + 1
+            }
+            out_lines = out_lines ++ [""]
+        }
+
+        // Generate @Extern function declarations
+        if result.functions.size() > 0 {
+            out_lines = out_lines ++ ["    // ----------------------------------------"]
+            out_lines = out_lines ++ ["    //  External function declarations"]
+            out_lines = out_lines ++ ["    // ----------------------------------------"]
+            out_lines = out_lines ++ [""]
+
+            let mut i: i32 = 0
+            while i < result.functions.size() {
+                let fn_lines = gen_extern_func(config, result.functions[i])
+                let mut li: i32 = 0
+                while li < fn_lines.size() {
+                    out_lines = out_lines ++ [fn_lines[li]]
+                    li = li + 1
+                }
+                out_lines = out_lines ++ [""]
+                i = i + 1
+            }
+        }
+
+        // Generate wrapper functions
+        if config.gen_wrappers && result.functions.size() > 0 {
+            out_lines = out_lines ++ ["    // ----------------------------------------"]
+            out_lines = out_lines ++ ["    //  Type-safe wrapper functions"]
+            out_lines = out_lines ++ ["    // ----------------------------------------"]
+            out_lines = out_lines ++ [""]
+
+            let mut i: i32 = 0
+            while i < result.functions.size() {
+                let wrap_lines = gen_wrapper(config, result.functions[i])
+                let mut li: i32 = 0
+                while li < wrap_lines.size() {
+                    out_lines = out_lines ++ [wrap_lines[li]]
+                    li = li + 1
+                }
+                out_lines = out_lines ++ [""]
+                i = i + 1
+            }
+        }
+
+        // Close namespace
+        out_lines = out_lines ++ ["} // namespace " ++ config.module_name]
+        out_lines = out_lines ++ [""]
+
+        // Join all lines
+        let mut output = ""
+        let mut i: i32 = 0
+        while i < out_lines.size() {
+            if i > 0 { output = output ++ "\n" }
+            output = output ++ out_lines[i]
+            i = i + 1
+        }
+
+        return output
+    }
+
+} // namespace vexbindgen.vx_gen

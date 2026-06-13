@@ -1,0 +1,328 @@
+// tools/vexfmt/rules.vex
+// Formatting rules engine for vexfmt.
+// Rule definitions as data structures. Customizable via .vexfmt.json.
+
+enum RuleCategory {
+    Indentation,
+    Spacing,
+    LineBreaks,
+    Ordering
+}
+
+enum RuleSeverity {
+    Error,
+    Warning,
+    Ignore
+}
+
+struct FormatRule {
+    string name;
+    RuleCategory category;
+    RuleSeverity severity;
+    string description;
+    string config_path;
+    string default_value;
+}
+
+struct ConfigOverride {
+    string rule_name;
+    string value;
+}
+
+struct IndentConfig {
+    i32 size;
+    bool use_spaces;
+}
+
+struct SpacingConfig {
+    bool before_parenthesis;
+    bool around_binary;
+    bool after_comma;
+    bool after_colon;
+    bool after_semicolon;
+}
+
+struct LineBreakConfig {
+    i32 max_width;
+    bool braces_same_line;
+    bool blank_line_between_fns;
+    i32 blank_lines_between_fns;
+}
+
+struct OrderingConfig {
+    bool imports_first;
+    bool consts_before_vars;
+    bool fns_after_types;
+    bool public_before_private;
+}
+
+struct VexfmtConfig {
+    IndentConfig indent;
+    SpacingConfig spacing;
+    LineBreakConfig line_breaks;
+    OrderingConfig ordering;
+    map<string, string> overrides;
+}
+
+// Default configuration matching Vex conventions.
+fn VexfmtConfig default_config() {
+    VexfmtConfig cfg;
+    cfg.indent.size = 4;
+    cfg.indent.use_spaces = true;
+    cfg.spacing.before_parenthesis = false;
+    cfg.spacing.around_binary = true;
+    cfg.spacing.after_comma = true;
+    cfg.spacing.after_colon = true;
+    cfg.spacing.after_semicolon = true;
+    cfg.line_breaks.max_width = 100;
+    cfg.line_breaks.braces_same_line = true;
+    cfg.line_breaks.blank_line_between_fns = true;
+    cfg.line_breaks.blank_lines_between_fns = 1;
+    cfg.ordering.imports_first = true;
+    cfg.ordering.consts_before_vars = true;
+    cfg.ordering.fns_after_types = true;
+    cfg.ordering.public_before_private = true;
+    return cfg;
+}
+
+// Built-in rules table.
+fn FormatRule[] builtin_rules() {
+    FormatRule[] rules;
+    rules.resize(14);
+
+    rules[0].name = "indent_size";
+    rules[0].category = RuleCategory.Indentation;
+    rules[0].severity = RuleSeverity.Error;
+    rules[0].description = "Indentation size in spaces";
+    rules[0].config_path = "indent.size";
+    rules[0].default_value = "4";
+
+    rules[1].name = "indent_style";
+    rules[1].category = RuleCategory.Indentation;
+    rules[1].severity = RuleSeverity.Error;
+    rules[1].description = "Use spaces instead of tabs";
+    rules[1].config_path = "indent.use_spaces";
+    rules[1].default_value = "true";
+
+    rules[2].name = "space_before_paren";
+    rules[2].category = RuleCategory.Spacing;
+    rules[2].severity = RuleSeverity.Error;
+    rules[2].description = "No space before parenthesis in function calls";
+    rules[2].config_path = "spacing.before_parenthesis";
+    rules[2].default_value = "false";
+
+    rules[3].name = "space_around_binary";
+    rules[3].category = RuleCategory.Spacing;
+    rules[3].severity = RuleSeverity.Error;
+    rules[3].description = "Spaces around binary operators";
+    rules[3].config_path = "spacing.around_binary";
+    rules[3].default_value = "true";
+
+    rules[4].name = "space_after_comma";
+    rules[4].category = RuleCategory.Spacing;
+    rules[4].severity = RuleSeverity.Error;
+    rules[4].description = "Space after comma";
+    rules[4].config_path = "spacing.after_comma";
+    rules[4].default_value = "true";
+
+    rules[5].name = "space_after_colon";
+    rules[5].category = RuleCategory.Spacing;
+    rules[5].severity = RuleSeverity.Error;
+    rules[5].description = "Space after colon";
+    rules[5].config_path = "spacing.after_colon";
+    rules[5].default_value = "true";
+
+    rules[6].name = "space_after_semicolon";
+    rules[6].category = RuleCategory.Spacing;
+    rules[6].severity = RuleSeverity.Error;
+    rules[6].description = "Space after semicolon in for loops";
+    rules[6].config_path = "spacing.after_semicolon";
+    rules[6].default_value = "true";
+
+    rules[7].name = "max_line_width";
+    rules[7].category = RuleCategory.LineBreaks;
+    rules[7].severity = RuleSeverity.Warning;
+    rules[7].description = "Maximum line width in characters";
+    rules[7].config_path = "line_breaks.max_width";
+    rules[7].default_value = "100";
+
+    rules[8].name = "brace_style";
+    rules[8].category = RuleCategory.LineBreaks;
+    rules[8].severity = RuleSeverity.Error;
+    rules[8].description = "K&R brace style (same line)";
+    rules[8].config_path = "line_breaks.braces_same_line";
+    rules[8].default_value = "true";
+
+    rules[9].name = "blank_line_between_fns";
+    rules[9].category = RuleCategory.LineBreaks;
+    rules[9].severity = RuleSeverity.Warning;
+    rules[9].description = "Single blank line between functions";
+    rules[9].config_path = "line_breaks.blank_line_between_fns";
+    rules[9].default_value = "true";
+
+    rules[10].name = "ordering_imports_first";
+    rules[10].category = RuleCategory.Ordering;
+    rules[10].severity = RuleSeverity.Warning;
+    rules[10].description = "Imports must appear before declarations";
+    rules[10].config_path = "ordering.imports_first";
+    rules[10].default_value = "true";
+
+    rules[11].name = "ordering_consts_before_vars";
+    rules[11].category = RuleCategory.Ordering;
+    rules[11].severity = RuleSeverity.Warning;
+    rules[11].description = "Constants before mutable variables";
+    rules[11].config_path = "ordering.consts_before_vars";
+    rules[11].default_value = "true";
+
+    rules[12].name = "ordering_fns_after_types";
+    rules[12].category = RuleCategory.Ordering;
+    rules[12].severity = RuleSeverity.Warning;
+    rules[12].description = "Functions after type declarations";
+    rules[12].config_path = "ordering.fns_after_types";
+    rules[12].default_value = "true";
+
+    rules[13].name = "ordering_public_before_private";
+    rules[13].category = RuleCategory.Ordering;
+    rules[13].severity = RuleSeverity.Warning;
+    rules[13].description = "Public members before private members";
+    rules[13].config_path = "ordering.public_before_private";
+    rules[13].default_value = "true";
+
+    return rules;
+}
+
+// Load config from .vexfmt.json if present, else return defaults.
+fn VexfmtConfig load_config(string path) {
+    string full_path;
+    if (path == "") {
+        full_path = ".vexfmt.json";
+    } else {
+        full_path = path;
+    }
+
+    VexfmtConfig cfg = default_config();
+
+    i64 fh = open(full_path, O_READ);
+    if (fh == 0) {
+        return cfg;
+    }
+
+    string content = read_all(fh);
+    close(fh);
+
+    // Parse JSON and apply overrides (simplified).
+    // In a full implementation, use json_parse from stdlib.
+    // Here we do basic key-value extraction.
+    map<string, string> parsed = json_simple_parse(content);
+    string[] keys = parsed.keys();
+    i32 i = 0;
+    while (i < keys.size()) {
+        string key = keys[i];
+        string val = parsed.get(key);
+        cfg.overrides.put(key, val);
+        i = i + 1;
+    }
+
+    return cfg;
+}
+
+// Apply a single formatting rule to a source line.
+// Returns the corrected line or empty string if no change needed.
+fn string apply_rule(FormatRule rule, string line, VexfmtConfig cfg) {
+    string result = line;
+
+    if (rule.name == "indent_size") {
+        // Check leading spaces are multiple of indent size.
+        i32 leading = 0;
+        while (leading < str_bytes(line) && str_get_char(line, leading) == ' ') {
+            leading = leading + 1;
+        }
+        i32 indent_sz = parse_i32(cfg.overrides.getOrDefault("indent_size",
+                                        rule.default_value));
+        if (leading % indent_sz != 0) {
+            // Fix indentation (approximate).
+            i32 level = leading / indent_sz;
+            if (leading % indent_sz >= indent_sz / 2) {
+                level = level + 1;
+            }
+            string new_leading = str_repeat(" ", level * indent_sz);
+            result = new_leading + str_trim_start(line);
+        }
+    }
+
+    if (rule.name == "space_around_binary") {
+        // Simplified: ensure spaces around =, +, -, *, /, etc.
+        // This is AST-based in the full formatter; here we do basic fix.
+        result = fix_binary_spacing(result);
+    }
+
+    if (rule.name == "space_after_comma") {
+        result = fix_comma_spacing(result);
+    }
+
+    return result;
+}
+
+// Simple binary operator spacing fix (non-AST approximation).
+fn string fix_binary_spacing(string line) {
+    string ops = "=+-*/%&|^<>)!";
+    // Skip strings and comments.
+    string result = line;
+    i32 i = 0;
+    while (i < str_bytes(result)) {
+        i32 c = str_get_char(result, i);
+        if (c == '"') {
+            // Skip string literal.
+            i = i + 1;
+            while (i < str_bytes(result) && str_get_char(result, i) != '"') {
+                i = i + 1;
+            }
+            i = i + 1;
+            continue;
+        }
+        if (c == '/' && i + 1 < str_bytes(result)
+            && str_get_char(result, i + 1) == '/') {
+            break;  // rest is comment
+        }
+        // Check if char is an operator that needs spaces.
+        if (c == '=' || c == '+' || c == '-' || c == '*' || c == '/' || c == '%'
+            || c == '&' || c == '|' || c == '^' || c == '<' || c == '>'
+            || c == '!') {
+            // Ensure space before (unless start of line or already space).
+            if (i > 0 && str_get_char(result, i - 1) != ' ') {
+                string before = str_substring(result, 0, i);
+                string after = str_substring(result, i);
+                result = before + " " + after;
+                i = i + 1;
+            }
+            // Ensure space after (unless end of line or already space or next is operator).
+            if (i + 1 < str_bytes(result) && str_get_char(result, i + 1) != ' ') {
+                string before = str_substring(result, 0, i + 1);
+                string after = str_substring(result, i + 1);
+                result = before + " " + after;
+                i = i + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+// Fix spacing after commas.
+fn string fix_comma_spacing(string line) {
+    string result = line;
+    i32 i = 0;
+    while (i < str_bytes(result)) {
+        i32 c = str_get_char(result, i);
+        if (c == ',') {
+            if (i + 1 < str_bytes(result) && str_get_char(result, i + 1) != ' ') {
+                string before = str_substring(result, 0, i + 1);
+                string after = str_substring(result, i + 1);
+                result = before + " " + after;
+                i = i + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return result;
+}

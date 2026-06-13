@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vexpm - Registry de Paquetes Vex</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .package-card { cursor: pointer; transition: all 0.2s; }
+  .package-card:hover { border-color: var(--accent); transform: translateY(-1px); box-shadow: var(--shadow); }
+  .package-name { font-weight: 600; }
+  .package-stats { font-size: 0.85rem; color: var(--text-secondary); white-space: nowrap; }
+
+  .featured-section { margin-bottom: 2rem; }
+  .featured-section h2 { margin-bottom: 0.75rem; }
+
+  .hero {
+    text-align: center; padding: 2.5rem 1rem; margin-bottom: 2rem;
+    background: linear-gradient(135deg, var(--bg-secondary), var(--bg-tertiary));
+    border: 1px solid var(--border); border-radius: var(--radius);
+  }
+  .hero h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+  .hero p { color: var(--text-secondary); max-width: 500px; margin: 0 auto 1.25rem; }
+  .hero .badge { font-size: 0.8rem; }
+
+  .stats-row {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 1rem; margin-bottom: 1.5rem;
+  }
+  .stat-card {
+    text-align: center; padding: 1rem;
+    background: var(--bg-secondary); border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .stat-value { font-size: 1.5rem; font-weight: 700; color: var(--accent); }
+  .stat-label { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.15rem; }
+
+  .detail-loading { display: none; }
+  .error-indicator { display: none; }
+
+  table { border-collapse: collapse; width: 100%; }
+  table td, table th { padding: 0.4rem 0; }
+</style>
+</head>
+<body>
+<nav class="navbar">
+  <a href="registry.html" class="navbar-brand">
+    <svg class="icon" viewBox="0 0 24 24" fill="currentColor"><path d="M4 3h16v2H4V3zm1 4h14v2H5V7zm2 4h10v2H7v-2zm3 4h4v6h-4v-6z"/></svg>
+    Vexpm Registry
+  </a>
+  <div class="navbar-links">
+    <a href="tutorial.html">Tutorial</a>
+    <a href="registry.html" class="active">Registry</a>
+  </div>
+</nav>
+
+<div class="container" id="registry-app">
+  <div id="package-detail">
+    <div class="hero">
+      <h1><svg class="icon" viewBox="0 0 24 24" fill="currentColor" style="width:1.5em;height:1.5em;vertical-align:-0.3em"><path d="M4 3h16v2H4V3zm1 4h14v2H5V7zm2 4h10v2H7v-2zm3 4h4v6h-4v-6z"/></svg> Vexpm</h1>
+      <p>Registro oficial de paquetes para el lenguaje Vex. Busca, instala y comparte paquetes.</p>
+      <div>
+        <span class="badge badge-blue">v0.4.0</span>
+        <span class="badge badge-green">MIT</span>
+      </div>
+    </div>
+
+    <div class="stats-row">
+      <div class="stat-card"><div class="stat-value">12</div><div class="stat-label">Paquetes</div></div>
+      <div class="stat-card"><div class="stat-value">76.5K</div><div class="stat-label">Descargas totales</div></div>
+      <div class="stat-card"><div class="stat-value">7</div><div class="stat-label">Autores</div></div>
+      <div class="stat-card"><div class="stat-value">6</div><div class="stat-label">Actualizados esta semana</div></div>
+    </div>
+
+    <div class="search-bar">
+      <input type="text" id="search-input" placeholder="Buscar paquetes..." autocomplete="off">
+    </div>
+
+    <div class="sort-controls">
+      <label for="sort-select">Ordenar por:</label>
+      <select id="sort-select">
+        <option value="downloads">Descargas</option>
+        <option value="name">Nombre</option>
+        <option value="updated">Última actualización</option>
+        <option value="version">Versión</option>
+      </select>
+      <span style="margin-left:auto;font-size:0.85rem;color:var(--text-muted)" id="package-count">0 paquetes</span>
+    </div>
+
+    <div id="loading-indicator" class="loading" style="display:none">
+      <div class="spinner"></div>
+      <p>Cargando paquetes...</p>
+    </div>
+
+    <div id="error-indicator" class="alert alert-error error-indicator" style="display:none"></div>
+
+    <div class="grid grid-2" id="package-list"></div>
+  </div>
+</div>
+
+<script src="registry.js"></script>
+</body>
+</html>

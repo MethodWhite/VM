@@ -1,0 +1,97 @@
+// vexbuild/profile.vex - Build profile definitions
+// Defines standard and custom build profiles for vexbuild.
+
+namespace vexbuild.profile {
+
+    type Profile = struct {
+        name:          string
+        opt_level:     i32     // 0-3
+        debug_info:    bool
+        strip_symbols: bool
+        lto:           bool
+        optimize_for:  string  // "speed", "size", or ""
+    }
+
+    fn default_release() -> Profile {
+        return Profile {
+            name: "release", opt_level: 3,
+            debug_info: false, strip_symbols: true,
+            lto: true, optimize_for: "speed"
+        }
+    }
+
+    fn default_debug() -> Profile {
+        return Profile {
+            name: "debug", opt_level: 0,
+            debug_info: true, strip_symbols: false,
+            lto: false, optimize_for: ""
+        }
+    }
+
+    fn default_size() -> Profile {
+        return Profile {
+            name: "size", opt_level: 2,
+            debug_info: false, strip_symbols: true,
+            lto: true, optimize_for: "size"
+        }
+    }
+
+    fn get_default(name: string) -> Profile {
+        if name == "release" { return default_release() }
+        elif name == "debug" { return default_debug() }
+        elif name == "size"  { return default_size() }
+        else { return default_debug() }
+    }
+
+    fn profile_to_flags(p: Profile) -> string {
+        let mut flags: string = ""
+        flags = flags ++ " -O" ++ i32_to_str(p.opt_level)
+        if p.debug_info {
+            flags = flags ++ " -g"
+        }
+        if p.strip_symbols {
+            flags = flags ++ " --strip"
+        }
+        if p.lto {
+            flags = flags ++ " --lto"
+        }
+        if p.optimize_for == "size" {
+            flags = flags ++ " --optimize-for-size"
+        }
+        return flags
+    }
+
+    type ProfileConfig = struct {
+        profiles: Profile[]
+    }
+
+    fn parse_json_config(json_str: string) -> ProfileConfig {
+        let cfg = ProfileConfig { profiles: [] }
+        let parsed = std.json.parse(json_str)
+        if parsed.kind != 5 { return cfg }
+        let profs = std.json.get_field(parsed, "profiles")
+        if profs.kind != 4 { return cfg }
+        let items = std.json.get_items(profs)
+        for item in items {
+            if item.kind != 5 { continue }
+            let name_field = std.json.get_field(item, "name")
+            let opt_field  = std.json.get_field(item, "opt_level")
+            let dbg_field  = std.json.get_field(item, "debug_info")
+            let strp_field = std.json.get_field(item, "strip")
+            let lto_field  = std.json.get_field(item, "lto")
+            let size_field = std.json.get_field(item, "optimize_for")
+            if name_field.kind != 3 { continue }
+            let p = Profile {
+                name:          name_field.s,
+                opt_level:     if opt_field.kind == 2 { i32(opt_field.n) } else { 0 },
+                debug_info:    if dbg_field.kind == 1 { dbg_field.b } else { false },
+                strip_symbols: if strp_field.kind == 1 { strp_field.b } else { false },
+                lto:           if lto_field.kind == 1 { lto_field.b } else { false },
+                optimize_for:  if size_field.kind == 3 { size_field.s } else { "" }
+            }
+            cfg.profiles = cfg.profiles ++ [p]
+        }
+        return cfg
+    }
+
+} // namespace vexbuild.profile

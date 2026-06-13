@@ -1,0 +1,269 @@
+// vexbuild/vexbuild.vex - Vex Build System
+// Usage: vexbuild <command> [options]
+//   vexbuild build --release   Build with release profile
+//   vexbuild build --debug     Build with debug profile
+//   vexbuild clean             Remove build artifacts
+//   vexbuild run               Build and run
+//   vexbuild bench             Build and run benchmarks
+//   vexbuild target wasm       Cross-compile to WebAssembly
+//   vexbuild target native     Compile to native (via AOT)
+
+import vexbuild.profile.*
+import vexbuild.cross.*
+
+namespace vexbuild {
+
+    type BuildConfig = struct {
+        profile:      Profile
+        target:       cross.TargetConfig
+        source_dir:   string
+        output_dir:   string
+        main_source:  string
+        output_name:  string
+    }
+
+    fn default_config() -> BuildConfig {
+        return BuildConfig {
+            profile:     profile.default_debug(),
+            target:      cross.native_target(),
+            source_dir:  ".",
+            output_dir:  "./build",
+            main_source: "main.vex",
+            output_name: "output"
+        }
+    }
+
+    // ---- argument parsing ----
+
+    type CliArgs = struct {
+        command: string     // "build", "clean", "run", "bench", "target"
+        profile: string     // "release", "debug", or custom name
+        target:  string     // "native", "wasm", "arm64", or triple
+        has_profile: bool
+        has_target:  bool
+    }
+
+    fn parse_args(args: string[]) -> CliArgs {
+        let result = CliArgs {
+            command: "", profile: "", target: "",
+            has_profile: false, has_target: false
+        }
+        if args.size() < 2 { return result }
+
+        result.command = args[1]
+
+        let mut i: i32 = 2
+        while i < args.size() {
+            if args[i] == "--release" {
+                result.profile = "release"
+                result.has_profile = true
+            } elif args[i] == "--debug" {
+                result.profile = "debug"
+                result.has_profile = true
+            } elif args[i] == "--profile" || args[i] == "-p" {
+                i = i + 1
+                if i < args.size() {
+                    result.profile = args[i]
+                    result.has_profile = true
+                }
+            }
+            i = i + 1
+        }
+
+        // For `vexbuild target wasm`, the target is the second arg
+        if result.command == "target" && args.size() > 2 {
+            result.target = args[2]
+            result.has_target = true
+        }
+
+        return result
+    }
+
+    // ---- build commands ----
+
+    fn compile(cfg: BuildConfig) -> bool {
+        let profile_flags = profile.profile_to_flags(cfg.profile)
+        let target_flags  = cross.target_to_flag(cfg.target)
+
+        let cmd = "vm --vex " ++ cfg.main_source
+            ++ profile_flags ++ target_flags
+            ++ " -o " ++ cfg.output_dir ++ "/" ++ cfg.output_name
+
+        println("vexbuild: compiling " ++ cfg.main_source ++ " ...")
+        println("vexbuild: " ++ cmd)
+
+        let result = std.system.shell(cmd)
+        if result != "" {
+            println(result)
+        }
+
+        // Check if output file exists
+        let output_path = cfg.output_dir ++ "/" ++ cfg.output_name
+        let ok = std.io.exists(output_path)
+        if ok {
+            println("vexbuild: build OK -> " ++ output_path)
+        } else {
+            println("vexbuild: build FAILED")
+        }
+        return ok
+    }
+
+    fn build(args: CliArgs) -> i32 {
+        let mut cfg = default_config()
+
+        if args.has_profile {
+            cfg.profile = profile.get_default(args.profile)
+        }
+
+        // Read vex.json if it exists
+        if std.io.exists("vex.json") {
+            let json_str = std.io.read_all("vex.json")
+            let parsed = std.json.parse(json_str)
+            if parsed.kind == 5 {
+                let src_field = std.json.get_field(parsed, "source")
+                if src_field.kind == 3 { cfg.main_source = src_field.s }
+
+                let out_field = std.json.get_field(parsed, "output")
+                if out_field.kind == 3 { cfg.output_name = out_field.s }
+
+                let dir_field = std.json.get_field(parsed, "build_dir")
+                if dir_field.kind == 3 { cfg.output_dir = dir_field.s }
+
+                // Load custom profile if specified
+                if args.has_profile && profile.get_default(args.profile).name != args.profile {
+                    let pcfg = profile.parse_json_config(json_str)
+                    for p in pcfg.profiles {
+                        if p.name == args.profile {
+                            cfg.profile = p
+                        }
+                    }
+                }
+            }
+        }
+
+        // Ensure build directory exists
+        std.system.mkdir(cfg.output_dir)
+
+        if compile(cfg) { return 0 }
+        return 1
+    }
+
+    fn clean() -> i32 {
+        println("vexbuild: cleaning build artifacts...")
+        if std.io.exists("build") {
+            let files = std.system.list_dir("build")
+            for f in files {
+                let path = "build/" ++ f
+                std.io.delete(path)
+            }
+            println("vexbuild: cleaned " ++ i32_to_str(files.size()) ++ " files")
+        } else {
+            println("vexbuild: no build directory found")
+        }
+        return 0
+    }
+
+    fn run(args: CliArgs) -> i32 {
+        let code = build(args)
+        if code != 0 { return code }
+
+        let bin_path = "./build/output"
+        println("vexbuild: running " ++ bin_path ++ " ...")
+        let result = std.system.shell(bin_path)
+        println(result)
+        return 0
+    }
+
+    fn bench(args: CliArgs) -> i32 {
+        // Build with release profile for benchmarking
+        let mut bench_args = args
+        if !bench_args.has_profile {
+            bench_args.profile = "release"
+            bench_args.has_profile = true
+        }
+
+        let code = build(bench_args)
+        if code != 0 { return code }
+
+        let bin_path = "./build/output"
+        println("vexbuild: benchmarking " ++ bin_path ++ " ...")
+        let result = std.system.shell("perf stat " ++ bin_path ++ " 2>&1")
+        println(result)
+        return 0
+    }
+
+    fn target_cmd(args: CliArgs) -> i32 {
+        if !args.has_target {
+            println("vexbuild: error - no target specified")
+            println("usage: vexbuild target <wasm|native|arm64>")
+            return 1
+        }
+
+        let tc = cross.resolve_target(args.target)
+        println("vexbuild: target=" ++ args.target)
+        println("  arch:   " ++ tc.arch.name)
+        println("  vendor: " ++ tc.arch.vendor)
+        println("  system: " ++ tc.arch.system)
+        println("  abi:    " ++ tc.arch.abi)
+        println("  linker: " ++ tc.linker)
+
+        // Build with cross-compilation target
+        let mut cfg = default_config()
+        cfg.target = tc
+        if args.has_profile {
+            cfg.profile = profile.get_default(args.profile)
+        }
+
+        if compile(cfg) { return 0 }
+        return 1
+    }
+
+    fn print_usage() {
+        println("vexbuild - Vex Build System")
+        println("")
+        println("Usage:")
+        println("  vexbuild build --release   Build with release profile")
+        println("  vexbuild build --debug     Build with debug profile")
+        println("  vexbuild clean             Remove build artifacts")
+        println("  vexbuild run               Build and run")
+        println("  vexbuild bench             Build and run benchmarks")
+        println("  vexbuild target wasm       Cross-compile to WebAssembly")
+        println("  vexbuild target native     Compile to native (via AOT)")
+        println("  vexbuild target arm64      Cross-compile to ARM64")
+        println("")
+        println("Profiles:")
+        println("  release: opt_level=3, debug=false, strip=true,  lto=true")
+        println("  debug:   opt_level=0, debug=true,  strip=false, lto=false")
+        println("  size:    opt_level=2, debug=false, strip=true,  lto=true (optimize for size)")
+        println("")
+        println("Custom profiles can be defined in vex.json")
+    }
+
+    i32 main() {
+        let args = std.system.args()
+
+        if args.size() < 2 {
+            print_usage()
+            return 0
+        }
+
+        let parsed = parse_args(args)
+
+        if parsed.command == "build" {
+            return build(parsed)
+        } elif parsed.command == "clean" {
+            return clean()
+        } elif parsed.command == "run" {
+            return run(parsed)
+        } elif parsed.command == "bench" {
+            return bench(parsed)
+        } elif parsed.command == "target" {
+            return target_cmd(parsed)
+        } else {
+            println("vexbuild: unknown command '" ++ parsed.command ++ "'")
+            print_usage()
+            return 1
+        }
+    }
+
+} // namespace vexbuild

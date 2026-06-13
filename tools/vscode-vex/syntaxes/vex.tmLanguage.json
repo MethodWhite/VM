@@ -1,0 +1,88 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Vex",
+  "scopeName": "source.vex",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#annotations" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "begin": "/\\*",
+          "end": "\\*/",
+          "name": "comment.block.vex"
+        },
+        {
+          "begin": "//",
+          "end": "$",
+          "name": "comment.line.double-slash.vex"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.vex",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "match": "\\\\.",
+          "name": "constant.character.escape.vex"
+        },
+        {
+          "begin": "\\$\\{",
+          "beginCaptures": {
+            "0": { "name": "keyword.interpolation.vex" }
+          },
+          "end": "\\}",
+          "endCaptures": {
+            "0": { "name": "keyword.interpolation.vex" }
+          },
+          "patterns": [
+            { "include": "#numbers" },
+            { "include": "#keywords" },
+            { "include": "#types" }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "name": "constant.numeric.vex",
+      "match": "\\b[0-9][0-9_]*([.][0-9][0-9_]*)?([eE][+-]?[0-9][0-9_]*)?\\b"
+    },
+    "annotations": {
+      "name": "keyword.annotation.vex",
+      "match": "@(Extern|Inline|Macro|Solid|Photon)"
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.vex",
+          "match": "\\b(if|else|while|for|return|break|continue|match|case|spawn|await|async)\\b"
+        },
+        {
+          "name": "keyword.declaration.vex",
+          "match": "\\b(fn|let|mut|import|namespace|type|struct|enum|const)\\b"
+        },
+        {
+          "name": "constant.language.vex",
+          "match": "\\b(true|false)\\b"
+        }
+      ]
+    },
+    "types": {
+      "name": "storage.type.vex",
+      "match": "\\b(i32|i64|u32|u64|f32|f64|bool|string|void)\\b"
+    },
+    "operators": {
+      "name": "keyword.operator.vex",
+      "match": "(?:\\+|-|\\*|/|%|==?|!=|<=?|>=?|&&|\\|\\||!|&|\\||\\^|~|<<|>>)"
+    }
+  }
+}

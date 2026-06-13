@@ -1,0 +1,409 @@
+// tools/vexlint/vexlint.vex
+// Vex Linter - vexlint
+// Usage:
+//   vexlint file.vex         Lint a file
+//   vexlint --fix file.vex   Auto-fix warnings
+//   vexlint --ci src/        CI mode (exit code 1 on any warning)
+
+// Configuration for the linter.
+struct VexlintConfig {
+    bool fix;
+    bool ci_mode;
+    bool verbose;
+    string target;
+    string config_path;
+    map<string, string> rule_overrides;
+}
+
+// Load config from .vexlint.json if present.
+fn VexlintConfig load_lint_config(string path) {
+    VexlintConfig cfg;
+    cfg.fix = false;
+    cfg.ci_mode = false;
+    cfg.verbose = false;
+    cfg.target = "";
+    cfg.config_path = path;
+
+    if (path == "") {
+        path = ".vexlint.json";
+    }
+
+    i64 fh = open(path, O_READ);
+    if (fh == 0) {
+        return cfg;
+    }
+
+    string content = read_all(fh);
+    close(fh);
+
+    // Parse simple JSON overrides.
+    map<string, string> parsed = json_simple_parse(content);
+    cfg.rule_overrides = parsed;
+
+    return cfg;
+}
+
+// Run all lint rules on a source file.
+fn LintResult lint_file(string source, VexlintConfig cfg) {
+    LintResult result;
+    result.success = true;
+    result.error_count = 0;
+    result.warning_count = 0;
+    result.info_count = 0;
+
+    // Load the lint rules.
+    LintRule[] rules = builtin_lint_rules();
+
+    // Adjust rule severities from config overrides.
+    i32 i = 0;
+    while (i < rules.size()) {
+        string rule_name = rules[i].name;
+        if (cfg.rule_overrides.has(rule_name)) {
+            string override = cfg.rule_overrides.get(rule_name);
+            if (override == "error") {
+                rules[i].severity = LintSeverity.Error;
+            } else if (override == "warning") {
+                rules[i].severity = LintSeverity.Warning;
+            } else if (override == "info") {
+                rules[i].severity = LintSeverity.Info;
+            } else if (override == "off") {
+                rules[i].severity = LintSeverity.Hint; // effectively skip
+            }
+        }
+        i = i + 1;
+    }
+
+    // Run each rule.
+    i = 0;
+    while (i < rules.size()) {
+        LintRule rule = rules[i];
+
+        if (rule.severity == LintSeverity.Hint) {
+            i = i + 1;
+            continue; // Rule disabled
+        }
+
+        if (rule.name == "unused_variable") {
+            ScopeInfo scope = build_scope_tree(source);
+            check_unused_variables(scope, result, rule);
+        }
+
+        if (rule.name == "unused_function") {
+            ScopeInfo scope = build_scope_tree(source);
+            check_unused_functions(scope, result, rule);
+        }
+
+        if (rule.name == "shadowing") {
+            ScopeInfo scope = build_scope_tree(source);
+            ScopeInfo[] ancestors;
+            check_shadowing(scope, result, rule, ancestors);
+        }
+
+        if (rule.name == "naming_convention") {
+            check_naming_conventions(source, result, rule);
+        }
+
+        if (rule.name == "no_global_mutable") {
+            check_global_mutable(source, result, rule);
+        }
+
+        if (rule.name == "no_unused_import") {
+            check_unused_imports(source, result, rule);
+        }
+
+        if (rule.name == "prefer_const") {
+            check_prefer_const(source, result, rule);
+        }
+
+        i = i + 1;
+    }
+
+    // Determine overall success.
+    if (result.error_count > 0) {
+        result.success = false;
+    }
+    if (cfg.ci_mode && (result.warning_count > 0 || result.error_count > 0)) {
+        result.success = false;
+    }
+
+    return result;
+}
+
+// Apply auto-fixes for fixable diagnostics.
+fn string apply_fixes(string source, LintResult lint_result) {
+    string result = source;
+    string[] lines = str_split_lines(source);
+
+    // Apply fixes in reverse order to preserve line numbers.
+    i32 i = lint_result.diagnostics.size() - 1;
+    while (i >= 0) {
+        LintDiagnostic diag = lint_result.diagnostics[i];
+        if (diag.has_fix && diag.suggestion != "") {
+            i32 line_idx = diag.line - 1;
+            if (line_idx >= 0 && line_idx < lines.size()) {
+                if (diag.rule_name == "naming_convention") {
+                    // Replace the name with the suggestion.
+                    string old_line = lines[line_idx];
+                    string old_name = str_substring(old_line, diag.column - 1,
+                                                    diag.end_column - diag.column + 1);
+                    string new_line = str_replace_substring(old_line, old_name, diag.suggestion);
+                    lines[line_idx] = new_line;
+                }
+                if (diag.rule_name == "prefer_const") {
+                    // Replace the line with const prefix.
+                    lines[line_idx] = diag.suggestion;
+                }
+            }
+        }
+        i = i - 1;
+    }
+
+    // Reconstruct source.
+    result = "";
+    i32 j = 0;
+    while (j < lines.size()) {
+        if (result != "") result = result + "\n";
+        result = result + lines[j];
+        j = j + 1;
+    }
+
+    return result;
+}
+
+fn string str_replace_substring(string s, string from, string to) {
+    i32 pos = find_substring(s, from);
+    if (pos < 0) return s;
+    string before = str_substring(s, 0, pos);
+    string after = str_substring(s, pos + str_bytes(from));
+    return before + to + after;
+}
+
+fn i32 find_substring(string haystack, string needle) {
+    i32 i = 0;
+    i32 hl = str_bytes(haystack);
+    i32 nl = str_bytes(needle);
+    while (i <= hl - nl) {
+        string part = str_substring(haystack, i, nl);
+        if (part == needle) return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn i32 find_char(string s, i32 ch) {
+    i32 i = 0;
+    while (i < str_bytes(s)) {
+        if (str_get_char(s, i) == ch) return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Format a diagnostic for display.
+fn string format_diagnostic(LintDiagnostic diag, string file_path) {
+    string severity_str;
+    if (diag.severity == LintSeverity.Error) {
+        severity_str = "error";
+    } else if (diag.severity == LintSeverity.Warning) {
+        severity_str = "warning";
+    } else if (diag.severity == LintSeverity.Info) {
+        severity_str = "info";
+    } else {
+        severity_str = "hint";
+    }
+
+    string result = file_path + ":" + to_str(diag.line) + ":" + to_str(diag.column)
+                     + ": " + severity_str + ": " + diag.message
+                     + " [" + diag.rule_name + "]";
+    return result;
+}
+
+fn string to_str(i32 v) {
+    if (v == 0) return "0";
+    string result = "";
+    i32 n = v;
+    if (n < 0) {
+        result = "-";
+        n = -n;
+    }
+    string digits = "";
+    while (n > 0) {
+        i32 d = n % 10;
+        digits = str_char(48 + d) + digits;
+        n = n / 10;
+    }
+    return result + digits;
+}
+
+// CLI entry point.
+fn i32 main(i32 argc, string[] argv) {
+    bool fix_mode = false;
+    bool ci_mode = false;
+    bool verbose = false;
+    string target = "";
+    string config_path = "";
+
+    i32 i = 1;
+    while (i < argc) {
+        string arg = argv[i];
+        if (arg == "--fix") {
+            fix_mode = true;
+        } else if (arg == "--ci") {
+            ci_mode = true;
+        } else if (arg == "--verbose" || arg == "-v") {
+            verbose = true;
+        } else if (arg == "--config") {
+            i = i + 1;
+            if (i < argc) {
+                config_path = argv[i];
+            }
+        } else if (str_get_char(arg, 0) == '-') {
+            println("vexlint: unknown option: " + arg);
+            println("Usage: vexlint [--fix] [--ci] [--config path] <file|dir>");
+            return 1;
+        } else {
+            target = arg;
+        }
+        i = i + 1;
+    }
+
+    if (target == "") {
+        println("vexlint: no target specified");
+        println("Usage: vexlint [--fix] [--ci] [--config path] <file|dir>");
+        return 1;
+    }
+
+    VexlintConfig cfg = load_lint_config(config_path);
+    cfg.fix = fix_mode;
+    cfg.ci_mode = ci_mode;
+    cfg.verbose = verbose;
+    cfg.target = target;
+
+    i32 exit_code = 0;
+    i32 total_errors = 0;
+    i32 total_warnings = 0;
+    i32 total_infos = 0;
+
+    // Check if target is a directory.
+    bool is_dir = false;
+    i64 dh = open(target, O_READ);
+    if (dh != 0) {
+        // Try to get file info to determine if directory.
+        // In a real implementation, use stat().
+        // For now, check if target has .vex extension.
+        if (find_substring(target, ".vex") >= 0) {
+            is_dir = false;
+        } else {
+            is_dir = true;
+        }
+    }
+
+    if (is_dir) {
+        // Lint all .vex files in directory.
+        string[] entries = list_dir(target);
+        i32 j = 0;
+        while (j < entries.size()) {
+            string entry = entries[j];
+            i32 ext_pos = find_substring(entry, ".vex");
+            if (ext_pos >= 0 && ext_pos == str_bytes(entry) - 4) {
+                string full_path;
+                if (str_get_char(target, str_bytes(target) - 1) == '/') {
+                    full_path = target + entry;
+                } else {
+                    full_path = target + "/" + entry;
+                }
+
+                i64 fh = open(full_path, O_READ);
+                if (fh == 0) {
+                    println("vexlint: cannot open " + full_path);
+                    exit_code = 1;
+                    continue;
+                }
+                string source = read_all(fh);
+                close(fh);
+
+                if (verbose) {
+                    println("vexlint: linting " + full_path);
+                }
+
+                LintResult lint_res = lint_file(source, cfg);
+
+                i32 k = 0;
+                while (k < lint_res.diagnostics.size()) {
+                    LintDiagnostic diag = lint_res.diagnostics[k];
+                    println(format_diagnostic(diag, full_path));
+                    k = k + 1;
+                }
+
+                total_errors = total_errors + lint_res.error_count;
+                total_warnings = total_warnings + lint_res.warning_count;
+                total_infos = total_infos + lint_res.info_count;
+
+                if (fix_mode && !ci_mode) {
+                    string fixed = apply_fixes(source, lint_res);
+                    if (fixed != source) {
+                        i64 wfh = open(full_path, O_WRITE);
+                        write(wfh, fixed);
+                        close(wfh);
+                        if (verbose) {
+                            println("vexlint: fixed " + full_path);
+                        }
+                    }
+                }
+
+                if (!lint_res.success) {
+                    exit_code = 1;
+                }
+            }
+            j = j + 1;
+        }
+    } else {
+        // Lint single file.
+        i64 fh = open(target, O_READ);
+        if (fh == 0) {
+            println("vexlint: cannot open " + target);
+            return 1;
+        }
+        string source = read_all(fh);
+        close(fh);
+
+        LintResult lint_res = lint_file(source, cfg);
+
+        i32 i = 0;
+        while (i < lint_res.diagnostics.size()) {
+            LintDiagnostic diag = lint_res.diagnostics[i];
+            println(format_diagnostic(diag, target));
+            i = i + 1;
+        }
+
+        total_errors = lint_res.error_count;
+        total_warnings = lint_res.warning_count;
+        total_infos = lint_res.info_count;
+
+        if (fix_mode && !ci_mode) {
+            string fixed = apply_fixes(source, lint_res);
+            if (fixed != source) {
+                i64 wfh = open(target, O_WRITE);
+                write(wfh, fixed);
+                close(wfh);
+                if (verbose) {
+                    println("vexlint: fixed " + target);
+                }
+            }
+        }
+
+        if (!lint_res.success) {
+            exit_code = 1;
+        }
+    }
+
+    if (verbose || ci_mode) {
+        string summary = "vexlint: ";
+        summary = summary + to_str(total_errors) + " errors, ";
+        summary = summary + to_str(total_warnings) + " warnings, ";
+        summary = summary + to_str(total_infos) + " infos";
+        println(summary);
+    }
+
+    return exit_code;
+}

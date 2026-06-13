@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vex Playground</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div id="sidebar-header">
+      <h1>Vex</h1>
+      <span class="subtitle">playground</span>
+    </div>
+    <nav id="examples">
+      <h3>Examples</h3>
+      <ul id="example-list"></ul>
+    </nav>
+    <nav id="docs-links">
+      <h3>Docs</h3>
+      <ul>
+        <li><a href="docs/index.html" target="_blank">Stdlib Reference</a></li>
+        <li><a href="docs/motivation.html" target="_blank">Why Vex?</a></li>
+      </ul>
+    </nav>
+  </aside>
+  <main id="main">
+    <header id="toolbar">
+      <div class="toolbar-left">
+        <span id="filename">main.vex</span>
+      </div>
+      <div class="toolbar-right">
+        <button id="run-btn" title="Run (Ctrl+Enter)">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M4 2l10 6-10 6V2z"/></svg>
+          Run
+        </button>
+        <button id="clear-btn" title="Clear output">Clear</button>
+      </div>
+    </header>
+    <div id="editor-panel">
+      <div id="line-numbers"></div>
+      <textarea id="editor" spellcheck="false" placeholder="Write Vex code here..."></textarea>
+    </div>
+    <div id="output-container">
+      <div id="output-header">
+        <span>Output</span>
+        <span id="status"></span>
+      </div>
+      <pre id="output"></pre>
+      <div id="error" class="hidden"></div>
+    </div>
+  </main>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>

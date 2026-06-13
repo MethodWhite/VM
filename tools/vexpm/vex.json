@@ -1,0 +1,13 @@
+{
+    "name": "my-package",
+    "version": "0.1.0",
+    "description": "A Vex package",
+    "license": "VMProject",
+    "dependencies": {
+        "std": "^1.0"
+    },
+    "scripts": {
+        "build": "vxc src/main.vex -o build/output.velb",
+        "test": "vxc tests/test.vex --run"
+    }
+}

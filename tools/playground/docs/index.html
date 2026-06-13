@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vex Standard Library &amp; Language Reference</title>
+<style>
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg: #0d1117; --bg2: #161b22; --bg3: #21262d;
+    --accent: #58a6ff; --text: #e6edf3; --text2: #8b949e;
+    --text3: #484f58; --border: #30363d; --green: #7ec894;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  }
+  body {
+    background: var(--bg); color: var(--text); font-family: var(--font);
+    line-height: 1.6; font-size: 15px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .container { max-width: 960px; margin: 0 auto; padding: 0 20px; }
+
+  header {
+    background: var(--bg2); border-bottom: 1px solid var(--border);
+    padding: 24px 0 20px; text-align: center;
+  }
+  header h1 { font-size: 28px; color: var(--accent); }
+  header p { color: var(--text2); margin-top: 6px; font-size: 14px; }
+  header nav { margin-top: 16px; display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+  header nav a { padding: 4px 12px; border-radius: 4px; font-size: 13px; background: var(--bg3); }
+
+  #search { max-width: 480px; margin: 20px auto; }
+  #search input {
+    width: 100%; padding: 10px 14px; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--bg2); color: var(--text);
+    font-family: var(--mono); font-size: 14px; outline: none;
+  }
+  #search input:focus { border-color: var(--accent); }
+
+  section { margin: 40px 0; }
+  section h2 {
+    font-size: 20px; color: var(--accent); border-bottom: 1px solid var(--border);
+    padding-bottom: 8px; margin-bottom: 20px;
+  }
+
+  .module-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+  .module-card {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px; transition: border-color 0.15s;
+  }
+  .module-card:hover { border-color: var(--accent); }
+  .module-card h3 { font-size: 15px; font-family: var(--mono); color: var(--accent); }
+  .module-card p { color: var(--text2); font-size: 13px; margin-top: 4px; }
+  .module-card .badge {
+    display: inline-block; font-size: 10px; padding: 2px 8px;
+    border-radius: 10px; background: var(--bg3); color: var(--text2);
+    margin-top: 8px; font-family: var(--mono);
+  }
+
+  .lang-ref { list-style: none; }
+  .lang-ref li {
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+    display: flex; gap: 12px; align-items: baseline;
+  }
+  .lang-ref li:last-child { border: none; }
+  .lang-ref .term { font-family: var(--mono); color: var(--green); min-width: 140px; font-size: 13px; }
+  .lang-ref .desc { color: var(--text2); font-size: 13px; }
+
+  .tutorial-box {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 24px; text-align: center; margin: 20px 0;
+  }
+  .tutorial-box h3 { font-size: 18px; margin-bottom: 8px; }
+  .tutorial-box p { color: var(--text2); font-size: 14px; margin-bottom: 16px; }
+  .tutorial-box .btn {
+    display: inline-block; padding: 10px 24px; background: #1f6feb;
+    color: #fff; border-radius: 6px; font-weight: 500;
+  }
+  .tutorial-box .btn:hover { background: #388bfd; text-decoration: none; }
+
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  @media (max-width: 640px) {
+    header h1 { font-size: 22px; }
+    .module-grid { grid-template-columns: 1fr; }
+    .lang-ref li { flex-direction: column; gap: 4px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="container">
+    <h1>Vex Documentation</h1>
+    <p>Standard Library &mdash; Language Reference &mdash; Tutorials</p>
+    <nav>
+      <a href="#stdlib">Stdlib</a>
+      <a href="#lang-ref">Language Reference</a>
+      <a href="#tutorial">Tutorial</a>
+      <a href="../">Playground</a>
+      <a href="motivation.html">Why Vex?</a>
+    </nav>
+  </div>
+</header>
+
+<div class="container">
+
+<div id="search">
+  <input type="text" id="search-input" placeholder="Search modules, types, functions..." autocomplete="off">
+</div>
+
+<section id="stdlib">
+  <h2>Standard Library Modules</h2>
+  <div class="module-grid" id="module-grid"></div>
+</section>
+
+<section id="lang-ref">
+  <h2>Language Reference</h2>
+  <ul class="lang-ref">
+    <li><span class="term">Comments</span><span class="desc"><code>// line</code> or <code>/* block */</code></span></li>
+    <li><span class="term">Primitives</span><span class="desc"><code>i8</code>, <code>i16</code>, <code>i32</code>, <code>i64</code>, <code>u8</code>, <code>u16</code>, <code>u32</code>, <code>u64</code>, <code>f32</code>, <code>f64</code>, <code>bool</code>, <code>str</code></span></li>
+    <li><span class="term">Functions</span><span class="desc"><code>i32 main() { ... }</code> &mdash; typed args and return, recursion, overloading</span></li>
+    <li><span class="term">Variables</span><span class="desc"><code>let x: i32 = 5;</code> (immutable), <code>let mut x: i32 = 5;</code> (mutable)</span></li>
+    <li><span class="term">Pointers</span><span class="desc"><code>unique&lt;T&gt;</code> (unique ownership), <code>shared&lt;T&gt;</code> (GC-traced), borrow checking at compile time</span></li>
+    <li><span class="term">Control Flow</span><span class="desc"><code>if</code> / <code>else</code>, <code>for</code>, <code>while</code>, <code>break</code>, <code>continue</code>, <code>return</code></span></li>
+    <li><span class="term">Structs</span><span class="desc"><code>struct Point { x: f64, y: f64 }</code> with named fields, methods via <code>impl</code></span></li>
+    <li><span class="term">Enums</span><span class="desc"><code>enum Option&lt;T&gt; { Some(T), None }</code> with pattern matching via <code>match</code></span></li>
+    <li><span class="term">Generics</span><span class="desc"><code>fn max&lt;T&gt;(a: T, b: T) -&gt; T</code> with trait bounds</span></li>
+    <li><span class="term">Traits</span><span class="desc"><code>trait Display { fn to_str(self) -&gt; str; }</code> with <code>impl Display for T</code></span></li>
+    <li><span class="term">Imports</span><span class="desc"><code>import std.math.*</code> or <code>import std.json.JSON</code></span></li>
+    <li><span class="term">RAII</span><span class="desc">Destructors called deterministically; <code>unique&lt;T&gt;</code> dropped at end of scope</span></li>
+    <li><span class="term">GC</span><span class="desc">Tracing GC for <code>shared&lt;T&gt;</code> references; write barriers for cycle collection</span></li>
+    <li><span class="term">Async</span><span class="desc"><code>async fn</code> / <code>await</code> for cooperative multitasking</span></li>
+    <li><span class="term">Unsafe</span><span class="desc"><code>unsafe { }</code> blocks for raw pointer dereference and FFI</span></li>
+    <li><span class="term">FFI</span><span class="desc"><code>extern "C" fn puts(s: str) -&gt; i32;</code> for C ABI interop</span></li>
+    <li><span class="term">Attributes</span><span class="desc"><code>#[inline]</code>, <code>#[no_mangle]</code>, <code>#[test]</code> annotations</span></li>
+    <li><span class="term">Operators</span><span class="desc"><code>+</code>, <code>-</code>, <code>*</code>, <code>/</code>, <code>%</code>, <code>&amp;&amp;</code>, <code>||</code>, <code>!</code>, <code>==</code>, <code>!=</code>, <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code></span></li>
+  </ul>
+</section>
+
+<section id="tutorial">
+  <h2>Tutorial</h2>
+  <div class="tutorial-box">
+    <h3>Getting Started with Vex</h3>
+    <p>Learn Vex from scratch with our interactive step-by-step tutorial. Covers variables, functions, structs, pointers, and concurrency.</p>
+    <a class="btn" href="#">Start Tutorial &rarr;</a>
+  </div>
+  <div class="tutorial-box" style="margin-top: 12px;">
+    <h3>Vex by Example</h3>
+    <p>Browse runnable example programs in the <a href="../">Playground</a> sidebar &mdash; from Hello World to DFT signal processing.</p>
+  </div>
+</section>
+
+</div>
+
+<script>
+var modules = [
+  { name: 'std.crypto', desc: 'Cryptographic primitives: hashing (SHA-3, BLAKE3), symmetric encryption (AES-256-GCM, ChaCha20), key exchange, digital signatures.', badge: 'stable' },
+  { name: 'std.graphics', desc: 'Rendering pipeline: GPU-accelerated 2D/3D drawing, shader compilation, triangle meshes, camera transforms, pixel buffers.', badge: 'experimental' },
+  { name: 'std.io', desc: 'Input/output: file read/write, stdin/stdout/stderr, formatted print, buffered readers, memory-mapped I/O.', badge: 'stable' },
+  { name: 'std.json', desc: 'JSON parser and serializer: parse, query with dot-path, stringify, typed accessors for arrays/objects.', badge: 'stable' },
+  { name: 'std.linalg', desc: 'Linear algebra: float2/3/4 vectors, matrix4x4, quaternions, dot/cross product, normalization, perspective projection.', badge: 'stable' },
+  { name: 'std.log', desc: 'Structured logging: leveled logging (debug/info/warn/error), JSON output, async log flushing, severity filtering.', badge: 'stable' },
+  { name: 'std.materia', desc: 'BaseMateria JEPA model: latent-space embedding, temporal prediction, resonance measurement, photonic encoding/decoding.', badge: 'experimental' },
+  { name: 'std.math', desc: 'Math library: trig (sin/cos/tan), exponentials, log, sqrt, pow, floor/ceil, constants (PI, E), random number generation.', badge: 'stable' },
+  { name: 'std.net', desc: 'Networking: TCP/UDP sockets, HTTP client/server, DNS resolution, TLS, async I/O, connection pooling.', badge: 'stable' },
+  { name: 'std.photonic', desc: 'Photonic control: laser diode emission (RGB), self-mixing feedback, resonance scanning, learn_step for optical annealing.', badge: 'experimental' },
+  { name: 'std.result', desc: 'Error handling: Result&lt;T, E&gt; and Option&lt;T&gt; types, try operator, pattern matching, combinators (map, and_then, or_else).', badge: 'stable' },
+  { name: 'std.signal', desc: 'Signal processing: FFT/DCT, convolution, filtering (FIR/IIR), windowing, spectral analysis, resampling.', badge: 'stable' },
+  { name: 'std.string', desc: 'String utilities: concatenation, substring, split, replace, trim, formatting, UTF-8 validation, number-to-string conversions.', badge: 'stable' },
+  { name: 'std.system', desc: 'System interface: environment variables, process spawning, clock/time, CPU info, memory stats, atomic operations.', badge: 'stable' },
+  { name: 'std.test', desc: 'Testing framework: #[test] attribute, assertions (assert_eq, assert_ne, assert_approx), test runner, benchmark harness.', badge: 'stable' },
+  { name: 'std.time', desc: 'Time and timing: Instant/Duration types, sleep, timers, monotonic clocks, time formatting, epoch conversion.', badge: 'stable' }
+];
+
+var grid = document.getElementById('module-grid');
+modules.forEach(function (m) {
+  var card = document.createElement('div');
+  card.className = 'module-card';
+  card.innerHTML = '<h3>' + m.name + '</h3><p>' + m.desc + '</p><span class="badge">' + m.badge + '</span>';
+  card.dataset.name = m.name;
+  card.dataset.desc = m.desc;
+  grid.appendChild(card);
+});
+
+document.getElementById('search-input').addEventListener('input', function () {
+  var q = this.value.toLowerCase();
+  document.querySelectorAll('.module-card').forEach(function (card) {
+    var name = card.dataset.name.toLowerCase();
+    var desc = card.dataset.desc.toLowerCase();
+    card.style.display = name.indexOf(q) !== -1 || desc.indexOf(q) !== -1 ? 'block' : 'none';
+  });
+});
+</script>
+
+</body>
+</html>

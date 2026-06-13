@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>¿Por qué Vex? &mdash; Vex Documentation</title>
+<style>
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg: #0d1117; --bg2: #161b22; --bg3: #21262d;
+    --accent: #58a6ff; --text: #e6edf3; --text2: #8b949e;
+    --border: #30363d; --green: #7ec894;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  }
+  body {
+    background: var(--bg); color: var(--text); font-family: var(--font);
+    line-height: 1.7; font-size: 16px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .container { max-width: 800px; margin: 0 auto; padding: 0 20px; }
+
+  header {
+    background: var(--bg2); border-bottom: 1px solid var(--border);
+    padding: 20px 0; text-align: center;
+  }
+  header h1 { font-size: 26px; color: var(--accent); }
+  header .sub { color: var(--text2); font-size: 14px; margin-top: 4px; }
+  header nav { margin-top: 12px; }
+  header nav a { padding: 4px 12px; border-radius: 4px; font-size: 13px; background: var(--bg3); margin: 0 4px; }
+
+  main { padding: 40px 0; }
+
+  h2 { font-size: 22px; color: var(--accent); margin: 40px 0 16px; }
+  h3 { font-size: 17px; color: var(--green); margin: 24px 0 10px; }
+  p { margin-bottom: 14px; color: var(--text2); }
+  strong { color: var(--text); }
+
+  ul { margin: 12px 0 20px 24px; }
+  ul li { margin-bottom: 8px; color: var(--text2); }
+  ul li strong { color: var(--text); }
+
+  .comparison { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 14px; }
+  .comparison th, .comparison td {
+    padding: 10px 14px; border: 1px solid var(--border); text-align: left;
+  }
+  .comparison th { background: var(--bg3); color: var(--accent); font-weight: 600; }
+  .comparison td { background: var(--bg2); color: var(--text2); }
+  .comparison .check { color: var(--green); }
+  .comparison .cross { color: var(--text3); }
+
+  .quote {
+    border-left: 3px solid var(--accent); padding: 16px 20px;
+    margin: 24px 0; background: var(--bg2); border-radius: 0 6px 6px 0;
+    font-style: italic; color: var(--text2);
+  }
+  .quote cite { display: block; margin-top: 8px; color: var(--text3); font-style: normal; font-size: 13px; }
+
+  .feature-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; margin: 20px 0; }
+  .feature-card {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px; text-align: center;
+  }
+  .feature-card h3 { font-size: 15px; margin: 0 0 6px; }
+  .feature-card p { font-size: 13px; margin: 0; }
+
+  .back-link { display: inline-block; margin-bottom: 20px; font-size: 14px; }
+
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  @media (max-width: 640px) {
+    header h1 { font-size: 20px; }
+    .comparison th, .comparison td { padding: 6px 8px; font-size: 12px; }
+    .feature-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="container">
+    <h1>&iquest;Por qu&eacute; Vex?</h1>
+    <p class="sub">Un lenguaje para la pr&oacute;xima d&eacute;cada &mdash; sistemas, distribuci&oacute;n, gr&aacute;ficos y AGI fot&oacute;nica</p>
+    <nav>
+      <a href="index.html">Docs</a>
+      <a href="../">Playground</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container">
+
+<a class="back-link" href="index.html">&larr; Back to docs</a>
+
+<h2>Qu&eacute; problemas resuelve Vex</h2>
+
+<p>
+  La industria del software enfrenta una <strong>triple tensi&oacute;n</strong>:
+  necesitamos rendimiento de bajo nivel (<em>como C o Rust</em>),
+  productividad de alto nivel (<em>como Go o Java</em>),
+  y la capacidad de ejecutar c&oacute;digo de forma segura en entornos distribuidos y heterog&eacute;neos.
+  Ning&uacute;n lenguaje dominante resuelve las tres al mismo tiempo.
+</p>
+
+<p><strong>Vex</strong> nace para cerrar esa brecha. Es un lenguaje compilado, est&aacute;ticamente tipado,
+con recolector de basura opcional, borrow checker, y un backend JIT que genera c&oacute;digo nativo
+para bytecode distribuido. Est&aacute; dise&ntilde;ado desde cero para sistemas, c&oacute;mputo paralelo,
+gr&aacute;ficos en tiempo real, e inteligencia artificial fot&oacute;nica.</p>
+
+<h2>Comparaci&oacute;n con lenguajes existentes</h2>
+
+<table class="comparison">
+  <thead>
+    <tr>
+      <th>Caracter&iacute;stica</th>
+      <th>Vex</th>
+      <th>Rust</th>
+      <th>C</th>
+      <th>Go</th>
+      <th>Java</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Borrow checker + GC</td>
+      <td class="check">S&iacute; (h&iacute;brido)</td>
+      <td class="check">S&iacute; (solo borrow)</td>
+      <td class="cross">No</td>
+      <td class="cross">No</td>
+      <td class="cross">No (solo GC)</td>
+    </tr>
+    <tr>
+      <td>Recolecci&oacute;n de basura</td>
+      <td class="check">Opcional (tracing)</td>
+      <td class="cross">No</td>
+      <td class="cross">No</td>
+      <td class="check">S&iacute;</td>
+      <td class="check">S&iacute;</td>
+    </tr>
+    <tr>
+      <td>Bytecode portable + JIT</td>
+      <td class="check">Nativo</td>
+      <td class="cross">No (solo nativo)</td>
+      <td class="cross">No</td>
+      <td class="cross">No</td>
+      <td class="check">S&iacute; (JVM)</td>
+    </tr>
+    <tr>
+      <td>Bytecode distribuido</td>
+      <td class="check">S&iacute; (VELB)</td>
+      <td class="cross">No</td>
+      <td class="cross">No</td>
+      <td class="cross">No</td>
+      <td class="cross">No</td>
+    </tr>
+    <tr>
+      <td>Self-hosted</td>
+      <td class="check">En progreso</td>
+      <td class="check">S&iacute;</td>
+      <td class="check">S&iacute;</td>
+      <td class="cross">No</td>
+      <td class="cross">No</td>
+    </tr>
+    <tr>
+      <td>RAII determinista</td>
+      <td class="check">S&iacute;</td>
+      <td class="check">S&iacute;</td>
+      <td class="cross">No</td>
+      <td class="cross">No</td>
+      <td class="cross">No</td>
+    </tr>
+    <tr>
+      <td>Async nativo</td>
+      <td class="check">S&iacute;</td>
+      <td class="check">S&iacute;</td>
+      <td class="cross">No</td>
+      <td class="check">S&iacute; (goroutines)</td>
+      <td class="check">S&iacute;</td>
+    </tr>
+    <tr>
+      <td>Fot&oacute;nica/Materia</td>
+      <td class="check">S&iacute; (stdlib)</td>
+      <td class="cross">No</td>
+      <td class="cross">No</td>
+      <td class="cross">No</td>
+      <td class="cross">No</td>
+    </tr>
+    <tr>
+      <td>Tiempo de compilaci&oacute;n</td>
+      <td>Segundos</td>
+      <td>Minutos</td>
+      <td>Segundos</td>
+      <td>Segundos</td>
+      <td>Minutos</td>
+    </tr>
+    <tr>
+      <td>Curva de aprendizaje</td>
+      <td>Moderada</td>
+      <td>Empinada</td>
+      <td>Empinada</td>
+      <td>Baja</td>
+      <td>Moderada</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Caracter&iacute;sticas &uacute;nicas de Vex</h2>
+
+<div class="feature-grid">
+  <div class="feature-card">
+    <h3>Borrow checker + GC h&iacute;brido</h3>
+    <p>Usa <code>unique&lt;T&gt;</code> para cero overhead o <code>shared&lt;T&gt;</code> con GC tracing. El borrow checker opera en ambos.</p>
+  </div>
+  <div class="feature-card">
+    <h3>Bytecode distribuido (VELB)</h3>
+    <p>El backend emite VELB (Vex Executable Layout Binary), un formato portable que puede ejecutarse, migrarse y parchearse en caliente en cl&uacute;steres.</p>
+  </div>
+  <div class="feature-card">
+    <h3>JIT con tiered compilation</h3>
+    <p>El int&eacute;rprete VELB arranca al instante; el JIT compila los hot paths a c&oacute;digo nativo en segundo plano con perfiles de ejecuci&oacute;n reales.</p>
+  </div>
+  <div class="feature-card">
+    <h3>Self-hosted</h3>
+    <p>El compilador de Vex est&aacute; escrito en Vex. El bootstrap parte de un n&uacute;cleo en C++ y se eleva progresivamente.</p>
+  </div>
+  <div class="feature-card">
+    <h3>Fot&oacute;nica cu&aacute;ntica (std.photonic)</h3>
+    <p>Control directo de diodos l&aacute;ser RGB, medici&oacute;n de feedback self-mixing, y ciclos de aprendizaje para recocido &oacute;ptico.</p>
+  </div>
+  <div class="feature-card">
+    <h3>Materia JEPA (std.materia)</h3>
+    <p>Modelos de representaci&oacute;n latente entrenables en tiempo de ejecuci&oacute;n: embedding, predicci&oacute;n temporal, resonancia interna y codificaci&oacute;n fot&oacute;nica.</p>
+  </div>
+</div>
+
+<h2>Dominios objetivo</h2>
+
+<ul>
+  <li><strong>Sistemas y embebidos</strong> &mdash; rendimiento de C con seguridad de memoria, sin GC forzoso. Ideal para kernels, drivers, firmware.</li>
+  <li><strong>Sistemas distribuidos</strong> &mdash; el bytecode VELB permite migrar procesos entre nodos, balanceo de carga y actualizaciones en caliente.</li>
+  <li><strong>Gr&aacute;ficos en tiempo real</strong> &mdash; std.graphics expone pipelines GPU, shaders, buffers de p&iacute;xeles y c&aacute;maras con integraci&oacute;n directa a std.linalg.</li>
+  <li><strong>AGI fot&oacute;nica</strong> &mdash; Vex es el &uacute;nico lenguaje de programaci&oacute;n con soporte nativo para control de l&aacute;ser, retroalimentaci&oacute;n &oacute;ptica y modelos de mundo latente (JEPA) en su biblioteca est&aacute;ndar.</li>
+</ul>
+
+<h2>Vex vs D++: la realidad supera la ficci&oacute;n</h2>
+
+<div class="quote">
+  <p>En la novela de ficci&oacute;n, D++ era un lenguaje creado para la &eacute;poca post-Moore: compilado, con recolector de basura, tipado est&aacute;tico, y capaz de ejecutarse en hardware fot&oacute;nico. Sus arquitectos lo llamaban &laquo;el &uacute;ltimo lenguaje de programaci&oacute;n&raquo;.</p>
+  <p>Vex es D++ hecho real.</p>
+  <p>Donde D++ exist&iacute;a solo en p&aacute;gina impresa, Vex compila, ejecuta, y controla l&aacute;seres reales. Donde D++ promet&iacute;a un GC h&iacute;brido, Vex lo tiene funcionando con write barriers y recolecci&oacute;n de ciclos. Donde D++ imaginaba un bytecode portable para cl&uacute;steres, Vex genera VELB y lo ejecuta en la VestaVM.</p>
+  <p>La ficci&oacute;n imagin&oacute; el destino. Vex lo construy&oacute;.</p>
+  <cite>&mdash; David L&oacute;pez T., arquitecto de VestaVM</cite>
+</div>
+
+<p>
+  Vex no es solo un lenguaje m&aacute;s. Es la materializaci&oacute;n de una d&eacute;cada de investigaci&oacute;n en
+  compiladores, m&aacute;quinas virtuales, sistemas distribuidos y computaci&oacute;n fot&oacute;nica.
+  Es el lenguaje que la ficci&oacute;n prometi&oacute; y que la ingenier&iacute;a cumpli&oacute;.
+</p>
+
+</main>
+
+</body>
+</html>

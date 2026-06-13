@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aprende Vex en 15 minutos - Tutorial Interactivo</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  #tutorial-app { display: flex; gap: 1.5rem; align-items: flex-start; }
+  .sidebar { width: 240px; flex-shrink: 0; position: sticky; top: 5rem; }
+  .main-content { flex: 1; min-width: 0; }
+
+  .lesson-grid { display: flex; flex-direction: column; gap: 0.35rem; }
+  .lesson-grid-item {
+    display: flex; align-items: center; gap: 0.5rem;
+    padding: 0.5rem 0.75rem; border-radius: var(--radius-sm);
+    cursor: pointer; transition: all 0.2s;
+    font-size: 0.85rem; border: 1px solid transparent;
+  }
+  .lesson-grid-item:hover { background: var(--bg-tertiary); }
+  .lesson-grid-item.active { background: var(--bg-tertiary); border-color: var(--accent); }
+  .lesson-grid-item.done { opacity: 0.8; }
+  .lesson-grid-num {
+    width: 22px; height: 22px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.7rem; font-weight: 600;
+    background: var(--bg-tertiary); flex-shrink: 0;
+  }
+  .lesson-grid-item.active .lesson-grid-num { background: var(--accent); color: #fff; }
+  .lesson-grid-item.done .lesson-grid-num { background: var(--success); color: #fff; }
+  .lesson-grid-check { color: var(--accent-green); margin-left: auto; font-weight: 700; }
+  .lesson-grid-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .lesson-header { margin-bottom: 1rem; }
+  .lesson-header h1 { margin-bottom: 0.2rem; }
+  .lesson-header .badge { font-size: 0.75rem; }
+
+  .lesson-explanation {
+    background: var(--bg-secondary); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 1rem; margin-bottom: 1rem;
+    font-size: 0.95rem; line-height: 1.7;
+  }
+  .lesson-explanation code { font-size: 0.85rem; }
+
+  .code-section { margin-bottom: 1rem; }
+  .code-section label {
+    display: block; font-size: 0.85rem; font-weight: 600;
+    color: var(--text-secondary); margin-bottom: 0.35rem;
+  }
+  .code-section textarea {
+    font-family: var(--font-mono); font-size: 0.85rem;
+    width: 100%; min-height: 180px; padding: 1rem;
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); color: var(--text-primary);
+    resize: vertical; tab-size: 2; line-height: 1.5;
+  }
+  .code-section textarea:focus { border-color: var(--accent); }
+
+  .code-display { margin-bottom: 1rem; }
+  .code-display pre { margin: 0; }
+
+  .output-panel {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 1rem;
+    font-family: var(--font-mono); font-size: 0.85rem;
+    min-height: 60px; white-space: pre-wrap; margin-bottom: 1rem;
+  }
+
+  .lesson-nav { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
+
+  .exercise-box {
+    background: var(--bg-secondary); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 1rem; margin-bottom: 1rem;
+  }
+  .exercise-box h3 { margin-bottom: 0.5rem; }
+  .exercise-box input { width: 100%; margin-bottom: 0.5rem; font-family: var(--font-mono); }
+
+  @media (max-width: 768px) {
+    #tutorial-app { flex-direction: column; }
+    .sidebar { width: 100%; position: static; }
+    .lesson-grid { flex-direction: row; overflow-x: auto; padding-bottom: 0.5rem; }
+    .lesson-grid-item { flex-shrink: 0; }
+  }
+</style>
+</head>
+<body>
+<nav class="navbar">
+  <a href="tutorial.html" class="navbar-brand">
+    <svg class="icon" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L2 7v10l10 5 10-5V7L12 2zm0 2.18l7 3.5v7l-7 3.5-7-3.5v-7l7-3.5z"/></svg>
+    Aprende Vex
+  </a>
+  <div class="navbar-links">
+    <a href="tutorial.html" class="active">Tutorial</a>
+    <a href="registry.html">Registry</a>
+  </div>
+</nav>
+
+<div class="container" id="tutorial-app">
+  <aside class="sidebar">
+    <div style="margin-bottom:1rem">
+      <div style="font-size:0.8rem;font-weight:600;color:var(--text-muted);margin-bottom:0.5rem;text-transform:uppercase;letter-spacing:0.05em">Progreso</div>
+      <div class="progress-bar" style="margin-bottom:0.25rem">
+        <div class="progress-bar-fill" id="progress-fill" style="width:0%"></div>
+      </div>
+      <div class="progress-text" id="progress-text">0 / 10 lecciones (0%)</div>
+    </div>
+    <div style="font-size:0.8rem;font-weight:600;color:var(--text-muted);margin-bottom:0.5rem;text-transform:uppercase;letter-spacing:0.05em">Lecciones</div>
+    <div class="lesson-grid" id="lesson-grid"></div>
+  </aside>
+
+  <main class="main-content">
+    <div class="lesson-header">
+      <h1 id="lesson-title">1. Hello World</h1>
+      <div>
+        <span class="badge badge-blue" id="lesson-counter">1 / 10</span>
+        <span class="badge badge-cyan" id="lesson-desc">Tu primer programa en Vex</span>
+      </div>
+    </div>
+
+    <div class="lesson-explanation" id="lesson-explanation"></div>
+
+    <div class="code-display">
+      <label>Ejemplo de código:</label>
+      <pre><code id="lesson-code"></code></pre>
+    </div>
+
+    <div class="code-section">
+      <label>Editor de código (puedes modificar y ejecutar):</label>
+      <textarea id="code-editor" spellcheck="false"></textarea>
+    </div>
+
+    <div class="lesson-nav">
+      <button id="prev-btn" class="btn" disabled>&larr; Anterior</button>
+      <button id="run-btn" class="btn btn-success">Ejecutar</button>
+      <button id="reset-btn" class="btn btn-danger">Restablecer</button>
+      <button id="next-btn" class="btn">Siguiente &rarr;</button>
+    </div>
+
+    <div class="output-panel" id="output-panel"></div>
+
+    <div class="exercise-box">
+      <h3>Ejercicio</h3>
+      <p id="exercise-prompt" style="margin-bottom:0.5rem;font-size:0.9rem"></p>
+      <input type="text" id="exercise-input" placeholder="Escribe tu respuesta aquí..." autocomplete="off" spellcheck="false">
+      <button id="check-exercise-btn" class="btn btn-primary btn-sm">Verificar</button>
+      <div id="exercise-feedback" style="margin-top:0.5rem"></div>
+    </div>
+  </main>
+</div>
+
+<script src="tutorial.js"></script>
+</body>
+</html>

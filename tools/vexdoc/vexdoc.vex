@@ -1,0 +1,321 @@
+// vexdoc.vex - Vex Documentation Generator
+// Usage:
+//   vexdoc file.vex               - Generate markdown docs for a single file (stdout)
+//   vexdoc --html file.vex -o dir/  - Generate HTML output
+//   vexdoc --project src/ -o dir/   - Generate docs for entire project
+//   vexdoc --serve dir/             - Start HTTP server to preview docs
+//
+// Requires: vexdoc.extract, vexdoc.html_gen
+
+// Import submodules
+use vexdoc.extract
+use vexdoc.html_gen
+
+// -----------------------------------------------------------------
+//  CLI argument parsing
+// -----------------------------------------------------------------
+
+type CliArgs = struct {
+    mode:       string   // "markdown", "html", "project", "serve"
+    input:      string   // file or directory path
+    output_dir: string   // output directory (for html/project modes)
+}
+
+/// Parse command-line arguments
+fn parse_args(args: string[]) -> CliArgs {
+    let result = CliArgs { mode: "markdown", input: "", output_dir: "./docs" }
+
+    let mut i: i32 = 1  // skip program name (arg[0])
+    while i < args.size() {
+        let arg = args[i]
+
+        if arg == "--html" {
+            result.mode = "html"
+        } elif arg == "--project" {
+            result.mode = "project"
+            i = i + 1
+            if i < args.size() { result.input = args[i] }
+        } elif arg == "--serve" {
+            result.mode = "serve"
+            i = i + 1
+            if i < args.size() { result.output_dir = args[i] }
+        } elif arg == "-o" {
+            i = i + 1
+            if i < args.size() { result.output_dir = args[i] }
+        } elif arg[0] == '-' {
+            // Skip unknown flags
+        } else {
+            // Positional argument: input file or directory
+            result.input = arg
+        }
+        i = i + 1
+    }
+
+    return result
+}
+
+// -----------------------------------------------------------------
+//  Markdown output
+// -----------------------------------------------------------------
+
+/// Generate markdown documentation for a single module
+fn generate_markdown(mod: extract.ModuleDoc) -> string {
+    let mut md: string = ""
+
+    // Title
+    md = md ++ "# " ++ mod.namespace ++ "\n\n"
+    if mod.description.size() > 0 {
+        md = md ++ mod.description ++ "\n\n"
+    }
+    md = md ++ "**File:** `" ++ mod.file_path ++ "`\n\n"
+
+    // Types
+    if mod.types.size() > 0 {
+        md = md ++ "## Types\n\n"
+        let mut i: i32 = 0
+        while i < mod.types.size() {
+            let t = mod.types[i]
+            md = md ++ "### " ++ t.name ++ " (" ++ t.type_kind ++ ")\n\n"
+            if t.doc.text.size() > 0 {
+                md = md ++ t.doc.text ++ "\n\n"
+            }
+
+            if t.fields.size() > 0 {
+                md = md ++ "| Field | Type | Description |\n"
+                md = md ++ "|-------|------|-------------|\n"
+                let mut j: i32 = 0
+                while j < t.fields.size() {
+                    let f = t.fields[j]
+                    let desc = if f.doc.text.size() > 0 { f.doc.text } else { "" }
+                    md = md ++ "| `" ++ f.name ++ "` | `" ++ f.type_name ++ "` | " ++ desc ++ " |\n"
+                    j = j + 1
+                }
+                md = md ++ "\n"
+            }
+            i = i + 1
+        }
+    }
+
+    // Functions
+    if mod.functions.size() > 0 {
+        md = md ++ "## Functions\n\n"
+        let mut i: i32 = 0
+        while i < mod.functions.size() {
+            let f = mod.functions[i]
+            md = md ++ "### " ++ f.name ++ "\n\n"
+            md = md ++ "```vex\n" ++ f.signature ++ "\n```\n\n"
+
+            if f.doc.text.size() > 0 {
+                md = md ++ f.doc.text ++ "\n\n"
+            }
+
+            // Parameters
+            if f.params.size() > 0 {
+                md = md ++ "**Parameters:**\n\n"
+                md = md ++ "| Name | Type | Description |\n"
+                md = md ++ "|------|------|-------------|\n"
+                let mut j: i32 = 0
+                while j < f.params.size() {
+                    let p = f.params[j]
+                    // Find matching @param tag
+                    let mut desc: string = ""
+                    let mut k: i32 = 0
+                    while k < f.doc.tags.size() {
+                        if f.doc.tags[k].name == "param" && f.doc.tags[k].key == p.name {
+                            desc = f.doc.tags[k].value
+                        }
+                        k = k + 1
+                    }
+                    md = md ++ "| `" ++ p.name ++ "` | `" ++ p.type_name ++ "` | " ++ desc ++ " |\n"
+                    j = j + 1
+                }
+                md = md ++ "\n"
+            }
+
+            // Return type
+            if f.return_type.size() > 0 {
+                md = md ++ "**Returns:** `" ++ f.return_type ++ "`"
+                let mut j: i32 = 0
+                while j < f.doc.tags.size() {
+                    if f.doc.tags[j].name == "return" && f.doc.tags[j].value.size() > 0 {
+                        md = md ++ " - " ++ f.doc.tags[j].value
+                    }
+                    j = j + 1
+                }
+                md = md ++ "\n\n"
+            }
+
+            // Tags
+            let mut j: i32 = 0
+            while j < f.doc.tags.size() {
+                let tag = f.doc.tags[j]
+                if tag.name == "example" {
+                    md = md ++ "**Example:**\n\n```vex\n" ++ tag.value ++ "\n```\n\n"
+                }
+                if tag.name == "see" {
+                    md = md ++ "**See also:** " ++ tag.value ++ "\n\n"
+                }
+                if tag.name == "deprecated" {
+                    let dep_msg = if tag.value.size() > 0 { tag.value } else { "This item is deprecated." }
+                    md = md ++ "> **Deprecated:** " ++ dep_msg ++ "\n\n"
+                }
+                j = j + 1
+            }
+
+            i = i + 1
+        }
+    }
+
+    // Constants
+    if mod.constants.size() > 0 {
+        md = md ++ "## Constants\n\n"
+        let mut i: i32 = 0
+        while i < mod.constants.size() {
+            md = md ++ "- `" ++ mod.constants[i] ++ "`\n"
+            i = i + 1
+        }
+        md = md ++ "\n"
+    }
+
+    return md
+}
+
+// -----------------------------------------------------------------
+//  File enumeration
+// -----------------------------------------------------------------
+
+/// Collect all .vex files from a directory (non-recursive, flat)
+fn collect_vex_files(dir_path: string) -> string[] {
+    // Use directory listing via system
+    let mut files: string[] = []
+    // We read the directory entries. In Vex we'd need a directory API.
+    // For now, we rely on the entries being passed from the host.
+    return files
+}
+
+/// Enumerate all .vex files recursively from a project directory
+fn enumerate_project(dir_path: string) -> string[] {
+    let mut result: string[] = []
+    // Read directory entries - in real Vex we'd use a directory listing API
+    // For the template, we show the intended logic:
+    // 1. List all .vex files in dir_path
+    // 2. For each subdirectory, recurse
+    // 3. Skip vexdoc itself
+    
+    // Placeholder: return empty
+    return result
+}
+
+// -----------------------------------------------------------------
+//  Server mode
+// -----------------------------------------------------------------
+
+/// Write a simple HTTP server script for previewing docs
+fn write_server_script(docs_dir: string) {
+    // Write a Python-based HTTP server script for convenience
+    let script: string = ""
+    script = script ++ "#!/usr/bin/env python3\n"
+    script = script ++ "import http.server\n"
+    script = script ++ "import socketserver\n"
+    script = script ++ "import os\n\n"
+    script = script ++ "PORT = 8080\n"
+    script = script ++ "DIR = " ++ "\"" ++ docs_dir ++ "\"\n\n"
+    script = script ++ "os.chdir(DIR)\n"
+    script = script ++ "Handler = http.server.SimpleHTTPRequestHandler\n"
+    script = script ++ "with socketserver.TCPServer((\"\", PORT), Handler) as httpd:\n"
+    script = script ++ "    print(\"VexDoc server running at http://localhost:\" + str(PORT))\n"
+    script = script ++ "    httpd.serve_forever()\n"
+
+    std.io.write_all(docs_dir ++ "/serve.py", script)
+}
+
+// -----------------------------------------------------------------
+//  Main entry point
+// -----------------------------------------------------------------
+
+i32 main() {
+    // Get command-line arguments (in Vex this comes from the runtime)
+    // For now, we read from the standard args mechanism
+    let args = std.system.args()
+    let cli = parse_args(args)
+
+    if cli.input.size() == 0 && cli.mode != "serve" {
+        std.io.println("VexDoc - Vex Documentation Generator")
+        std.io.println("")
+        std.io.println("Usage:")
+        std.io.println("  vexdoc file.vex                  Generate markdown docs (stdout)")
+        std.io.println("  vexdoc --html file.vex -o docs/  Generate HTML output")
+        std.io.println("  vexdoc --project src/ -o docs/   Generate docs for entire project")
+        std.io.println("  vexdoc --serve docs/             Start preview server")
+        return 1
+    }
+
+    if cli.mode == "serve" {
+        // Start HTTP server
+        std.io.println("Starting VexDoc server...")
+        write_server_script(cli.output_dir)
+        std.io.println("Server script written to: " ++ cli.output_dir ++ "/serve.py")
+        std.io.println("Run: python3 " ++ cli.output_dir ++ "/serve.py")
+        return 0
+    }
+
+    if cli.mode == "project" {
+        // Generate docs for all .vex files in project directory
+        std.io.println("Scanning project: " ++ cli.input)
+        let files = enumerate_project(cli.input)
+        if files.size() == 0 {
+            std.io.println("Warning: No .vex files found. Processing explicitly provided paths.")
+        }
+
+        // Process each file and generate HTML
+        let mut modules: extract.ModuleDoc[] = []
+        let mut i: i32 = 0
+        while i < files.size() {
+            let f = files[i]
+            std.io.println("  Processing: " ++ f)
+            let mod = extract.extract_file(f)
+            modules = modules ++ [mod]
+            i = i + 1
+        }
+
+        if modules.size() > 0 {
+            std.io.println("Generating HTML documentation...")
+            std.io.write_all(cli.output_dir, "")
+            html_gen.write_all_pages(modules, cli.output_dir)
+            std.io.println("Done. Output: " ++ cli.output_dir)
+        }
+        return 0
+    }
+
+    // Process single input file
+    if cli.input.size() == 0 {
+        std.io.println("Error: No input file specified.")
+        return 1
+    }
+
+    // Check if file exists
+    if !std.io.exists(cli.input) {
+        std.io.println("Error: File not found: " ++ cli.input)
+        return 1
+    }
+
+    if cli.mode == "markdown" {
+        // Generate markdown to stdout
+        let mod = extract.extract_file(cli.input)
+        let md = generate_markdown(mod)
+        std.io.print(md)
+        return 0
+    }
+
+    if cli.mode == "html" {
+        // Generate HTML output
+        std.io.println("Generating HTML documentation for: " ++ cli.input)
+        let mod = extract.extract_file(cli.input)
+        let modules = [mod]
+        html_gen.write_all_pages(modules, cli.output_dir)
+        std.io.println("Done. Output: " ++ cli.output_dir ++ "/index.html")
+        return 0
+    }
+
+    return 0
+}

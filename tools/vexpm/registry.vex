@@ -1,0 +1,226 @@
+// =============================================================================
+// registry.vex - Package registry client
+// Part of vexpm - Vex Package Manager
+// =============================================================================
+
+namespace vexpm.registry {
+
+    import vexpm.resolver
+
+    comptime DEFAULT_REGISTRY: string = "https://packages.vex-lang.org"
+
+    comptime OK: i32 = 0
+    comptime ERR_NETWORK: i32 = 1
+    comptime ERR_NOT_FOUND: i32 = 2
+
+    type Package = struct {
+        name:        string
+        version:     string
+        description: string
+        license:     string
+    }
+
+    type ResolvedDeps = struct {
+        names:    string[]
+        versions: string[]
+    }
+
+    // =========================================================================
+    // HTTP helpers
+    // =========================================================================
+
+    fn registry_url(path: string) -> string {
+        return DEFAULT_REGISTRY ++ path
+    }
+
+    fn http_get_json(url: string) -> string {
+        let cmd = "curl -s --max-time 15 \"" ++ url ++ "\" 2>/dev/null"
+        return std.system.shell(cmd)
+    }
+
+    fn http_post_json(url: string, body: string) -> string {
+        let tmpfile = "_vexpm_post.tmp"
+        let escaped = body.replace("'", "'\\''")
+        let cmd = "curl -s --max-time 15 -X POST -H 'Content-Type: application/json' -d '" ++ escaped ++ "' '" ++ url ++ "' 2>/dev/null"
+        return std.system.shell(cmd)
+    }
+
+    fn http_put_json(url: string, body: string) -> string {
+        let cmd = "curl -s --max-time 15 -X PUT -H 'Content-Type: application/json' -d '" ++ body ++ "' '" ++ url ++ "' 2>/dev/null"
+        return std.system.shell(cmd)
+    }
+
+    fn http_delete(url: string) -> string {
+        let cmd = "curl -s --max-time 15 -X DELETE '" ++ url ++ "' 2>/dev/null"
+        return std.system.shell(cmd)
+    }
+
+    // =========================================================================
+    // JSON parsing helpers using std.json
+    // =========================================================================
+
+    fn json_get_string(val: std.json.Value, key: string) -> string {
+        let f = std.json.get_field(val, key)
+        if f.kind == 3 { return f.s }
+        return ""
+    }
+
+    fn json_get_number(val: std.json.Value, key: string) -> i64 {
+        let f = std.json.get_field(val, key)
+        if f.kind == 2 { return f.n }
+        return 0
+    }
+
+    fn json_get_bool(val: std.json.Value, key: string) -> bool {
+        let f = std.json.get_field(val, key)
+        if f.kind == 1 { return f.b }
+        return false
+    }
+
+    fn json_get_items(val: std.json.Value) -> std.json.Value[] {
+        if val.kind == 4 {
+            return std.json.get_items(val)
+        }
+        return []
+    }
+
+    // =========================================================================
+    // Public API
+    // =========================================================================
+
+    fn search(query: string) -> Package[] {
+        let results: Package[] = []
+        let url = registry_url("/api/search?q=" ++ query)
+        let resp = http_get_json(url)
+        if resp == "" { return results }
+
+        let parsed = std.json.parse(resp)
+        if parsed.kind != 4 { return results }
+
+        let items = json_get_items(parsed)
+        for item in items {
+            if item.kind != 5 { continue }
+            let pkg = Package {
+                name:        json_get_string(item, "name"),
+                version:     json_get_string(item, "version"),
+                description: json_get_string(item, "description"),
+                license:     json_get_string(item, "license")
+            }
+            results = results ++ [pkg]
+        }
+        return results
+    }
+
+    fn publish(name: string, version: string, tarball_path: string) -> i32 {
+        let url = registry_url("/api/publish")
+        let body = "{\"name\":\"" ++ name ++ "\",\"version\":\"" ++ version ++ "\",\"tarball\":\"" ++ tarball_path ++ "\"}"
+        let resp = http_post_json(url, body)
+        if resp == "" { return ERR_NETWORK }
+        let parsed = std.json.parse(resp)
+        if parsed.kind == 5 {
+            let ok = json_get_bool(parsed, "success")
+            if ok { return OK }
+        }
+        return ERR_NETWORK
+    }
+
+    fn download(name: string, version: string) -> string {
+        let url = registry_url("/api/packages/" ++ name ++ "/" ++ version ++ "/download")
+        return http_get_json(url)
+    }
+
+    fn package_info(name: string) -> Package {
+        let empty = Package { name: "", version: "", description: "", license: "" }
+        let url = registry_url("/api/packages/" ++ name)
+        let resp = http_get_json(url)
+        if resp == "" { return empty }
+        let parsed = std.json.parse(resp)
+        if parsed.kind != 5 { return empty }
+        return Package {
+            name:        json_get_string(parsed, "name"),
+            version:     json_get_string(parsed, "version"),
+            description: json_get_string(parsed, "description"),
+            license:     json_get_string(parsed, "license")
+        }
+    }
+
+    fn fetch_versions(name: string) -> string[] {
+        let versions: string[] = []
+        let url = registry_url("/api/packages/" ++ name ++ "/versions")
+        let resp = http_get_json(url)
+        if resp == "" { return versions }
+        let parsed = std.json.parse(resp)
+        if parsed.kind != 4 { return versions }
+        let items = json_get_items(parsed)
+        for item in items {
+            if item.kind == 3 {
+                versions = versions ++ [item.s]
+            }
+        }
+        return versions
+    }
+
+    fn resolve(deps: string[]) -> ResolvedDeps {
+        let result = ResolvedDeps { names: [], versions: [] }
+        let g = resolver.graph_new()
+
+        for dep in deps {
+            let eq_pos = dep.find("=")
+            if eq_pos <= 0 { continue }
+            let name = dep.substr(0, eq_pos)
+            let constraint = dep.substr(eq_pos + 1, dep.size())
+            let idx = resolver.graph_add_node(&mut g, name, constraint)
+
+            // Fetch package info from registry
+            let pkg = package_info(name)
+            if pkg.name != "" {
+                // Try to find a matching version
+                let versions = fetch_versions(name)
+                let c = resolver.constraint_parse(constraint)
+                let best: string = ""
+                let best_semver = resolver.Semver { major: -1, minor: -1, patch: 0, prerelease: "" }
+                for v in versions {
+                    let vs = resolver.semver_parse(v)
+                    if resolver.constraint_matches(c, v) {
+                        if resolver.semver_cmp(vs, best_semver) > 0 {
+                            best = v
+                            best_semver = vs
+                        }
+                    }
+                }
+                if best != "" {
+                    resolver.graph_set_version(&mut g, idx, best)
+                }
+            }
+        }
+
+        // Check for conflicts
+        let conflict = resolver.graph_detect_conflicts(g)
+        if conflict >= 0 {
+            println("vexpm: conflict detected for " ++ g.nodes[conflict].name)
+            return result
+        }
+
+        // Check for cycles
+        if resolver.graph_has_cycle(g) {
+            println("vexpm: cyclic dependency detected")
+            return result
+        }
+
+        // Export resolved deps
+        let mut i: i32 = 0
+        while i < g.nodes.size() {
+            if g.nodes[i].resolved {
+                result.names = result.names ++ [g.nodes[i].name]
+                result.versions = result.versions ++ [g.nodes[i].version]
+            }
+            i = i + 1
+        }
+
+        // Write lockfile
+        resolver.lockfile_write_to_disk(g)
+
+        return result
+    }
+
+} // namespace vexpm.registry

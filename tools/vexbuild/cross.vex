@@ -1,0 +1,105 @@
+// vexbuild/cross.vex - Cross-compilation target definitions
+// Supports native, wasm32, and arm64 targets with triple parsing.
+
+namespace vexbuild.cross {
+
+    type TargetArch = struct {
+        name:      string  // e.g. "x86_64", "wasm32", "aarch64"
+        vendor:    string  // e.g. "pc", "unknown"
+        system:    string  // e.g. "linux", "windows", "none"
+        abi:       string  // e.g. "gnu", "musl", "msvc"
+    }
+
+    type TargetConfig = struct {
+        arch:      TargetArch
+        linker:    string
+        flags:     string
+        output_ext: string
+    }
+
+    fn parse_triple(triple: string) -> TargetArch {
+        let parts: string[] = []
+        let mut current: string = ""
+        let mut i: i32 = 0
+        while i < triple.size() {
+            if triple[i] == '-' {
+                parts = parts ++ [current]
+                current = ""
+            } else {
+                current = current ++ triple[i]
+            }
+            i = i + 1
+        }
+        parts = parts ++ [current]
+
+        let arch_name  = if parts.size() > 0 { parts[0] } else { "unknown" }
+        let vendor     = if parts.size() > 1 { parts[1] } else { "unknown" }
+        let system     = if parts.size() > 2 { parts[2] } else { "unknown" }
+        let abi_val    = if parts.size() > 3 { parts[3] } else { "" }
+
+        return TargetArch {
+            name: arch_name, vendor: vendor,
+            system: system, abi: abi_val
+        }
+    }
+
+    fn native_target() -> TargetConfig {
+        return TargetConfig {
+            arch: TargetArch {
+                name: "x86_64", vendor: "pc",
+                system: "linux", abi: "gnu"
+            },
+            linker: "ld",
+            flags: "-march=x86-64-v2 -mtune=generic",
+            output_ext: ".o"
+        }
+    }
+
+    fn wasm_target() -> TargetConfig {
+        return TargetConfig {
+            arch: TargetArch {
+                name: "wasm32", vendor: "unknown",
+                system: "none", abi: ""
+            },
+            linker: "wasm-ld",
+            flags: "--target=wasm32-unknown-none -nostdlib",
+            output_ext: ".wasm"
+        }
+    }
+
+    fn arm64_target() -> TargetConfig {
+        return TargetConfig {
+            arch: TargetArch {
+                name: "aarch64", vendor: "unknown",
+                system: "linux", abi: "gnu"
+            },
+            linker: "aarch64-linux-gnu-ld",
+            flags: "--target=aarch64-linux-gnu",
+            output_ext: ".o"
+        }
+    }
+
+    fn resolve_target(name: string) -> TargetConfig {
+        if name == "native" || name == "x86_64" || name == "x86-64" {
+            return native_target()
+        } elif name == "wasm" || name == "wasm32" {
+            return wasm_target()
+        } elif name == "arm64" || name == "aarch64" {
+            return arm64_target()
+        } else {
+            // Try parsing as a full target triple
+            let arch = parse_triple(name)
+            return TargetConfig {
+                arch: arch,
+                linker: "ld",
+                flags: "--target=" ++ name,
+                output_ext: ".o"
+            }
+        }
+    }
+
+    fn target_to_flag(tc: TargetConfig) -> string {
+        return " --target=" ++ tc.arch.name ++ "-" ++ tc.arch.vendor ++ "-" ++ tc.arch.system
+    }
+
+} // namespace vexbuild.cross

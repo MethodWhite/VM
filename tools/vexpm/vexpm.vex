@@ -1,0 +1,473 @@
+// =============================================================================
+// vexpm.vex - Vex Package Manager CLI
+// Usage: vexpm <command> [options]
+//   vexpm init          Initialize a new package
+//   vexpm add <pkg>     Add a dependency
+//   vexpm remove <pkg>  Remove a dependency
+//   vexpm install       Install all dependencies
+//   vexpm build         Build the project
+//   vexpm test          Run tests
+//   vexpm publish       Publish to registry
+// =============================================================================
+
+namespace vexpm {
+
+    // =========================================================================
+    // Manifest types
+    // =========================================================================
+
+    type PackageManifest = struct {
+        name:         string
+        version:      string
+        description:  string
+        license:      string
+        dependencies: std.json.Value  // parsed JSON object
+        scripts:      std.json.Value  // parsed JSON object
+    }
+
+    comptime MANIFEST_FILE: string = "vex.json"
+
+    fn manifest_load() -> PackageManifest {
+        let empty = PackageManifest {
+            name: "", version: "", description: "",
+            license: "", dependencies: std.json.null_value(),
+            scripts: std.json.null_value()
+        }
+        if !std.io.exists(MANIFEST_FILE) {
+            println("vexpm: error: " ++ MANIFEST_FILE ++ " not found")
+            return empty
+        }
+        let content = std.io.read_all(MANIFEST_FILE)
+        let parsed = std.json.parse(content)
+        if parsed.kind != 5 {
+            println("vexpm: error: invalid " ++ MANIFEST_FILE)
+            return empty
+        }
+        let name_f = std.json.get_field(parsed, "name")
+        let ver_f  = std.json.get_field(parsed, "version")
+        let desc_f = std.json.get_field(parsed, "description")
+        let lic_f  = std.json.get_field(parsed, "license")
+        let dep_f  = std.json.get_field(parsed, "dependencies")
+        let scr_f  = std.json.get_field(parsed, "scripts")
+
+        return PackageManifest {
+            name:         if name_f.kind == 3 { name_f.s } else { "" },
+            version:      if ver_f.kind == 3 { ver_f.s } else { "" },
+            description:  if desc_f.kind == 3 { desc_f.s } else { "" },
+            license:      if lic_f.kind == 3 { lic_f.s } else { "" },
+            dependencies: dep_f,
+            scripts:      scr_f
+        }
+    }
+
+    fn manifest_save(m: PackageManifest) {
+        let mut json: string = "{\n"
+        json = json ++ "    \"name\": \"" ++ m.name ++ "\",\n"
+        json = json ++ "    \"version\": \"" ++ m.version ++ "\",\n"
+        json = json ++ "    \"description\": \"" ++ m.description ++ "\",\n"
+        json = json ++ "    \"license\": \"" ++ m.license ++ "\",\n"
+
+        // Dependencies
+        json = json ++ "    \"dependencies\": {\n"
+        let first: bool = true
+        if m.dependencies.kind == 5 {
+            let keys = std.json.get_keys(m.dependencies)
+            for key in keys {
+                let val = std.json.get_field(m.dependencies, key)
+                let comma = if first { "" } else { ",\n" }
+                let val_str = if val.kind == 3 { val.s } else { "" }
+                json = json ++ comma ++ "        \"" ++ key ++ "\": \"" ++ val_str ++ "\""
+                first = false
+            }
+        }
+        json = json ++ "\n    },\n"
+
+        // Scripts
+        json = json ++ "    \"scripts\": {\n"
+        first = true
+        if m.scripts.kind == 5 {
+            let keys = std.json.get_keys(m.scripts)
+            for key in keys {
+                let val = std.json.get_field(m.scripts, key)
+                let comma = if first { "" } else { ",\n" }
+                let val_str = if val.kind == 3 { val.s } else { "" }
+                json = json ++ comma ++ "        \"" ++ key ++ "\": \"" ++ escape_json(val_str) ++ "\""
+                first = false
+            }
+        }
+        json = json ++ "\n    }\n}\n"
+
+        std.io.write(MANIFEST_FILE, json)
+        println("vexpm: wrote " ++ MANIFEST_FILE)
+    }
+
+    fn escape_json(s: string) -> string {
+        let result: string = ""
+        let mut i: i32 = 0
+        while i < s.size() {
+            let c = s[i]
+            if c == '"' { result = result ++ "\\\"" }
+            elif c == '\\' { result = result ++ "\\\\" }
+            elif c == '\n' { result = result ++ "\\n" }
+            elif c == '\t' { result = result ++ "\\t" }
+            else { result = result ++ c }
+            i = i + 1
+        }
+        return result
+    }
+
+    // =========================================================================
+    // Command: init
+    // =========================================================================
+
+    fn cmd_init() -> i32 {
+        if std.io.exists(MANIFEST_FILE) {
+            println("vexpm: error: " ++ MANIFEST_FILE ++ " already exists")
+            return 1
+        }
+        let manifest = PackageManifest {
+            name:         std.io.basename(std.system.cwd()),
+            version:      "0.1.0",
+            description:  "A Vex package",
+            license:      "VMProject",
+            dependencies: std.json.parse("{}"),
+            scripts:      std.json.parse("{}")
+        }
+        manifest_save(manifest)
+        println("vexpm: initialized " ++ manifest.name)
+
+        // Create standard directory structure
+        if !std.io.exists("src") {
+            std.system.mkdir("src")
+        }
+        if !std.io.exists("tests") {
+            std.system.mkdir("tests")
+        }
+        if !std.io.exists("build") {
+            std.system.mkdir("build")
+        }
+        return 0
+    }
+
+    // =========================================================================
+    // Command: add
+    // =========================================================================
+
+    fn cmd_add(pkg_name: string) -> i32 {
+        let m = manifest_load()
+        if m.name == "" { return 1 }
+
+        let mut deps_obj = m.dependencies
+        if deps_obj.kind != 5 {
+            deps_obj = std.json.parse("{}")
+        }
+
+        // Check if already exists
+        let existing = std.json.get_field(deps_obj, pkg_name)
+        if existing.kind != 0 {
+            println("vexpm: " ++ pkg_name ++ " is already a dependency")
+            return 0
+        }
+
+        // Default constraint is "^1.0"
+        let constraint = "^1.0"
+        let pkg_str = "{\"" ++ pkg_name ++ "\":\"" ++ constraint ++ "\"}"
+        let pkg_parsed = std.json.parse(pkg_str)
+        if pkg_parsed.kind == 5 {
+            deps_obj = std.json.merge(deps_obj, pkg_parsed)
+        }
+
+        let new_m = PackageManifest {
+            name: m.name, version: m.version,
+            description: m.description, license: m.license,
+            dependencies: deps_obj, scripts: m.scripts
+        }
+        manifest_save(new_m)
+        println("vexpm: added " ++ pkg_name ++ " (" ++ constraint ++ ")")
+        return 0
+    }
+
+    // =========================================================================
+    // Command: remove
+    // =========================================================================
+
+    fn cmd_remove(pkg_name: string) -> i32 {
+        let m = manifest_load()
+        if m.name == "" { return 1 }
+
+        let mut deps_obj = m.dependencies
+        if deps_obj.kind != 5 {
+            println("vexpm: no dependencies to remove")
+            return 0
+        }
+
+        let existing = std.json.get_field(deps_obj, pkg_name)
+        if existing.kind == 0 {
+            println("vexpm: " ++ pkg_name ++ " is not a dependency")
+            return 0
+        }
+
+        deps_obj = std.json.remove_field(deps_obj, pkg_name)
+
+        let new_m = PackageManifest {
+            name: m.name, version: m.version,
+            description: m.description, license: m.license,
+            dependencies: deps_obj, scripts: m.scripts
+        }
+        manifest_save(new_m)
+        println("vexpm: removed " ++ pkg_name)
+        return 0
+    }
+
+    // =========================================================================
+    // Command: install
+    // =========================================================================
+
+    fn cmd_install() -> i32 {
+        let m = manifest_load()
+        if m.name == "" { return 1 }
+
+        println("vexpm: installing dependencies for " ++ m.name)
+
+        if m.dependencies.kind != 5 {
+            println("vexpm: no dependencies to install")
+            return 0
+        }
+
+        // Resolve each dependency
+        let keys = std.json.get_keys(m.dependencies)
+        let deps: string[] = []
+        for key in keys {
+            let val = std.json.get_field(m.dependencies, key)
+            let constraint = if val.kind == 3 { val.s } else { "^1.0" }
+            deps = deps ++ [key ++ "=" ++ constraint]
+        }
+
+        let resolved = registry.resolve(deps)
+        if resolved.names.size() == 0 {
+            println("vexpm: dependency resolution failed")
+            return 1
+        }
+
+        println("vexpm: resolved " ++ i32_to_str(resolved.names.size()) ++ " dependencies")
+        let mut i: i32 = 0
+        while i < resolved.names.size() {
+            println("  " ++ resolved.names[i] ++ "@" ++ resolved.versions[i])
+            i = i + 1
+        }
+
+        // Download each dependency to vex_modules/
+        if !std.io.exists("vex_modules") {
+            std.system.mkdir("vex_modules")
+        }
+
+        i = 0
+        while i < resolved.names.size() {
+            println("vexpm: downloading " ++ resolved.names[i] ++ "@" ++ resolved.versions[i] ++ " ...")
+            let data = registry.download(resolved.names[i], resolved.versions[i])
+            if data != "" {
+                let out_path = "vex_modules/" ++ resolved.names[i] ++ ".velb"
+                std.io.write(out_path, data)
+                println("vexpm: downloaded to " ++ out_path)
+            } else {
+                println("vexpm: warning: could not download " ++ resolved.names[i])
+            }
+            i = i + 1
+        }
+
+        println("vexpm: install complete")
+        return 0
+    }
+
+    // =========================================================================
+    // Command: build
+    // =========================================================================
+
+    fn cmd_build() -> i32 {
+        let m = manifest_load()
+        if m.name == "" { return 1 }
+
+        // Look for build script
+        if m.scripts.kind == 5 {
+            let build_scr = std.json.get_field(m.scripts, "build")
+            if build_scr.kind == 3 {
+                println("vexpm: running build script...")
+                let result = std.system.shell(build_scr.s)
+                if result != "" {
+                    println(result)
+                }
+                return 0
+            }
+        }
+
+        // Default build
+        if !std.io.exists("src") { std.system.mkdir("src") }
+        if !std.io.exists("build") { std.system.mkdir("build") }
+
+        let src_main = "src/main.vex"
+        let output = "build/" ++ m.name ++ ".velb"
+
+        if std.io.exists(src_main) {
+            let cmd = "vm --vex " ++ src_main ++ " -o " ++ output
+            println("vexpm: building " ++ src_main ++ " -> " ++ output)
+            let result = std.system.shell(cmd)
+            if result != "" { println(result) }
+            if std.io.exists(output) {
+                println("vexpm: build OK -> " ++ output)
+                return 0
+            }
+        } else {
+            println("vexpm: no source file found at " ++ src_main)
+            println("vexpm: define a build script in " ++ MANIFEST_FILE)
+        }
+        return 1
+    }
+
+    // =========================================================================
+    // Command: test
+    // =========================================================================
+
+    fn cmd_test() -> i32 {
+        let m = manifest_load()
+        if m.name == "" { return 1 }
+
+        // Look for test script
+        if m.scripts.kind == 5 {
+            let test_scr = std.json.get_field(m.scripts, "test")
+            if test_scr.kind == 3 {
+                println("vexpm: running test script...")
+                let result = std.system.shell(test_scr.s)
+                if result != "" { println(result) }
+                return 0
+            }
+        }
+
+        // Default: look for tests/ directory
+        if std.io.exists("tests") {
+            println("vexpm: running tests in tests/ ...")
+            let files = std.system.list_dir("tests")
+            let mut pass: i32 = 0
+            let mut fail: i32 = 0
+            for f in files {
+                if f.size() >= 4 && f.substr(f.size() - 4, f.size()) == ".vex" {
+                    let test_path = "tests/" ++ f
+                    let output = "build/" ++ f ++ ".velb"
+                    let cmd_comp = "vm --vex " ++ test_path ++ " -o " ++ output
+                    let cmd_run = "vm --run " ++ output
+                    let comp_res = std.system.shell(cmd_comp)
+                    if std.io.exists(output) {
+                        let run_res = str_to_i32(std.system.shell(cmd_run))
+                        if run_res == 0 {
+                            pass = pass + 1
+                            println("  [PASS] " ++ f)
+                        } else {
+                            fail = fail + 1
+                            println("  [FAIL] " ++ f ++ " (exit " ++ i32_to_str(run_res) ++ ")")
+                        }
+                    } else {
+                        fail = fail + 1
+                        println("  [FAIL] " ++ f ++ " (compilation error)")
+                    }
+                }
+            }
+            println("vexpm: " ++ i32_to_str(pass) ++ " passed, " ++ i32_to_str(fail) ++ " failed")
+            if fail > 0 { return 1 }
+            return 0
+        }
+
+        println("vexpm: no tests found")
+        return 0
+    }
+
+    // =========================================================================
+    // Command: publish
+    // =========================================================================
+
+    fn cmd_publish() -> i32 {
+        let m = manifest_load()
+        if m.name == "" { return 1 }
+
+        println("vexpm: publishing " ++ m.name ++ " " ++ m.version)
+
+        // Build first
+        let build_ok = cmd_build()
+        if build_ok != 0 {
+            println("vexpm: build failed, aborting publish")
+            return 1
+        }
+
+        // Create tarball (simplified - just use the compiled output)
+        let tarball = "build/" ++ m.name ++ ".tar.gz"
+        let tar_cmd = "tar czf " ++ tarball ++ " " ++ MANIFEST_FILE ++ " src/ build/"
+        let tar_res = std.system.shell(tar_cmd)
+
+        // Upload to registry
+        let rc = registry.publish(m.name, m.version, tarball)
+        if rc == registry.OK {
+            println("vexpm: published " ++ m.name ++ "@" ++ m.version)
+            return 0
+        } else {
+            println("vexpm: publish failed (network error)")
+            return 1
+        }
+    }
+
+    // =========================================================================
+    // Main entry point
+    // =========================================================================
+
+    fn print_usage() {
+        println("vexpm - Vex Package Manager")
+        println("")
+        println("Usage:")
+        println("  vexpm init              Initialize a new package")
+        println("  vexpm add <package>     Add a dependency")
+        println("  vexpm remove <package>  Remove a dependency")
+        println("  vexpm install           Install all dependencies")
+        println("  vexpm build             Build the project")
+        println("  vexpm test              Run tests")
+        println("  vexpm publish           Publish to registry")
+        println("")
+        println("See README.md for more information")
+    }
+
+    i32 main() {
+        let args = std.system.args()
+
+        if args.size() < 2 {
+            print_usage()
+            return 0
+        }
+
+        let command = args[1]
+
+        if command == "init" {
+            return cmd_init()
+        } elif command == "add" {
+            if args.size() < 3 {
+                println("vexpm: usage: vexpm add <package>")
+                return 1
+            }
+            return cmd_add(args[2])
+        } elif command == "remove" {
+            if args.size() < 3 {
+                println("vexpm: usage: vexpm remove <package>")
+                return 1
+            }
+            return cmd_remove(args[2])
+        } elif command == "install" {
+            return cmd_install()
+        } elif command == "build" {
+            return cmd_build()
+        } elif command == "test" {
+            return cmd_test()
+        } elif command == "publish" {
+            return cmd_publish()
+        } else {
+            println("vexpm: unknown command '" ++ command ++ "'")
+            print_usage()
+            return 1
+        }
+    }
+
+} // namespace vexpm

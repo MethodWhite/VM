@@ -1,0 +1,94 @@
+# Vex Ecosystem Testing Configuration
+
+Este archivo define la configuración para el sistema de testing Vex, permitiendo personalización y control de los tests.
+
+## Índice
+
+1. [Visión general](#1-visión-general)
+2. [Estructura de configuración](#2-estructura-de-configuración)
+3. [Secciones de configuración](#3-secciones-de-configuración)
+4. [Variables de entorno](#4-variables-de-entorno)
+5. [Ejemplo de archivo de configuración](#5-ejemplo-de-archivo-de-configuración)
+6. [Convenciones de implementación](#6-convenciones-de-implementación)
+
+---
+
+## 1. Visión general
+
+El sistema de configuración de testing Vex está diseñado para:
+
+- Proporcionar control granular sobre qué tests ejecutar
+- Permitir configuración de opciones de tests (timeout, paralelismo, verbose)
+- Soportar diferentes modos de testing (unitario, integración, E2E, benchmarks)
+- Integrar con CI/CD pipelines
+- Proporcionar métricas y reportes de tests
+
+El sistema está inspirado en:
+
+- **Synapsis**: Configuración de tests modular con secciones bien definidas
+- **Oura**: Soporte para variables de entorno y valores por defecto limpios
+- **Vex**: Configuración específica para tests del lenguaje, runtime y distribución
+
+---
+
+## 2. Estructura de configuración
+
+La configuración de testing Vex está organizada en secciones lógicas:
+
+```toml
+# Ejemplo de archivo de configuración de testing
+[testing]
+modo = "completo"  # completo, unitario, integracion, e2e, benchmarks
+
+[testing.unitario]
+habilitado = true
+patrones = ["test_vex_*.cpp", "test_runtime_*.cpp"]
+timeout_segundos = 300
+verbose = false
+parallel = true
+
+[testing.integracion]
+habilitado = true
+patrones = ["test_vex_module_*.cpp", "test_cli_*.cpp"]
+timeout_segundos = 600
+verbose = false
+parallel = true
+
+[testing.e2e]
+habilitado = true
+rutas = ["examples_codes_vex/"]
+timeout_segundos = 1800
+verbose = true
+parallel = false
+
+[testing.benchmarks]
+habilitado = true
+rutas = ["examples_codes_vex/benchmark/"]
+timeout_segundos = 3600
+verbose = false
+parallel = true
+
+[testing.borrow_checker]
+habilitado = true
+patrones = ["test_borrow_*.cpp"]
+timeout_segundos = 300
+verbose = false
+parallel = true
+
+[testing.edge_cases]
+habilitado = true
+patrones = ["test_memory_safety.cpp", "test_exceptions.cpp"]
+timeout_segundos = 300
+verbose = false
+parallel = true
+
+[testing.runner]
+nombre = "VexTestRunner"
+versión = "1.0.0"
+autor = "Equipo VestaVM"
+
+[testing.reports]
+directorio = "test_results"
+formato = "json"
+incluir_cobertura = true
+incluir_performance = true

@@ -313,6 +313,40 @@ VESTA_PLUGIN_EXPORT uint64_t vmath_tan(uint64_t bits) {
     return f64_to_u64(tan(u64_to_f64(bits)));
 }
 
+/* -----------------------------------------------------------------------
+ * Exponencial, tangente hiperbolica y error function
+ * ----------------------------------------------------------------------- */
+
+/**
+ * @brief Exponencial (e^x) de un double.
+ *
+ * @param bits  Bits IEEE 754 del exponente.
+ * @return      Bits IEEE 754 de e^bits.
+ */
+VESTA_PLUGIN_EXPORT uint64_t vmath_exp(uint64_t bits) {
+    return f64_to_u64(exp(u64_to_f64(bits)));
+}
+
+/**
+ * @brief Tangente hiperbolica de un double.
+ *
+ * @param bits  Bits IEEE 754 del angulo hiperbolico.
+ * @return      Bits IEEE 754 del resultado en [-1.0, 1.0].
+ */
+VESTA_PLUGIN_EXPORT uint64_t vmath_tanh(uint64_t bits) {
+    return f64_to_u64(tanh(u64_to_f64(bits)));
+}
+
+/**
+ * @brief Funcion error (erf) de un double.
+ *
+ * @param bits  Bits IEEE 754 del operando.
+ * @return      Bits IEEE 754 de erf(operando).
+ */
+VESTA_PLUGIN_EXPORT uint64_t vmath_erf(uint64_t bits) {
+    return f64_to_u64(erf(u64_to_f64(bits)));
+}
+
 /* =======================================================================
  * Math-IR-promote v2.2a: ops bit + int extendidas.
  *

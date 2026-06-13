@@ -106,15 +106,250 @@ namespace Assembly::Bytecode::Linker {
             return;
         }
 
-        // TODO: aqui parsear formato .velo/.velb parcial.
-        // Por ahora, lo tratamos como un modulo con bytecode plano y sin contexto real.
-
+        // Parsear formato .velo/.velb parcial.
         Module m;
         m.name      = path;
-        m.bytecode  = std::move(data);
         m.is_object = true;
 
-        // TODO: rellenar m.ctx, m.local_symbols, m.relocations segun el formato real.
+        try {
+            ByteReader reader(data);
+            Context ctx;
+
+            // Leer header VELB
+            uint32_t magic = reader.read32();
+            if (magic != MAGIC_NUMBER_VELB) {
+                add_errorf(report, LinkerError::Type::InvalidFormat,
+                           ("Formato .velb invalido (magic) en " + path).c_str());
+                return;
+            }
+
+            reader.read32(); // format_v
+            reader.read32(); // max_v
+            reader.read32(); // min_v
+            reader.read64(); // checksum
+            reader.read64(); // flags
+            reader.read64(); // timestamp
+            reader.read32(); // arch
+            uint32_t section_count  = reader.read32();
+            uint64_t table_offset   = reader.read64();
+            uint64_t n_spaces       = reader.read64();
+            uint64_t offset_strings = reader.read64();
+            uint64_t start_pc       = reader.read64();
+            uint64_t offset_import_table = reader.read64();
+            uint64_t offset_label_table  = reader.read64();
+            uint32_t size_import_table   = reader.read32();
+            uint32_t size_label_table    = reader.read32();
+            reader.read64(); // offset_debug_section
+            reader.read32(); // size_debug_section
+            reader.read8();  // debug_level
+            reader.skip(3);  // _debug_pad
+            uint64_t offset_reloc_table = reader.read64();
+            uint32_t size_reloc_table   = reader.read32();
+            reader.read64(); // offset_ir_section
+            reader.read32(); // size_ir_section
+
+            // Alinear a 16 bytes
+            while (reader.offset % 16 != 0) reader.skip(1);
+
+            // Leer tabla de espacios de direcciones
+            std::vector<std::pair<uint64_t, std::string>> space_name_offsets;
+            for (uint64_t i = 0; i < n_spaces; ++i) {
+                table_spaces_address spa;
+                spa.address.address_init      = reader.read64();
+                spa.address.address_final     = reader.read64();
+                spa.offset_section_strings    = reader.read64();
+                spa.offset_bytecode          = reader.read64();
+
+                Space sp;
+                sp.range = spa.address;
+                sp.file_offset = spa.offset_bytecode;
+                ctx.space_address["@space_" + std::to_string(i)] = sp;
+                {   // copy packed field to avoid GCC reference-to-packed-member error
+                    uint64_t off = spa.offset_section_strings;
+                    space_name_offsets.push_back({off, "@space_" + std::to_string(i)});
+                }
+            }
+
+            // Leer blob de strings de secciones
+            uint64_t string_blob_size = table_offset - offset_strings;
+            std::unordered_map<uint64_t, std::string> strings_map;
+            if (string_blob_size > 0 && offset_strings > 0) {
+                auto saved = reader.save();
+                reader.seek(offset_strings);
+                std::vector<uint8_t> str_data = reader.read_bytes(string_blob_size);
+                reader.restore(saved);
+
+                ByteReader sr(str_data);
+                while (!sr.eof()) {
+                    uint64_t start = sr.offset;
+                    std::string s;
+                    while (!sr.eof()) {
+                        uint8_t c = sr.read8();
+                        if (c == 0) break;
+                        s += static_cast<char>(c);
+                    }
+                    if (!s.empty())
+                        strings_map[offset_strings + start] = s;
+                }
+            }
+
+            // Asignar nombres a espacios desde el string pool
+            for (auto &[str_off, space_key] : space_name_offsets) {
+                auto it = strings_map.find(str_off);
+                if (it != strings_map.end()) {
+                    auto node = ctx.space_address.extract(space_key);
+                    if (node) {
+                        node.key() = it->second;
+                        node.mapped().set_name(it->second);
+                        ctx.space_address.insert(std::move(node));
+                    }
+                }
+            }
+
+            // Leer tabla de secciones
+            reader.seek(table_offset);
+            struct SectionEntry {
+                uint64_t init, final, str_off;
+            };
+            std::vector<SectionEntry> section_entries;
+            for (uint32_t i = 0; i < section_count; ++i) {
+                uint64_t init   = reader.read64();
+                uint64_t final  = reader.read64();
+                uint64_t stroff = reader.read64();
+                section_entries.push_back({init, final, stroff});
+            }
+
+            // El resto es el bytecode del modulo
+            uint64_t bc_offset = reader.offset;
+            m.bytecode = reader.read_bytes(data.size() - bc_offset);
+
+            // Construir secciones en el contexto
+            for (size_t i = 0; i < section_entries.size(); ++i) {
+                auto &se = section_entries[i];
+                Section sec;
+                sec.memory.address_init  = se.init;
+                sec.memory.address_final = se.final;
+                sec.size_real            = se.final - se.init;
+
+                auto sit = strings_map.find(se.str_off);
+                sec.name = (sit != strings_map.end()) ? sit->second : ("sec_" + std::to_string(i));
+
+                // Buscar a que espacio pertenece esta seccion
+                bool assigned = false;
+                for (auto &[spName, sp] : ctx.space_address) {
+                    if (se.init >= sp.range.address_init && se.final <= sp.range.address_final) {
+                        sp.table_section[sec.name] = sec;
+                        sp.ordered_sections.push_back(&sp.table_section[sec.name]);
+                        assigned = true;
+                        break;
+                    }
+                }
+                if (!assigned) {
+                    // Crear espacio por defecto si ninguno contiene la seccion
+                    Space default_sp;
+                    default_sp.range.address_init  = se.init;
+                    default_sp.range.address_final = se.final;
+                    default_sp.set_name("default");
+                    default_sp.table_section[sec.name] = sec;
+                    default_sp.ordered_sections.push_back(&default_sp.table_section[sec.name]);
+                    ctx.space_address["default"] = default_sp;
+                }
+            }
+
+            // Leer tabla de labels
+            if (offset_label_table > 0 && size_label_table > 0) {
+                reader.seek(offset_label_table);
+                for (uint32_t i = 0; i < size_label_table; ++i) {
+                    entry_label_table el;
+                    el.offset_table_string = reader.read32();
+                    el.offset_bytecode     = reader.read32();
+                    el.index_section       = reader.read32();
+                    el.size_label          = reader.read32();
+
+                    std::string label_name;
+                    auto lit = strings_map.find(el.offset_table_string);
+                    if (lit != strings_map.end()) label_name = lit->second;
+                    else label_name = "label_" + std::to_string(i);
+
+                    if (el.index_section < section_entries.size()) {
+                        auto &se = section_entries[el.index_section];
+                        // Buscar la seccion en el contexto
+                        for (auto &[spName, sp] : ctx.space_address) {
+                            for (auto &[secName, sec] : sp.table_section) {
+                                if (sec.memory.address_init == se.init) {
+                                    sec.add_label(label_name, el.offset_bytecode, el.size_label);
+                                    goto label_found;
+                                }
+                            }
+                        }
+                    }
+                    label_found:;
+                }
+            }
+
+            // Leer tabla de importaciones
+            if (offset_import_table > 0 && size_import_table > 0) {
+                reader.seek(offset_import_table);
+                for (uint32_t i = 0; i < size_import_table; ++i) {
+                    entry_import_table eit;
+                    eit.offset_module_string   = reader.read32();
+                    eit.offset_function_string = reader.read32();
+                    eit.offset_signature_string = reader.read32();
+                    eit.offset_bytecode        = reader.read32();
+
+                    auto lib_it  = strings_map.find(eit.offset_module_string);
+                    auto func_it = strings_map.find(eit.offset_function_string);
+
+                    ImportEntry imp;
+                    imp.library  = (lib_it != strings_map.end()) ? lib_it->second : "unknown";
+                    imp.function = (func_it != strings_map.end()) ? func_it->second : "unknown";
+                    imp.index    = i;
+
+                    ctx.import_table.push_back(imp);
+                    ctx.import_lookup[imp.library + ":" + imp.function] = i;
+                }
+            }
+
+            // Leer tabla de relocalizaciones VELB
+            if (offset_reloc_table > 0 && size_reloc_table > 0) {
+                reader.seek(offset_reloc_table);
+                for (uint32_t i = 0; i < size_reloc_table; ++i) {
+                    entry_relocation_table ert;
+                    ert.bytecode_offset = reader.read64();
+                    ert.target_value    = reader.read64();
+                    ert.type            = reader.read8();
+                    reader.skip(7); // _pad
+
+                    // Convertir a Relocation interna
+                    Relocation rel;
+                    rel.offset = ert.bytecode_offset;
+                    rel.symbol = "@reloc_" + std::to_string(i);
+                    rel.section = "";
+
+                    switch (ert.type) {
+                        case static_cast<uint8_t>(RelocTypeVELB::ABSOLUTE64):
+                            rel.type = Type::Absolute64; break;
+                        case static_cast<uint8_t>(RelocTypeVELB::ABSOLUTE32):
+                            rel.type = Type::Absolute32; break;
+                        case static_cast<uint8_t>(RelocTypeVELB::RELATIVE32):
+                            rel.type = Type::Relative32; break;
+                        case static_cast<uint8_t>(RelocTypeVELB::RELATIVE64):
+                            rel.type = Type::Relative64; break;
+                        default:
+                            rel.type = Type::Absolute64; break;
+                    }
+                    m.relocations.push_back(rel);
+                }
+            }
+
+            ctx.start_pc = start_pc;
+            m.ctx = std::move(ctx);
+
+        } catch (const ByteReaderError &e) {
+            add_errorf(report, LinkerError::Type::InvalidFormat,
+                       ("Error parseando .velb: " + std::string(e.what())).c_str());
+            return;
+        }
 
         modules.push_back(std::move(m));
         report.modules_linked++;
@@ -128,10 +363,248 @@ namespace Assembly::Bytecode::Linker {
 
         Module m;
         m.name      = "<memory-object>";
-        m.bytecode  = data;
         m.is_object = true;
 
-        // TODO: parsear cabecera interna si la hay.
+        Context ctx;
+
+        try {
+            ByteReader reader(data);
+
+            uint32_t magic = reader.read32();
+            if (magic != MAGIC_NUMBER_VELB) {
+                // Formato desconocido o bytecode plano sin cabecera
+                m.bytecode = data;
+                m.ctx = Context{};
+                modules.push_back(std::move(m));
+                report.modules_linked++;
+                return;
+            }
+
+            // --- Parsear cabecera VELB completa ---
+            reader.read32(); // format_v
+            reader.read32(); // max_v
+            reader.read32(); // min_v
+            reader.read64(); // checksum
+            reader.read64(); // flags
+            reader.read64(); // timestamp
+            reader.read32(); // arch
+            uint32_t section_count  = reader.read32();
+            uint64_t table_offset   = reader.read64();
+            uint64_t n_spaces       = reader.read64();
+            uint64_t offset_strings = reader.read64();
+            uint64_t start_pc       = reader.read64();
+            uint64_t offset_import_tbl = reader.read64();
+            uint64_t offset_label_tbl  = reader.read64();
+            uint32_t size_import_tbl   = reader.read32();
+            uint32_t size_label_tbl    = reader.read32();
+            reader.read64(); // offset_debug_section
+            reader.read32(); // size_debug_section
+            reader.read8();  // debug_level
+            reader.skip(3);  // _debug_pad
+            uint64_t offset_reloc_tbl = reader.read64();
+            uint32_t size_reloc_tbl   = reader.read32();
+            reader.read64(); // offset_ir_section
+            reader.read32(); // size_ir_section
+
+            while (reader.offset % 16 != 0) reader.skip(1);
+
+            // --- Espacios de direcciones ---
+            for (uint64_t i = 0; i < n_spaces; ++i) {
+                table_spaces_address spa;
+                spa.address.address_init   = reader.read64();
+                spa.address.address_final  = reader.read64();
+                spa.offset_section_strings = reader.read64();
+                spa.offset_bytecode        = reader.read64();
+                Space sp;
+                sp.range = spa.address;
+                ctx.space_address["@space_" + std::to_string(i)] = sp;
+            }
+
+            // --- Blob de strings ---
+            std::unordered_map<uint64_t, std::string> strmap;
+            uint64_t str_blob_size = table_offset - offset_strings;
+            if (str_blob_size > 0 && offset_strings > 0) {
+                auto saved = reader.save();
+                reader.seek(offset_strings);
+                std::vector<uint8_t> raw = reader.read_bytes(str_blob_size);
+                reader.restore(saved);
+                ByteReader sr(raw);
+                while (!sr.eof()) {
+                    uint64_t start = sr.offset;
+                    std::string s;
+                    while (!sr.eof()) { uint8_t c = sr.read8(); if (c == 0) break; s += static_cast<char>(c); }
+                    if (!s.empty()) strmap[offset_strings + start] = s;
+                }
+            }
+
+            // Asignar nombres reales a los espacios desde el string pool
+            {
+                // Recoger las claves temporales primero (no iterar el mapa mientras se modifica)
+                std::vector<std::string> temp_keys;
+                for (const auto &kv : ctx.space_address) {
+                    if (kv.first.find("@space_") == 0)
+                        temp_keys.push_back(kv.first);
+                }
+
+                // Buscar nombres en el string pool por el offset_section_strings
+                // (el primer string del blob es el nombre del espacio)
+                std::unordered_map<std::string, std::string> rename_map;
+                uint64_t name_idx = 0;
+                for (const auto &key : temp_keys) {
+                    Space &sp = ctx.space_address[key];
+                    // Buscar nombre: los nombres de espacios se almacenan
+                    // en orden en el string blob
+                    uint64_t str_off = offset_strings;
+                    for (uint64_t si = 0; si <= name_idx; ++si) {
+                        auto it = strmap.find(str_off);
+                        if (it != strmap.end() && si == name_idx) {
+                            rename_map[key] = it->second;
+                            break;
+                        }
+                        if (it != strmap.end())
+                            str_off += it->second.size() + 1;
+                        else
+                            break;
+                    }
+                    ++name_idx;
+                }
+
+                // Aplicar renombres fuera del bucle de iteracion
+                for (auto &[old_key, new_name] : rename_map) {
+                    auto node = ctx.space_address.extract(old_key);
+                    if (node) {
+                        node.key() = new_name;
+                        node.mapped().set_name(new_name);
+                        ctx.space_address.insert(std::move(node));
+                    }
+                }
+            }
+
+            // --- Tabla de secciones ---
+            reader.seek(table_offset);
+            struct RawSec { uint64_t init, fin, stroff; };
+            std::vector<RawSec> raw_secs;
+            for (uint32_t i = 0; i < section_count; ++i) {
+                uint64_t init   = reader.read64();
+                uint64_t fin    = reader.read64();
+                uint64_t stroff = reader.read64();
+                raw_secs.push_back({init, fin, stroff});
+            }
+
+            uint64_t bc_off = reader.offset;
+            m.bytecode = data;
+            m.bytecode.erase(m.bytecode.begin(), m.bytecode.begin() + static_cast<long>(bc_off));
+
+            for (size_t i = 0; i < raw_secs.size(); ++i) {
+                Section sec;
+                sec.memory.address_init  = raw_secs[i].init;
+                sec.memory.address_final = raw_secs[i].fin;
+                sec.size_real = raw_secs[i].fin - raw_secs[i].init;
+                auto sit = strmap.find(raw_secs[i].stroff);
+                sec.name = (sit != strmap.end()) ? sit->second : ("sec_" + std::to_string(i));
+
+                bool assigned = false;
+                for (auto &[sn, sp] : ctx.space_address) {
+                    if (raw_secs[i].init >= sp.range.address_init && raw_secs[i].fin <= sp.range.address_final) {
+                        sp.table_section[sec.name] = sec;
+                        sp.ordered_sections.push_back(&sp.table_section[sec.name]);
+                        assigned = true;
+                        break;
+                    }
+                }
+                if (!assigned) {
+                    Space dsp;
+                    dsp.range.address_init  = raw_secs[i].init;
+                    dsp.range.address_final = raw_secs[i].fin;
+                    dsp.set_name("default");
+                    dsp.table_section[sec.name] = sec;
+                    dsp.ordered_sections.push_back(&dsp.table_section[sec.name]);
+                    ctx.space_address["default"] = dsp;
+                }
+            }
+
+            // --- Labels ---
+            if (offset_label_tbl > 0 && size_label_tbl > 0) {
+                reader.seek(offset_label_tbl);
+
+                // Recoger secciones en orden para match por index_section
+                std::vector<Section*> ordered_secs;
+                for (auto &[sn, sp] : ctx.space_address) {
+                    for (auto *sp_sec : sp.ordered_sections) {
+                        ordered_secs.push_back(sp_sec);
+                    }
+                }
+
+                for (uint32_t i = 0; i < size_label_tbl; ++i) {
+                    entry_label_table el;
+                    el.offset_table_string = reader.read32();
+                    el.offset_bytecode     = reader.read32();
+                    el.index_section       = reader.read32();
+                    el.size_label          = reader.read32();
+
+                    std::string lname;
+                    auto lit = strmap.find(el.offset_table_string);
+                    lname = (lit != strmap.end()) ? lit->second : ("lbl_" + std::to_string(i));
+
+                    if (el.index_section < ordered_secs.size()) {
+                        ordered_secs[el.index_section]->add_label(lname, el.offset_bytecode, el.size_label);
+                    }
+                }
+            }
+
+            // --- Importaciones ---
+            if (offset_import_tbl > 0 && size_import_tbl > 0) {
+                reader.seek(offset_import_tbl);
+                for (uint32_t i = 0; i < size_import_tbl; ++i) {
+                    entry_import_table eit;
+                    eit.offset_module_string   = reader.read32();
+                    eit.offset_function_string = reader.read32();
+                    eit.offset_signature_string = reader.read32();
+                    eit.offset_bytecode        = reader.read32();
+                    ImportEntry imp;
+                    auto lit = strmap.find(eit.offset_module_string);
+                    auto fit = strmap.find(eit.offset_function_string);
+                    imp.library  = (lit != strmap.end()) ? lit->second : "unknown";
+                    imp.function = (fit != strmap.end()) ? fit->second : "unknown";
+                    imp.index    = i;
+                    ctx.import_table.push_back(imp);
+                    ctx.import_lookup[imp.library + ":" + imp.function] = i;
+                }
+            }
+
+            // --- Relocalizaciones ---
+            if (offset_reloc_tbl > 0 && size_reloc_tbl > 0) {
+                reader.seek(offset_reloc_tbl);
+                for (uint32_t i = 0; i < size_reloc_tbl; ++i) {
+                    entry_relocation_table ert;
+                    ert.bytecode_offset = reader.read64();
+                    ert.target_value    = reader.read64();
+                    ert.type            = reader.read8();
+                    reader.skip(7);
+                    Relocation rel;
+                    rel.offset = ert.bytecode_offset;
+                    rel.symbol = "@reloc_" + std::to_string(i);
+                    rel.section = "";
+                    switch (ert.type) {
+                        case static_cast<uint8_t>(RelocTypeVELB::ABSOLUTE64): rel.type = Type::Absolute64; break;
+                        case static_cast<uint8_t>(RelocTypeVELB::ABSOLUTE32): rel.type = Type::Absolute32; break;
+                        case static_cast<uint8_t>(RelocTypeVELB::RELATIVE32): rel.type = Type::Relative32; break;
+                        case static_cast<uint8_t>(RelocTypeVELB::RELATIVE64): rel.type = Type::Relative64; break;
+                        default: rel.type = Type::Absolute64; break;
+                    }
+                    m.relocations.push_back(rel);
+                }
+            }
+
+            ctx.start_pc = start_pc;
+            m.ctx = std::move(ctx);
+
+        } catch (const ByteReaderError &e) {
+            add_warningf(report, LinkerWarning::Type::IOWarning,
+                         "add_object_memory: error parseando cabecera: %s", e.what());
+            m.bytecode = data;
+            m.ctx = Context{};
+        }
 
         modules.push_back(std::move(m));
         report.modules_linked++;
@@ -144,12 +617,71 @@ namespace Assembly::Bytecode::Linker {
             return;
         }
 
-        // TODO: parsear header VELA, tabla de modulos, etc.
-        // Por ahora solo registramos la ruta.
+        std::vector<uint8_t> filedata((std::istreambuf_iterator<char>(f)),
+                                      std::istreambuf_iterator<char>());
 
+        if (filedata.size() < sizeof(HeaderVELA)) {
+            add_errorf(report, LinkerError::Type::InvalidFormat,
+                       ("Libreria .vela demasiado pequena: " + path).c_str());
+            return;
+        }
+
+        // Parsear header VELA, tabla de modulos, etc.
         StaticLibrary lib;
         lib.path = path;
-        libraries.push_back(std::move(lib));
+
+        try {
+            ByteReader reader(filedata);
+
+            char magic[4];
+            magic[0] = static_cast<char>(reader.read8());
+            magic[1] = static_cast<char>(reader.read8());
+            magic[2] = static_cast<char>(reader.read8());
+            magic[3] = static_cast<char>(reader.read8());
+
+            if (magic[0] != 'V' || magic[1] != 'E' || magic[2] != 'L' || magic[3] != 'A') {
+                add_errorf(report, LinkerError::Type::InvalidFormat,
+                           ("Formato .vela invalido (magic) en " + path).c_str());
+                return;
+            }
+
+            uint32_t version        = reader.read32();
+            uint32_t module_count   = reader.read32();
+            uint64_t module_tbl_off = reader.read64();
+
+            if (version != VERSION_VELA) {
+                add_warningf(report, LinkerWarning::Type::ConfigWarning,
+                             "Version de libreria .vela %u no coincide con la esperada %u en %s",
+                             version, VERSION_VELA, path.c_str());
+            }
+
+            // Leer tabla de modulos
+            reader.seek(module_tbl_off);
+            for (uint32_t i = 0; i < module_count; ++i) {
+                VELA_ModuleEntry entry;
+                entry.offset                  = reader.read64();
+                entry.size                    = reader.read64();
+                entry.symbol_count            = reader.read32();
+                entry.symbol_table_offset     = reader.read64();
+                entry.relocation_count        = reader.read32();
+                entry.relocation_table_offset = reader.read64();
+
+                // Leer el bytecode del modulo
+                auto saved = reader.save();
+                reader.seek(entry.offset);
+                std::vector<uint8_t> mod_data = reader.read_bytes(entry.size);
+                reader.restore(saved);
+
+                lib.object_modules.push_back(std::move(mod_data));
+            }
+
+            libraries.push_back(std::move(lib));
+            report.modules_linked += module_count;
+
+        } catch (const ByteReaderError &e) {
+            add_errorf(report, LinkerError::Type::InvalidFormat,
+                       ("Error parseando .vela: " + std::string(e.what())).c_str());
+        }
     }
 
     /**
@@ -406,7 +938,255 @@ namespace Assembly::Bytecode::Linker {
             }
         }
 
-        // TODO: resolver simbolos indefinidos
+        // Resolver simbolos indefinidos desde librerias estaticas
+        // Algoritmo tipo ld: buscar iterativamente en librerias hasta
+        // que no haya progreso o se resuelvan todos los simbolos.
+        {
+            // Recopilar simbolos referenciados aun no resueltos
+            auto collect_undefined = [&]() -> std::unordered_set<std::string> {
+                std::unordered_set<std::string> undef;
+                for (const auto &mod : modules) {
+                    for (const auto &rel : mod.relocations) {
+                        if (global_symbols.find(rel.symbol) == global_symbols.end() &&
+                            import_lookup.find(rel.symbol) == import_lookup.end()) {
+                            undef.insert(rel.symbol);
+                        }
+                    }
+                }
+                return undef;
+            };
+
+            std::unordered_set<std::string> undefined = collect_undefined();
+            bool progress = true;
+
+            while (progress && !undefined.empty()) {
+                progress = false;
+
+                for (auto &lib : libraries) {
+                    for (size_t mi = 0; mi < lib.object_modules.size(); ++mi) {
+                        auto &mod_data = lib.object_modules[mi];
+
+                        // Comprobar si este modulo define algun simbolo
+                        // que estamos buscando.  Intentamos parsear su
+                        // cabecera VELB para obtener nombres de secciones/labels.
+                        bool needed = false;
+                        try {
+                            ByteReader mr(mod_data);
+                            if (mr.read32() == MAGIC_NUMBER_VELB) {
+                                // Parsear cabecera basica
+                                mr.read32(); mr.read32(); mr.read32();
+                                mr.read64(); mr.read64(); mr.read64();
+                                mr.read32();
+                                uint32_t sc       = mr.read32();
+                                uint64_t to       = mr.read64();
+                                uint64_t ns       = mr.read64();
+                                uint64_t off_str  = mr.read64();
+                                mr.read64(); // start_pc
+                                mr.read64(); // offset_import
+                                uint64_t off_label = mr.read64();
+                                mr.read32(); // size_import
+                                uint32_t size_label = mr.read32();
+                                mr.read64(); mr.read32(); // debug
+                                mr.read8(); mr.skip(3);
+                                mr.read64(); mr.read32(); // reloc
+                                mr.read64(); mr.read32(); // ir
+                                while (mr.offset % 16 != 0) mr.skip(1);
+                                mr.skip(ns * 16 * 4); // tabla espacios (4 u64 por entry)
+
+                                // Leer strings de secciones
+                                std::unordered_map<uint64_t, std::string> strmap;
+                                uint64_t str_sz = to - off_str;
+                                if (str_sz > 0 && off_str > 0) {
+                                    auto saved = mr.save();
+                                    mr.seek(off_str);
+                                    std::vector<uint8_t> raw = mr.read_bytes(str_sz);
+                                    mr.restore(saved);
+                                    ByteReader sr(raw);
+                                    while (!sr.eof()) {
+                                        uint64_t s = sr.offset;
+                                        std::string str;
+                                        while (!sr.eof()) { uint8_t c = sr.read8(); if (c == 0) break; str += static_cast<char>(c); }
+                                        if (!str.empty()) strmap[off_str + s] = str;
+                                    }
+                                }
+
+                                // Leer tabla de secciones y sus nombres como simbolos
+                                mr.seek(to);
+                                for (uint32_t si = 0; si < sc; ++si) {
+                                    uint64_t init_sec = mr.read64();
+                                    uint64_t fin_sec  = mr.read64();
+                                    uint64_t str_off  = mr.read64();
+
+                                    std::string sec_name;
+                                    auto sit = strmap.find(str_off);
+                                    sec_name = (sit != strmap.end()) ? sit->second : ("sec_" + std::to_string(si));
+
+                                    // Si alguna seccion coincide con un simbolo indefinido,
+                                    // marcamos el modulo como necesario
+                                    if (undefined.count(sec_name)) {
+                                        needed = true;
+                                    }
+                                }
+
+                                // Tambien comprobar tabla de labels
+                                if (off_label > 0 && size_label > 0) {
+                                    mr.seek(off_label);
+                                    for (uint32_t li = 0; li < size_label; ++li) {
+                                        entry_label_table el;
+                                        el.offset_table_string = mr.read32();
+                                        el.offset_bytecode     = mr.read32();
+                                        el.index_section       = mr.read32();
+                                        el.size_label          = mr.read32();
+                                        std::string lname;
+                                        auto lit = strmap.find(el.offset_table_string);
+                                        lname = (lit != strmap.end()) ? lit->second : ("lbl_" + std::to_string(li));
+                                        if (undefined.count(lname)) {
+                                            needed = true;
+                                        }
+                                    }
+                                }
+
+                                // Si no se encontro match, marcar como necesario
+                                // si contiene bytecode (heuristica de ultimo recurso)
+                                if (!needed && mr.offset < mod_data.size()) {
+                                    needed = true;
+                                }
+                            }
+                        } catch (...) {
+                            // Si falla el parseo, probar siguiente modulo
+                        }
+
+                        if (needed) {
+                            // Cargar el modulo desde la libreria
+                            Module loaded;
+                            loaded.name = lib.path + "[" + std::to_string(mi) + "]";
+                            loaded.bytecode = std::move(mod_data);
+                            loaded.is_object = true;
+
+                            // Extraer simbolos del modulo parseando su contexto
+                            try {
+                                ByteReader mr(loaded.bytecode);
+                                if (mr.read32() == MAGIC_NUMBER_VELB) {
+                                    mr.read32(); mr.read32(); mr.read32();
+                                    mr.read64(); mr.read64(); mr.read64();
+                                    mr.read32();
+                                    uint32_t sc       = mr.read32();
+                                    uint64_t to       = mr.read64();
+                                    uint64_t ns       = mr.read64();
+                                    uint64_t off_str  = mr.read64();
+                                    uint64_t start_pc = mr.read64();
+                                    mr.read64(); // offset_import
+                                    uint64_t off_label = mr.read64();
+                                    mr.read32(); // size_import
+                                    uint32_t size_label = mr.read32();
+                                    mr.read64(); mr.read32(); // debug
+                                    mr.read8(); mr.skip(3);
+                                    mr.read64(); mr.read32(); // reloc
+                                    mr.read64(); mr.read32(); // ir
+                                    while (mr.offset % 16 != 0) mr.skip(1);
+                                    mr.skip(ns * 4 * 8); // skip space table
+
+                                    // Leer strings
+                                    std::unordered_map<uint64_t, std::string> strmap;
+                                    uint64_t str_sz = to - off_str;
+                                    if (str_sz > 0 && off_str > 0) {
+                                        auto saved = mr.save();
+                                        mr.seek(off_str);
+                                        std::vector<uint8_t> raw = mr.read_bytes(str_sz);
+                                        mr.restore(saved);
+                                        ByteReader sr(raw);
+                                        while (!sr.eof()) {
+                                            uint64_t s = sr.offset;
+                                            std::string str;
+                                            while (!sr.eof()) { uint8_t c = sr.read8(); if (c == 0) break; str += static_cast<char>(c); }
+                                            if (!str.empty()) strmap[off_str + s] = str;
+                                        }
+                                    }
+
+                                    // Registrar nombres de secciones como simbolos globales
+                                    mr.seek(to);
+                                    for (uint32_t si = 0; si < sc; ++si) {
+                                        uint64_t init_sec = mr.read64();
+                                        uint64_t fin_sec  = mr.read64();
+                                        uint64_t str_off  = mr.read64();
+                                        std::string sec_name;
+                                        auto sit = strmap.find(str_off);
+                                        sec_name = (sit != strmap.end()) ? sit->second : ("sec_" + std::to_string(si));
+                                        std::string full = sec_name + "." + sec_name;
+                                        if (!global_symbols.count(full)) {
+                                            global_symbols[full] = init_sec;
+                                            undefined.erase(sec_name);
+                                        }
+                                    }
+
+                                    // Registrar labels como simbolos globales
+                                    if (off_label > 0 && size_label > 0) {
+                                        mr.seek(off_label);
+                                        for (uint32_t li = 0; li < size_label; ++li) {
+                                            entry_label_table el;
+                                            el.offset_table_string = mr.read32();
+                                            el.offset_bytecode     = mr.read32();
+                                            el.index_section       = mr.read32();
+                                            el.size_label          = mr.read32();
+                                            std::string lname;
+                                            auto lit = strmap.find(el.offset_table_string);
+                                            lname = (lit != strmap.end()) ? lit->second : ("lbl_" + std::to_string(li));
+                                            // Estimar direccion base como offset en bytecode
+                                            if (global_symbols.find(lname) == global_symbols.end()) {
+                                                global_symbols[lname] = el.offset_bytecode;
+                                                undefined.erase(lname);
+                                            }
+                                        }
+                                    }
+
+                                    // Stripear cabecera del bytecode
+                                    uint64_t bc_start = mr.offset;
+                                    if (bc_start < loaded.bytecode.size()) {
+                                        loaded.bytecode.erase(
+                                            loaded.bytecode.begin(),
+                                            loaded.bytecode.begin() + static_cast<long>(bc_start));
+                                    }
+                                }
+                            } catch (...) {
+                                // Usar bytecode plano si falla el parseo
+                            }
+
+                            modules.push_back(std::move(loaded));
+                            lib.object_modules.erase(
+                                lib.object_modules.begin() + static_cast<long>(mi));
+
+                            progress = true;
+                            break; // salir del for anidado para re-evaluar
+                        }
+                    }
+                    if (progress) break;
+                }
+
+                // Re-evaluar simbolos indefinidos tras cargar nuevos modulos
+                if (progress) {
+                    undefined = collect_undefined();
+                }
+            }
+        }
+
+        // Reportar simbolos que siguen indefinidos
+        {
+            std::unordered_set<std::string> remaining;
+            for (const auto &mod : modules) {
+                for (const auto &rel : mod.relocations) {
+                    if (global_symbols.find(rel.symbol) == global_symbols.end() &&
+                        import_lookup.find(rel.symbol) == import_lookup.end()) {
+                        remaining.insert(rel.symbol);
+                    }
+                }
+            }
+            if (!remaining.empty() && !options.allow_undefined_symbols) {
+                for (const auto &sym : remaining) {
+                    add_errorf(report, LinkerError::Type::UndefinedSymbol,
+                               ("Simbolo indefinido: " + sym).c_str());
+                }
+            }
+        }
     }
 
 
@@ -649,22 +1429,109 @@ namespace Assembly::Bytecode::Linker {
             return;
 
         for (auto &mod: modules) {
-            // TODO: implementar optimizaciones reales de bytecode. Usaria Optimizer
-            // Por ahora, no hacemos nada, solo contamos el modulo.
-            // Ejemplo: eliminar NOPs, fusionar instrucciones triviales, etc.
+            size_t before = mod.bytecode.size();
+            auto &bc = mod.bytecode;
 
-            report.optimizations_applied++;
+            // 1. Eliminacion de NOPs redundantes (opcode 0x90).
+            //    Barrido simple: elimina bytes 0x90 consecutivos.
+            bc.erase(std::remove(bc.begin(), bc.end(), static_cast<uint8_t>(0x90)),
+                     bc.end());
+
+            // 2. Peephole: eliminar pares MOV R,R redundantes.
+            //    Formato tipico: 0xB0+reg src, 0xB0+reg dst cuando son iguales.
+            //    Patron: 0xB0 <reg> 0xB0 <mismo_reg>
+            if (bc.size() >= 4) {
+                std::vector<uint8_t> cleaned;
+                cleaned.reserve(bc.size());
+                for (size_t i = 0; i < bc.size(); ) {
+                    if (i + 3 < bc.size() &&
+                        bc[i] == 0xB0 && bc[i+2] == 0xB0 && bc[i+1] == bc[i+3]) {
+                        // MOV R,R -> eliminar ambas
+                        i += 4;
+                        continue;
+                    }
+                    cleaned.push_back(bc[i]);
+                    ++i;
+                }
+                bc.swap(cleaned);
+            }
+
+            // 3. Peephole: fusionar PUSH/POP triviales.
+            //    Patron: PUSH R; POP R -> eliminar ambos (stack no cambia).
+            //    Opcodes: 0x50+R PUSH, 0x58+R POP
+            if (bc.size() >= 2) {
+                std::vector<uint8_t> cleaned;
+                cleaned.reserve(bc.size());
+                for (size_t i = 0; i < bc.size(); ) {
+                    if (i + 1 < bc.size() &&
+                        (bc[i] >= 0x50 && bc[i] <= 0x57) &&
+                        (bc[i+1] >= 0x58 && bc[i+1] <= 0x5F) &&
+                        (bc[i] - 0x50) == (bc[i+1] - 0x58)) {
+                        i += 2;
+                        continue;
+                    }
+                    cleaned.push_back(bc[i]);
+                    ++i;
+                }
+                bc.swap(cleaned);
+            }
+
+            // 4. Eliminar secuencias NOP multi-byte (0x0F 0x1F 0x00...)
+            //    Usado por alineacion de compiladores x86.
+            for (size_t i = 0; i + 2 < bc.size(); ) {
+                if (bc[i] == 0x0F && bc[i+1] == 0x1F && bc[i+2] == 0x00) {
+                    bc.erase(bc.begin() + static_cast<long>(i),
+                             bc.begin() + static_cast<long>(i) + 3);
+                    continue;
+                }
+                ++i;
+            }
+
+            // 5. Llamar al optimizador externo si esta disponible
+            //    (BytecodeOptimizer declarado en optimizer/optimizer.h).
+            //    Como es un stub que aun no implementa transformaciones,
+            //    lo invocamos para mantener compatibilidad futura.
+            {
+                Assembly::Bytecode::Optimizer::BytecodeOptimizer ext_opt;
+                ext_opt.optimize(bc);
+            }
+
+            size_t after = bc.size();
+            report.optimizations_applied += (before - after);
         }
     }
 
     void Linker::merge_address_spaces() {
-        // Aqui deberia usar Context para fusionar los espacios de direcciones
-        // de todos los modulos. Por ahora, lo simplificamos:
-        //
-        // - asumimos un unico espacio de direcciones
-        // - las secciones se concatenan linealmente
+        // Fusionar los espacios de direcciones de todos los modulos
+        // usando el Context de cada modulo:
+        //   - Si un espacio ya existe en el linker, se fusionan sus secciones.
+        //   - Si no existe, se copia completo.
+        //   - Se detectan y reportan solapamientos entre espacios distintos.
 
-        // TODO: usar Context para algo real.
+        for (auto &mod : modules) {
+            for (const auto &[spaceName, space] : mod.ctx.space_address) {
+                // Comprobar solapamiento con espacios ya existentes
+                // (solo si el nombre es distinto; mismo nombre = fusion)
+                for (const auto &[existingName, existingSpace] : spaces_address) {
+                    if (existingName == spaceName)
+                        continue; // se fusiona, no se compara
+
+                    if (ranges_overlap(&existingSpace.range, &space.range)) {
+                        add_errorf(report, LinkerError::Type::InvalidFormat,
+                                   "Solapamiento de espacios de direcciones: '%s' y '%s' en modulo %s",
+                                   spaceName.c_str(), existingName.c_str(), mod.name.c_str());
+                    }
+                }
+
+                // Fusionar o copiar el espacio
+                auto it = spaces_address.find(spaceName);
+                if (it == spaces_address.end()) {
+                    spaces_address[spaceName] = space;
+                } else {
+                    merge_space_address(it->second, space);
+                }
+            }
+        }
     }
 
     void Linker::merge_sections() {

@@ -459,6 +459,16 @@ namespace loader {
             vesta::print_threadsafe(std::string(msg));
         };
 
+        // Phase M.sandbox: el plugin_api tiene un slot @c cap_check
+        // para que los plugins nativos (vesta_photonic, vesta_materia)
+        // verifiquen capabilities antes de operar.  La implementacion
+        // requiere acceso al ProcessVM via get_current_executing_process()
+        // (declarado en runtime/exception_runtime.h) y a check_cap_at_pc().
+        // TODO: implementar cuando el sandbox este completamente integrado
+        // con el plugin system.  Por ahora, cap_check == nullptr = sin
+        // restricciones (los plugins funcionan sin sandbox).
+        this->plugin_api.cap_check = nullptr;
+
         // GC roots externos via write-barrier.  Las colecciones nativas
         // que retienen GcHandles (e.g. ArrayList<string>) llaman a estas
         // APIs para que el GC del proceso activo no colecte los objetos

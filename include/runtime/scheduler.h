@@ -308,7 +308,7 @@ namespace runtime {
          * Cuando es true el run_loop() termina al final del quantum actual.
          * Se activa desde VM::stop() para un apagado limpio.
          */
-        bool should_kill = false;
+         std::atomic<bool> should_kill = false;
 
         /**
          * @brief Registra un hook de depuracion sin ningun mecanismo de sincronizacion.

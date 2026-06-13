@@ -123,10 +123,9 @@ namespace jit {
      * Stub en v1: simplemente retorna.  La implementacion real llega
      * en D.5 (tiered dispatch + OSR).
      */
-    inline void return_from_jit(vrt_proc *proc, uint64_t bytecode_pc) {
-        (void)proc; (void)bytecode_pc;
-        /* TODO Phase D.5 */
-    }
+    /// Declarado en jit/return_from_jit.cpp.  No puede ser inline porque
+    /// necesita el tipo completo runtime::ProcessVM.
+    void return_from_jit(vrt_proc *proc, uint64_t bytecode_pc);
 
 } // namespace jit
 

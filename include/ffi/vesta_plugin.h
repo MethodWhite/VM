@@ -223,6 +223,34 @@ typedef struct VestaPluginAPI {
      */
     void       (*log)           (const char *msg);
 
+    /* --- sandbox capabilities --- */
+
+    /**
+     * @brief Comprueba si el modulo actual tiene concedida una capability
+     *        del sandbox.
+     *
+     * Consulta las capabilities del modulo VELB que invoco la funcion
+     * nativa actual via CALLN.  Si el sandbox no esta activo (default),
+     * siempre retorna 1 (true) sin coste mensurable.
+     *
+     * Las funciones nativas que realizan operaciones sensibles (acceso
+     * a hardware, memoria host, red, filesystem) DEBEN llamar a esta
+     * funcion antes de ejecutar la operacion y abortar si retorna 0.
+     *
+     * Uso tipico:
+     * @code
+     *   if (g_api && g_api->cap_check) {
+     *       if (!g_api->cap_check(loader::Caps::FFI_CALL)) return 0;
+     *   }
+     * @endcode
+     *
+     * @param required_caps Bitmask de caps requeridas (ver loader::Caps
+     *                      en loader/sandbox.h).  Pueden combinarse con OR.
+     * @return 1 si todas las caps requeridas estan concedidas;
+     *         0 en caso contrario.
+     */
+    int (*cap_check)(uint32_t required_caps);
+
     /* --- - GC roots externos (write-barrier para colecciones nativas) --- */
 
     /**

@@ -10,9 +10,11 @@
  *   - Profile summary ordenado por total_ns desc al @c atexit
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 #include "../../../include/ffi/vesta_plugin.h"
 

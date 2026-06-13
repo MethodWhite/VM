@@ -399,7 +399,7 @@ static void test_vm_alloca() {
     fn.params = { x };
     ir::IrBlockId bb = fn.new_block("e");
     { ir::IrInstr i; i.op = ir::IrOp::ALLOCA; i.type = ir::IrType::I8; i.dst = p;
-      i.imm = 8; i.host_alloca = true; fn.append(bb, i); }
+      i.imm = 8; i.set_host_alloca(true); fn.append(bb, i); }
     { ir::IrInstr i; i.op = ir::IrOp::STORE; i.type = I64;
       i.operands = { x, p }; fn.append(bb, i); }          // [p] = x
     { ir::IrInstr i; i.op = ir::IrOp::LOAD; i.type = I64; i.dst = v;
@@ -431,7 +431,7 @@ static void test_vm_raw_free_host_alloca() {
     fn.params = { x };
     ir::IrBlockId bb = fn.new_block("e");
     { ir::IrInstr i; i.op = ir::IrOp::ALLOCA; i.type = ir::IrType::I8; i.dst = p;
-      i.imm = 8; i.host_alloca = true; fn.append(bb, i); }
+      i.imm = 8; i.set_host_alloca(true); fn.append(bb, i); }
     { ir::IrInstr i; i.op = ir::IrOp::STORE; i.type = I64;
       i.operands = { x, p }; fn.append(bb, i); }            // [p] = x
     { ir::IrInstr i; i.op = ir::IrOp::LOAD; i.type = I64; i.dst = v;

@@ -37,6 +37,7 @@
 #include "jit/jit_regalloc.h"
 #include "vesta_rt/abi.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdio>
@@ -599,7 +600,7 @@ namespace jit {
                      * STORE sobre derivados use native mov directo (sin
                      * inline cache). */
                     case ir::IrOp::ALLOCA:
-                        if (ins.host_alloca) {
+                        if (ins.host_alloca()) {
                             host_in_jit[ins.dst] = 1u;
                             /* Sprint mem-loop-fix-v2: AMBOS casos
                              * (con/sin explicit_free) emiten `sub rsp, N`
@@ -608,7 +609,7 @@ namespace jit {
                              * en el RAW_FREE matching para no acumular
                              * stack en loops.  Marcamos skip_raw_free_vid
                              * + guardamos size para el RAW_FREE. */
-                            if (ins.host_alloca_explicit_free
+                            if (ins.host_alloca_explicit_free()
                              && ins.dst < skip_raw_free_vid.size()) {
                                 skip_raw_free_vid[ins.dst] = 1u;
                                 alloca_size_by_vid[ins.dst] = ins.imm;
@@ -1814,7 +1815,7 @@ namespace jit {
                          * balancear el stack per-iteracion (ver case
                          * RAW_FREE).  Asi loops con malloc/free dentro
                          * de cuerpos inlineados no acumulan stack. */
-                        if (ins.host_alloca) {
+                        if (ins.host_alloca()) {
                             const uint64_t size_bytes = ins.imm;
                             if (size_bytes > 0 && size_bytes < INT32_MAX) {
                                 const uint64_t aligned =
@@ -7055,12 +7056,13 @@ namespace jit {
                         // ya cubre las STRMAKEs de literales -- ~50ns hit.
                         // El JIT IC anyadia ~5ns vs ~50ns, pero a costo de
                         // correctness.  Diferencia despreciable.
-                        // Sprint string-perf-2 debug (2026-06-02): IC
-                        // deshabilitado temporalmente para validar
-                        // correctness en bench string_workout.
-                        // TODO: re-enable tras determinar causa raiz
-                        // de discrepancia interp vs JIT.
-                        bool use_ic = false;
+                        // Sprint string-perf-2 (2026-06-02): IC re-habilitado
+                        // con guard de contenido via string_intern (hash content-
+                        // based).  El fix: las claves del IC son el hash del
+                        // contenido (via runtime::get_intern_hash), no la
+                        // GcHandle directa, eliminando falsos misses por
+                        // handles diferentes al mismo contenido.
+                        bool use_ic = true;
                         (void)opts_.reserve_ic_slot;
                         uint64_t str_ic_slot = 0;
                         MLabelId ic_hit_label = 0, ic_miss_label = 0, ic_done_label = 0;

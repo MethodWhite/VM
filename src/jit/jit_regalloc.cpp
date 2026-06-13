@@ -140,7 +140,7 @@ namespace jit {
                             is_call_like = true;
                             break;
                         case ir::IrOp::RAW_ASM:
-                            if (ins.is_call_site) is_call_like = true;
+                            if (ins.is_call_site()) is_call_like = true;
                             break;
                         default:
                             break;

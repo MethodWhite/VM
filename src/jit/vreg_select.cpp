@@ -232,7 +232,7 @@ namespace jit {
         std::vector<uint8_t>  v_is_host_alloca(fn.values.size(), 0);
         for (const auto &blk : fn.blocks)
             for (const auto &ins2 : blk.instrs)
-                if (ins2.op == ir::IrOp::ALLOCA && ins2.host_alloca
+                if (ins2.op == ir::IrOp::ALLOCA && ins2.host_alloca()
                  && ins2.dst != ir::IR_NO_VALUE
                  && ins2.dst < v_is_host_alloca.size())
                     v_is_host_alloca[ins2.dst] = 1u;
@@ -592,7 +592,7 @@ namespace jit {
                      * (host_alloca=false) caen a fallback. */
                     case ir::IrOp::ALLOCA: {
                         flush_pending();
-                        if (!in.host_alloca) {
+                        if (!in.host_alloca()) {
                             vreg_dbg(fn.name.c_str(), "alloca-vm"); return false;
                         }
                         const uint64_t size = in.imm;

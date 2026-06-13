@@ -322,4 +322,22 @@ namespace Assembly::Bytecode {
             }
         }
     }
+
+    void apply_ini_address(const vm::AnnotationNode *node, Assembler &assembler) {
+        if (!node || !assembler.current_section) return;
+        assembler.current_section->memory.address_init =
+            vm::parse_number(node->value);
+    }
+
+    void apply_end_address(const vm::AnnotationNode *node, Assembler &assembler) {
+        if (!node || !assembler.current_section) return;
+        assembler.current_section->memory.address_final =
+            vm::parse_number(node->value);
+    }
+
+    void apply_name(const vm::AnnotationNode *node, Assembler &assembler) {
+        if (!node || !assembler.current_section || node->value.empty()) return;
+        assembler.current_section->add_label(
+            node->value, assembler.output.offset, 0);
+    }
 }

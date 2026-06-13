@@ -736,28 +736,49 @@ void vrt_safepoint_poll(vrt_proc *proc) {
 }
 
 void vrt_safepoint_handler(vrt_proc *proc) {
-    /* D.2-foundation v1: implementacion minima del handler.
-     *
-     * El handler corre cuando el GC del propio proceso quiere pausar
-     * para hacer stack scan.  En esta fase:
-     *
-     *   1. Limpiamos el flag para que el JIT no quede en bucle al
-     *      retornar (en cada poll comprobara y vera 0).
-     *   2. Reservamos espacio para que la integracion GC (Phase
-     *      D.2-integration) capture RIP/RBP aqui y coordine con el GC.
-     *
-     * Como en D.2-foundation aun no hay GC integration, el handler
-     * simplemente limpia el flag y retorna.  La proxima iteracion del
-     * codigo JIT continuara normalmente. */
     if (!proc) return;
     runtime::ProcessVM *p = as_proc(proc);
+
+    // Capturar RBP del caller para que el GC pueda escanear el stack.
+    // RBP apunta al frame base del codigo JIT que hizo el safepoint poll.
+    uint64_t caller_rbp = 0;
+#if defined(__GNUC__) || defined(__clang__)
+    caller_rbp = (uint64_t)__builtin_frame_address(0);
+#elif defined(_MSC_VER)
+    caller_rbp = (uint64_t)_AddressOfReturnAddress() - 8;
+#else
+    // fallback: asumir RBP apunta al frame actual
+    void *rbp_ptr = &caller_rbp;
+    caller_rbp = *(uint64_t*)rbp_ptr;
+#endif
+
+    // Coordinacion con el shared GC (si aplica).
+    // El protocolo:
+    //   1. Limpiar flag para que el JIT no vuelva a entrar al handler
+    //      inmediatamente al retornar.
+    //   2. Ack al GC via shared_gc_acks.
+    //   3. Esperar sobre shared_gc_cv hasta que shared_gc_active sea false.
     p->safepoint_flag = 0;
-    /* TODO D.2-integration:
-     *   - Capturar RBP del caller (necesita assembly inline o
-     *     llamada con __builtin_frame_address).
-     *   - Notificar al GC que llegamos al safepoint.
-     *   - Esperar sobre condvar hasta que el GC termine.
-     *   - Restaurar y retornar. */
+
+    runtime::Scheduler &sched = p->scheduler;
+    runtime::VM &vm = sched.vm_reference;
+
+    if (vm.num_schedulers > 1) {
+        // Increment shared_gc_acks para senyalar que este scheduler
+        // llego al safepoint.
+        vm.shared_gc_acks.fetch_add(1, std::memory_order_acq_rel);
+
+        // Esperar hasta que el GC termine (shared_gc_active false).
+        std::unique_lock<std::mutex> lk(vm.shared_gc_mtx);
+        vm.shared_gc_cv.wait(lk, [&]() {
+            return !vm.shared_gc_active.load(std::memory_order_acquire);
+        });
+    }
+
+    // Si hay un RBP capturado, registrarlo para el stack scan del GC.
+    if (caller_rbp) {
+        p->jit_rbp_for_gc = caller_rbp;
+    }
 }
 
 /* ----------------------------------------------------------------------- */

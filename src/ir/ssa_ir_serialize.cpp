@@ -158,10 +158,10 @@ namespace ir {
             // indica "esta op no produce valor" (e.g. STORE, RET void).
             write_u32(o, static_cast<uint32_t>(i.dst));
             uint8_t flags = 0;
-            if (i.preserve)     flags |= INSTR_FLAG_PRESERVE;
-            if (i.is_call_site) flags |= INSTR_FLAG_IS_CALL_SITE;
-            if (i.host_alloca)  flags |= INSTR_FLAG_HOST_ALLOCA;
-            if (i.host_alloca_explicit_free) flags |= INSTR_FLAG_HOST_ALLOCA_EXPLICIT_FREE;
+            if (i.preserve())     flags |= INSTR_FLAG_PRESERVE;
+            if (i.is_call_site()) flags |= INSTR_FLAG_IS_CALL_SITE;
+            if (i.host_alloca())  flags |= INSTR_FLAG_HOST_ALLOCA;
+            if (i.host_alloca_explicit_free()) flags |= INSTR_FLAG_HOST_ALLOCA_EXPLICIT_FREE;
             write_u8(o, flags);
             // source_line: util para diagnosticos y stack traces.  0 si
             // el frontend no aporto info de linea.
@@ -228,10 +228,10 @@ namespace ir {
             i.op            = static_cast<IrOp>(op_v);
             i.type          = static_cast<IrType>(type_v);
             i.dst           = static_cast<IrValueId>(dst_v);
-            i.preserve      = (flags & INSTR_FLAG_PRESERVE)      != 0;
-            i.is_call_site  = (flags & INSTR_FLAG_IS_CALL_SITE)  != 0;
-            i.host_alloca   = (flags & INSTR_FLAG_HOST_ALLOCA)   != 0;
-            i.host_alloca_explicit_free = (flags & INSTR_FLAG_HOST_ALLOCA_EXPLICIT_FREE) != 0;
+            i.set_preserve((flags & INSTR_FLAG_PRESERVE) != 0);
+            i.set_is_call_site((flags & INSTR_FLAG_IS_CALL_SITE) != 0);
+            i.set_host_alloca((flags & INSTR_FLAG_HOST_ALLOCA) != 0);
+            i.set_host_alloca_explicit_free((flags & INSTR_FLAG_HOST_ALLOCA_EXPLICIT_FREE) != 0);
             i.source_line   = source_line;
             i.imm           = imm;
             /* operands */

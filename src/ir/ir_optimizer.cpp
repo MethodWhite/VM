@@ -343,7 +343,7 @@ bool ir_pass_dead_alloc_elim(IrFunction &fn) {
             if (ins.op == IrOp::CALL
              && ins.dst != IR_NO_VALUE
              && !used.count(ins.dst)
-             && !ins.preserve
+             && !ins.preserve()
              && is_pure_allocator_name(ins.func_name)) {
                 /* CALL a allocator puro, resultado no usado -> eliminar.
                  * El frontend Vex no espera efectos secundarios visibles
@@ -470,8 +470,8 @@ bool ir_pass_promote_callned_allocas(IrFunction &fn) {
              && ins.dst != IR_NO_VALUE
              && ins.dst < reaches_calln.size()
              && reaches_calln[ins.dst]
-             && !ins.host_alloca) {
-                ins.host_alloca = true;
+             && !ins.host_alloca()) {
+                ins.set_host_alloca(true);
                 promoted_dsts.push_back(ins.dst);
                 changed = true;
             }
@@ -589,7 +589,7 @@ bool ir_pass_promote_local_allocas(IrFunction &fn) {
         for (const auto &ins : blk.instrs) {
             if (ins.op == IrOp::ALLOCA
              && ins.dst != IR_NO_VALUE
-             && !ins.host_alloca) {
+             && !ins.host_alloca()) {
                 candidates.push_back(ins.dst);
             }
         }
@@ -780,8 +780,8 @@ bool ir_pass_promote_local_allocas(IrFunction &fn) {
         IrValueId v = candidates[i];
         for (auto &blk : fn.blocks) {
             for (auto &ins : blk.instrs) {
-                if (ins.op == IrOp::ALLOCA && ins.dst == v && !ins.host_alloca) {
-                    ins.host_alloca = true;
+                if (ins.op == IrOp::ALLOCA && ins.dst == v && !ins.host_alloca()) {
+                    ins.set_host_alloca(true);
                     /* NO explicit_free: el JIT libera con leave/ret;
                      * el interp con htrack + frame cleanup. */
                     any_promoted = true;
@@ -1023,7 +1023,7 @@ bool ir_pass_promote_local_raw_alloc(IrFunction &fn) {
         alloc_ins.op = IrOp::ALLOCA;
         alloc_ins.imm = c.size_bytes;
         alloc_ins.type = IrType::I8;  // ALLOCA convencion: type=I8, imm=N bytes
-        alloc_ins.host_alloca = true;
+        alloc_ins.set_host_alloca(true);
         alloc_ins.operands.clear();  // ALLOCA no toma operands (tamano en imm)
 
         // Marcar el dst como is_host_ptr para que LOAD/STORE emitan movh.
@@ -1044,7 +1044,7 @@ bool ir_pass_promote_local_raw_alloc(IrFunction &fn) {
         // se marca con @c host_alloca_explicit_free=true para que el
         // bytecode emit del interp SKIPE el `htrack` (porque el free
         // explicito ya libera el ptr en su sitio).
-        alloc_ins.host_alloca_explicit_free = true;
+        alloc_ins.set_host_alloca_explicit_free(true);
         // NO eliminar los RAW_FREE: dejarlos para que el bytecode emit
         // los convierta en `free` opcodes correctamente.
 
@@ -3574,7 +3574,7 @@ bool ir_pass_dce(IrFunction &fn) {
             if (ins.dst != IR_NO_VALUE
                 && !used.count(ins.dst)
                 && !is_side_effecting(ins.op)
-                && !ins.preserve) {
+                && !ins.preserve()) {
                 keep  = false;
                 changed = true;
             }
@@ -3598,7 +3598,7 @@ bool ir_pass_copy_prop(IrFunction &fn) {
     for (const auto &bb : fn.blocks) {
         for (const auto &ins : bb.instrs) {
             if (ins.op == IrOp::MOV
-                && !ins.preserve
+                && !ins.preserve()
                 && ins.dst != IR_NO_VALUE
                 && ins.operands.size() == 1
                 && ins.operands[0] != IR_NO_VALUE) {
@@ -5104,7 +5104,7 @@ bool ir_pass_licm(IrFunction &fn) {
              * @c is_licm_hoistable_alloc. */
             if (!is_pure(ins.op) && !is_licm_hoistable_alloc(ins.op)) return false;
             if (ins.op == IrOp::PHI) return false;
-            if (ins.preserve) return false;
+            if (ins.preserve()) return false;
             if (ins.dst == IR_NO_VALUE) return false;
             /* Sprint string-perf-2 bug fix: STRMAKE solo es seguro hoistar
              * si su vm_addr operand apunta a memoria immutable (literal

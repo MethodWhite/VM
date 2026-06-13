@@ -43,6 +43,7 @@ add_library(vex_lib STATIC
     # a su propia libreria port_lib en CMakeLists del root.
     ${CMAKE_SOURCE_DIR}/src/port/transpiler_base.cpp
     ${CMAKE_SOURCE_DIR}/src/port/c/c_backend.cpp
+    ${CMAKE_SOURCE_DIR}/src/port/wasm/wasm_backend.cpp
 )
 
 # La libreria expone sus headers desde include/vex/; PUBLIC para que los

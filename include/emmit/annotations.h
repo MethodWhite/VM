@@ -200,7 +200,10 @@ namespace Assembly::Bytecode {
      * @param node      Nodo AST de la anotacion; node->value contiene los parametros ("T" o "K,V").
      * @param assembler Contexto global del ensamblador que se modifica.
      */
-    void apply_generic(const vm::AnnotationNode *node, Assembler &assembler);
+     void apply_ini_address(const vm::AnnotationNode *node, Assembler &assembler);
+     void apply_end_address(const vm::AnnotationNode *node, Assembler &assembler);
+     void apply_name(const vm::AnnotationNode *node, Assembler &assembler);
+     void apply_generic(const vm::AnnotationNode *node, Assembler &assembler);
 
     /**
      * @brief Tabla de despacho de anotaciones: nombre -> funcion manejadora.
@@ -214,9 +217,9 @@ namespace Assembly::Bytecode {
         { "Format",       apply_format        }, ///< Establece el formato de salida
         { "Section",      apply_section       }, ///< Crea una seccion dentro de un espacio
         { "InitPc",       apply_init_pc       }, ///< Establece el punto de entrada
-        { "IniAddress",   [](const vm::AnnotationNode *a, Assembler &ctx) { /* pendiente */ } },
-        { "EndAddress",   [](const vm::AnnotationNode *a, Assembler &ctx) { /* pendiente */ } },
-        { "Name",         [](const vm::AnnotationNode *a, Assembler &ctx) { /* pendiente */ } },
+        { "IniAddress",   apply_ini_address }, ///< Establece la direccion inicial de una seccion
+        { "EndAddress",   apply_end_address }, ///< Establece la direccion final de una seccion
+        { "Name",         apply_name        }, ///< Asigna un nombre (label) a la posicion actual
         { "Import",       apply_import        }, ///< Registra una importacion para el linker
         { "Relative",     apply_relative      }, ///< Relocalizacion relativa (PIC)
         { "Absolute",     apply_absolute      }, ///< Relocalizacion absoluta

@@ -174,22 +174,12 @@ namespace vex {
     }
 
     bool ComptimeRuntime::try_invoke(const std::string &macro_name) noexcept {
-        /*   : VM lifecycle bootstrap funcional pero la ejecucion
-         * real todavia no esta wired (  anyade load + marshalling +
-         * call).  El caller debe seguir interpretando @c false como
-         * "fallback al AST evaluator".
-         *
-         * Despues de   esto sera:
-         *   1. Lookup en macro_entry_pc_.  Si no esta -> false.
-         *   2. ensure_vm_initialized() -- lazy bootstrap.
-         *   3. Verificar que el bytecode esta cargado.
-         *   4. Marshalling args -> VM regs.
-         *   5. Spawn process en entry_pc, run hasta retorno.
-         *   6. Read R0 -> out_result.
-         *   7. Cache si @Pure.
-         */
-        (void)macro_name;
-        return false;
+        auto it = macro_entry_pc_.find(macro_name);
+        if (it == macro_entry_pc_.end()) return false;
+        ensure_vm_initialized();
+        if (!impl_ || !impl_->proc) return false;
+        uint64_t result = 0;
+        return invoke_simple_macro(macro_name, {}, result);
     }
 
     void ComptimeRuntime::ensure_vm_initialized() noexcept {

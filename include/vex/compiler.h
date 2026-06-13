@@ -28,11 +28,101 @@
 
 #include <string>
 #include <vector>
+#include <memory>
+#include <functional>
 
 #include "vex/diagnostic.h"
 #include "port/port_options.h"
 
 namespace vex {
+
+    // Forward declarations
+    struct CompileOptions;
+    struct CompileResult;
+
+    /**
+     * @class CompilerPass
+     * @brief Base class for a single pass in the compilation pipeline.
+     *
+     * Each pass takes the current compilation context and can modify it.
+     * Passes are registered in order in @c CompilerPassManager::add_pass().
+     */
+    class CompilerPass {
+    public:
+        virtual ~CompilerPass() = default;
+
+        /**
+         * @brief Context passed through the pipeline.
+         *
+         * Each pass reads/writes the context as needed.
+         */
+        struct Context {
+            const std::string      *source      = nullptr;
+            const std::string      *filename    = nullptr;
+            const CompileOptions   *opts        = nullptr;
+            CompileResult          *result      = nullptr;
+            // Internal state shared between passes
+            std::shared_ptr<void>   ast;           ///< Parsed AST (opaque)
+            std::shared_ptr<void>   ir_module;     ///< Lowered IR
+            std::shared_ptr<void>   type_checker;  ///< TypeChecker state
+            bool                    has_errors = false;
+        };
+
+        /** @brief Human-readable pass name (for diagnostics/profiling). */
+        virtual const char *name() const = 0;
+
+        /** @brief Execute the pass.  Return false to abort pipeline. */
+        virtual bool run(Context &ctx) = 0;
+    };
+
+    /**
+     * @class CompilerPassManager
+     * @brief Orchestrates a sequence of CompilerPass instances.
+     *
+     * Usage:
+     * @code
+     *   CompilerPassManager pm;
+     *   pm.add_pass<LexParsePass>();
+     *   pm.add_pass<TypeCheckPass>();
+     *   pm.add_pass<LoweringPass>();
+     *   CompilerPass::Context ctx = { ... };
+     *   bool ok = pm.run(ctx);
+     * @endcode
+     */
+    class CompilerPassManager {
+    public:
+        CompilerPassManager() = default;
+
+        /** @brief Register a pass by type (forwarded to constructor). */
+        template<typename T, typename... Args>
+        T *add_pass(Args&&... args) {
+            auto p = std::make_unique<T>(std::forward<Args>(args)...);
+            T *ptr = p.get();
+            passes_.push_back(std::move(p));
+            return ptr;
+        }
+
+        /** @brief Register a pass by pointer (for custom subclasses). */
+        void add_pass(std::unique_ptr<CompilerPass> pass) {
+            passes_.push_back(std::move(pass));
+        }
+
+        /** @brief Run all registered passes in order.  Returns false if any pass fails. */
+        bool run(CompilerPass::Context &ctx) {
+            for (auto &pass : passes_) {
+                if (!pass->run(ctx)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /** @brief Number of registered passes. */
+        size_t pass_count() const { return passes_.size(); }
+
+    private:
+        std::vector<std::unique_ptr<CompilerPass>> passes_;
+    };
 
     /**
      * @struct CompileOptions

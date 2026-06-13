@@ -28,12 +28,11 @@
  *     individual: la memoria solo se libera al destruir el CodeCache
  *     (cuando la VM termina) o via @c invalidate para deopt.
  *
- *   - **Modo RWX simple** en v1: cada pagina es escribible y ejecutable
- *     simultaneamente.  Phase E migrara a W^X (write-XOR-exec) para
- *     hardening: durante emit las paginas son RW, durante exec son RX,
- *     transicion via @c mprotect / @c VirtualProtect.  Sin esto, en
- *     macOS moderno + Apple Silicon directamente no funciona (hardware
- *     enforcement).
+ *   - **W^X (write-XOR-exec)**: las paginas se crean como RW y la
+ *     transicion a RX ocurre via @c transition_to_executable() que llama
+ *     a @c mprotect / @c VirtualProtect.  Asi un buffer overflow durante
+ *     la generacion de codigo no puede inyectar bytes ejecutables.  En
+ *     macOS moderno + Apple Silicon es obligatorio (hardware enforcement).
  *
  *   - **Flush de icache** tras commit: en x86-64 es no-op (modelo
  *     coherente), pero en ARM/AArch64 es OBLIGATORIO para que el CPU
@@ -46,7 +45,7 @@
  * | Reservar pagina  | VirtualAlloc(NULL, n, RESERVE\|COMMIT, RWX)  | mmap(NULL, n, RWX, PRIV\|ANON)    |
  * | Liberar pagina   | VirtualFree(p, 0, MEM_RELEASE)               | munmap(p, n)                      |
  * | Flush icache     | FlushInstructionCache(GetCurrentProcess(),..)| __builtin___clear_cache           |
- * | Transicion perms | VirtualProtect (Phase E, futuro)             | mprotect (Phase E, futuro)        |
+ * | Transicion perms | VirtualProtect (RW->RX en commit())         | mprotect (RW->RX en commit())     |
  */
 
 #include "jit/code_cache.h"
@@ -145,21 +144,23 @@ namespace jit {
         //   - NULL = el SO escoge la direccion (random ASLR).
         //   - chunk_bytes_ = tamano deseado.
         //   - MEM_RESERVE|MEM_COMMIT = reservar VAS Y comprometer pages.
-        //   - PAGE_EXECUTE_READWRITE = permisos RWX para que podamos
-        //     escribir bytes y luego saltar a ellos.
+        // W^X hardening: inicialmente solo RW (escritura).  Antes de
+        // ejecutar, @c commit() cambiara los permisos a RX via
+        // @c transition_to_executable().
         void *p = ::VirtualAlloc(nullptr,
                                  chunk_bytes_,
                                  MEM_RESERVE | MEM_COMMIT,
-                                 PAGE_EXECUTE_READWRITE);
+                                 PAGE_READWRITE);
         if (!p) return false;
 #else
         // mmap con flags equivalentes:
         //   - MAP_PRIVATE = copy-on-write, no compartido entre procesos.
         //   - MAP_ANONYMOUS = no respaldo en fichero; -1 / 0 son los
         //     valores convencionales para fd/offset en este caso.
+        // W^X: inicialmente PROT_READ|PROT_WRITE (sin EXEC).
         void *p = ::mmap(nullptr,
                          chunk_bytes_,
-                         PROT_READ | PROT_WRITE | PROT_EXEC,
+                         PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS,
                          -1, 0);
         // mmap devuelve MAP_FAILED (cast de -1) en error, NO nullptr.
@@ -207,8 +208,8 @@ namespace jit {
         // hacer bump.  First-fit: la primera region cuyo inicio alineado
         // + size cabe dentro de ella.  El hueco por alineacion (head) se
         // descarta (pequeno); el remanente, si es util (>= 64 B), se
-        // reinserta al free-list.  Las regiones del free-list ya son RWX
-        // (fueron committed antes); el caller las re-escribe + commit.
+        // reinserta al free-list.  Las regiones del free-list ya fueron
+        // commit-eadas como RX; el caller las re-escribe + commit.
         for (size_t i = 0; i < free_list_.size(); ++i) {
             uint8_t *fb = free_list_[i].ptr;
             const size_t cap = free_list_[i].size;
@@ -271,9 +272,8 @@ namespace jit {
      */
     void CodeCache::commit(const uint8_t *ptr, size_t size) {
         if (!ptr || size == 0) return;
-        // En modo RWX la transicion es no-op.  Cuando llegue Phase E,
-        // esta funcion hara @c mprotect(ptr, size, PROT_READ|PROT_EXEC)
-        // para hacer la region read-only ejecutable.
+        // Transicion RW -> RX via transition_to_executable() que llama
+        // a @c mprotect / @c VirtualProtect.
         transition_to_executable(const_cast<uint8_t *>(ptr), size);
         flush_icache(ptr, size);
     }
@@ -332,16 +332,37 @@ namespace jit {
     }
 
     /**
-     * @brief Hook reservado para futura transicion RW -> RX (W^X).
+     * @brief Transiciona una region de RW a RX (cierre W^X).
      *
-     * En modo RWX simple (v1) es no-op porque la region ya tiene los
-     * tres permisos.  Cuando llegue Phase E, esta funcion hara
-     * @c VirtualProtect / @c mprotect para retirar el bit de escritura
-     * antes de ejecutar.  Asi un buffer overflow en el JIT compiler
-     * no puede inyectar codigo en regiones ya commit-eadas.
+     * Quita el permiso de escritura y anyade el de ejecucion via
+     * @c VirtualProtect / @c mprotect.  Asi un buffer overflow en el
+     * JIT compiler no puede inyectar codigo en regiones ya commit-eadas.
      */
     void CodeCache::transition_to_executable(uint8_t *ptr, size_t size) {
-        (void)ptr; (void)size;
+        if (!ptr || size == 0) return;
+        // Alinear a pagina para las llamadas al SO
+        size_t page_size = 4096;
+#if defined(_WIN32)
+        SYSTEM_INFO si;
+        ::GetSystemInfo(&si);
+        page_size = si.dwPageSize;
+#else
+        page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+#endif
+        uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+        uintptr_t aligned_start = start & ~(page_size - 1);
+        size_t aligned_size = round_up(size + (start - aligned_start), page_size);
+#if defined(_WIN32)
+        DWORD old;
+        ::VirtualProtect(reinterpret_cast<void *>(aligned_start),
+                         aligned_size,
+                         PAGE_EXECUTE_READ,
+                         &old);
+#else
+        ::mprotect(reinterpret_cast<void *>(aligned_start),
+                   aligned_size,
+                   PROT_READ | PROT_EXEC);
+#endif
     }
 
     /**

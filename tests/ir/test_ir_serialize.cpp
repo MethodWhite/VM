@@ -56,8 +56,8 @@ namespace {
         if (a.op != b.op) return false;
         if (a.type != b.type) return false;
         if (a.dst != b.dst) return false;
-        if (a.preserve != b.preserve) return false;
-        if (a.is_call_site != b.is_call_site) return false;
+        if (a.preserve() != b.preserve()) return false;
+        if (a.is_call_site() != b.is_call_site()) return false;
         if (a.source_line != b.source_line) return false;
         if (a.imm != b.imm) return false;
         if (a.operands != b.operands) return false;

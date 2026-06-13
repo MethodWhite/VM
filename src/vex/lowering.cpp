@@ -5441,7 +5441,7 @@ namespace vex {
                         sf.operands     = {v_ptr, v_del};
                         sf.imm          = 0;   /* SRET_DISPATCH */
                         sf.source_line  = it->source_line;
-                        sf.is_call_site = true;
+                        sf.set_is_call_site(true);
                         fn_->append(current_block_, std::move(sf));
                         (void)done_lbl; (void)default_lbl; /* labels no usadas (emitter las genera) */
                     } else if (it->literal_deleter == "free") {
@@ -5465,7 +5465,7 @@ namespace vex {
                         sf.imm          = 1;   /* EXTERN_CALLN */
                         sf.func_name    = fn_label;  /* "<lib>:<fn>" */
                         sf.source_line  = it->source_line;
-                        sf.is_call_site = true;
+                        sf.set_is_call_site(true);
                         fn_->append(current_block_, std::move(sf));
                     } else {
                         // raw_asm-elim wave 2: SMARTPTR_FREE kind=2 (VESTA_CALLVM).
@@ -5477,7 +5477,7 @@ namespace vex {
                         sf.imm          = 2;   /* VESTA_CALLVM */
                         sf.func_name    = it->literal_deleter;  /* "<fn_label>" */
                         sf.source_line  = it->source_line;
-                        sf.is_call_site = true;
+                        sf.set_is_call_site(true);
                         fn_->append(current_block_, std::move(sf));
                     }
                     break;
@@ -6190,7 +6190,7 @@ namespace vex {
             // Convencion del IR emitter de RSPAWN: operands[0]=node_idx,
             // operands[1]=fn_addr.  Ver case IrOp::RSPAWN en ir_emitter.cpp.
             rs.operands     = {v_node, v_pc};
-            rs.is_call_site = true;
+            rs.set_is_call_site(true);
             rs.source_line  = e->loc.line;
             fn_->append(current_block_, std::move(rs));
         }
@@ -7335,7 +7335,7 @@ namespace vex {
             sa.dst          = v_pid;
             sa.operands     = std::move(ops);
             sa.source_line  = e->loc.line;
-            sa.is_call_site = true;
+            sa.set_is_call_site(true);
             fn_->append(current_block_, std::move(sa));
             return v_pid;
         }
@@ -7353,7 +7353,7 @@ namespace vex {
             sp.type         = ir::IrType::I64;
             sp.dst          = v_pid;
             sp.operands     = {v_pc};
-            sp.is_call_site = true;
+            sp.set_is_call_site(true);
             sp.source_line  = e->loc.line;
             fn_->append(current_block_, std::move(sp));
             return v_pid;
@@ -7385,7 +7385,7 @@ namespace vex {
         sp.type         = ir::IrType::I64;
         sp.dst          = v_pid;
         sp.operands     = {v_pc, v_hint};
-        sp.is_call_site = true;
+        sp.set_is_call_site(true);
         sp.source_line  = e->loc.line;
         fn_->append(current_block_, std::move(sp));
         return v_pid;
@@ -7600,7 +7600,7 @@ namespace vex {
             fu.op           = ir::IrOp::FUTURE;
             fu.type         = ir::IrType::I64;
             fu.dst          = v_fut;
-            fu.is_call_site = true;
+            fu.set_is_call_site(true);
             fu.source_line  = fd->loc.line;
             fn_->append(current_block_, std::move(fu));
         }
@@ -9728,7 +9728,7 @@ namespace vex {
                     aw.type         = ir::IrType::I64;
                     aw.dst          = v_raw;
                     aw.operands     = {v};
-                    aw.is_call_site = true; // bloquea -> save/restore live regs
+                    aw.set_is_call_site(true); // bloquea -> save/restore live regs
                     aw.source_line  = e->loc.line;
                     fn_->append(current_block_, std::move(aw));
                 }
@@ -10475,7 +10475,7 @@ namespace vex {
               || callee_kind == PrimitiveKind::RESULT
               || callee_is_enum_sret);
             if (is_optres_retbuf) {
-                al.host_alloca = true;
+                al.set_host_alloca(true);
             }
             fn_->append(current_block_, std::move(al));
             if (is_optres_retbuf) {
@@ -13750,7 +13750,7 @@ namespace vex {
             ml.operands     = {v_path_addr, v_path_len};
             ml.imm          = 0;   /* loadmod */
             ml.source_line  = e->loc.line;
-            ml.is_call_site = true;
+            ml.set_is_call_site(true);
             fn_->append(current_block_, std::move(ml));
             out_value = v_dst;
             return true;
@@ -14412,7 +14412,7 @@ namespace vex {
                 sl.dst          = v_dst;
                 sl.operands     = {v_str, v_range};
                 sl.source_line  = e->loc.line;
-                sl.is_call_site = true;
+                sl.set_is_call_site(true);
                 fn_->append(current_block_, std::move(sl));
             }
             out_value = v_dst;
@@ -14781,7 +14781,7 @@ namespace vex {
                 ins.type         = ir::IrType::I64;
                 ins.dst          = v_dst;
                 ins.operands     = {v_str};
-                ins.is_call_site = true;
+                ins.set_is_call_site(true);
                 ins.source_line  = e->loc.line;
                 fn_->append(current_block_, std::move(ins));
                 out_value = v_dst;
@@ -15369,7 +15369,7 @@ namespace vex {
             al.dst         = v_buf;
             al.source_line = line;
             if (for_optres) {
-                al.host_alloca = true;
+                al.set_host_alloca(true);
             }
             fn_->append(current_block_, std::move(al));
             if (for_optres) {
@@ -17128,7 +17128,7 @@ namespace vex {
             ms.type         = ir::IrType::I32;
             ms.dst          = v_dst;
             ms.operands     = {v_pid, v_buf, v_len};
-            ms.is_call_site = true;
+            ms.set_is_call_site(true);
             ms.source_line  = e->loc.line;
             fn_->append(current_block_, std::move(ms));
             out_value = v_dst;
@@ -17164,7 +17164,7 @@ namespace vex {
                 mr.type         = ir::IrType::VOID;
                 mr.dst          = ir::IR_NO_VALUE;
                 mr.operands     = {v_buf, v_max};
-                mr.is_call_site = true; // bloquea -> save/restore live regs
+                mr.set_is_call_site(true); // bloquea -> save/restore live regs
                 mr.source_line  = e->loc.line;
                 fn_->append(current_block_, std::move(mr));
             }
@@ -17198,7 +17198,7 @@ namespace vex {
             fu.op           = ir::IrOp::FUTURE;
             fu.type         = ir::IrType::I64;
             fu.dst          = v_fut;
-            fu.is_call_site = true; // GC alloc
+            fu.set_is_call_site(true); // GC alloc
             fu.source_line  = e->loc.line;
             fn_->append(current_block_, std::move(fu));
             out_value = v_fut;
@@ -19202,7 +19202,7 @@ namespace vex {
             // BugFix sret-cross-mem (2026-06-04): forzar host_alloca para
             // el retbuf de metodos Optional/Result.  Asi el callee escribe
             // con `movh` y el caller lee con `movh` consistentemente.
-            al.host_alloca = true;
+            al.set_host_alloca(true);
             fn_->append(current_block_, std::move(al));
             fn_->values[v_method_call_retbuf].is_host_ptr = true;
         }
@@ -19491,7 +19491,7 @@ namespace vex {
         ins.type         = ir::IrType::I64;
         ins.dst          = v_str;
         ins.operands     = {v_buf, v_len};
-        ins.is_call_site = true;
+        ins.set_is_call_site(true);
         ins.source_line  = source_line;
         fn_->append(current_block_, std::move(ins));
         return v_str;
@@ -19506,7 +19506,7 @@ namespace vex {
         ins.type         = ir::IrType::I64;
         ins.dst          = v_str;
         ins.operands     = {v_a, v_b};
-        ins.is_call_site = true;
+        ins.set_is_call_site(true);
         ins.source_line  = source_line;
         fn_->append(current_block_, std::move(ins));
         return v_str;
@@ -19539,7 +19539,7 @@ namespace vex {
         ins.dst          = v_dst;
         ins.operands     = {v_str};
         ins.imm          = enc_imm;
-        ins.is_call_site = true;
+        ins.set_is_call_site(true);
         ins.source_line  = source_line;
         fn_->append(current_block_, std::move(ins));
         return v_dst;
@@ -19596,7 +19596,7 @@ namespace vex {
         ins.type        = ir::IrType::PTR;
         ins.dst         = v;
         ins.operands    = {v_params};
-        ins.is_call_site = true;
+        ins.set_is_call_site(true);
         ins.source_line = line;
         fn_->append(current_block_, std::move(ins));
         return v;
@@ -19610,7 +19610,7 @@ namespace vex {
         ins.type        = ir::IrType::PTR;
         ins.dst         = v;
         ins.operands    = {v_params};
-        ins.is_call_site = true;
+        ins.set_is_call_site(true);
         ins.source_line = line;
         fn_->append(current_block_, std::move(ins));
         return v;
@@ -19624,7 +19624,7 @@ namespace vex {
         ins.type         = ir::IrType::PTR;
         ins.dst          = v;
         ins.operands     = {v_size};
-        ins.is_call_site = true;
+        ins.set_is_call_site(true);
         ins.source_line  = line;
         fn_->append(current_block_, std::move(ins));
         return v;
@@ -19638,7 +19638,7 @@ namespace vex {
         ins.type         = ir::IrType::PTR;
         ins.dst          = v;
         ins.operands     = {v_src};
-        ins.is_call_site = true;
+        ins.set_is_call_site(true);
         ins.source_line  = line;
         fn_->append(current_block_, std::move(ins));
         return v;
@@ -19652,7 +19652,7 @@ namespace vex {
         ins.type         = ir::IrType::PTR;
         ins.dst          = v;
         ins.operands     = {v_src};
-        ins.is_call_site = true;
+        ins.set_is_call_site(true);
         ins.source_line  = line;
         fn_->append(current_block_, std::move(ins));
         return v;
@@ -19742,7 +19742,7 @@ namespace vex {
         ins.op           = ir::IrOp::PROCEED;
         ins.type         = ir::IrType::I64;
         ins.dst          = v;
-        ins.is_call_site = true;
+        ins.set_is_call_site(true);
         ins.source_line  = line;
         fn_->append(current_block_, std::move(ins));
         return v;
@@ -19819,7 +19819,7 @@ namespace vex {
         ins.type        = ir::IrType::PTR;
         ins.dst         = v;
         ins.operands    = {v_params};
-        ins.is_call_site = true;
+        ins.set_is_call_site(true);
         ins.source_line = line;
         fn_->append(current_block_, std::move(ins));
         return v;
@@ -19833,7 +19833,7 @@ namespace vex {
         ins.type         = ir::IrType::PTR;
         ins.dst          = v;
         ins.operands     = {v_params};
-        ins.is_call_site = true;
+        ins.set_is_call_site(true);
         ins.source_line  = line;
         fn_->append(current_block_, std::move(ins));
         return v;

@@ -692,6 +692,17 @@ namespace ir {
      *   SWAPCTX:       operands[0]=dst_ctx, operands[1]=src_ctx
      *   RAW_ASM:       func_name=texto_ensamblador (sin dst, sin operandos, nunca optimizado)
      */
+    /**
+     * @struct IrInstr
+     * @brief Una instruccion SSA del IR.
+     *
+     * Los flags booleanos estan empaquetados en un bitfield para reducir
+     * el sizeof(IrInstr) de 96+ bytes a ~72 bytes (en x86-64).
+     *
+     * @note El vector @c operands es el miembro mas pesado (24 bytes en
+     * x86-64).  Para la mayoria de instrucciones (0-3 operandos) se
+     * podria usar SmallVector en una version futura.
+     */
     struct IrInstr {
         IrOp    op;          ///< operacion
         IrType  type;        ///< tipo del resultado (VOID si sin resultado)
@@ -711,47 +722,30 @@ namespace ir {
 
         uint32_t source_line;  ///< numero de linea del fuente original (0 = desconocido)
 
-        /// Si true, esta instruccion NO debe ser eliminada por copy_prop
-        /// ni DCE.  Util para barreras de codegen como los MOVs que el
-        /// lower_for/lower_while inserta antes del back-edge para
-        /// proteger los SSA values de loop-carry contra el "live hole"
-        /// del linear scan (ver lower_for / lower_while).
-        bool     preserve = false;
+        /// Flags empaquetados en un byte para reducir sizeof(IrInstr).
+        /// Bit 0: preserve, Bit 1: is_call_site, Bit 2: host_alloca,
+        /// Bit 3: host_alloca_explicit_free.
+        uint8_t flags_ = 0;
 
-        /// Si true para una RAW_ASM, el emitter envuelve el bloque con
-        /// emit_save_live_regs / emit_restore_live_regs.  Necesario cuando
-        /// el RAW_ASM internamente dispara una llamada que clobreara los
-        /// registros caller-saved (e.g. `loadmod`, que ejecuta el main del
-        /// plugin antes de retornar).  Sin esto, el regalloc no sabe que
-        /// el RAW_ASM es un "call site" y los locales vivos quedan
-        /// invalidados cuando la callee corre.
-        bool     is_call_site = false;
+        static constexpr uint8_t FLAG_PRESERVE                = 1 << 0;
+        static constexpr uint8_t FLAG_IS_CALL_SITE            = 1 << 1;
+        static constexpr uint8_t FLAG_HOST_ALLOCA             = 1 << 2;
+        static constexpr uint8_t FLAG_HOST_ALLOCA_EXPLICIT_FREE = 1 << 3;
 
-        /// Phase D.jit-mem-model AUTO-PROMOTE: si true en un IrOp::ALLOCA,
-        /// el JIT emite ese ALLOCA en host stack (en lugar de VM-stack).
-        /// El ptr resultante es directamente dereferenciable por code C
-        /// nativo (e.g. para `&local` pasado a Win API).  Lo marca el IR
-        /// pass `ir_pass_promote_callned_allocas` cuando el dst del ALLOCA
-        /// fluye a un arg de CALLN.  El bytecode emit del interp lo
-        /// IGNORA (sigue emitiendo `subsp` VM-stack) -- en interp, el
-        /// patron `&local -> CALLN` requiere JIT activo o malloc explicito.
-        bool     host_alloca = false;
+        bool preserve()                  const { return flags_ & FLAG_PRESERVE; }
+        bool is_call_site()              const { return flags_ & FLAG_IS_CALL_SITE; }
+        bool host_alloca()               const { return flags_ & FLAG_HOST_ALLOCA; }
+        bool host_alloca_explicit_free() const { return flags_ & FLAG_HOST_ALLOCA_EXPLICIT_FREE; }
 
-        /// Sprint mem-loop-fix (2026-06-02): si true en un ALLOCA con
-        /// `host_alloca=true`, indica que el RAW_FREE original SE
-        /// PRESERVO en el IR (no fue eliminado por el promote pass).
-        /// El bytecode emit del interp NO debe llamar @c htrack para
-        /// no acumular en el vector @c host_allocas del frame -- el
-        /// RAW_FREE preservado libera explicitamente el ptr en su
-        /// posicion correcta (al fin de cada iteracion, no al RET).
-        /// Resuelve el bottleneck del bench @c mem_malloc_free donde
-        /// 5M iter acumulaban 5M ptrs tracked sin liberar.
-        bool     host_alloca_explicit_free = false;
+        void set_preserve(bool v)                { if (v) flags_ |= FLAG_PRESERVE; else flags_ &= ~FLAG_PRESERVE; }
+        void set_is_call_site(bool v)            { if (v) flags_ |= FLAG_IS_CALL_SITE; else flags_ &= ~FLAG_IS_CALL_SITE; }
+        void set_host_alloca(bool v)             { if (v) flags_ |= FLAG_HOST_ALLOCA; else flags_ &= ~FLAG_HOST_ALLOCA; }
+        void set_host_alloca_explicit_free(bool v) { if (v) flags_ |= FLAG_HOST_ALLOCA_EXPLICIT_FREE; else flags_ &= ~FLAG_HOST_ALLOCA_EXPLICIT_FREE; }
 
         IrInstr() : op(IrOp::NOP), type(IrType::VOID), dst(IR_NO_VALUE),
                     imm(0), func_ptr(IR_NO_VALUE),
                     target_block(IR_NO_BLOCK), false_block(IR_NO_BLOCK),
-                    source_line(0) {}
+                    source_line(0), flags_(0) {}
     };
 
     // =========================================================================

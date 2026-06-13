@@ -2486,7 +2486,7 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             // evitar leaks en exits normales.  THROW sin try/catch que
             // envuelva sigue pudiendo leakear (sprint sucesor cubrira
             // tracking runtime para cleanup en do_throw).
-            if (ins.host_alloca && ins.dst != IR_NO_VALUE) {
+            if (ins.host_alloca() && ins.dst != IR_NO_VALUE) {
                 // Tratar como CALL: `alloc` clobrea r0 implicitamente y
                 // puede ejecutar codigo arbitrario (slab grow).
                 const uint32_t call_pos = lin_pos_of(ctx, bb.id, idx);
@@ -2509,7 +2509,7 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
                 // acumular en el vector host_allocas del frame.
                 // Bottleneck antes: 5M iter de malloc(96)+free -> 20s
                 // por acumular 5M ptrs tracked sin liberar hasta RET.
-                if (!ins.host_alloca_explicit_free) {
+                if (!ins.host_alloca_explicit_free()) {
                     std::string rd_track = ctx.dst_of(ins.dst);
                     ctx.out << "    htrack " << rd_track << "\n";
                 }
@@ -3773,7 +3773,7 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             // para preservar los locales del caller a traves del call.
             const uint32_t call_pos_raw = lin_pos_of(ctx, bb.id, idx);
             std::vector<int> regs_to_save_raw;
-            if (ins.is_call_site) {
+            if (ins.is_call_site()) {
                 regs_to_save_raw = live_regs_through_call(ctx, call_pos_raw, ins.dst);
                 emit_save_all_gc_aware(ctx, call_pos_raw, regs_to_save_raw);
             }
@@ -3820,7 +3820,7 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             if (ins.dst != IR_NO_VALUE) {
                 ctx.store_spilled(ins.dst);
             }
-            if (ins.is_call_site) {
+            if (ins.is_call_site()) {
                 emit_restore_all_gc_aware(ctx, call_pos_raw, regs_to_save_raw);
             }
             break;

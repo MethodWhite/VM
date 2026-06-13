@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdio>
 #include <fstream>
+#include <sys/stat.h>
 #include <sstream>
 #include <vector>
 

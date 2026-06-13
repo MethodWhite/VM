@@ -12,6 +12,7 @@
 #include "debug/debugger.h"
 
 #include <csetjmp>
+#include <csignal>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>

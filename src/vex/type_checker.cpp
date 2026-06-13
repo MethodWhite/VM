@@ -1,4 +1,27 @@
 /*
+ * type_checker.cpp - Type checking pass for Vex language
+ *
+ * SECTION MAP:
+ *   Lines     1-  236: Static helpers, extern "C" functions, constructor
+ *   Lines   237-  266: Destructor
+ *   Lines   267-  972: Mangle functions, utility functions
+ *   Lines   973- 1246: class_is_assignable
+ *   Lines  1247- 1513: TypeChecker::run()
+ *   Lines  1514- 1833: Scope management, type_from_node helper
+ *   Lines  1834- 3101: collect_globals() - first pass
+ *   Lines  3102- 3602: check_functions() - second pass
+ *   Lines  3603- 4099: check_class_method, check_block, check_stmt
+ *   Lines  4100- 4554: check_var_decl
+ *   Lines  4555- 4734: if/while/for/return statement checking
+ *   Lines  4735- 6815: Expression checking (check_expr and helpers)
+ *   Lines  6816- 9729: check_call + generic monomorphization
+ *   Lines  9730:      Namespace close
+ *
+ * To split: extract each range into a separate .cpp file under
+ * namespace vex { ... } with #include "vex/type_checker.h"
+ * and register in src/vex/CMakeLists.txt
+ */
+/*
  * VestaVM - Maquina Virtual Distribuida
  *
  * Copyright (C) 2026 David Lopez.T (DesmonHak) (Castilla y Leon, ES)
@@ -38,6 +61,7 @@
 #include "loader/oop_types.h"  // para sizeof(loader::ObjectHeader) en el layout de clases
 
 #include <algorithm>
+#include <functional>
 #include <utility>
 #include <cstdlib>      // getenv para VESTA_MC_VMONLY/PREBUILT
 #include <cstring>      // memcpy para bitcast f64 -> u64

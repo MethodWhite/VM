@@ -475,9 +475,17 @@ set(VESTA_RT_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/src/util/ThreadPool.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/util/sqlite_singleton.cpp
 
+        # LSP server (Language Server Protocol para Vex)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/lsp/json_rpc.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/lsp/lsp_diagnostics.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/lsp/lsp_server.cpp
+
         # Controller TLS (usado por VDP)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/controller/tls_connection.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/controller/tls_context.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/controller/vm_manager.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/controller/request_router.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/controller/socket_server.cpp
 
         # Phase C/D.0 (snapshot 2026-05-13): C ABI estable + ABI checks +
         # infraestructura JIT inicial (code cache, runtime entries, bridge).
@@ -489,6 +497,7 @@ set(VESTA_RT_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/runtime_entries.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/x86_encoder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/jit_registry.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/return_from_jit.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/stack_scan.cpp
 
         # Opcion W Fase 3b: serializer IR.  Necesario para que el Loader

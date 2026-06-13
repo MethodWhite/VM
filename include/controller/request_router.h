@@ -1,41 +1,57 @@
-/*
- * VestaVM - Maquina Virtual Distribuida
- *
- * Copyright (C) 2026 David Lopez.T (DesmonHak) (Castilla y Leon, ES)
- * Licencia VMProject
- *
- * USO LIBRE NO COMERCIAL con atribucion obligatoria.
- * PROHIBIDO lucro sin permiso escrito.
- *
- * Descargo: Autor no responsable por modificaciones.
- */
-
-/**
- * @file request_router.h
- * @brief Enrutador de peticiones entre el servidor de sockets y el gestor de VMs.
- *
- * RequestRouter es la capa intermedia del controlador de VestaVM.  Recibe los mensajes
- * brutos aceptados por el SocketServer, los parsea como comandos y los redirige al
- * VMManager que gestiona las instancias VM activas.
- *
- * Flujo del controlador:
- * @verbatim
- *   SocketServer  -> acepta conexiones y pasa los mensajes al router
- *        |
- *        v
- *   RequestRouter -> parsea comandos recibidos y los enruta al manager
- *        |
- *        v
- *   VMManager     -> gestiona las instancias VM segun el comando
- *        |
- *        v
- *   Runtime VM    -> ejecuta el bytecode en la instancia VM correcta
- * @endverbatim
- *
- * @note Clase pendiente de implementacion completa.
- */
-
 #ifndef REQUEST_ROUTER_H
 #define REQUEST_ROUTER_H
 
-#endif // REQUEST_ROUTER_H
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <string_view>
+
+namespace controller { class VMManager; }
+
+namespace controller {
+
+    struct Request {
+        std::string method;
+        std::string params;
+        uint64_t    id = 0;
+    };
+
+    struct Response {
+        uint64_t    id = 0;
+        bool        ok = false;
+        std::string data;
+        std::string error;
+    };
+
+    class RequestRouter {
+    public:
+        explicit RequestRouter(VMManager &mgr);
+        ~RequestRouter();
+
+        RequestRouter(const RequestRouter &) = delete;
+        RequestRouter &operator=(const RequestRouter &) = delete;
+
+        bool parse_request(const std::string_view &raw, Request &out) const;
+        Response dispatch(const Request &req);
+
+        // Conveniencia: parse + dispatch en un solo paso
+        Response handle(const std::string_view &raw);
+
+    private:
+        Response dispatch_create(const Request &req);
+        Response dispatch_destroy(const Request &req);
+        Response dispatch_start(const Request &req);
+        Response dispatch_stop(const Request &req);
+        Response dispatch_list(const Request &req);
+        Response dispatch_info(const Request &req);
+        Response dispatch_eval(const Request &req);
+        Response dispatch_load(const Request &req);
+
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
+    };
+
+} // namespace controller
+
+#endif

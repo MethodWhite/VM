@@ -356,7 +356,15 @@ namespace runtime {
          * @c std::atomic<bool> @c safepoint_acked posteriormente.
          */
         uint8_t safepoint_flag = 0;
-        uint8_t _safepoint_pad[7] = {0};  ///< Alineacion a 8 bytes
+        uint8_t _safepoint_pad[7] = {0};
+
+        /// 1 si este proceso esta ejecutando codigo JIT (para OSR/deopt).
+        uint8_t jit_active = 0;
+        uint8_t _jit_pad[7] = {0};
+
+        /// RBP del frame JIT activo, capturado por vrt_safepoint_handler.
+        /// Usado por el GC stack scan para encontrar roots en el stack JIT.
+        uint64_t jit_rbp_for_gc = 0;
 
         GlobalPID pid; ///< Identificador global del proceso (scheduler_id + local_pid)
 

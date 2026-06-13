@@ -11,6 +11,7 @@ env:
 
 jobs:
   build:
+    timeout-minutes: 120
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -42,18 +43,35 @@ jobs:
         choco install openssl -y --no-progress
         "OPENSSL_ROOT_DIR=C:\Program Files\OpenSSL-Win64" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-    - name: Configure CMake
+    - name: Configure CMake (Linux/macOS)
+      if: runner.os != 'Windows'
       run: |
         cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
           -DVESTA_BUILD_STDLIB=ON \
           -DVESTA_BUILD_EXAMPLES=ON
 
-    - name: Build
+    - name: Configure CMake (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DVESTA_BUILD_STDLIB=ON -DVESTA_BUILD_EXAMPLES=ON
+
+    - name: Build (Linux/macOS)
+      if: runner.os != 'Windows'
       run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
 
-    - name: Run tests
+    - name: Build (Windows)
+      if: runner.os == 'Windows'
+      run: cmake --build build --config Release --parallel
+
+    - name: Run tests (Linux/macOS)
+      if: runner.os != 'Windows'
       working-directory: build
       run: ctest --output-on-failure -C ${{ env.BUILD_TYPE }} --parallel
+
+    - name: Run tests (Windows)
+      if: runner.os == 'Windows'
+      working-directory: build
+      run: ctest --output-on-failure -C Release --parallel
 
     - name: Lint check (Linux)
       if: runner.os == 'Linux'

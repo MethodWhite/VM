@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VestaVM - Diagramas de Arquitectura</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; margin: 0; padding: 20px; }
+  h1 { color: #58a6ff; border-bottom: 2px solid #30363d; padding-bottom: 10px; }
+  h2 { color: #f0883e; margin-top: 40px; }
+  .diagram-container { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin: 20px 0; overflow-x: auto; }
+  .desc { color: #8b949e; font-size: 14px; margin-bottom: 10px; }
+  .toc { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin: 20px 0; }
+  .toc a { color: #58a6ff; text-decoration: none; display: block; padding: 4px 0; }
+  .toc a:hover { text-decoration: underline; }
+  .badge { display: inline-block; background: #1f6feb; color: #fff; padding: 2px 8px; border-radius: 12px; font-size: 12px; margin-left: 8px; }
+</style>
+</head>
+<body>
+
+<h1>🏗️ VestaVM — Diagramas de Arquitectura</h1>
+<p style="color:#8b949e">Generado: 2026-06-12 | Proyecto: VestaVM + AGI Fotónica + M.A.T.E.R.I.A.</p>
+
+<div class="toc">
+<h3>Índice</h3>
+<a href="#arch-general">1. Arquitectura general del ecosistema</a>
+<a href="#arch-vm">2. VestaVM: componentes internos</a>
+<a href="#pipeline-compiler">3. Pipeline del compilador Vex</a>
+<a href="#jit-pipeline">4. Pipeline JIT (C1 → C2)</a>
+<a href="#gc-arch">5. GC Generacional</a>
+<a href="#dist-arch">6. Sistema Distribuido VDP</a>
+<a href="#photonic">7. Sistema Fotónico AGI</a>
+<a href="#materia">8. BaseMateria + JEPA</a>
+<a href="#photonic-materia">9. Integración Fotónico + M.A.T.E.R.I.A.</a>
+<a href="#structs">10. structs_data_C: estructuras de datos</a>
+<a href="#opcodes">11. opcodes: encoder/decoder x86</a>
+</div>
+
+<!-- ============================================================ -->
+<!-- 1. ARQUITECTURA GENERAL -->
+<!-- ============================================================ -->
+<h2 id="arch-general">1. Arquitectura general del ecosistema</h2>
+<div class="diagram-container">
+<div class="desc">Visión general de los 3 proyectos y su integración con el sistema fotónico y M.A.T.E.R.I.A.</div>
+<pre class="mermaid">
+flowchart TB
+    subgraph VestaVM["🔥 VestaVM"]
+        direction TB
+        Vex["Vex Language"] --> Compiler["Compiler<br/>SSA IR → Bytecode"]
+        Compiler --> VM["Virtual Machine<br/>Interpreter ~340 MIPS"]
+        VM --> JIT["JIT C1<br/>20-60× speedup"]
+        VM --> GC["Generational GC"]
+        VM --> Dist["Distributed Runtime<br/>VDP Protocol"]
+    end
+
+    subgraph Photonic["💡 Photonic AGI System"]
+        direction TB
+        Laser["Laser Matrix RGBI<br/>650/532/450/850/405nm"] --> Crystal["Quartz Crystal<br/>Refractive Index 1.544"]
+        Crystal --> Interferometry["Self-Mixing Interferometry<br/>Feedback Voltage Detection"]
+        Interferometry --> Resonance["Standing Wave Detection<br/>Resonance 0-1000"]
+    end
+
+    subgraph Materia["🧠 M.A.T.E.R.I.A."]
+        direction TB
+        BaseMateria["BaseMateria<br/>JEPA Embedding Engine"]
+        BaseMateria --> Predict["Predictive Projection"]
+        BaseMateria --> History["Temporal Context<br/>History Buffer"]
+        Predict --> Validate["Resonance Validation<br/>Coherence Check"]
+    end
+
+    VestaVM <-->|"FFI (.so)"| Photonic
+    VestaVM <-->|"FFI (.so)"| Materia
+    Photonic <-->|"UTF-32 Protocol<br/>bits 0-15=freq, 16-31=duty"| Materia
+
+    subgraph Tools["🛠️ Ecosystem"]
+        Opcodes["opcodes<br/>x86 Assembler/Disassembler"]
+        Structs["structs_data_C<br/>Array List + Hash Table"]
+    end
+
+    VestaVM --- Tools
+
+    style VestaVM fill:#1f6feb22,stroke:#1f6feb,stroke-width:2px
+    style Photonic fill:#23863622,stroke:#238636,stroke-width:2px
+    style Materia fill:#9e6a0322,stroke:#9e6a03,stroke-width:2px
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<!-- 2. VestaVM COMPONENTES INTERNOS -->
+<!-- ============================================================ -->
+<h2 id="arch-vm">2. VestaVM: componentes internos</h2>
+<div class="diagram-container">
+<div class="desc">Arquitectura de la máquina virtual, mostrando los subsistemas principales y su interacción.</div>
+<pre class="mermaid">
+flowchart LR
+    subgraph Frontend["Frontend (vex_lib)"]
+        Lexer["Lexer"] --> Parser["Parser"]
+        Parser --> TypeChecker["TypeChecker<br/>14K LoC"]
+        TypeChecker --> Lowering["Lowering<br/>AST → SSA IR"]
+    end
+
+    subgraph IR["Intermediate Representation"]
+        SSA["SSA IR Module"]
+        Optimizer["Optimizer<br/>15+ passes"]
+        RegAlloc["Linear Scan<br/>Register Allocator"]
+    end
+
+    subgraph Backend["Backend"]
+        Emitter["IR Emitter<br/>→ .vel bytecode"]
+        Assembler["Assembler<br/>→ .velb binary"]
+        Linker["Linker<br/>Symbol Resolution<br/>Address Space Merge"]
+    end
+
+    subgraph Runtime["Runtime"]
+        Interpreter["Threaded Interpreter<br/>computed-goto ~340 MIPS"]
+        SuperInstr["Super-instructions<br/>alu3, cmpjmp, decjnz"]
+        Scheduler["M:N Scheduler<br/>Cooperative Round-Robin"]
+        GCGen["Generational GC<br/>Young/Old + Conservative Scan"]
+        JITC1["JIT C1<br/>Template-based ~87% coverage"]
+        JITC2["JIT C2 (Phase D.8)<br/>Optimizing with PGO"]
+    end
+
+    subgraph Distribution["Distributed"]
+        VDP["VDP Protocol<br/>TCP/TLS"]
+        Discovery["UDP LAN Discovery"]
+        Rspawn["rspawn<br/>Remote Process Spawn"]
+        MemSync["memsync<br/>Cross-Node Memory Sync"]
+    end
+
+    Frontend --> IR --> Backend --> Runtime
+    Runtime --> Distribution
+
+    style Frontend fill:#1f6feb22,stroke:#1f6feb
+    style IR fill:#23863622,stroke:#238636
+    style Backend fill:#9e6a0322,stroke:#9e6a03
+    style Runtime fill:#da363322,stroke:#da3633
+    style Distribution fill:#8957e522,stroke:#8957e5
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<!-- 3. PIPELINE DEL COMPILADOR VEX -->
+<!-- ============================================================ -->
+<h2 id="pipeline-compiler">3. Pipeline del compilador Vex</h2>
+<div class="diagram-container">
+<div class="desc">Flujo de compilación desde código fuente .vex hasta bytecode .velb, mostrando cada pase y los diagramas opcionales.</div>
+<pre class="mermaid">
+flowchart TB
+    Source[".vex Source Code"] --> LexParse["Pass 1: Lex + Parse<br/>(Lexer + Parser)"]
+    LexParse --> TypeCheck["Pass 2: TypeCheck<br/>(Namespace Flatten + TypeChecker)"]
+
+    TypeCheck --> ASTDiag["Optional: AST Diagrams<br/>Mermaid · Graphviz · HTML"]
+
+    TypeCheck --> Lower["Pass 3: Lowering<br/>(AST → SSA IR Module)"]
+
+    Lower --> IRPreDiag["Optional: IR Pre-opt Diagrams<br/>Mermaid · Graphviz · HTML"]
+
+    Lower --> Optimize["Pass 4: Optimize IR<br/>(DCE, CSE, Copy Prop, Const Fold, TCO, LICM, ...)"]
+
+    Optimize --> IRPost["Pass 5: Post-opt + Emit<br/>(IR Serialization + Port Transpile + .vel emit)"]
+
+    IRPost --> VEL[".vel bytecode text"]
+
+    VEL --> Assembler["Assembler → .velb binary"]
+    Assembler --> Linker["Linker → merged .velb"]
+
+    Linker --> Final["Executable .velb"]
+
+    style Source fill:#1f6feb33,stroke:#1f6feb,stroke-width:3px
+    style VEL fill:#23863633,stroke:#238636,stroke-width:3px
+    style Final fill:#da363333,stroke:#da3633,stroke-width:3px
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<!-- 4. PIPELINE JIT -->
+<!-- ============================================================ -->
+<h2 id="jit-pipeline">4. Pipeline JIT (C1 → C2)</h2>
+<div class="diagram-container">
+<div class="desc">Sistema de compilación JIT en dos niveles: C1 baseline y C2 optimizador con PGO.</div>
+<pre class="mermaid">
+flowchart TB
+    subgraph Interp["Interpreter"]
+        IC["Invocation Counter"]
+        IC -->|"count > threshold"| C1["JIT C1: Template Compile"]
+    end
+
+    C1 --> Selector["IR Opcode Selector<br/>x86-64 code emission"]
+    Selector --> CodeCache["Code Cache<br/>W^X Pages"]
+
+    subgraph PGO["Profile-Guided Optimization"]
+        BranchProf["Branch Counters<br/>taken/not_taken"]
+        TypeProf["CALLVIRT Type Observations<br/>up to 4 types per site"]
+        AllocProf["Allocation Counters<br/>per PC"]
+    end
+
+    C1 -->|"tier-up"| C2["JIT C2: Optimizing Compiler<br/>(Phase D.8 - pending)"]
+
+    subgraph C2Features["C2 Planned Features"]
+        Inlining["Inlining + Devirtualization"]
+        Escape["Escape Analysis"]
+        LICM["Loop Invariant Code Motion"]
+        BCE["Bounds Check Elimination"]
+        Deopt["Speculative Optimization + Deopt"]
+    end
+
+    PGO --> C2Features
+
+    style Interp fill:#1f6feb22,stroke:#1f6feb
+    style C1 fill:#23863622,stroke:#238636
+    style C2 fill:#9e6a0322,stroke:#9e6a03
+    style PGO fill:#8957e522,stroke:#8957e5
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<!-- 5. GC GENERACIONAL -->
+<!-- ============================================================ -->
+<h2 id="gc-arch">5. GC Generacional</h2>
+<div class="diagram-container">
+<div class="desc">Recolector de basura generacional con Young/Old generaciones y stack scanning conservativo.</div>
+<pre class="mermaid">
+flowchart TB
+    subgraph Mutator["Mutator (Program)"]
+        Alloc["new object"] --> Nursery["Nursery (Young Gen)<br/>Bump-pointer alloc"]
+    end
+
+    Nursery -->|"minor_gc()"| MinorGC["Minor GC<br/>Evacuate survivors to Old"]
+    MinorGC -->|"tenured"| OldGen["Old Generation<br/>Mark-Sweep"]
+
+    OldGen -->|"major_gc()"| MajorGC["Major GC<br/>Full heap mark + sweep"]
+
+    subgraph Roots["GC Roots"]
+        Stacks["Thread Stacks<br/>Conservative Scan"]
+        Registers["GP Registers R0-R15<br/>Conservative Scan"]
+        JITStacks["JIT Frames<br/>Precise Stackmaps"]
+    end
+
+    Roots --> MinorGC
+    Roots --> MajorGC
+
+    subgraph SharedGC["Shared GC (Cross-Process)"]
+        SharedHeap["SharedHeap<br/>Inter-process objects"]
+        STW["Stop-The-World<br/>Coordination via safepoints"]
+    end
+
+    MajorGC --> SharedGC
+
+    style Nursery fill:#1f6feb22,stroke:#1f6feb
+    style OldGen fill:#23863622,stroke:#238636
+    style SharedGC fill:#8957e522,stroke:#8957e5
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<!-- 6. SISTEMA DISTRIBUIDO VDP -->
+<!-- ============================================================ -->
+<h2 id="dist-arch">6. Sistema Distribuido VDP</h2>
+<div class="diagram-container">
+<div class="desc">Protocolo Vesta Distributed Protocol (VDP) para ejecución remota transparente.</div>
+<pre class="mermaid">
+flowchart LR
+    subgraph NodeA["Node A"]
+        VM1["VM Instance"]
+        VDP1["VDP Session"]
+        Rspawn1["rspawn handler"]
+    end
+
+    subgraph NodeB["Node B"]
+        VM2["VM Instance"]
+        VDP2["VDP Session"]
+        Rspawn2["rspawn handler"]
+    end
+
+    subgraph NodeC["Node C (LAN)"]
+        Discovery["UDP Discovery"]
+    end
+
+    NodeA <-->|"TCP/TLS + mTLS"| NodeB
+    NodeA <-->|"TCP/TLS"| NodeC
+    NodeB <-->|"TCP/TLS"| NodeC
+
+    VM1 -->|"rspawn(node) { ... }<br/>transparente"| Rspawn1
+    Rspawn1 -->|"VDP protocol"| Rspawn2
+    Rspawn2 -->|"spawn local"| VM2
+
+    style NodeA fill:#1f6feb22,stroke:#1f6feb
+    style NodeB fill:#23863622,stroke:#238636
+    style NodeC fill:#9e6a0322,stroke:#9e6a03
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<!-- 7. SISTEMA FOTÓNICO AGI -->
+<!-- ============================================================ -->
+<h2 id="photonic">7. Sistema Fotónico AGI</h2>
+<div class="diagram-container">
+<div class="desc">Arquitectura del sistema AGI Fotónica de Resonancia Armónica: cámara Fabry-Pérot, matriz láser, cuarzo y self-mixing interferometry.</div>
+<pre class="mermaid">
+flowchart TB
+    subgraph Controller["Controlador"]
+        MCU["RP2350 / ESP32-S3<br/>PIO para timing preciso"]
+        VexVM["VestaVM<br/>Ejecutando Vex"]
+        VexVM -->|"FFI call"| PhotonicPlugin["vesta_photonic.so"]
+    end
+
+    subgraph Optics["Sistema Óptico"]
+        LaserMatrix["Matriz de Láseres RGBI+UV"]
+        LaserMatrix -->|"650nm R"| L1
+        LaserMatrix -->|"532nm G"| L2
+        LaserMatrix -->|"450nm B"| L3
+        LaserMatrix -->|"850nm IR"| L4
+        LaserMatrix -->|"405nm UV"| L5
+
+        L1 & L2 & L3 & L4 & L5 -->|"Pulsos modulados PWM"| Crystal["Prisma de Cuarzo<br/>Índice refracción 1.544<br/>Geometría 20mm"]
+        Crystal -->|"Refracción + Interferencia"| Mirror["Espejo de Alta Reflectividad<br/>Onda Estacionaria"]
+        Mirror -->|"Retroreflexión"| Crystal
+    end
+
+    subgraph Detection["Self-Mixing Interferometry"]
+        Crystal -->|"Feedback óptico al láser"| LaserFeedback["Cambio en voltaje<br/>del láser emisor"]
+        LaserFeedback -->|"mV detectado"| ADC["ADC del MCU"]
+        ADC -->|"Valor digital"| PhotonicPlugin
+    end
+
+    subgraph Protocol["Protocolo UTF-32"]
+        Direction LR
+        Code["Código de 32 bits"] --> Freq["Bits 0-15: Frecuencia<br/>(λ × 10, 0.1nm resolución)"]
+        Code --> Duty["Bits 16-31: Duty Cycle<br/>(nanosegundos de pulso)"]
+    end
+
+    PhotonicPlugin --> Protocol
+
+    style Controller fill:#1f6feb22,stroke:#1f6feb
+    style Optics fill:#23863622,stroke:#238636
+    style Detection fill:#9e6a0322,stroke:#9e6a03
+    style Protocol fill:#8957e522,stroke:#8957e5
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<!-- 8. BASEMATERIA + JEPA -->
+<!-- ============================================================ -->
+<h2 id="materia">8. BaseMateria + JEPA</h2>
+<div class="diagram-container">
+<div class="desc">Arquitectura del modelo BaseMateria basado en JEPA (Joint Embedding Predictive Architecture). El flujo de datos atraviesa embedding, predicción y validación por resonancia.</div>
+<pre class="mermaid">
+flowchart TB
+    subgraph Input["Datos de Entrada<br/>(cualquier dominio)"]
+        Raw["Raw Data<br/>f64[]"]
+        Domain["Domain Config<br/>ModelConfig{domain, dim, freq}"]
+    end
+
+    subgraph BaseMateria["BaseMateria Engine"]
+        Init["init(config)<br/>Configurar dominio"]
+        Embed["embed(data) → i32<br/>Proyección JEPA armónica<br/>a espacio latente"]
+        History["History Buffer<br/>Contexto temporal<br/>últimos N embeddings"]
+
+        Embed --> Latent["Latent Space<br/>current_embedding[f64; dim]"]
+        Latent --> Predict["predict(n) → i32<br/>Proyección desde latente<br/>+ corrección temporal"]
+        Latent --> Resonance["resonance() → 0-1000<br/>Coherencia interna<br/>del embedding"]
+
+        Predict --> Result["Prediction{f64[], len, resonance}"]
+    end
+
+    subgraph PhotonicInterface["Interface Fotónica"]
+        Encode["encode_photonic(idx) → u32<br/>Embedding → frecuencia nm"]
+        Decode["decode_photonic(u32) → f64<br/>Frecuencia → embedding"]
+        EmitAll["emit_photonic()<br/>Embedding completo → pulsos"]
+    end
+
+    Input --> Init
+    Input --> Embed
+    Latent --> History
+    History --> Embed
+    Latent --> PhotonicInterface
+
+    style Input fill:#1f6feb22,stroke:#1f6feb
+    style BaseMateria fill:#23863622,stroke:#238636,stroke-width:2px
+    style PhotonicInterface fill:#9e6a0322,stroke:#9e6a03
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<!-- 9. INTEGRACIÓN FOTÓNICO + MATERIA -->
+<!-- ============================================================ -->
+<h2 id="photonic-materia">9. Integración Fotónico + M.A.T.E.R.I.A.</h2>
+<div class="diagram-container">
+<div class="desc">Ciclo completo de aprendizaje por resonancia: los datos se embedding en BaseMateria, se codifican como pulsos láser, el cuarzo valida por interferencia, y el feedback cierra el loop.</div>
+<pre class="mermaid">
+sequenceDiagram
+    participant V as Vex/VM
+    participant BM as BaseMateria
+    participant PL as Photonic Plugin
+    participant HW as Hardware Fotónico
+    participant Q as Cuarzo
+
+    Note over V,Q: Ciclo de Aprendizaje por Resonancia
+
+    V->>BM: init(domain, dim, freq)
+    V->>BM: embed(raw_data)
+    BM->>BM: Proyección JEPA → latente
+    BM-->>V: dim
+
+    V->>BM: predict(output_len)
+    BM->>BM: Proyección + contexto histórico
+    BM-->>V: prediction[]
+
+    V->>BM: resonance()
+    BM-->>V: coherence 0-1000
+
+    opt Fotónico
+        V->>PL: encode_photonic(idx)
+        PL-->>V: UTF-32 code (freq + intensity)
+        V->>PL: photonic_emit(code)
+        PL->>HW: PWM pulse to laser
+        HW->>Q: Light pulse at λ nm
+        Q->>Q: Refraction + interference
+        Q->>HW: Self-mixing feedback (mV)
+        HW-->>PL: ADC value
+        PL-->>V: feedback_voltage
+
+        V->>BM: decode_photonic(code)
+        BM-->>V: decoded_value
+    end
+
+    V->>BM: process(new_data, n)
+    BM-->>V: Prediction{values, resonance}
+    Note over V,Q: Resonance > 700 = coherente
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<!-- 10. structs_data_C -->
+<!-- ============================================================ -->
+<h2 id="structs">10. structs_data_C: estructuras de datos</h2>
+<div class="diagram-container">
+<div class="desc">Librería de estructuras de datos genéricas en C con API limpia.</div>
+<pre class="mermaid">
+classDiagram
+    class ds_array_list {
+        +size_t size
+        +size_t capacity
+        +void** data
+        +create(initial_capacity) ds_array_list*
+        +destroy(list)
+        +push(list, value)
+        +pop(list)
+        +get(list, index) void*
+        +set(list, index, value)
+        +insert(list, index, value)
+        +erase(list, index)
+        +reserve(list, capacity)
+        +shrink(list)
+        +foreach(list, callback, ctx)
+        +size(list) size_t
+        +capacity(list) size_t
+    }
+
+    class ds_hash_table {
+        +size_t size
+        +size_t capacity
+        +ds_hash_entry** table
+        +create(initial_capacity) ds_hash_table*
+        +destroy(table)
+        +put(table, key, value)
+        +get(table, key) void*
+        +contains(table, key) bool
+        +remove(table, key) bool
+        +foreach(table, callback, ctx)
+        +size(table) size_t
+        +clear(table)
+    }
+
+    class ds_hash_entry {
+        +char* key
+        +void* value
+        +ds_hash_entry* next
+    }
+
+    ds_hash_table --> ds_hash_entry : contains
+
+    note for ds_array_list "Growth factor: 2x<br/>Min capacity: 8"
+    note for ds_hash_table "Load factor: 0.75<br/>Hash: djb2<br/>Min capacity: 16"
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<!-- 11. opcodes x86 -->
+<!-- ============================================================ -->
+<h2 id="opcodes">11. opcodes: encoder/decoder x86</h2>
+<div class="diagram-container">
+<div class="desc">Librería de ensamblado y desensamblado de instrucciones x86 (16, 32 y 64 bits).</div>
+<pre class="mermaid">
+flowchart TB
+    subgraph Encoder["Encoder (Assembly → Bytes)"]
+        AsmText["Assembly Text<br/>'add eax, ebx'"]
+        AsmText --> Parse["Parse Mnemonic + Operands"]
+        Parse --> Lookup["Instruction Table Lookup"]
+        Lookup --> Opcode["Set Opcode Byte(s)"]
+        Opcode --> ModRM["Set ModR/M Byte"]
+        ModRM --> SIB["Set SIB (optional)"]
+        SIB --> Displacement["Set Displacement (optional)"]
+        Displacement --> Immediate["Set Immediate (optional)"]
+        Immediate --> Bytes["Machine Code Bytes"]
+    end
+
+    subgraph Decoder["Decoder (Bytes → Assembly)"]
+        RawBytes["Machine Code Bytes<br/>'20 C0 21 D6 ...'"]
+        RawBytes --> ReadPref["Read Prefixes<br/>(0-4 bytes)"]
+        ReadPref --> ReadOp["Read Opcode<br/>(1-3 bytes)"]
+        ReadOp --> MatchOp["Match Instruction<br/>in 200+ entry table"]
+        MatchOp --> ParseFields["Parse ModR/M + SIB"]
+        ParseFields --> Format["Format Mnemonic + Operands"]
+        Format --> AsmOut["Assembly Output"]
+    end
+
+    style Encoder fill:#1f6feb22,stroke:#1f6feb
+    style Decoder fill:#23863622,stroke:#238636
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<!-- FOOTER -->
+<!-- ============================================================ -->
+<div style="text-align:center; color:#8b949e; margin-top:60px; padding:20px; border-top:1px solid #30363d;">
+<p>VestaVM © 2026 — desmonHak | AGI Fotónica + M.A.T.E.R.I.A. © 2026 — MethodWhite</p>
+<p>Generado con Mermaid.js · <a href="https://mermaid.js.org/" style="color:#58a6ff">mermaid.js.org</a></p>
+</div>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    themeVariables: {
+      primaryColor: '#1f6feb',
+      primaryTextColor: '#c9d1d9',
+      primaryBorderColor: '#30363d',
+      lineColor: '#58a6ff',
+      secondaryColor: '#238636',
+      tertiaryColor: '#9e6a03'
+    }
+  });
+</script>
+
+</body>
+</html>

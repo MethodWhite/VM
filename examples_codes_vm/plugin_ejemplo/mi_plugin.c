@@ -54,7 +54,6 @@ void vesta_init(const VestaPluginAPI *api) {
  *   ; r0 = 42
  */
 uint64_t suma(uint64_t a, uint64_t b) {
-    (void)ctx; /* contexto no usado en este ejemplo */
     return a + b;
 }
 

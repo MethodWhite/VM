@@ -1,11 +1,27 @@
 // examples_codes_vex/00_aritmetica.vex
 //
-// Ejemplo end-to-end mas minimo: expresion aritmetica.
+// Ejemplo end-to-end mínimo: expresión aritmética.
 //
-// Devuelve 1 + 2 * 3 = 7 (precedencia C: multiplicacion antes que suma).
+// Demuestra:
+//   - Operadores aritméticos básicos (+, -, *, /)
+//   - Precedencia de operadores (C-style: * antes que +)
+//   - Función main() con retorno tipado
+//   - Código de salida simple
 //
 // Resultado esperado:
-//   exit code / R00 == 7
+//   exit code / R00 == 7  (1 + 2 * 3 = 7)
+//
+// Configuración requerida (vex.toml):
+//   [language]
+//   dialecto = "vex"
+//   backend = "velb"
+//
+//   [runtime]
+//   modo = "interp"
+//
+// Compilar y ejecutar:
+//   vesta --vex examples_codes_vex/00_aritmetica.vex -o aritmetica
+//   vesta --run aritmetica.velb
 
 i32 main() {
     return 1 + 2 * 3;

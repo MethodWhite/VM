@@ -866,7 +866,38 @@ return "(" + to_str(n) + ")";
 
 ---
 
-## 21. Comparativas side-by-side con otros lenguajes
+## 21. Photónica y M.A.T.E.R.I.A. (plugins nativos)
+
+**[`photonic_hello.vex`](../examples_codes_vex/photonic_hello.vex)** - Hello
+World fotónico: emite pulsos láser RGB y mide feedback self-mixing:
+
+```vex
+import std.photonic.*
+
+i32 main() {
+    let fb_r = emit(LASER_R);
+    println("LASER_R feedback: " + f32_to_str(fb_r) + " mV");
+    let res = resonance(LASER_R);
+    println("Resonancia: " + i32_to_str(res) + "/1000");
+    laser_off();
+    return 0;
+}
+```
+
+**[`materia_demo.vex`](../examples_codes_vex/materia_demo.vex)** - Demo de
+BaseMateria: modelo de representación latente JEPA con embedding, predicción,
+resonancia y codificación fotónica.
+
+**[`photonic_jepa_learn.vex`](../examples_codes_vex/photonic_jepa_learn.vex)** -
+Ciclo de aprendizaje JEPA completo: búsqueda de resonancia, embedding,
+predicción, critic loss y learn_step iterativo.
+
+Tests dedicados en [`tests/photonic/`](../tests/photonic/) y
+[`tests/materia/`](../tests/materia/).
+
+---
+
+## 22. Comparativas side-by-side con otros lenguajes
 
 ### Hello World
 

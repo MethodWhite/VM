@@ -1,22 +1,32 @@
 // examples_codes_vex/01_factorial.vex
 //
-// Ejemplo de funcion recursiva del lenguaje Vex.
+// Ejemplo de función recursiva del lenguaje Vex.
 //
 // Demuestra:
-//   - Funciones top-level con parametro y retorno tipado.
-//   - Recursion con caso base y caso recursivo.
-//   - Llamada con valor vivo a traves del CALL: el operando 'n' del
+//   - Funciones top-level con parámetro y retorno tipado
+//   - Recursión con caso base y caso recursivo
+//   - Llamada con valor vivo a través del CALL: el operando 'n' del
 //     producto 'n * factorial(n - 1)' debe preservarse durante la
-//     llamada recursiva.  El emisor IR genera push/pop alrededor del
+//     llamada recursiva. El emisor IR genera push/pop alrededor del
 //     callvm para garantizarlo.
-//   - main() devuelve el resultado al codigo de salida.
+//   - main() devuelve el resultado al código de salida
+//   - Uso de tipos primitivos (i64) y operaciones aritméticas
 //
 // Resultado esperado:
-//   factorial(5) == 120  ->  R00 == 0x78 == 120
+//   factorial(10) == 3628800  ->  R00 == 0x375F00 == 3628800
+//
+// Configuración requerida (vex.toml):
+//   [language]
+//   dialecto = "vex"
+//   backend = "velb"
+//
+//   [runtime]
+//   modo = "interp"
+//   jit_threshold = 100
 //
 // Compilar y ejecutar:
-//   vm --vex examples_codes_vex/01_factorial.vex -o factorial
-//   vm --run factorial.velb --stats
+//   vesta --vex examples_codes_vex/01_factorial.vex -o factorial
+//   vesta --run factorial.velb --stats
 
 i64 factorial(i64 n) {
     if (n <= 1) {

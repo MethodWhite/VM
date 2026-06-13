@@ -1,0 +1,87 @@
+// examples_codes_vex/quantum_qft.vex
+//
+// Quantum Fourier Transform on 3 qubits.
+//
+// Applies QFT to a prepared input state and measures the result.
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/quantum_qft.vex -o /tmp/quantum_qft
+//   vm --run /tmp/quantum_qft.velb
+
+import std.quantum.*
+
+/// Controlled phase helper
+fn cp(circuit: &QuantumCircuit, control: i32, target: i32, angle: f64) -> &QuantumCircuit {
+    let half = angle * 0.5
+    circuit = rz(circuit, target, half)
+    circuit = cx(circuit, control, target)
+    circuit = rz(circuit, target, -half)
+    circuit = cx(circuit, control, target)
+    return circuit
+}
+
+/// QFT on specified qubits
+fn qft(circuit: &QuantumCircuit, qubits: i32[]) -> &QuantumCircuit {
+    let n = qubits.size()
+    let mut i: i32 = 0
+    while i < n {
+        circuit = h(circuit, qubits[i])
+        let mut j: i32 = 1
+        let mut k: i32 = i + 1
+        while k < n {
+            let angle = PI / f64(1 << j)
+            circuit = cp(circuit, qubits[k], qubits[i], angle)
+            j = j + 1
+            k = k + 1
+        }
+        i = i + 1
+    }
+    // Reverse qubit order
+    let mut l: i32 = 0
+    while l < n / 2 {
+        circuit = swap(circuit, qubits[l], qubits[n - 1 - l])
+        l = l + 1
+    }
+    return circuit
+}
+
+i32 main() {
+    println(">>> Quantum Fourier Transform (3 qubits) <<<")
+    println("")
+
+    let n: i32 = 3
+    let mut circuit = create_circuit(n)
+
+    // Prepare input state: apply X to q0 -> |001>
+    circuit = x(circuit, 0)
+
+    // Apply QFT
+    let qubits: i32[] = [0, 1, 2]
+    circuit = qft(circuit, qubits)
+
+    println("QFT circuit created with " + i32_to_str(n) + " qubits")
+    println("")
+
+    // Measure
+    let mut i: i32 = 0
+    while i < n {
+        circuit = measure(circuit, i)
+        i = i + 1
+    }
+
+    // Run simulation
+    let results = run_simulator(circuit)
+    println("Measurement results:")
+    let mut j: i32 = 0
+    while j < results.size() {
+        let m = results[j]
+        println("  Qubit " + i32_to_str(m.qubit)
+              + ": " + bool_to_str(m.result)
+              + " (p=" + f64_to_str(m.probability) + ")")
+        j = j + 1
+    }
+
+    println("")
+    println("Done.")
+    return 0
+}

@@ -1,0 +1,91 @@
+// examples_codes_vex/materia_demo.vex
+//
+// Demo de BaseMateria — modelo de representación latente JEPA.
+//
+// Demuestra:
+//   - Import del namespace std.materia
+//   - Creación de un ModelConfig para un dominio
+//   - Inicialización con init()
+//   - Embedding de datos crudos a espacio latente
+//   - Predicción desde el embedding
+//   - Medición de resonancia interna
+//   - Codificación/decodificación fotónica
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/materia_demo.vex -o /tmp/materia_demo
+//   vm --run /tmp/materia_demo.velb
+//
+// Salida esperada:
+//   BaseMateria inicializado para dominio 'series_temporales'
+//   Dimensión del embedding: 16
+//   Predicción: [ ... ]
+//   Resonancia interna: XXX/1000
+//   Código fotónico dimensión 0: 0x...
+
+import std.materia.*
+
+i32 main() {
+    println("=== BaseMateria Demo ===")
+    println("")
+
+    // Configurar modelo para series temporales
+    let cfg = ModelConfig {
+        domain    = "series_temporales",
+        dim       = 16,
+        base_freq = 650.0,
+        freq_step = 10.0
+    }
+
+    let ok = init(cfg)
+    if !ok {
+        println("ERROR: init() failed")
+        return 1
+    }
+    println("BaseMateria inicializado para dominio '" + cfg.domain + "'")
+    println("")
+
+    // Embedding de datos de entrada
+    let data: f64[] = [0.5, 1.2, 2.8, 3.1, 4.0, 5.5, 6.2, 7.8]
+    let dim = embed(data)
+    println("Datos embedidos. Dimensión: " + i32_to_str(dim))
+
+    // Mostrar primeras dimensiones del embedding
+    let mut i: i32 = 0
+    while i < dim && i < 4 {
+        let val = get_embedding(i)
+        println("  embedding[" + i32_to_str(i) + "] = " + f64_to_str(val))
+        i = i + 1
+    }
+    println("")
+
+    // Generar predicción
+    let n = predict(4)
+    println("Predicción (" + i32_to_str(n) + " valores):")
+    i = 0
+    while i < n {
+        let val = get_prediction(i)
+        println("  pred[" + i32_to_str(i) + "] = " + f64_to_str(val))
+        i = i + 1
+    }
+    println("")
+
+    // Medir coherencia interna
+    let res = resonance()
+    let res_norm = f64(res) / 1000.0
+    println("Resonancia interna: " + i32_to_str(res) + "/1000 ("
+          + f64_to_str(res_norm) + ")")
+    println("")
+
+    // Codificar embedding a frecuencia láser
+    let code = encode_photonic(0)
+    let decoded = decode_photonic(code)
+    println("Codificación fotónica dim[0]:")
+    println("  código: 0x" + u32_to_hex(code))
+    println("  decodificado: " + f64_to_str(decoded))
+    println("")
+
+    // Limpiar
+    reset()
+    println("BaseMateria reset. Demo completada.")
+    return 0
+}

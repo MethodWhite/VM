@@ -1,0 +1,58 @@
+// examples_codes_vex/photonic_hello.vex
+//
+// Hello World fotónico — emite pulsos láser RGB y mide feedback.
+//
+// Demuestra:
+//   - Import del namespace std.photonic
+//   - Constantes físicas LASER_R, LASER_G, LASER_B
+//   - Función emit() para emitir pulsos
+//   - Función get_feedback() para leer voltaje self-mixing
+//   - Ciclo de aprendizaje learn_step()
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/photonic_hello.vex -o /tmp/ph_hello
+//   vm --run /tmp/ph_hello.velb
+//
+// Salida esperada:
+//   >>> Hello World Fotónico <<<
+//   LASER_R (650.0 nm) -> feedback:  X.XX mV
+//   LASER_G (532.0 nm) -> feedback:  X.XX mV
+//   LASER_B (450.0 nm) -> feedback:  X.XX mV
+//   Resonancia en LASER_R: XXX/1000
+//   Done.
+
+import std.photonic.*
+
+i32 main() {
+    println(">>> Hello World Fotónico <<<")
+    println("")
+
+    // Emitir láser rojo y medir feedback self-mixing
+    let fb_r = emit(LASER_R)
+    println("LASER_R (650.0 nm) -> feedback: " + f32_to_str(fb_r) + " mV")
+
+    // Emitir láser verde
+    let fb_g = emit(LASER_G)
+    println("LASER_G (532.0 nm) -> feedback: " + f32_to_str(fb_g) + " mV")
+
+    // Emitir láser azul
+    let fb_b = emit(LASER_B)
+    println("LASER_B (450.0 nm) -> feedback: " + f32_to_str(fb_b) + " mV")
+
+    println("")
+
+    // Medir resonancia del rojo
+    let res = resonance(LASER_R)
+    println("Resonancia en LASER_R: " + i32_to_str(res) + "/1000")
+
+    // Un paso de aprendizaje
+    let (r, collapsed) = learn_step(LASER_G)
+    println("Learn step @ LASER_G: resonance=" + i32_to_str(r)
+          + " collapsed=" + bool_to_str(collapsed))
+
+    println("")
+    println("Done.")
+
+    laser_off()
+    return 0
+}

@@ -1,0 +1,154 @@
+// examples_codes_vex/solid_basic.vex
+//
+// Basic SolidScript example — renders a lit triangle.
+//
+// Demonstrates:
+//   - Import of std.graphics types and solid_macro
+//   - @Solid vertex shader with model/view/proj transform
+//   - @Solid fragment shader with diffuse lighting
+//   - @Solid material combining shaders
+//   - @Solid pipeline configuration
+//   - Scene construction and rendering
+//
+// Compile and run:
+//   vm --vex examples_codes_vex/solid_basic.vex -o /tmp/solid_basic
+//   vm --run /tmp/solid_basic.velb
+//
+// Expected output:
+//   Frame rendered: 480000 pixels
+//   Done.
+//
+// Note: Requires vestalib graphics backend (--with-graphics).
+// Without HW rasterizer, the render_pipeline call returns a mock FrameBuffer.
+
+import std.graphics.*
+import std.graphics.solid_macro.*
+
+// -----------------------------------------------------------------
+//  SolidScript vertex shader
+// -----------------------------------------------------------------
+
+@Solid vertex {
+    input:   { position: float3, normal: float3, uv: float2 }
+    output:  { position: float4, color: float3, normal: float3, uv: float2 }
+    uniform: { model: matrix4x4, view: matrix4x4, proj: matrix4x4 }
+
+    fn main() {
+        output.position = proj * view * model * float4(input.position, 1.0)
+        output.normal   = normalize((view * model) * float4(input.normal, 0.0)).xyz
+        output.uv       = input.uv
+        output.color    = float3(1.0, 1.0, 1.0)
+    }
+}
+
+// -----------------------------------------------------------------
+//  SolidScript fragment shader
+// -----------------------------------------------------------------
+
+@Solid fragment {
+    input:   { position: float4, color: float3, normal: float3, uv: float2 }
+    output:  { color: float4 }
+    uniform: { light_dir: float3, light_color: float3, ambient: float3 }
+
+    fn main() {
+        let n = normalize(input.normal)
+        let l = normalize(light_dir)
+        let diff = max(dot(n, l), 0.0)
+        let ambient_factor = 0.15
+        let lit = ambient_factor + (1.0 - ambient_factor) * diff
+        output.color = float4(lit * input.color * light_color, 1.0)
+    }
+}
+
+// -----------------------------------------------------------------
+//  SolidScript material definition
+// -----------------------------------------------------------------
+
+@Solid material {
+    vertex: {
+        input:   { position: float3, normal: float3, uv: float2 }
+        output:  { position: float4, color: float3, normal: float3, uv: float2 }
+        uniform: { model: matrix4x4, view: matrix4x4, proj: matrix4x4 }
+        fn main() {
+            output.position = proj * view * model * float4(input.position, 1.0)
+            output.normal   = normalize((view * model) * float4(input.normal, 0.0)).xyz
+            output.uv       = input.uv
+            output.color    = float3(1.0, 1.0, 1.0)
+        }
+    }
+    fragment: {
+        input:   { position: float4, color: float3, normal: float3, uv: float2 }
+        output:  { color: float4 }
+        uniform: { light_dir: float3, light_color: float3, ambient: float3 }
+        fn main() {
+            let n = normalize(input.normal)
+            let l = normalize(light_dir)
+            let diff = max(dot(n, l), 0.0)
+            output.color = float4(ambient + diff * input.color, 1.0)
+        }
+    }
+    properties: {
+        albedo:    float3_make(0.9, 0.6, 0.3),
+        roughness: 0.4,
+        metallic:  0.1
+    }
+}
+
+// -----------------------------------------------------------------
+//  SolidScript pipeline configuration
+// -----------------------------------------------------------------
+
+@Solid pipeline {
+    stages:   vertex, fragment
+    viewport: 800x600
+}
+
+// -----------------------------------------------------------------
+//  Main — build scene and render
+// -----------------------------------------------------------------
+
+fn main() -> i32 {
+    // Create a mesh (triangle with normals)
+    let mesh = Mesh {
+        vertices: [
+            float3_make( 0.0,  0.5, 0.0),
+            float3_make(-0.5, -0.5, 0.0),
+            float3_make( 0.5, -0.5, 0.0)
+        ],
+        normals: [
+            float3_make(0.0, 0.0, 1.0),
+            float3_make(0.0, 0.0, 1.0),
+            float3_make(0.0, 0.0, 1.0)
+        ],
+        uvs: [
+            float2_make(0.5, 1.0),
+            float2_make(0.0, 0.0),
+            float2_make(1.0, 0.0)
+        ],
+        indices: [0, 1, 2]
+    }
+
+    // Build scene with camera
+    let scene = Scene {
+        meshes:       [mesh],
+        camera:       Camera {
+            position:    float3_make(0.0, 0.0, 3.0),
+            target:      float3_make(0.0, 0.0, 0.0),
+            up:          float3_make(0.0, 1.0, 0.0),
+            fov:         60.0,
+            aspect_ratio: 800.0 / 600.0,
+            near_plane:  0.1,
+            far_plane:   100.0
+        },
+        ambient_light: float3_make(0.15, 0.15, 0.2)
+    }
+
+    // Render the frame
+    let image = render_pipeline(scene)
+
+    // Print result
+    println("Frame rendered: " + i32_to_str(framebuffer_size(image)) + " pixels")
+    println("Done.")
+
+    return 0
+}

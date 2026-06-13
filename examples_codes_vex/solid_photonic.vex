@@ -1,0 +1,264 @@
+// examples_codes_vex/solid_photonic.vex
+//
+// SolidScript + Photonic AGI — real-time shader driven by laser
+// self-mixing interferometry feedback.
+//
+// This example demonstrates the full convergence of:
+//   1. SolidEngine (SolidScript graphics DSL via @Solid macro)
+//   2. Photonic AGI (std.photonic — laser emission, self-mixing feedback,
+//      JEPA embedding/prediction)
+//   3. VestaVM JIT (compile-time macro expansion + runtime JIT code gen)
+//
+// Concept:
+//   A scene is rendered where the fragment shader's lighting parameters
+//   are driven by real photonic feedback from a self-mixing interferometer.
+//   A laser pulse is emitted, the feedback voltage is measured, and that
+//   value modulates the shader's light color, ambient, and specular
+//   intensity in real time.  The JEPA predictor learns the resonance
+//   pattern and adjusts the shader to match the optimal optical response.
+//
+// Compile and run:
+//   vm --vex examples_codes_vex/solid_photonic.vex -o /tmp/solid_photonic
+//   vm --run /tmp/solid_photonic.velb
+//
+// Expected output:
+//   >>> SolidScript + Photonic AGI <<<
+//   Emitting LASER_R (650.0 nm)...
+//   Feedback: XXX.XX mV  |  Resonance: XXX/1000
+//   Shader modulated by photonic field.
+//   Frame[0]  feedback=XXX.XXmV  resonance=XXX/1000  collapsed=false
+//   ...
+//   JEPA latent embedding: 0x...
+//   JEPA predicted next color: 0x...
+//   [cycle repeats 4 more times]
+//   Laser off.  Demo complete.
+
+import std.graphics.*
+import std.graphics.solid_macro.*
+import std.photonic.*
+
+// -----------------------------------------------------------------
+//  SolidScript vertex shader — standard transform
+// -----------------------------------------------------------------
+
+@Solid vertex {
+    input:   { position: float3, normal: float3, uv: float2 }
+    output:  { position: float4, color: float3, normal: float3, uv: float2 }
+    uniform: { model: matrix4x4, view: matrix4x4, proj: matrix4x4 }
+
+    fn main() {
+        output.position = proj * view * model * float4(input.position, 1.0)
+        output.normal   = normalize((view * model) * float4(input.normal, 0.0)).xyz
+        output.uv       = input.uv
+        output.color    = input.normal * 0.5 + float3(0.5, 0.5, 0.5)
+    }
+}
+
+// -----------------------------------------------------------------
+//  SolidScript fragment shader — photonic-driven lighting
+// -----------------------------------------------------------------
+//  The uniform `feedback_intensity` is set per-frame from the laser
+//  self-mixing interferometry measurement.  It modulates the light
+//  color and specular response in real time.
+
+@Solid fragment {
+    input:   { position: float4, color: float3, normal: float3, uv: float2 }
+    output:  { color: float4 }
+    uniform: { light_dir: float3, ambient: float3, feedback_intensity: float, resonance_factor: float }
+
+    fn main() {
+        // feedback_intensity [0..1] controls warmth + brightness
+        let n = normalize(input.normal)
+        let l = normalize(light_dir)
+        let diff = max(dot(n, l), 0.0)
+
+        // Warm color when feedback is high (resonant), cool when low
+        let warmth = float3(feedback_intensity, 0.6 + 0.4 * (1.0 - feedback_intensity), 0.3 + 0.7 * (1.0 - feedback_intensity))
+        let ambient_warm = ambient * (1.0 + 0.5 * feedback_intensity)
+        let spec = pow(max(dot(n, l), 0.0), 8.0 + 24.0 * resonance_factor)
+
+        output.color = float4(ambient_warm + diff * warmth * input.color + float3(spec, spec * 0.7, spec * 0.3) * 0.6, 1.0)
+    }
+}
+
+// -----------------------------------------------------------------
+//  SolidScript pipeline
+// -----------------------------------------------------------------
+
+@Solid pipeline {
+    stages:   vertex, fragment
+    viewport: 640x480
+}
+
+// -----------------------------------------------------------------
+//  Helpers
+// -----------------------------------------------------------------
+
+struct PhotonicState {
+    f32 feedback_mV
+    i32 resonance
+    bool collapsed
+    u64 latent
+    u32 predicted_color
+}
+
+/// Map photonic feedback (mV) to a shader uniform [0..1]
+@Inline
+fn feedback_to_uniform(fb: f32) -> f32 {
+    // Typical feedback range ~0..500 mV, map to 0..1 with soft clip
+    let clamped = if fb < 0.0 { 0.0 } else if fb > 500.0 { 500.0 } else { fb }
+    return clamped / 500.0
+}
+
+/// Map resonance [0..1000] to shader factor [0..1]
+@Inline
+fn resonance_to_factor(r: i32) -> f32 {
+    let rf = f32(r) / 1000.0
+    return if rf < 0.0 { 0.0 } else if rf > 1.0 { 1.0 } else { rf }
+}
+
+// -----------------------------------------------------------------
+//  Main — photonic-driven rendering loop
+// -----------------------------------------------------------------
+
+fn main() -> i32 {
+    println(">>> SolidScript + Photonic AGI <<<")
+    println("")
+
+    // --- Create geometry: a cube that will be photonic-lit ---
+    let cube = _solid_cube()
+    let scene = Scene {
+        meshes:       [cube],
+        camera:       Camera {
+            position:    float3_make(2.0, 1.5, 4.0),
+            target:      float3_make(0.0, 0.0, 0.0),
+            up:          float3_make(0.0, 1.0, 0.0),
+            fov:         50.0,
+            aspect_ratio: 640.0 / 480.0,
+            near_plane:  0.1,
+            far_plane:   100.0
+        },
+        ambient_light: float3_make(0.1, 0.1, 0.12)
+    }
+
+    // --- Photonic learning state ---
+    let mut state = PhotonicState {
+        feedback_mV:     0.0,
+        resonance:       0,
+        collapsed:       false,
+        latent:          0,
+        predicted_color: 0
+    }
+
+    // --- Render loop: 5 frames with photonic feedback ---
+    let mut frame: i32 = 0
+    while frame < 5 {
+        println("--- Frame " + i32_to_str(frame) + " ---")
+
+        // 1. Emit laser and measure self-mixing feedback
+        let hypothesis = if frame == 0 { LASER_R } else { state.predicted_color }
+        state.feedback_mV = emit(hypothesis)
+        let (res, coll) = learn_step(hypothesis)
+        state.resonance  = res
+        state.collapsed  = coll
+
+        println("Emitting 0x" + u32_to_hex(hypothesis) + " -> feedback: "
+            + f32_to_str(state.feedback_mV) + " mV, resonance: "
+            + i32_to_str(state.resonance) + "/1000")
+
+        // 2. Map photonic measurements to shader uniforms
+        let fb_uniform   = feedback_to_uniform(state.feedback_mV)
+        let res_uniform  = resonance_to_factor(state.resonance)
+
+        // 3. Set shader uniforms via FFI (the @Solid fragment shader
+        //    reads feedback_intensity and resonance_factor)
+        let shader_id: i32 = 1  // placeholder: real shader ID from compile_shader
+        let fb_data: f32[] = [fb_uniform]
+        let res_data: f32[] = [res_uniform]
+        let _ = set_uniform(shader_id, "feedback_intensity", fb_data)
+        let _ = set_uniform(shader_id, "resonance_factor", res_data)
+
+        // 4. Render the frame with photonic-modulated shader
+        let image = render_pipeline(scene)
+        println("  Frame rendered: " + i32_to_str(framebuffer_size(image))
+            + " pixels (feedback=" + f32_to_str(state.feedback_mV)
+            + "mV, resonance=" + i32_to_str(state.resonance)
+            + ", collapsed=" + bool_to_str(state.collapsed) + ")")
+
+        // 5. JEPA learning step: embed the photonic state and predict
+        //    the next optimal color
+        state.latent = jepa_embed(hypothesis)
+        state.predicted_color = jepa_predict(state.latent)
+        let loss = jepa_critic(state.predicted_color, hypothesis)
+
+        println("  JEPA latent=0x" + u64_to_hex(state.latent)
+            + " predicted=0x" + u32_to_hex(state.predicted_color)
+            + " loss=" + f32_to_str(loss))
+        println("")
+
+        frame = frame + 1
+    }
+
+    // --- Cleanup ---
+    laser_off()
+    println("Laser off.  Demo complete.")
+
+    return 0
+}
+
+// -----------------------------------------------------------------
+//  Cube mesh helper (matches std.graphics.create_cube layout)
+// -----------------------------------------------------------------
+
+fn _solid_cube() -> Mesh {
+    let hs: f32 = 0.5
+    return Mesh {
+        vertices: [
+            float3_make(-hs, -hs,  hs), float3_make( hs, -hs,  hs),
+            float3_make( hs,  hs,  hs), float3_make(-hs,  hs,  hs),
+            float3_make(-hs, -hs, -hs), float3_make(-hs,  hs, -hs),
+            float3_make( hs,  hs, -hs), float3_make( hs, -hs, -hs),
+            float3_make(-hs,  hs, -hs), float3_make(-hs,  hs,  hs),
+            float3_make( hs,  hs,  hs), float3_make( hs,  hs, -hs),
+            float3_make(-hs, -hs, -hs), float3_make( hs, -hs, -hs),
+            float3_make( hs, -hs,  hs), float3_make(-hs, -hs,  hs),
+            float3_make( hs, -hs, -hs), float3_make( hs,  hs, -hs),
+            float3_make( hs,  hs,  hs), float3_make( hs, -hs,  hs),
+            float3_make(-hs, -hs, -hs), float3_make(-hs, -hs,  hs),
+            float3_make(-hs,  hs,  hs), float3_make(-hs,  hs, -hs)
+        ],
+        normals: [
+            float3_make(0,0,1), float3_make(0,0,1),
+            float3_make(0,0,1), float3_make(0,0,1),
+            float3_make(0,0,-1),float3_make(0,0,-1),
+            float3_make(0,0,-1),float3_make(0,0,-1),
+            float3_make(0,1,0), float3_make(0,1,0),
+            float3_make(0,1,0), float3_make(0,1,0),
+            float3_make(0,-1,0),float3_make(0,-1,0),
+            float3_make(0,-1,0),float3_make(0,-1,0),
+            float3_make(1,0,0), float3_make(1,0,0),
+            float3_make(1,0,0), float3_make(1,0,0),
+            float3_make(-1,0,0),float3_make(-1,0,0),
+            float3_make(-1,0,0),float3_make(-1,0,0)
+        ],
+        uvs: [
+            float2_make(0,0),float2_make(1,0),
+            float2_make(1,1),float2_make(0,1),
+            float2_make(1,0),float2_make(1,1),
+            float2_make(0,1),float2_make(0,0),
+            float2_make(0,1),float2_make(0,0),
+            float2_make(1,0),float2_make(1,1),
+            float2_make(1,1),float2_make(0,1),
+            float2_make(0,0),float2_make(1,0),
+            float2_make(0,0),float2_make(0,1),
+            float2_make(1,1),float2_make(1,0),
+            float2_make(0,0),float2_make(1,0),
+            float2_make(1,1),float2_make(0,1)
+        ],
+        indices: [
+            0,1,2,0,2,3, 4,5,6,4,6,7,
+            8,9,10,8,10,11, 12,13,14,12,14,15,
+            16,17,18,16,18,19, 20,21,22,20,22,23
+        ]
+    }
+}

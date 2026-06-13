@@ -1,0 +1,38 @@
+// Vex Inline Assembly Examples
+// Phase AS: embedding raw machine instructions in Vex code
+// for OS development (interrupts, system calls, CPU features).
+
+fn rdtsc() -> u64 {
+    let mut lo: u32 = 0
+    let mut hi: u32 = 0
+    asm volatile (
+        "rdtsc" : "=a"(lo), "=d"(hi) :
+        : "memory"
+    )
+    return (u64(hi) << 32) | u64(lo)
+}
+
+fn outb(port: u16, val: u8) {
+    asm volatile (
+        "out dx, al" : : "d"(port), "a"(val) :
+    )
+}
+
+fn cpuid(eax_in: u32) -> (u32, u32, u32, u32) {
+    let mut eax: u32 = 0
+    let mut ebx: u32 = 0
+    let mut ecx: u32 = 0
+    let mut edx: u32 = 0
+    asm volatile (
+        "cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(eax_in) :
+    )
+    return (eax, ebx, ecx, edx)
+}
+
+fn main() -> i32 {
+    let ts = rdtsc()
+    let (a, b, c, d) = cpuid(0)
+    println("RDTSC: ${ts}")
+    println("CPUID: ${std.io.format(f64(a), 0)}")
+    return 0
+}

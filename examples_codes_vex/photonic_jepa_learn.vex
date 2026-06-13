@@ -1,0 +1,70 @@
+// examples_codes_vex/photonic_jepa_learn.vex
+//
+// Ciclo de aprendizaje JEPA con fotónica.
+//
+// Demuestra:
+//   - Búsqueda de frecuencia de resonancia máxima con search_resonance()
+//   - Ciclo completo: emitir → medir resonancia → colapsar → predecir
+//   - Uso de jepa_embed / jepa_predict / jepa_critic
+//   - learn_step() para aprendizaje por refuerzo fotónico
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/photonic_jepa_learn.vex -o /tmp/jepa_learn
+//   vm --run /tmp/jepa_learn.velb
+//
+// Salida esperada:
+//   Buscando frecuencia de resonancia máxima...
+//   Mejor frecuencia encontrada: XXXX (0.1nm) con resonancia XX/1000
+//   Loss del critic: X.XXXX
+//   Done.
+
+import std.photonic.*
+
+i32 main() {
+    println("=== Ciclo de Aprendizaje JEPA Fotónico ===")
+    println("")
+
+    // --- Fase 1: Búsqueda de resonancia ---
+    println("Fase 1: Buscando frecuencia de resonancia máxima...")
+    let best = search_resonance(400.0, 900.0, 50)
+    let (best_res, _) = learn_step(best)
+    println("  Mejor frecuencia: " + u32_to_str(best) + " (0.1nm)")
+    println("  Resonancia: " + i32_to_str(best_res) + "/1000")
+    println("")
+
+    // --- Fase 2: Embedding JEPA ---
+    println("Fase 2: Embedding del patrón resonante...")
+    let latent = jepa_embed(best)
+    println("  Latent: 0x" + u64_to_hex(latent))
+    println("")
+
+    // --- Fase 3: Predicción ---
+    println("Fase 3: Predicción del siguiente patrón...")
+    let predicted = jepa_predict(latent)
+    println("  Color predicho: " + u32_to_str(predicted))
+    println("")
+
+    // --- Fase 4: Critic loss ---
+    println("Fase 4: Evaluación del critic...")
+    let target = LASER_G
+    let loss = jepa_critic(predicted, target)
+    println("  Target: LASER_G (" + f32_to_str(LASER_G) + " nm)")
+    println("  Loss (MSE): " + f32_to_str(loss))
+    println("")
+
+    // --- Fase 5: Paso de aprendizaje ---
+    println("Fase 5: learn_step sobre el mejor candidato...")
+    let mut i: i32 = 0
+    while i < 5 {
+        let (r, c) = learn_step(best)
+        println("  iter " + i32_to_str(i) + ": resonance=" + i32_to_str(r)
+              + " collapsed=" + bool_to_str(c))
+        i = i + 1
+    }
+    println("")
+
+    println("Ciclo JEPA completado.")
+
+    laser_off()
+    return 0
+}

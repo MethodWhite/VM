@@ -1,0 +1,63 @@
+// examples_codes_vex/quantum_teleport.vex
+//
+// Quantum Teleportation protocol.
+//
+// Teleports the quantum state of qubit 0 to qubit 2 using
+// an entangled pair between qubits 1 and 2.
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/quantum_teleport.vex -o /tmp/quantum_teleport
+//   vm --run /tmp/quantum_teleport.velb
+
+import std.quantum.*
+
+i32 main() {
+    println(">>> Quantum Teleportation <<<")
+    println("")
+
+    let mut circuit = create_circuit(3)
+
+    // Prepare the state to teleport: set q0 to |1>
+    circuit = x(circuit, 0)
+
+    // Create entanglement between q1 and q2
+    circuit = h(circuit, 1)
+    circuit = cx(circuit, 1, 2)
+
+    // Teleportation protocol
+    circuit = cx(circuit, 0, 1)
+    circuit = h(circuit, 0)
+
+    // Measure q0 and q1
+    circuit = measure(circuit, 0)
+    circuit = measure(circuit, 1)
+
+    // Apply correction based on measurement
+    circuit = cx(circuit, 1, 2)   // if q1=1, apply X to q2
+    circuit = h(circuit, 2)       // CZ via H-CX-H
+    circuit = cx(circuit, 0, 2)
+    circuit = h(circuit, 2)
+
+    // Measure target qubit
+    circuit = measure(circuit, 2)
+
+    println("Teleportation circuit created")
+    println("Gates: " + i32_to_str(circuit.gates.size()))
+    println("")
+
+    // Run simulation
+    let results = run_simulator(circuit)
+    println("Measurement results:")
+    let mut i: i32 = 0
+    while i < results.size() {
+        let m = results[i]
+        println("  Qubit " + i32_to_str(m.qubit)
+              + ": " + bool_to_str(m.result)
+              + " (p=" + f64_to_str(m.probability) + ")")
+        i = i + 1
+    }
+
+    println("")
+    println("Expected: q2 should equal the initial state of q0 (|1>)")
+    return 0
+}

@@ -1,0 +1,53 @@
+// examples_codes_vex/quantum_ghz.vex
+//
+// GHZ (Greenberger-Horne-Zeilinger) state preparation for 4 qubits.
+//
+// Creates the state: (|0000> + |1111>) / sqrt(2)
+//
+// Compilar y ejecutar:
+//   vm --vex examples_codes_vex/quantum_ghz.vex -o /tmp/quantum_ghz
+//   vm --run /tmp/quantum_ghz.velb
+
+import std.quantum.*
+
+i32 main() {
+    println(">>> GHZ State Preparation (4 qubits) <<<")
+    println("")
+
+    let n_qubits: i32 = 4
+    let mut circuit = create_circuit(n_qubits)
+
+    // Apply Hadamard to q0
+    circuit = h(circuit, 0)
+
+    // Apply CNOT gates to entangle all qubits
+    circuit = cx(circuit, 0, 1)
+    circuit = cx(circuit, 0, 2)
+    circuit = cx(circuit, 0, 3)
+
+    println("Circuit created with " + i32_to_str(n_qubits) + " qubits")
+    println("Gates applied: " + i32_to_str(circuit.gates.size()))
+    println("")
+
+    // Measure all qubits
+    circuit = measure(circuit, 0)
+    circuit = measure(circuit, 1)
+    circuit = measure(circuit, 2)
+    circuit = measure(circuit, 3)
+
+    // Run simulation
+    let results = run_simulator(circuit)
+    println("Measurement results:")
+    let mut i: i32 = 0
+    while i < results.size() {
+        let m = results[i]
+        println("  Qubit " + i32_to_str(m.qubit)
+              + ": " + bool_to_str(m.result)
+              + " (p=" + f64_to_str(m.probability) + ")")
+        i = i + 1
+    }
+
+    println("")
+    println("Expected: all qubits equal (0000 or 1111)")
+    return 0
+}

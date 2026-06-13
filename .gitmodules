@@ -1,6 +1,6 @@
 [submodule "libs/SourceCode/keystone"]
 	path = libs/SourceCode/keystone
-	url = https://github.com/desmonHak/keystone
+	url = https://github.com/MethodWhite/keystone.git
 [submodule "libs/SourceCode/capstone"]
 	path = libs/SourceCode/capstone
 	url = https://github.com/desmonHak/capstone

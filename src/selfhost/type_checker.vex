@@ -1,0 +1,314 @@
+import "ast";
+
+struct TypeInfo {
+    string name;
+    i32 size;
+    i32 align;
+    bool isPrimitive;
+}
+
+struct Symbol {
+    string name;
+    TypeInfo type;
+    i32 scopeDepth;
+    bool isConst;
+    bool isFunction;
+}
+
+struct Scope {
+    Symbol[256] symbols;
+    i32 count;
+    i32 parentIndex;
+}
+
+Scope[64] tc_scopes;
+i32 tc_scopeCount;
+string[64] tc_errors;
+i32 tc_errorCount;
+
+void tc_init() {
+    tc_scopeCount = 0;
+    tc_errorCount = 0;
+    tc_pushScope();
+}
+
+void tc_pushScope() {
+    Scope s;
+    s.count = 0;
+    if (tc_scopeCount > 0) {
+        s.parentIndex = tc_scopeCount - 1;
+    } else {
+        s.parentIndex = -1;
+    }
+    tc_scopes[tc_scopeCount] = s;
+    tc_scopeCount = tc_scopeCount + 1;
+}
+
+void tc_popScope() {
+    if (tc_scopeCount > 0) {
+        tc_scopeCount = tc_scopeCount - 1;
+    }
+}
+
+void tc_registerType(string name, i32 size, i32 align) {
+    TypeInfo ti;
+    ti.name = name;
+    ti.size = size;
+    ti.align = align;
+    ti.isPrimitive = true;
+    Symbol sym;
+    sym.name = name;
+    sym.type = ti;
+    sym.scopeDepth = tc_scopeCount - 1;
+    sym.isConst = false;
+    sym.isFunction = false;
+    Scope s = tc_scopes[tc_scopeCount - 1];
+    s.symbols[s.count] = sym;
+    s.count = s.count + 1;
+    tc_scopes[tc_scopeCount - 1] = s;
+}
+
+void tc_declare(string name, TypeInfo type, bool isConst, bool isFn) {
+    Symbol sym;
+    sym.name = name;
+    sym.type = type;
+    sym.scopeDepth = tc_scopeCount - 1;
+    sym.isConst = isConst;
+    sym.isFunction = isFn;
+    Scope s = tc_scopes[tc_scopeCount - 1];
+    s.symbols[s.count] = sym;
+    s.count = s.count + 1;
+    tc_scopes[tc_scopeCount - 1] = s;
+}
+
+Symbol tc_lookup(string name) {
+    i32 d = tc_scopeCount - 1;
+    while (d >= 0) {
+        Scope s = tc_scopes[d];
+        i32 i = 0;
+        while (i < s.count) {
+            if (s.symbols[i].name == name) {
+                return s.symbols[i];
+            }
+            i = i + 1;
+        }
+        d = d - 1;
+    }
+    Symbol empty;
+    empty.name = "";
+    return empty;
+}
+
+void tc_error(string msg, SourcePos pos) {
+    if (tc_errorCount < 64) {
+        tc_errors[tc_errorCount] = msg;
+        tc_errorCount = tc_errorCount + 1;
+    }
+}
+
+void tc_registerBuiltins() {
+    tc_registerType("i32", 4, 4);
+    tc_registerType("i64", 8, 8);
+    tc_registerType("i8", 1, 1);
+    tc_registerType("i16", 2, 2);
+    tc_registerType("u32", 4, 4);
+    tc_registerType("u64", 8, 8);
+    tc_registerType("u8", 1, 1);
+    tc_registerType("u16", 2, 2);
+    tc_registerType("f32", 4, 4);
+    tc_registerType("f64", 8, 8);
+    tc_registerType("bool", 1, 1);
+    tc_registerType("char", 1, 1);
+    tc_registerType("string", 8, 8);
+    tc_registerType("void", 0, 1);
+}
+
+TypeInfo typeFromAST(ASTNode node);
+
+void tc_checkProgram(ProgramNode prog) {
+    i32 i = 0;
+    while (i < 64) {
+        ASTNode decl = prog.decls[i];
+        if (decl.kind == ASTKind.FunctionDecl) {
+            FunctionDeclNode fn;
+            fn.base = decl;
+            fn.name = "";
+            tc_checkFunctionDecl(fn);
+        } else if (decl.kind == ASTKind.VariableDecl) {
+            VariableDeclNode vd;
+            vd.base = decl;
+            vd.name = "";
+            tc_checkVarDecl(vd);
+        } else if (decl.kind == ASTKind.StructDecl) {
+            StructDeclNode sd;
+            sd.base = decl;
+            sd.name = "";
+            tc_checkStructDecl(sd);
+        } else if (decl.kind == ASTKind.EnumDecl) {
+            EnumDeclNode ed;
+            ed.base = decl;
+            ed.name = "";
+            tc_checkEnumDecl(ed);
+        } else break;
+        i = i + 1;
+    }
+}
+
+void tc_checkFunctionDecl(FunctionDeclNode node) {
+    TypeInfo retType = typeFromAST(node.returnType);
+    Symbol existing = tc_lookup(node.name);
+    if (existing.name != "" && !existing.isFunction) {
+        tc_error("symbol already defined: " + node.name, node.base.pos);
+        return;
+    }
+    tc_declare(node.name, retType, false, true);
+    tc_pushScope();
+    i32 i = 0;
+    while (i < 16) {
+        ParamDeclNode pd = node.params[i];
+        if (pd.base.kind == ASTKind.ParamDecl) {
+            TypeInfo pt = typeFromAST(pd.paramType);
+            tc_declare(pd.name, pt, false, false);
+        } else break;
+        i = i + 1;
+    }
+    tc_checkBlock(node.body);
+    tc_popScope();
+}
+
+void tc_checkVarDecl(VariableDeclNode node) {
+    TypeInfo varType = typeFromAST(node.varType);
+    if (node.name != "") {
+        tc_declare(node.name, varType, node.isConst, false);
+    }
+}
+
+void tc_checkStructDecl(StructDeclNode node) {
+    TypeInfo structType;
+    structType.name = node.name;
+    structType.size = 0;
+    structType.isPrimitive = false;
+    i32 i = 0;
+    while (i < 64) {
+        VariableDeclNode fd = node.fields[i];
+        if (fd.base.kind == ASTKind.VariableDecl) {
+            TypeInfo ft = typeFromAST(fd.varType);
+            structType.size = structType.size + ft.size;
+        } else break;
+        i = i + 1;
+    }
+    tc_declare(node.name, structType, false, false);
+}
+
+void tc_checkEnumDecl(EnumDeclNode node) {
+    TypeInfo enumType;
+    enumType.name = node.name;
+    enumType.size = 4;
+    enumType.isPrimitive = false;
+    tc_declare(node.name, enumType, false, false);
+}
+
+void tc_checkBlock(ASTNode block) {
+    if (block.kind == ASTKind.BlockStmt) {
+        BlockStmtNode b;
+        b.base = block;
+        tc_pushScope();
+        i32 i = 0;
+        while (i < 256) {
+            ASTNode stmt = b.stmts[i];
+            if (stmt.kind == ASTKind.VariableDecl
+                || stmt.kind == ASTKind.IfStmt
+                || stmt.kind == ASTKind.WhileStmt
+                || stmt.kind == ASTKind.ForStmt
+                || stmt.kind == ASTKind.ReturnStmt
+                || stmt.kind == ASTKind.AssignStmt
+                || stmt.kind == ASTKind.BreakStmt
+                || stmt.kind == ASTKind.ContinueStmt
+                || stmt.kind == ASTKind.BlockStmt
+                || stmt.kind == ASTKind.BinaryOp
+                || stmt.kind == ASTKind.CallExpr
+                || stmt.kind == ASTKind.Identifier
+                || stmt.kind == ASTKind.LiteralInt) {
+                tc_checkStmt(stmt);
+            } else break;
+            i = i + 1;
+        }
+        tc_popScope();
+    }
+}
+
+void tc_checkStmt(ASTNode stmt) {
+    if (stmt.kind == ASTKind.VariableDecl) {
+        VariableDeclNode vd;
+        vd.base = stmt;
+        vd.name = "";
+        vd.isConst = false;
+        tc_checkVarDecl(vd);
+    } else if (stmt.kind == ASTKind.IfStmt) {
+        IfStmtNode ifs;
+        ifs.base = stmt;
+        tc_checkBlock(ifs.thenBranch);
+        if (ifs.elseBranch.kind != ASTKind.Identifier) {
+            tc_checkStmt(ifs.elseBranch);
+        }
+    } else if (stmt.kind == ASTKind.WhileStmt) {
+        WhileStmtNode ws;
+        ws.base = stmt;
+        tc_checkBlock(ws.body);
+    } else if (stmt.kind == ASTKind.ForStmt) {
+        ForStmtNode fs;
+        fs.base = stmt;
+        if (fs.init.kind != ASTKind.Identifier) {
+            tc_checkStmt(fs.init);
+        }
+        tc_checkBlock(fs.body);
+    } else if (stmt.kind == ASTKind.ReturnStmt) {
+    } else if (stmt.kind == ASTKind.BlockStmt) {
+        tc_checkBlock(stmt);
+    }
+}
+
+TypeInfo typeFromAST(ASTNode node) {
+    TypeInfo t;
+    t.name = "i64";
+    t.size = 8;
+    t.align = 8;
+    t.isPrimitive = true;
+    if (node.kind == ASTKind.TypeNode) {
+        TypeNode tn;
+        tn.base = node;
+        tn.typeName = "";
+        Symbol sym = tc_lookup(tn.typeName);
+        if (sym.name != "") {
+            return sym.type;
+        }
+        if (tn.typeName == "void") { t.name = "void"; t.size = 0; }
+        else if (tn.typeName == "i32") { t.name = "i32"; t.size = 4; }
+        else if (tn.typeName == "i64") { t.name = "i64"; t.size = 8; }
+        else if (tn.typeName == "i8") { t.name = "i8"; t.size = 1; }
+        else if (tn.typeName == "i16") { t.name = "i16"; t.size = 2; }
+        else if (tn.typeName == "u32") { t.name = "u32"; t.size = 4; }
+        else if (tn.typeName == "u64") { t.name = "u64"; t.size = 8; }
+        else if (tn.typeName == "u8") { t.name = "u8"; t.size = 1; }
+        else if (tn.typeName == "u16") { t.name = "u16"; t.size = 2; }
+        else if (tn.typeName == "f32") { t.name = "f32"; t.size = 4; }
+        else if (tn.typeName == "f64") { t.name = "f64"; t.size = 8; }
+        else if (tn.typeName == "bool") { t.name = "bool"; t.size = 1; }
+        else if (tn.typeName == "char") { t.name = "char"; t.size = 1; }
+        else if (tn.typeName == "string") { t.name = "string"; t.size = 8; }
+        else if (tn.typeName == "void") { t.name = "void"; t.size = 0; }
+    }
+    return t;
+}
+
+bool tc_run(ProgramNode ast, string[64] errors) {
+    tc_init();
+    tc_registerBuiltins();
+    tc_checkProgram(ast);
+    i32 i = 0;
+    while (i < tc_errorCount && i < 64) {
+        errors[i] = tc_errors[i];
+        i = i + 1;
+    }
+    return tc_errorCount == 0;
+}

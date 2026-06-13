@@ -1,0 +1,335 @@
+import "ast";
+
+const i32 OP_NOP = 0x03;
+const i32 OP_HLT = 0x00;
+const i32 OP_MOV_IMM = 0x30;
+const i32 OP_MOV_REG = 0x31;
+const i32 OP_ADD = 0x40;
+const i32 OP_SUB = 0x41;
+const i32 OP_MUL = 0x42;
+const i32 OP_DIV = 0x43;
+const i32 OP_CMP = 0x50;
+const i32 OP_JMP = 0x11;
+const i32 OP_CALLVM = 0x10;
+const i32 OP_RET = 0x1A;
+const i32 OP_PUSH = 0x12;
+const i32 OP_POP = 0x13;
+const i32 REG_R0 = 0;
+const i32 REG_SP = 14;
+const i32 REG_FP = 15;
+
+const i32 OUTPUT_SIZE = 65536;
+const i32 HEADER_SIZE = 144;
+
+u8[OUTPUT_SIZE] cg_output;
+i32 cg_size;
+i32[32] cg_labels;
+i32 cg_labelCount;
+i32[32] cg_patches;
+i32[32] cg_patchTargets;
+i32 cg_patchCount;
+string[32] cg_fnNames;
+i32[32] cg_fnLabels;
+i32 cg_fnCount;
+i32[32] cg_strings;
+i32 cg_strCount;
+i32 cg_dataOffset;
+
+void cg_init() {
+    cg_size = 0;
+    cg_labelCount = 0;
+    cg_patchCount = 0;
+    cg_fnCount = 0;
+    cg_strCount = 0;
+    cg_dataOffset = 0;
+}
+
+void cg_emitU8(u8 val) {
+    cg_output[cg_size] = val;
+    cg_size = cg_size + 1;
+}
+
+void cg_emitU32(u32 val) {
+    cg_output[cg_size] = val & 0xFF;
+    cg_output[cg_size + 1] = (val >> 8) & 0xFF;
+    cg_output[cg_size + 2] = (val >> 16) & 0xFF;
+    cg_output[cg_size + 3] = (val >> 24) & 0xFF;
+    cg_size = cg_size + 4;
+}
+
+void cg_emitU64(u64 val) {
+    i32 i = 0;
+    while (i < 8) {
+        cg_output[cg_size + i] = (val >> (i * 8)) & 0xFF;
+        i = i + 1;
+    }
+    cg_size = cg_size + 8;
+}
+
+i32 cg_defineLabel() {
+    i32 idx = cg_labelCount;
+    cg_labelCount = cg_labelCount + 1;
+    return idx;
+}
+
+void cg_patchLabel(i32 idx) {
+    cg_labels[idx] = cg_size;
+}
+
+void cg_emitPatch(i32 labelIdx) {
+    cg_patches[cg_patchCount] = cg_size;
+    cg_patchTargets[cg_patchCount] = labelIdx;
+    cg_patchCount = cg_patchCount + 1;
+    cg_emitU64(0);
+}
+
+void cg_resolvePatches() {
+    i32 i = 0;
+    while (i < cg_patchCount) {
+        i32 pos = cg_patches[i];
+        i32 target = cg_labels[cg_patchTargets[i]];
+        cg_output[pos] = target & 0xFF;
+        cg_output[pos + 1] = (target >> 8) & 0xFF;
+        cg_output[pos + 2] = (target >> 16) & 0xFF;
+        cg_output[pos + 3] = (target >> 24) & 0xFF;
+        cg_output[pos + 4] = (target >> 32) & 0xFF;
+        cg_output[pos + 5] = (target >> 40) & 0xFF;
+        cg_output[pos + 6] = (target >> 48) & 0xFF;
+        cg_output[pos + 7] = (target >> 56) & 0xFF;
+        i = i + 1;
+    }
+}
+
+void cg_emitMovImm(i32 reg, i64 val) {
+    cg_emitU8(OP_MOV_IMM);
+    cg_emitU8(reg);
+    cg_emitU64(val);
+}
+
+void cg_emitMovReg(i32 dst, i32 src) {
+    cg_emitU8(OP_MOV_REG);
+    cg_emitU8(dst);
+    cg_emitU8(src);
+}
+
+void cg_emitAdd(i32 dst, i32 src) {
+    cg_emitU8(OP_ADD);
+    cg_emitU8(dst);
+    cg_emitU8(src);
+}
+
+void cg_emitSub(i32 dst, i32 src) {
+    cg_emitU8(OP_SUB);
+    cg_emitU8(dst);
+    cg_emitU8(src);
+}
+
+void cg_emitMul(i32 dst, i32 src) {
+    cg_emitU8(OP_MUL);
+    cg_emitU8(dst);
+    cg_emitU8(src);
+}
+
+void cg_emitDiv(i32 dst, i32 src) {
+    cg_emitU8(OP_DIV);
+    cg_emitU8(dst);
+    cg_emitU8(src);
+}
+
+void cg_emitCmp(i32 a, i32 b) {
+    cg_emitU8(OP_CMP);
+    cg_emitU8(a);
+    cg_emitU8(b);
+}
+
+void cg_emitJmp(i32 labelIdx) {
+    cg_emitU8(OP_JMP);
+    cg_emitU8(0x0F);
+    cg_emitPatch(labelIdx);
+}
+
+void cg_emitCallVM(i32 labelIdx) {
+    cg_emitU8(OP_CALLVM);
+    cg_emitPatch(labelIdx);
+}
+
+void cg_emitRet() {
+    cg_emitU8(OP_RET);
+}
+
+void cg_emitPush(i32 reg) {
+    cg_emitU8(OP_PUSH);
+    cg_emitU8(reg);
+}
+
+void cg_emitPop(i32 reg) {
+    cg_emitU8(OP_POP);
+    cg_emitU8(reg);
+}
+
+void cg_addFunction(string name, i32 label) {
+    cg_fnNames[cg_fnCount] = name;
+    cg_fnLabels[cg_fnCount] = label;
+    cg_fnCount = cg_fnCount + 1;
+}
+
+i32 cg_findFunction(string name) {
+    i32 i = 0;
+    while (i < cg_fnCount) {
+        if (cg_fnNames[i] == name) {
+            return cg_fnLabels[i];
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+void cg_emitFunctionPrologue() {
+    cg_emitPush(REG_FP);
+    cg_emitMovReg(REG_FP, REG_SP);
+}
+
+void cg_emitFunctionEpilogue() {
+    cg_emitMovReg(REG_SP, REG_FP);
+    cg_emitPop(REG_FP);
+    cg_emitRet();
+}
+
+void cg_generateProgram(ProgramNode prog) {
+    i32 mainLabel = cg_defineLabel();
+    cg_patchLabel(mainLabel);
+    cg_addFunction("main", mainLabel);
+
+    cg_emitFunctionPrologue();
+
+    i32 i = 0;
+    while (i < 64) {
+        ASTNode decl = prog.decls[i];
+        if (decl.kind == ASTKind.FunctionDecl) {
+            FunctionDeclNode fn;
+            fn.base = decl;
+            fn.name = "";
+            i32 fnLabel = cg_defineLabel();
+            cg_addFunction(fn.name, fnLabel);
+        } else break;
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < 64) {
+        ASTNode decl = prog.decls[i];
+        if (decl.kind == ASTKind.FunctionDecl) {
+            FunctionDeclNode fn;
+            fn.base = decl;
+            fn.name = "";
+            i32 idx = cg_findFunction(fn.name);
+            if (idx >= 0) {
+                cg_patchLabel(idx);
+                cg_emitFunctionPrologue();
+                cg_emitStmt(fn.body);
+                cg_emitFunctionEpilogue();
+            }
+        } else if (decl.kind == ASTKind.VariableDecl) {
+            VariableDeclNode vd;
+            vd.base = decl;
+            vd.name = "";
+        }
+        i = i + 1;
+    }
+
+    cg_emitMovImm(REG_R0, 0);
+    cg_emitFunctionEpilogue();
+}
+
+void cg_emitStmt(ASTNode stmt) {
+    if (stmt.kind == ASTKind.BlockStmt) {
+        BlockStmtNode b;
+        b.base = stmt;
+        i32 i = 0;
+        while (i < 256) {
+            ASTNode s = b.stmts[i];
+            if (s.kind == ASTKind.VariableDecl
+                || s.kind == ASTKind.IfStmt
+                || s.kind == ASTKind.WhileStmt
+                || s.kind == ASTKind.ReturnStmt
+                || s.kind == ASTKind.AssignStmt
+                || s.kind == ASTKind.BreakStmt
+                || s.kind == ASTKind.ContinueStmt
+                || s.kind == ASTKind.BlockStmt
+                || s.kind == ASTKind.BinaryOp
+                || s.kind == ASTKind.CallExpr
+                || s.kind == ASTKind.LiteralInt) {
+                cg_emitStmt(s);
+            } else break;
+            i = i + 1;
+        }
+    } else if (stmt.kind == ASTKind.IfStmt) {
+        i32 elseLabel = cg_defineLabel();
+        i32 endLabel = cg_defineLabel();
+        cg_emitCmp(REG_R0, REG_R0);
+        cg_emitJmp(elseLabel);
+        cg_emitStmt(stmt.body);
+        cg_emitJmp(endLabel);
+        cg_patchLabel(elseLabel);
+        cg_patchLabel(endLabel);
+    } else if (stmt.kind == ASTKind.WhileStmt) {
+        WhileStmtNode ws;
+        ws.base = stmt;
+        i32 startLabel = cg_defineLabel();
+        i32 endLabel = cg_defineLabel();
+        cg_patchLabel(startLabel);
+        cg_emitCmp(REG_R0, REG_R0);
+        cg_emitJmp(endLabel);
+        cg_emitStmt(ws.body);
+        cg_emitJmp(startLabel);
+        cg_patchLabel(endLabel);
+    } else if (stmt.kind == ASTKind.ReturnStmt) {
+        cg_emitFunctionEpilogue();
+    } else if (stmt.kind == ASTKind.VariableDecl) {
+    } else if (stmt.kind == ASTKind.AssignStmt) {
+    } else if (stmt.kind == ASTKind.LiteralInt) {
+    } else if (stmt.kind == ASTKind.BinaryOp) {
+    } else if (stmt.kind == ASTKind.CallExpr) {
+    }
+}
+
+void cg_writeHeader() {
+    cg_output[0] = 0x56;
+    cg_output[1] = 0x45;
+    cg_output[2] = 0x4C;
+    cg_output[3] = 0x42;
+
+    cg_output[4] = 3;
+    cg_output[5] = 0;
+    cg_output[6] = 0;
+    cg_output[7] = 0;
+
+    cg_output[44] = 1;
+    cg_output[45] = 0;
+    cg_output[46] = 0;
+    cg_output[47] = 0;
+
+    cg_output[48] = HEADER_SIZE & 0xFF;
+    cg_output[49] = (HEADER_SIZE >> 8) & 0xFF;
+    cg_output[50] = (HEADER_SIZE >> 16) & 0xFF;
+    cg_output[51] = (HEADER_SIZE >> 24) & 0xFF;
+
+    i32 offset = HEADER_SIZE;
+    cg_output[72] = offset & 0xFF;
+    cg_output[73] = (offset >> 8) & 0xFF;
+    cg_output[74] = (offset >> 16) & 0xFF;
+    cg_output[75] = (offset >> 24) & 0xFF;
+}
+
+i32 generateBytecode(ProgramNode ast, u8[65536] output) {
+    cg_init();
+    cg_generateProgram(ast);
+    cg_resolvePatches();
+    cg_writeHeader();
+    i32 i = 0;
+    while (i < cg_size) {
+        output[i + HEADER_SIZE] = cg_output[i];
+        i = i + 1;
+    }
+    return HEADER_SIZE + cg_size;
+}

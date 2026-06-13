@@ -1,0 +1,287 @@
+struct SourcePos {
+    string file;
+    i32 line;
+    i32 column;
+    i32 length;
+}
+
+enum ASTKind {
+    Program,
+    FunctionDecl,
+    VariableDecl,
+    IfStmt,
+    WhileStmt,
+    ForStmt,
+    ReturnStmt,
+    BinaryOp,
+    UnaryOp,
+    CallExpr,
+    LiteralInt,
+    LiteralFloat,
+    LiteralString,
+    LiteralBool,
+    Identifier,
+    BlockStmt,
+    StructDecl,
+    EnumDecl,
+    NamespaceDecl,
+    ImportDecl,
+    AssignStmt,
+    BreakStmt,
+    ContinueStmt,
+    MatchStmt,
+    FieldAccess,
+    IndexExpr,
+    CastExpr,
+    TypeNode,
+    ParamDecl,
+    MatchArmNode
+}
+
+enum BinOpKind {
+    Add, Sub, Mul, Div, Mod,
+    Eq, Neq, Lt, Le, Gt, Ge,
+    LogicalAnd, LogicalOr,
+    BitAnd, BitOr, BitXor,
+    Shl, Shr
+}
+
+enum UnOpKind {
+    Neg, Pos, LogicalNot, BitNot,
+    PreInc, PreDec, PostInc, PostDec,
+    AddrOf, Deref
+}
+
+struct ASTNode {
+    ASTKind kind;
+    SourcePos pos;
+}
+
+enum TokenKind {
+    END_OF_FILE,
+    UNKNOWN,
+    IDENTIFIER,
+    INT_LITERAL,
+    FLOAT_LITERAL,
+    STRING_LITERAL,
+
+    KW_FN, KW_LET, KW_MUT, KW_IF, KW_ELSE,
+    KW_WHILE, KW_FOR, KW_RETURN,
+    KW_IMPORT, KW_NAMESPACE, KW_TYPE,
+    KW_STRUCT, KW_ENUM, KW_CONST,
+    KW_TRUE, KW_FALSE, KW_MATCH,
+    KW_CASE, KW_BREAK, KW_CONTINUE,
+
+    PLUS, MINUS, STAR, SLASH, PERCENT,
+    ASSIGN, EQ, NEQ, LT, GT, LE, GE,
+    AND_AND, OR_OR, BANG,
+    AMP, PIPE, CARET, TILDE,
+    SHL, SHR,
+
+    LPAREN, RPAREN, LBRACE, RBRACE,
+    LBRACKET, RBRACKET,
+    SEMICOLON, COLON, COMMA, DOT,
+    ARROW, DOTDOT
+}
+
+struct Token {
+    TokenKind kind;
+    string lexeme;
+    SourcePos pos;
+    i64 intValue;
+    f64 floatValue;
+    string stringValue;
+}
+
+struct Lexer {
+    string source;
+    string filename;
+    i32 pos;
+    i32 line;
+    i32 column;
+    Token peekBuf;
+    bool hasPeek;
+}
+
+struct ParamDeclNode {
+    ASTNode base;
+    string name;
+    ASTNode paramType;
+}
+
+struct VariableDeclNode {
+    ASTNode base;
+    string name;
+    ASTNode varType;
+    ASTNode init;
+    bool isConst;
+    bool isMutable;
+}
+
+struct FunctionDeclNode {
+    ASTNode base;
+    string name;
+    ParamDeclNode[16] params;
+    ASTNode returnType;
+    ASTNode body;
+    bool isPublic;
+}
+
+struct ProgramNode {
+    ASTNode base;
+    ASTNode[64] decls;
+}
+
+struct BlockStmtNode {
+    ASTNode base;
+    ASTNode[256] stmts;
+}
+
+struct IfStmtNode {
+    ASTNode base;
+    ASTNode cond;
+    ASTNode thenBranch;
+    ASTNode elseBranch;
+}
+
+struct WhileStmtNode {
+    ASTNode base;
+    ASTNode cond;
+    ASTNode body;
+}
+
+struct ForStmtNode {
+    ASTNode base;
+    ASTNode init;
+    ASTNode cond;
+    ASTNode step;
+    ASTNode body;
+}
+
+struct ReturnStmtNode {
+    ASTNode base;
+    ASTNode value;
+}
+
+struct BinaryOpNode {
+    ASTNode base;
+    BinOpKind op;
+    ASTNode lhs;
+    ASTNode rhs;
+}
+
+struct UnaryOpNode {
+    ASTNode base;
+    UnOpKind op;
+    ASTNode operand;
+    bool isPrefix;
+}
+
+struct CallExprNode {
+    ASTNode base;
+    ASTNode callee;
+    ASTNode[16] args;
+}
+
+struct LiteralIntNode {
+    ASTNode base;
+    i64 value;
+    string raw;
+}
+
+struct LiteralFloatNode {
+    ASTNode base;
+    f64 value;
+    string raw;
+}
+
+struct LiteralStringNode {
+    ASTNode base;
+    string value;
+}
+
+struct LiteralBoolNode {
+    ASTNode base;
+    bool value;
+}
+
+struct IdentifierNode {
+    ASTNode base;
+    string name;
+}
+
+struct AssignStmtNode {
+    ASTNode base;
+    ASTNode target;
+    ASTNode value;
+}
+
+struct BreakStmtNode {
+    ASTNode base;
+}
+
+struct ContinueStmtNode {
+    ASTNode base;
+}
+
+struct StructDeclNode {
+    ASTNode base;
+    string name;
+    VariableDeclNode[64] fields;
+    bool isPublic;
+}
+
+struct EnumDeclNode {
+    ASTNode base;
+    string name;
+    string[64] variants;
+    bool isPublic;
+}
+
+struct NamespaceDeclNode {
+    ASTNode base;
+    string name;
+    ASTNode[64] decls;
+}
+
+struct ImportDeclNode {
+    ASTNode base;
+    string path;
+    string alias;
+}
+
+struct FieldAccessNode {
+    ASTNode base;
+    ASTNode object;
+    string field;
+}
+
+struct IndexExprNode {
+    ASTNode base;
+    ASTNode array;
+    ASTNode index;
+}
+
+struct CastExprNode {
+    ASTNode base;
+    ASTNode expr;
+    ASTNode targetType;
+}
+
+struct MatchStmtNode {
+    ASTNode base;
+    ASTNode expr;
+    MatchArmNode[64] arms;
+}
+
+struct MatchArmNode {
+    ASTNode base;
+    string pattern;
+    string[8] bindings;
+    ASTNode body;
+}
+
+struct TypeNode {
+    ASTNode base;
+    string typeName;
+}

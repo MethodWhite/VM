@@ -1,0 +1,836 @@
+import "ast";
+
+Token[8192] parse_tokens;
+i32 parse_pos;
+string parse_filename;
+
+void parser_init(Token[8192] tokens, string file) {
+    parse_tokens = tokens;
+    parse_pos = 0;
+    parse_filename = file;
+}
+
+Token parser_current() {
+    return parse_tokens[parse_pos];
+}
+
+Token parser_advance() {
+    Token t = parse_tokens[parse_pos];
+    parse_pos = parse_pos + 1;
+    return t;
+}
+
+bool parser_match(TokenKind kind) {
+    if (parser_current().kind == kind) {
+        parser_advance();
+        return true;
+    }
+    return false;
+}
+
+ASTNode makeNode(ASTKind kind) {
+    ASTNode n;
+    n.kind = kind;
+    n.pos = parser_current().pos;
+    return n;
+}
+
+ASTNode parseType();
+ASTNode parseExpr();
+ASTNode parseStmt();
+ASTNode parseBlock();
+ASTNode parseIf();
+ASTNode parseWhile();
+ASTNode parseFor();
+ASTNode parseReturn();
+ASTNode parseDecl();
+ASTNode parseFunctionOrVar();
+ASTNode parseFunction();
+ASTNode parseLet();
+ASTNode parsePrimary();
+ASTNode parsePostfix();
+ASTNode parseUnary();
+ASTNode parseFactor();
+ASTNode parseTerm();
+ASTNode parseComparison();
+ASTNode parseEquality();
+ASTNode parseAnd();
+ASTNode parseOr();
+ASTNode parseAssignment();
+ASTNode parseExprStmt();
+ASTNode parseImport();
+ASTNode parseNamespace();
+ASTNode parseStruct();
+ASTNode parseEnum();
+ASTNode parseMatch();
+ASTNode parseType();
+
+bool isTypeToken(TokenKind kind) {
+    if (kind == TokenKind.IDENTIFIER) return true;
+    if (kind == TokenKind.KW_CONST) return true;
+    if (kind == TokenKind.KW_STRUCT) return true;
+    if (kind == TokenKind.KW_ENUM) return true;
+    return false;
+}
+
+ASTNode parseProgram() {
+    ASTNode[64] decls;
+    i32 count = 0;
+    while (parser_current().kind != TokenKind.END_OF_FILE) {
+        ASTNode decl = parseDecl();
+        decls[count] = decl;
+        count = count + 1;
+    }
+    ProgramNode prog;
+    prog.base = makeNode(ASTKind.Program);
+    prog.decls = decls;
+    return prog.base;
+}
+
+ASTNode parseDecl() {
+    if (parser_current().kind == TokenKind.KW_IMPORT) {
+        return parseImport();
+    }
+    if (parser_current().kind == TokenKind.KW_NAMESPACE) {
+        return parseNamespace();
+    }
+    if (parser_current().kind == TokenKind.KW_STRUCT) {
+        return parseStruct();
+    }
+    if (parser_current().kind == TokenKind.KW_ENUM) {
+        return parseEnum();
+    }
+    if (parser_current().kind == TokenKind.KW_FN) {
+        return parseFunction();
+    }
+    return parseFunctionOrVar();
+}
+
+ASTNode parseImport() {
+    ImportDeclNode node;
+    node.base = makeNode(ASTKind.ImportDecl);
+    parser_advance();
+    if (parser_current().kind == TokenKind.STRING_LITERAL) {
+        node.path = parser_current().stringValue;
+        parser_advance();
+    }
+    if (parser_current().kind == TokenKind.IDENTIFIER) {
+        parser_advance();
+    }
+    if (parser_current().kind == TokenKind.SEMICOLON) {
+        parser_advance();
+    }
+    return node.base;
+}
+
+ASTNode parseNamespace() {
+    NamespaceDeclNode node;
+    node.base = makeNode(ASTKind.NamespaceDecl);
+    parser_advance();
+    if (parser_current().kind == TokenKind.IDENTIFIER) {
+        node.name = parser_current().lexeme;
+        parser_advance();
+    }
+    if (parser_current().kind == TokenKind.LBRACE) {
+        parser_advance();
+    }
+    ASTNode[64] decls;
+    i32 count = 0;
+    while (parser_current().kind != TokenKind.RBRACE
+           && parser_current().kind != TokenKind.END_OF_FILE) {
+        decls[count] = parseDecl();
+        count = count + 1;
+    }
+    node.decls = decls;
+    if (parser_current().kind == TokenKind.RBRACE) {
+        parser_advance();
+    }
+    return node.base;
+}
+
+ASTNode parseStruct() {
+    StructDeclNode node;
+    node.base = makeNode(ASTKind.StructDecl);
+    parser_advance();
+    if (parser_current().kind == TokenKind.IDENTIFIER) {
+        node.name = parser_current().lexeme;
+        parser_advance();
+    }
+    if (parser_current().kind == TokenKind.LBRACE) {
+        parser_advance();
+    }
+    VariableDeclNode[64] fields;
+    i32 fcount = 0;
+    while (parser_current().kind != TokenKind.RBRACE
+           && parser_current().kind != TokenKind.END_OF_FILE) {
+        if (isTypeToken(parser_current().kind)) {
+            ASTNode ft = parseType();
+            if (parser_current().kind == TokenKind.IDENTIFIER) {
+                VariableDeclNode fd;
+                fd.base = makeNode(ASTKind.VariableDecl);
+                fd.name = parser_current().lexeme;
+                fd.varType = ft;
+                parser_advance();
+                if (parser_current().kind == TokenKind.SEMICOLON) {
+                    parser_advance();
+                }
+                fields[fcount] = fd;
+                fcount = fcount + 1;
+            } else {
+                if (parser_current().kind == TokenKind.SEMICOLON) {
+                    parser_advance();
+                } else {
+                    parser_advance();
+                }
+            }
+        } else {
+            parser_advance();
+        }
+    }
+    node.fields = fields;
+    if (parser_current().kind == TokenKind.RBRACE) {
+        parser_advance();
+    }
+    return node.base;
+}
+
+ASTNode parseEnum() {
+    EnumDeclNode node;
+    node.base = makeNode(ASTKind.EnumDecl);
+    parser_advance();
+    if (parser_current().kind == TokenKind.IDENTIFIER) {
+        node.name = parser_current().lexeme;
+        parser_advance();
+    }
+    if (parser_current().kind == TokenKind.LBRACE) {
+        parser_advance();
+    }
+    string[64] variants;
+    i32 vcount = 0;
+    while (parser_current().kind != TokenKind.RBRACE
+           && parser_current().kind != TokenKind.END_OF_FILE) {
+        if (parser_current().kind == TokenKind.IDENTIFIER) {
+            variants[vcount] = parser_current().lexeme;
+            vcount = vcount + 1;
+            parser_advance();
+            if (parser_current().kind == TokenKind.COMMA) {
+                parser_advance();
+            }
+        } else {
+            parser_advance();
+        }
+    }
+    node.variants = variants;
+    if (parser_current().kind == TokenKind.RBRACE) {
+        parser_advance();
+    }
+    return node.base;
+}
+
+ASTNode parseFunctionOrVar() {
+    ASTNode type = parseType();
+    if (parser_current().kind == TokenKind.IDENTIFIER) {
+        string name = parser_current().lexeme;
+        parser_advance();
+        if (parser_current().kind == TokenKind.LPAREN) {
+            FunctionDeclNode node;
+            node.base = makeNode(ASTKind.FunctionDecl);
+            node.name = name;
+            node.returnType = type;
+            parser_advance();
+            ParamDeclNode[16] params;
+            i32 pc = 0;
+            while (parser_current().kind != TokenKind.RPAREN
+                   && parser_current().kind != TokenKind.END_OF_FILE) {
+                ASTNode pt = parseType();
+                if (parser_current().kind == TokenKind.IDENTIFIER) {
+                    ParamDeclNode pd;
+                    pd.base = makeNode(ASTKind.ParamDecl);
+                    pd.name = parser_current().lexeme;
+                    pd.paramType = pt;
+                    parser_advance();
+                    params[pc] = pd;
+                    pc = pc + 1;
+                }
+                if (parser_current().kind == TokenKind.COMMA) {
+                    parser_advance();
+                }
+            }
+            node.params = params;
+            if (parser_current().kind == TokenKind.RPAREN) {
+                parser_advance();
+            }
+            node.body = parseBlock();
+            return node.base;
+        }
+        VariableDeclNode node;
+        node.base = makeNode(ASTKind.VariableDecl);
+        node.name = name;
+        node.varType = type;
+        if (parser_current().kind == TokenKind.ASSIGN) {
+            parser_advance();
+            node.init = parseExpr();
+        }
+        if (parser_current().kind == TokenKind.SEMICOLON) {
+            parser_advance();
+        }
+        return node.base;
+    }
+    VariableDeclNode empty;
+    empty.base = makeNode(ASTKind.VariableDecl);
+    return empty.base;
+}
+
+ASTNode parseFunction() {
+    FunctionDeclNode node;
+    node.base = makeNode(ASTKind.FunctionDecl);
+    parser_advance();
+    if (parser_current().kind == TokenKind.IDENTIFIER) {
+        node.name = parser_current().lexeme;
+        parser_advance();
+    }
+    if (parser_current().kind == TokenKind.LPAREN) {
+        parser_advance();
+    }
+    ParamDeclNode[16] params;
+    i32 pc = 0;
+    while (parser_current().kind != TokenKind.RPAREN
+           && parser_current().kind != TokenKind.END_OF_FILE) {
+        ASTNode pt = parseType();
+        if (parser_current().kind == TokenKind.IDENTIFIER) {
+            ParamDeclNode pd;
+            pd.base = makeNode(ASTKind.ParamDecl);
+            pd.name = parser_current().lexeme;
+            pd.paramType = pt;
+            parser_advance();
+            params[pc] = pd;
+            pc = pc + 1;
+        }
+        if (parser_current().kind == TokenKind.COMMA) {
+            parser_advance();
+        }
+    }
+    node.params = params;
+    if (parser_current().kind == TokenKind.RPAREN) {
+        parser_advance();
+    }
+    node.body = parseBlock();
+    return node.base;
+}
+
+ASTNode parseBlock() {
+    BlockStmtNode node;
+    node.base = makeNode(ASTKind.BlockStmt);
+    if (parser_current().kind == TokenKind.LBRACE) {
+        parser_advance();
+    }
+    ASTNode[256] stmts;
+    i32 count = 0;
+    while (parser_current().kind != TokenKind.RBRACE
+           && parser_current().kind != TokenKind.END_OF_FILE) {
+        stmts[count] = parseStmt();
+        count = count + 1;
+    }
+    node.stmts = stmts;
+    if (parser_current().kind == TokenKind.RBRACE) {
+        parser_advance();
+    }
+    return node.base;
+}
+
+ASTNode parseStmt() {
+    if (parser_current().kind == TokenKind.KW_IF) return parseIf();
+    if (parser_current().kind == TokenKind.KW_WHILE) return parseWhile();
+    if (parser_current().kind == TokenKind.KW_FOR) return parseFor();
+    if (parser_current().kind == TokenKind.KW_RETURN) return parseReturn();
+    if (parser_current().kind == TokenKind.KW_BREAK) {
+        BreakStmtNode n;
+        n.base = makeNode(ASTKind.BreakStmt);
+        parser_advance();
+        if (parser_current().kind == TokenKind.SEMICOLON) parser_advance();
+        return n.base;
+    }
+    if (parser_current().kind == TokenKind.KW_CONTINUE) {
+        ContinueStmtNode n;
+        n.base = makeNode(ASTKind.ContinueStmt);
+        parser_advance();
+        if (parser_current().kind == TokenKind.SEMICOLON) parser_advance();
+        return n.base;
+    }
+    if (parser_current().kind == TokenKind.KW_LET) {
+        return parseLet();
+    }
+    if (parser_current().kind == TokenKind.LBRACE) {
+        return parseBlock();
+    }
+    if (parser_current().kind == TokenKind.SEMICOLON) {
+        parser_advance();
+        return parseStmt();
+    }
+    return parseExprStmt();
+}
+
+ASTNode parseLet() {
+    VariableDeclNode node;
+    node.base = makeNode(ASTKind.VariableDecl);
+    parser_advance();
+    if (parser_current().kind == TokenKind.KW_MUT) {
+        node.isMutable = true;
+        parser_advance();
+    }
+    if (parser_current().kind == TokenKind.IDENTIFIER) {
+        node.name = parser_current().lexeme;
+        parser_advance();
+    }
+    if (parser_current().kind == TokenKind.COLON) {
+        parser_advance();
+        node.varType = parseType();
+    }
+    if (parser_current().kind == TokenKind.ASSIGN) {
+        parser_advance();
+        node.init = parseExpr();
+    }
+    if (parser_current().kind == TokenKind.SEMICOLON) {
+        parser_advance();
+    }
+    return node.base;
+}
+
+ASTNode parseIf() {
+    IfStmtNode node;
+    node.base = makeNode(ASTKind.IfStmt);
+    parser_advance();
+    if (parser_current().kind == TokenKind.LPAREN) {
+        parser_advance();
+        node.cond = parseExpr();
+        if (parser_current().kind == TokenKind.RPAREN) parser_advance();
+    } else {
+        node.cond = parseExpr();
+    }
+    node.thenBranch = parseBlock();
+    if (parser_current().kind == TokenKind.KW_ELSE) {
+        parser_advance();
+        if (parser_current().kind == TokenKind.KW_IF) {
+            node.elseBranch = parseIf();
+        } else {
+            node.elseBranch = parseBlock();
+        }
+    }
+    return node.base;
+}
+
+ASTNode parseWhile() {
+    WhileStmtNode node;
+    node.base = makeNode(ASTKind.WhileStmt);
+    parser_advance();
+    if (parser_current().kind == TokenKind.LPAREN) {
+        parser_advance();
+        node.cond = parseExpr();
+        if (parser_current().kind == TokenKind.RPAREN) parser_advance();
+    } else {
+        node.cond = parseExpr();
+    }
+    node.body = parseBlock();
+    return node.base;
+}
+
+ASTNode parseFor() {
+    ForStmtNode node;
+    node.base = makeNode(ASTKind.ForStmt);
+    parser_advance();
+    if (parser_current().kind == TokenKind.LPAREN) parser_advance();
+    if (parser_current().kind == TokenKind.SEMICOLON) {
+        parser_advance();
+    } else if (parser_current().kind == TokenKind.KW_LET) {
+        node.init = parseLet();
+    } else if (isTypeToken(parser_current().kind)) {
+        ASTNode type = parseType();
+        if (parser_current().kind == TokenKind.IDENTIFIER) {
+            VariableDeclNode vd;
+            vd.base = makeNode(ASTKind.VariableDecl);
+            vd.name = parser_current().lexeme;
+            vd.varType = type;
+            parser_advance();
+            if (parser_current().kind == TokenKind.ASSIGN) {
+                parser_advance();
+                vd.init = parseExpr();
+            }
+            node.init = vd.base;
+        }
+    }
+    if (parser_current().kind != TokenKind.SEMICOLON
+        && parser_current().kind != TokenKind.RPAREN
+        && parser_current().kind != TokenKind.LBRACE) {
+        node.cond = parseExpr();
+    }
+    if (parser_current().kind == TokenKind.SEMICOLON) {
+        parser_advance();
+        if (parser_current().kind != TokenKind.RPAREN
+            && parser_current().kind != TokenKind.LBRACE) {
+            node.step = parseExpr();
+        }
+    }
+    if (parser_current().kind == TokenKind.RPAREN) parser_advance();
+    node.body = parseBlock();
+    return node.base;
+}
+
+ASTNode parseReturn() {
+    ReturnStmtNode node;
+    node.base = makeNode(ASTKind.ReturnStmt);
+    parser_advance();
+    if (parser_current().kind != TokenKind.SEMICOLON
+        && parser_current().kind != TokenKind.RBRACE
+        && parser_current().kind != TokenKind.END_OF_FILE) {
+        node.value = parseExpr();
+    }
+    if (parser_current().kind == TokenKind.SEMICOLON) parser_advance();
+    return node.base;
+}
+
+ASTNode parseExprStmt() {
+    ASTNode expr = parseExpr();
+    if (parser_current().kind == TokenKind.ASSIGN) {
+        parser_advance();
+        ASTNode value = parseExpr();
+        if (parser_current().kind == TokenKind.SEMICOLON) parser_advance();
+        AssignStmtNode n;
+        n.base = makeNode(ASTKind.AssignStmt);
+        n.target = expr;
+        n.value = value;
+        return n.base;
+    }
+    if (parser_current().kind == TokenKind.SEMICOLON) parser_advance();
+    return expr;
+}
+
+ASTNode parseExpr() {
+    return parseAssignment();
+}
+
+ASTNode parseAssignment() {
+    ASTNode lhs = parseOr();
+    if (parser_current().kind == TokenKind.ASSIGN) {
+        parser_advance();
+        ASTNode rhs = parseAssignment();
+        BinaryOpNode node;
+        node.base = makeNode(ASTKind.BinaryOp);
+        node.op = BinOpKind.Add;
+        node.lhs = lhs;
+        node.rhs = rhs;
+        return node.base;
+    }
+    return lhs;
+}
+
+ASTNode parseOr() {
+    ASTNode lhs = parseAnd();
+    while (parser_current().kind == TokenKind.OR_OR) {
+        parser_advance();
+        ASTNode rhs = parseAnd();
+        BinaryOpNode node;
+        node.base = makeNode(ASTKind.BinaryOp);
+        node.op = BinOpKind.LogicalOr;
+        node.lhs = lhs;
+        node.rhs = rhs;
+        lhs = node.base;
+    }
+    return lhs;
+}
+
+ASTNode parseAnd() {
+    ASTNode lhs = parseEquality();
+    while (parser_current().kind == TokenKind.AND_AND) {
+        parser_advance();
+        ASTNode rhs = parseEquality();
+        BinaryOpNode node;
+        node.base = makeNode(ASTKind.BinaryOp);
+        node.op = BinOpKind.LogicalAnd;
+        node.lhs = lhs;
+        node.rhs = rhs;
+        lhs = node.base;
+    }
+    return lhs;
+}
+
+ASTNode parseEquality() {
+    ASTNode lhs = parseComparison();
+    while (parser_current().kind == TokenKind.EQ
+           || parser_current().kind == TokenKind.NEQ) {
+        TokenKind op = parser_current().kind;
+        parser_advance();
+        ASTNode rhs = parseComparison();
+        BinaryOpNode node;
+        node.base = makeNode(ASTKind.BinaryOp);
+        if (op == TokenKind.EQ) node.op = BinOpKind.Eq;
+        else node.op = BinOpKind.Neq;
+        node.lhs = lhs;
+        node.rhs = rhs;
+        lhs = node.base;
+    }
+    return lhs;
+}
+
+ASTNode parseComparison() {
+    ASTNode lhs = parseTerm();
+    while (parser_current().kind == TokenKind.LT
+           || parser_current().kind == TokenKind.GT
+           || parser_current().kind == TokenKind.LE
+           || parser_current().kind == TokenKind.GE) {
+        TokenKind op = parser_current().kind;
+        parser_advance();
+        ASTNode rhs = parseTerm();
+        BinaryOpNode node;
+        node.base = makeNode(ASTKind.BinaryOp);
+        if (op == TokenKind.LT) node.op = BinOpKind.Lt;
+        else if (op == TokenKind.GT) node.op = BinOpKind.Gt;
+        else if (op == TokenKind.LE) node.op = BinOpKind.Le;
+        else node.op = BinOpKind.Ge;
+        node.lhs = lhs;
+        node.rhs = rhs;
+        lhs = node.base;
+    }
+    return lhs;
+}
+
+ASTNode parseTerm() {
+    ASTNode lhs = parseFactor();
+    while (parser_current().kind == TokenKind.PLUS
+           || parser_current().kind == TokenKind.MINUS) {
+        TokenKind op = parser_current().kind;
+        parser_advance();
+        ASTNode rhs = parseFactor();
+        BinaryOpNode node;
+        node.base = makeNode(ASTKind.BinaryOp);
+        if (op == TokenKind.PLUS) node.op = BinOpKind.Add;
+        else node.op = BinOpKind.Sub;
+        node.lhs = lhs;
+        node.rhs = rhs;
+        lhs = node.base;
+    }
+    return lhs;
+}
+
+ASTNode parseFactor() {
+    ASTNode lhs = parseUnary();
+    while (parser_current().kind == TokenKind.STAR
+           || parser_current().kind == TokenKind.SLASH
+           || parser_current().kind == TokenKind.PERCENT) {
+        TokenKind op = parser_current().kind;
+        parser_advance();
+        ASTNode rhs = parseUnary();
+        BinaryOpNode node;
+        node.base = makeNode(ASTKind.BinaryOp);
+        if (op == TokenKind.STAR) node.op = BinOpKind.Mul;
+        else if (op == TokenKind.SLASH) node.op = BinOpKind.Div;
+        else node.op = BinOpKind.Mod;
+        node.lhs = lhs;
+        node.rhs = rhs;
+        lhs = node.base;
+    }
+    return lhs;
+}
+
+ASTNode parseUnary() {
+    if (parser_current().kind == TokenKind.MINUS
+        || parser_current().kind == TokenKind.BANG
+        || parser_current().kind == TokenKind.TILDE) {
+        TokenKind op = parser_current().kind;
+        parser_advance();
+        ASTNode operand = parseUnary();
+        UnaryOpNode node;
+        node.base = makeNode(ASTKind.UnaryOp);
+        node.isPrefix = true;
+        if (op == TokenKind.MINUS) node.op = UnOpKind.Neg;
+        else if (op == TokenKind.BANG) node.op = UnOpKind.LogicalNot;
+        else node.op = UnOpKind.BitNot;
+        node.operand = operand;
+        return node.base;
+    }
+    return parsePostfix();
+}
+
+ASTNode parsePostfix() {
+    ASTNode lhs = parsePrimary();
+    while (true) {
+        if (parser_current().kind == TokenKind.LPAREN) {
+            parser_advance();
+            ASTNode[16] args;
+            i32 count = 0;
+            while (parser_current().kind != TokenKind.RPAREN
+                   && parser_current().kind != TokenKind.END_OF_FILE) {
+                args[count] = parseExpr();
+                count = count + 1;
+                if (parser_current().kind == TokenKind.COMMA) parser_advance();
+            }
+            if (parser_current().kind == TokenKind.RPAREN) parser_advance();
+            CallExprNode node;
+            node.base = makeNode(ASTKind.CallExpr);
+            node.callee = lhs;
+            node.args = args;
+            lhs = node.base;
+        } else if (parser_current().kind == TokenKind.DOT) {
+            parser_advance();
+            FieldAccessNode node;
+            node.base = makeNode(ASTKind.FieldAccess);
+            node.object = lhs;
+            if (parser_current().kind == TokenKind.IDENTIFIER) {
+                node.field = parser_current().lexeme;
+                parser_advance();
+            }
+            lhs = node.base;
+        } else if (parser_current().kind == TokenKind.LBRACKET) {
+            parser_advance();
+            ASTNode idx = parseExpr();
+            if (parser_current().kind == TokenKind.RBRACKET) parser_advance();
+            IndexExprNode node;
+            node.base = makeNode(ASTKind.IndexExpr);
+            node.array = lhs;
+            node.index = idx;
+            lhs = node.base;
+        } else break;
+    }
+    return lhs;
+}
+
+ASTNode parsePrimary() {
+    if (parser_current().kind == TokenKind.INT_LITERAL) {
+        LiteralIntNode node;
+        node.base = makeNode(ASTKind.LiteralInt);
+        node.value = parser_current().intValue;
+        node.raw = parser_current().lexeme;
+        parser_advance();
+        return node.base;
+    }
+    if (parser_current().kind == TokenKind.FLOAT_LITERAL) {
+        LiteralFloatNode node;
+        node.base = makeNode(ASTKind.LiteralFloat);
+        node.value = parser_current().floatValue;
+        node.raw = parser_current().lexeme;
+        parser_advance();
+        return node.base;
+    }
+    if (parser_current().kind == TokenKind.STRING_LITERAL) {
+        LiteralStringNode node;
+        node.base = makeNode(ASTKind.LiteralString);
+        node.value = parser_current().stringValue;
+        parser_advance();
+        return node.base;
+    }
+    if (parser_current().kind == TokenKind.KW_TRUE) {
+        LiteralBoolNode node;
+        node.base = makeNode(ASTKind.LiteralBool);
+        node.value = true;
+        parser_advance();
+        return node.base;
+    }
+    if (parser_current().kind == TokenKind.KW_FALSE) {
+        LiteralBoolNode node;
+        node.base = makeNode(ASTKind.LiteralBool);
+        node.value = false;
+        parser_advance();
+        return node.base;
+    }
+    if (parser_current().kind == TokenKind.IDENTIFIER) {
+        IdentifierNode node;
+        node.base = makeNode(ASTKind.Identifier);
+        node.name = parser_current().lexeme;
+        parser_advance();
+        return node.base;
+    }
+    if (parser_current().kind == TokenKind.LPAREN) {
+        parser_advance();
+        ASTNode expr = parseExpr();
+        if (parser_current().kind == TokenKind.RPAREN) parser_advance();
+        return expr;
+    }
+    if (parser_current().kind == TokenKind.KW_MATCH) {
+        return parseMatch();
+    }
+    ASTNode empty;
+    empty.kind = ASTKind.Identifier;
+    empty.pos = parser_current().pos;
+    parser_advance();
+    return empty;
+}
+
+ASTNode parseMatch() {
+    MatchStmtNode node;
+    node.base = makeNode(ASTKind.MatchStmt);
+    parser_advance();
+    node.expr = parseExpr();
+    if (parser_current().kind == TokenKind.LBRACE) parser_advance();
+    MatchArmNode[64] arms;
+    i32 count = 0;
+    while (parser_current().kind != TokenKind.RBRACE
+           && parser_current().kind != TokenKind.END_OF_FILE) {
+        if (parser_current().kind == TokenKind.KW_CASE) parser_advance();
+        MatchArmNode arm;
+        arm.base = makeNode(ASTKind.MatchArmNode);
+        if (parser_current().kind == TokenKind.IDENTIFIER) {
+            arm.pattern = parser_current().lexeme;
+            parser_advance();
+        }
+        if (parser_current().kind == TokenKind.LPAREN) {
+            parser_advance();
+            string[8] bindings;
+            i32 bc = 0;
+            while (parser_current().kind != TokenKind.RPAREN
+                   && parser_current().kind != TokenKind.END_OF_FILE) {
+                if (parser_current().kind == TokenKind.IDENTIFIER) {
+                    bindings[bc] = parser_current().lexeme;
+                    bc = bc + 1;
+                    parser_advance();
+                }
+                if (parser_current().kind == TokenKind.COMMA) parser_advance();
+            }
+            arm.bindings = bindings;
+            if (parser_current().kind == TokenKind.RPAREN) parser_advance();
+        }
+        if (parser_current().kind == TokenKind.FAT_ARROW
+            || parser_current().kind == TokenKind.ARROW) {
+            parser_advance();
+        } else if (parser_current().kind == TokenKind.EQ) {
+            parser_advance();
+            if (parser_current().kind == TokenKind.GT) parser_advance();
+        }
+        arm.body = parseBlock();
+        arms[count] = arm;
+        count = count + 1;
+    }
+    node.arms = arms;
+    if (parser_current().kind == TokenKind.RBRACE) parser_advance();
+    return node.base;
+}
+
+ASTNode parseType() {
+    TypeNode node;
+    node.base = makeNode(ASTKind.TypeNode);
+    if (parser_current().kind == TokenKind.IDENTIFIER) {
+        node.typeName = parser_current().lexeme;
+        parser_advance();
+    } else if (parser_current().kind == TokenKind.KW_CONST) {
+        node.typeName = "const";
+        parser_advance();
+        if (parser_current().kind == TokenKind.IDENTIFIER) {
+            node.typeName = parser_current().lexeme;
+            parser_advance();
+        }
+    } else {
+        parser_advance();
+    }
+    if (parser_current().kind == TokenKind.LBRACKET) {
+        parser_advance();
+        while (parser_current().kind != TokenKind.RBRACKET
+               && parser_current().kind != TokenKind.END_OF_FILE) {
+            parser_advance();
+        }
+        if (parser_current().kind == TokenKind.RBRACKET) parser_advance();
+    }
+    return node.base;
+}
+
+ASTNode parse(Token[8192] tokens, string filename) {
+    parser_init(tokens, filename);
+    return parseProgram();
+}

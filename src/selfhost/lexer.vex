@@ -1,0 +1,473 @@
+import "ast";
+
+Lexer lx_global;
+
+void lex_init(string src, string file) {
+    lx_global.source = src;
+    lx_global.filename = file;
+    lx_global.pos = 0;
+    lx_global.line = 1;
+    lx_global.column = 1;
+    lx_global.hasPeek = false;
+}
+
+char lex_peek(i32 offset) {
+    i32 idx = lx_global.pos + offset;
+    if (idx >= 0 && idx < lx_global.source.length) {
+        return lx_global.source[idx];
+    }
+    return '\0';
+}
+
+void lex_advance() {
+    char c = lx_global.source[lx_global.pos];
+    lx_global.pos = lx_global.pos + 1;
+    if (c == '\n') {
+        lx_global.line = lx_global.line + 1;
+        lx_global.column = 1;
+    } else {
+        lx_global.column = lx_global.column + 1;
+    }
+}
+
+SourcePos lex_makePos(i32 len) {
+    SourcePos p;
+    p.file = lx_global.filename;
+    p.line = lx_global.line;
+    p.column = lx_global.column - len;
+    p.length = len;
+    return p;
+}
+
+void lex_skipWhitespace() {
+    while (lx_global.pos < lx_global.source.length) {
+        char c = lx_global.source[lx_global.pos];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            lex_advance();
+        } else if (c == '/') {
+            char n = lex_peek(1);
+            if (n == '/') {
+                lx_global.pos = lx_global.pos + 2;
+                lx_global.column = lx_global.column + 2;
+                while (lx_global.pos < lx_global.source.length
+                       && lx_global.source[lx_global.pos] != '\n') {
+                    lx_global.pos = lx_global.pos + 1;
+                    lx_global.column = lx_global.column + 1;
+                }
+            } else if (n == '*') {
+                lx_global.pos = lx_global.pos + 2;
+                lx_global.column = lx_global.column + 2;
+                while (lx_global.pos < lx_global.source.length) {
+                    if (lx_global.source[lx_global.pos] == '*'
+                        && lex_peek(1) == '/') {
+                        lx_global.pos = lx_global.pos + 2;
+                        lx_global.column = lx_global.column + 2;
+                        break;
+                    }
+                    lex_advance();
+                }
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+TokenKind classifyKeyword(string lexeme) {
+    if (lexeme == "fn") return TokenKind.KW_FN;
+    if (lexeme == "let") return TokenKind.KW_LET;
+    if (lexeme == "mut") return TokenKind.KW_MUT;
+    if (lexeme == "if") return TokenKind.KW_IF;
+    if (lexeme == "else") return TokenKind.KW_ELSE;
+    if (lexeme == "while") return TokenKind.KW_WHILE;
+    if (lexeme == "for") return TokenKind.KW_FOR;
+    if (lexeme == "return") return TokenKind.KW_RETURN;
+    if (lexeme == "import") return TokenKind.KW_IMPORT;
+    if (lexeme == "namespace") return TokenKind.KW_NAMESPACE;
+    if (lexeme == "type") return TokenKind.KW_TYPE;
+    if (lexeme == "struct") return TokenKind.KW_STRUCT;
+    if (lexeme == "enum") return TokenKind.KW_ENUM;
+    if (lexeme == "const") return TokenKind.KW_CONST;
+    if (lexeme == "true") return TokenKind.KW_TRUE;
+    if (lexeme == "false") return TokenKind.KW_FALSE;
+    if (lexeme == "match") return TokenKind.KW_MATCH;
+    if (lexeme == "case") return TokenKind.KW_CASE;
+    if (lexeme == "break") return TokenKind.KW_BREAK;
+    if (lexeme == "continue") return TokenKind.KW_CONTINUE;
+    return TokenKind.IDENTIFIER;
+}
+
+Token lex_readString() {
+    i32 startPos = lx_global.pos;
+    i32 startLine = lx_global.line;
+    i32 startCol = lx_global.column;
+    Token t;
+    lex_advance();
+    string value;
+    while (lx_global.pos < lx_global.source.length) {
+        char c = lx_global.source[lx_global.pos];
+        if (c == '"') {
+            lex_advance();
+            string lexeme = lx_global.source.substring(startPos,
+                lx_global.pos - startPos);
+            t.kind = TokenKind.STRING_LITERAL;
+            t.lexeme = lexeme;
+            t.pos.file = lx_global.filename;
+            t.pos.line = startLine;
+            t.pos.column = startCol;
+            t.pos.length = lx_global.pos - startPos;
+            t.stringValue = value;
+            return t;
+        }
+        if (c == '\\') {
+            lex_advance();
+            if (lx_global.pos >= lx_global.source.length) break;
+            char e = lx_global.source[lx_global.pos];
+            lex_advance();
+            if (e == 'n') value = value + '\n';
+            else if (e == 't') value = value + '\t';
+            else if (e == 'r') value = value + '\r';
+            else if (e == '0') value = value + '\0';
+            else if (e == '\\') value = value + '\\';
+            else if (e == '"') value = value + '"';
+            else value = value + e;
+        } else {
+            value = value + c;
+            lex_advance();
+        }
+    }
+    string lexeme = lx_global.source.substring(startPos,
+        lx_global.pos - startPos);
+    t.kind = TokenKind.STRING_LITERAL;
+    t.lexeme = lexeme;
+    t.pos = lex_makePos(lx_global.pos - startPos);
+    t.stringValue = value;
+    return t;
+}
+
+Token lex_readNumber() {
+    i32 startPos = lx_global.pos;
+    i32 startLine = lx_global.line;
+    i32 startCol = lx_global.column;
+    bool isFloat = false;
+
+    char c = lx_global.source[lx_global.pos];
+    if (c == '0' && lex_peek(1) == 'x') {
+        lex_advance();
+        lex_advance();
+        while (lx_global.pos < lx_global.source.length) {
+            c = lx_global.source[lx_global.pos];
+            if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+                || (c >= 'A' && c <= 'F')) {
+                lex_advance();
+            } else break;
+        }
+        string lexeme = lx_global.source.substring(startPos,
+            lx_global.pos - startPos);
+        Token t;
+        t.kind = TokenKind.INT_LITERAL;
+        t.lexeme = lexeme;
+        t.pos.file = lx_global.filename;
+        t.pos.line = startLine;
+        t.pos.column = startCol;
+        t.pos.length = lx_global.pos - startPos;
+        t.intValue = 0;
+        return t;
+    }
+
+    while (lx_global.pos < lx_global.source.length) {
+        c = lx_global.source[lx_global.pos];
+        if (c >= '0' && c <= '9') {
+            lex_advance();
+        } else if (c == '.' && lex_peek(1) >= '0' && lex_peek(1) <= '9') {
+            isFloat = true;
+            lex_advance();
+        } else if (c == 'e' || c == 'E') {
+            isFloat = true;
+            lex_advance();
+            if (lx_global.pos < lx_global.source.length
+                && (lx_global.source[lx_global.pos] == '+'
+                    || lx_global.source[lx_global.pos] == '-')) {
+                lex_advance();
+            }
+        } else if (c == '_') {
+            lex_advance();
+        } else break;
+    }
+
+    string lexeme = lx_global.source.substring(startPos,
+        lx_global.pos - startPos);
+    Token t;
+    t.lexeme = lexeme;
+    t.pos.file = lx_global.filename;
+    t.pos.line = startLine;
+    t.pos.column = startCol;
+    t.pos.length = lx_global.pos - startPos;
+    if (isFloat) {
+        t.kind = TokenKind.FLOAT_LITERAL;
+        t.floatValue = 0.0;
+    } else {
+        t.kind = TokenKind.INT_LITERAL;
+        t.intValue = 0;
+    }
+    return t;
+}
+
+Token lex_readIdentifier() {
+    i32 startPos = lx_global.pos;
+    i32 startLine = lx_global.line;
+    i32 startCol = lx_global.column;
+
+    while (lx_global.pos < lx_global.source.length) {
+        char c = lx_global.source[lx_global.pos];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '_') {
+            lex_advance();
+        } else break;
+    }
+
+    string lexeme = lx_global.source.substring(startPos,
+        lx_global.pos - startPos);
+    TokenKind kind = classifyKeyword(lexeme);
+
+    Token t;
+    t.kind = kind;
+    t.lexeme = lexeme;
+    t.pos.file = lx_global.filename;
+    t.pos.line = startLine;
+    t.pos.column = startCol;
+    t.pos.length = lx_global.pos - startPos;
+    if (kind == TokenKind.KW_TRUE) t.intValue = 1;
+    if (kind == TokenKind.KW_FALSE) t.intValue = 0;
+    return t;
+}
+
+Token lex_readSymbol() {
+    i32 startPos = lx_global.pos;
+    char c = lx_global.source[lx_global.pos];
+    char n = lex_peek(1);
+    Token t;
+    t.pos.file = lx_global.filename;
+    t.pos.line = lx_global.line;
+    t.pos.column = lx_global.column;
+
+    if (c == '+' && n == '=') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        t.kind = TokenKind.ASSIGN;
+        t.lexeme = "+=";
+        t.pos.length = 2;
+        return t;
+    }
+    if (c == '-' && n == '>') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        t.kind = TokenKind.ARROW;
+        t.lexeme = "->";
+        t.pos.length = 2;
+        return t;
+    }
+    if (c == '-' && n == '=') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        t.kind = TokenKind.ASSIGN;
+        t.lexeme = "-=";
+        t.pos.length = 2;
+        return t;
+    }
+    if (c == '*' && n == '=') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        t.kind = TokenKind.ASSIGN;
+        t.lexeme = "*=";
+        t.pos.length = 2;
+        return t;
+    }
+    if (c == '/' && n == '=') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        t.kind = TokenKind.ASSIGN;
+        t.lexeme = "/=";
+        t.pos.length = 2;
+        return t;
+    }
+    if (c == '=' && n == '=') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        t.kind = TokenKind.EQ;
+        t.lexeme = "==";
+        t.pos.length = 2;
+        return t;
+    }
+    if (c == '!' && n == '=') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        t.kind = TokenKind.NEQ;
+        t.lexeme = "!=";
+        t.pos.length = 2;
+        return t;
+    }
+    if (c == '<' && n == '=') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        t.kind = TokenKind.LE;
+        t.lexeme = "<=";
+        t.pos.length = 2;
+        return t;
+    }
+    if (c == '>' && n == '=') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        t.kind = TokenKind.GE;
+        t.lexeme = ">=";
+        t.pos.length = 2;
+        return t;
+    }
+    if (c == '<' && n == '<') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        if (lx_global.pos < lx_global.source.length
+            && lx_global.source[lx_global.pos] == '=') {
+            lx_global.pos = lx_global.pos + 1;
+            lx_global.column = lx_global.column + 1;
+            t.kind = TokenKind.ASSIGN;
+            t.lexeme = "<<=";
+            t.pos.length = 3;
+            return t;
+        }
+        t.kind = TokenKind.SHL;
+        t.lexeme = "<<";
+        t.pos.length = 2;
+        return t;
+    }
+    if (c == '>' && n == '>') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        if (lx_global.pos < lx_global.source.length
+            && lx_global.source[lx_global.pos] == '=') {
+            lx_global.pos = lx_global.pos + 1;
+            lx_global.column = lx_global.column + 1;
+            t.kind = TokenKind.ASSIGN;
+            t.lexeme = ">>=";
+            t.pos.length = 3;
+            return t;
+        }
+        t.kind = TokenKind.SHR;
+        t.lexeme = ">>";
+        t.pos.length = 2;
+        return t;
+    }
+    if (c == '&' && n == '&') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        t.kind = TokenKind.AND_AND;
+        t.lexeme = "&&";
+        t.pos.length = 2;
+        return t;
+    }
+    if (c == '|' && n == '|') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        t.kind = TokenKind.OR_OR;
+        t.lexeme = "||";
+        t.pos.length = 2;
+        return t;
+    }
+    if (c == '.' && n == '.') {
+        lx_global.pos = lx_global.pos + 2;
+        lx_global.column = lx_global.column + 2;
+        t.kind = TokenKind.DOTDOT;
+        t.lexeme = "..";
+        t.pos.length = 2;
+        return t;
+    }
+
+    lex_advance();
+    t.pos.length = 1;
+    t.lexeme = charToString(c);
+    if (c == '+') t.kind = TokenKind.PLUS;
+    else if (c == '-') t.kind = TokenKind.MINUS;
+    else if (c == '*') t.kind = TokenKind.STAR;
+    else if (c == '/') t.kind = TokenKind.SLASH;
+    else if (c == '%') t.kind = TokenKind.PERCENT;
+    else if (c == '=') t.kind = TokenKind.ASSIGN;
+    else if (c == '!') t.kind = TokenKind.BANG;
+    else if (c == '<') t.kind = TokenKind.LT;
+    else if (c == '>') t.kind = TokenKind.GT;
+    else if (c == '&') t.kind = TokenKind.AMP;
+    else if (c == '|') t.kind = TokenKind.PIPE;
+    else if (c == '^') t.kind = TokenKind.CARET;
+    else if (c == '~') t.kind = TokenKind.TILDE;
+    else if (c == '(') t.kind = TokenKind.LPAREN;
+    else if (c == ')') t.kind = TokenKind.RPAREN;
+    else if (c == '{') t.kind = TokenKind.LBRACE;
+    else if (c == '}') t.kind = TokenKind.RBRACE;
+    else if (c == '[') t.kind = TokenKind.LBRACKET;
+    else if (c == ']') t.kind = TokenKind.RBRACKET;
+    else if (c == ';') t.kind = TokenKind.SEMICOLON;
+    else if (c == ':') t.kind = TokenKind.COLON;
+    else if (c == ',') t.kind = TokenKind.COMMA;
+    else if (c == '.') t.kind = TokenKind.DOT;
+    else t.kind = TokenKind.UNKNOWN;
+    return t;
+}
+
+Token lex_lexOne() {
+    lex_skipWhitespace();
+    if (lx_global.pos >= lx_global.source.length) {
+        Token t;
+        t.kind = TokenKind.END_OF_FILE;
+        t.lexeme = "";
+        t.pos = lex_makePos(0);
+        return t;
+    }
+    char c = lx_global.source[lx_global.pos];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+        return lex_readIdentifier();
+    }
+    if (c >= '0' && c <= '9') {
+        return lex_readNumber();
+    }
+    if (c == '"') {
+        return lex_readString();
+    }
+    return lex_readSymbol();
+}
+
+Token lex_nextToken() {
+    if (lx_global.hasPeek) {
+        lx_global.hasPeek = false;
+        return lx_global.peekBuf;
+    }
+    return lex_lexOne();
+}
+
+Token lex_peekToken() {
+    if (!lx_global.hasPeek) {
+        lx_global.peekBuf = lex_lexOne();
+        lx_global.hasPeek = true;
+    }
+    return lx_global.peekBuf;
+}
+
+i32 lex(string source, string filename, Token[8192] buffer) {
+    lex_init(source, filename);
+    i32 count = 0;
+    while (true) {
+        Token t = lex_nextToken();
+        buffer[count] = t;
+        count = count + 1;
+        if (t.kind == TokenKind.END_OF_FILE) {
+            break;
+        }
+    }
+    return count;
+}
+
+string charToString(char c) {
+    string s;
+    s = s + c;
+    return s;
+}

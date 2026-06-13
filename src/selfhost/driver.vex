@@ -1,0 +1,111 @@
+import "ast";
+import "lexer";
+import "parser";
+import "type_checker";
+import "codegen";
+
+string driver_inputFile;
+string driver_outputFile;
+bool driver_verbose;
+string[64] driver_errors;
+i32 driver_errorCount;
+
+void driver_init(string input, string output, bool verbose) {
+    driver_inputFile = input;
+    driver_outputFile = output;
+    driver_verbose = verbose;
+    driver_errorCount = 0;
+}
+
+void driver_log(string msg) {
+    if (driver_verbose) {
+        println(msg);
+    }
+}
+
+void driver_addError(string msg) {
+    if (driver_errorCount < 64) {
+        driver_errors[driver_errorCount] = msg;
+        driver_errorCount = driver_errorCount + 1;
+    }
+}
+
+void driver_printErrors() {
+    i32 i = 0;
+    while (i < driver_errorCount) {
+        println(driver_errors[i]);
+        i = i + 1;
+    }
+}
+
+string driver_basename(string path) {
+    i32 lastSep = -1;
+    i32 i = 0;
+    while (i < path.length) {
+        if (path[i] == '/' || path[i] == '\\') {
+            lastSep = i;
+        }
+        i = i + 1;
+    }
+    string name;
+    i = lastSep + 1;
+    while (i < path.length) {
+        if (path[i] == '.') break;
+        name = name + path[i];
+        i = i + 1;
+    }
+    return name;
+}
+
+bool driver_compile() {
+    driver_log("reading source: " + driver_inputFile);
+    string source;
+    driver_log("  source length: " + source.length);
+
+    driver_log("lexing...");
+    Token[8192] tokens;
+    i32 tokenCount = lex(source, driver_inputFile, tokens);
+    driver_log("  tokens: " + tokenCount);
+
+    driver_log("parsing...");
+    ASTNode ast = parse(tokens, driver_inputFile);
+    if (ast.kind != ASTKind.Program) {
+        driver_addError("parse failed");
+        return false;
+    }
+    ProgramNode prog;
+    prog.base = ast;
+
+    driver_log("type checking...");
+    string[64] tcErrors;
+    bool tcOk = tc_run(prog, tcErrors);
+    if (!tcOk) {
+        driver_addError("type checking failed");
+        i32 i = 0;
+        while (i < 64) {
+            if (tcErrors[i] != "") {
+                driver_log(tcErrors[i]);
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    driver_log("generating bytecode...");
+    u8[65536] output;
+    i32 outputSize = generateBytecode(prog, output);
+    driver_log("  output bytes: " + outputSize);
+
+    driver_log("done: " + driver_outputFile);
+    return true;
+}
+
+i32 main() {
+    driver_init("src/selfhost/driver.vex", "driver.velb", true);
+    bool ok = driver_compile();
+    if (!ok) {
+        driver_printErrors();
+        return 1;
+    }
+    return 0;
+}

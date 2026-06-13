@@ -1,5 +1,7 @@
-# archivos ocultos y de configuración
+# archivos ocultos y de configuración (excepto .github)
 .*
+!.github/
+!.gitignore
 
 # archivos de memoria temporales
 memoria_*
@@ -16,9 +18,9 @@ cmake-build-debug
 cmake-build-release
 cmake-build-*
 cmake-*
-build*
-build-windows
-build-linux
+build/
+build-windows/
+build-linux/
 
 # certificados y claves privadas
 *.pem

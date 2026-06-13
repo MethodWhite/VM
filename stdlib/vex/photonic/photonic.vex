@@ -1,0 +1,152 @@
+// photonic.vex - Librería estándar de tipos y operadores fotónicos
+// para el proyecto AGI Fotónica de Resonancia Armónica.
+//
+// Define tipos Color, Wavefront, Resonance y primitivas JEPA
+// como parte del lenguaje Vex.
+
+namespace std.photonic {
+
+    // -----------------------------------------------------------------
+    //  Tipos de datos fotónicos
+    // -----------------------------------------------------------------
+
+    /// Color RGBI + UV representado como frecuencia (nm)
+    /// Bits 0-15: longitud de onda (0.1nm unidades)
+    /// Bits 16-31: duty cycle (ns)
+    @Photon(protocol: "UTF-32")
+    type Color = u32
+
+    /// Frente de onda: superposición de colores con fase e intensidad
+    type Wavefront = struct {
+        Color[] harmonics     // armónicos del frente de onda
+        f32    phase          // fase actual (radianes)
+        f32    intensity      // intensidad total (0..1)
+    }
+
+    /// Medida de resonancia: 0 (ruido) .. 1000 (onda estacionaria pura)
+    type Resonance = i32
+
+    /// Embedding JEPA: representación latente de un patrón fotónico
+    type JEPALatent = u64
+
+    // -----------------------------------------------------------------
+    //  Constantes físicas del sistema
+    // -----------------------------------------------------------------
+
+    const LASER_R   : f32 = 650.0  // nm - Rojo
+    const LASER_G   : f32 = 532.0  // nm - Verde
+    const LASER_B   : f32 = 450.0  // nm - Azul
+    const LASER_IR  : f32 = 850.0  // nm - Infrarrojo
+    const LASER_UV  : f32 = 405.0  // nm - UV (litografía)
+
+    const QUARTZ_REFRACTIVE_INDEX : f32 = 1.544
+    const C_LIGHT   : f32 = 299792458.0  // m/s
+
+    // -----------------------------------------------------------------
+    //  Operadores de superposición e interferencia
+    // -----------------------------------------------------------------
+
+    /// Superponer dos frentes de onda (interferencia constructiva)
+    @Inline
+    fn operator+(a: Wavefront, b: Wavefront) -> Wavefront {
+        return Wavefront {
+            harmonics = a.harmonics ++ b.harmonics,
+            phase     = (a.phase + b.phase) * 0.5,
+            intensity = min(a.intensity + b.intensity, 1.0)
+        }
+    }
+
+    /// Interferencia destructiva: restar frentes de onda
+    @Inline
+    fn operator-(a: Wavefront, b: Wavefront) -> Wavefront {
+        return Wavefront {
+            harmonics = a.harmonics,
+            phase     = a.phase - b.phase,
+            intensity = max(a.intensity - b.intensity, 0.0)
+        }
+    }
+
+    /// Colapsar un frente de onda a decisión binaria
+    @Inline
+    fn collapse(w: Wavefront) -> bool {
+        return w.intensity > 0.5
+    }
+
+    // -----------------------------------------------------------------
+    //  Primitivas JEPA (Joint Embedding Predictive Architecture)
+    // -----------------------------------------------------------------
+
+    /// Transformar patrón fotónico a representación latente
+    @Extern("vesta_photonic:photonic_jepa_embed")
+    fn jepa_embed(pattern: Color) -> JEPALatent
+
+    /// Predecir siguiente patrón desde representación latente
+    @Extern("vesta_photonic:photonic_jepa_predict")
+    fn jepa_predict(latent: JEPALatent) -> Color
+
+    /// Calcular pérdida entre predicción y objetivo (critic)
+    @Inline
+    fn jepa_critic(predicted: Color, target: Color) -> f32 {
+        let pd: f32 = f32(predicted & 0xFFFF)
+        let td: f32 = f32(target & 0xFFFF)
+        let diff = (pd - td) / 65535.0
+        return diff * diff
+    }
+
+    // -----------------------------------------------------------------
+    //  Control del hardware fotónico
+    // -----------------------------------------------------------------
+
+    /// Emitir pulso láser desde código UTF-32
+    @Extern("vesta_photonic:photonic_emit")
+    fn emit(code: Color) -> f32         // retorna feedback voltage (mV)
+
+    /// Medir resonancia de una hipótesis
+    @Extern("vesta_photonic:photonic_resonance")
+    fn resonance(hypothesis: Color) -> Resonance
+
+    /// Colapsar intensidad de onda a bit
+    @Extern("vesta_photonic:photonic_collapse")
+    fn collapse_intensity(intensity: u64) -> bool
+
+    /// Apagar todos los láseres
+    @Extern("vesta_photonic:photonic_laser_off")
+    fn laser_off()
+
+    /// Leer voltaje de feedback self-mixing
+    @Extern("vesta_photonic:photonic_get_feedback")
+    fn get_feedback() -> f32
+
+    // -----------------------------------------------------------------
+    //  Ciclo de aprendizaje por resonancia
+    // -----------------------------------------------------------------
+
+    /// Un paso de aprendizaje: emitir hipótesis, medir resonancia,
+    /// colapsar a decisión, retroalimentar.
+    @Inline
+    fn learn_step(hypothesis: Color) -> (Resonance, bool) {
+        let res = resonance(hypothesis)
+        let collapsed = collapse_intensity(u64(res))
+        return (res, collapsed)
+    }
+
+    /// Búsqueda de resonancia: variar hipótesis hasta encontrar
+    /// la frecuencia que maximiza la onda estacionaria.
+    fn search_resonance(min_nm: f32, max_nm: f32, steps: i32) -> Color {
+        let mut best: Color = 0
+        let mut best_res: Resonance = 0
+        let mut i: i32 = 0
+        while i < steps {
+            let nm = min_nm + (max_nm - min_nm) * f32(i) / f32(steps)
+            let code: Color = Color(i32(nm * 10.0))  // 0.1nm resolution
+            let (res, _) = learn_step(code)
+            if res > best_res {
+                best_res = res
+                best = code
+            }
+            i = i + 1
+        }
+        return best
+    }
+
+} // namespace std.photonic

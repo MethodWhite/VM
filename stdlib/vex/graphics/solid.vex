@@ -1,0 +1,288 @@
+// std.graphics.solid - SolidScript integration
+// DSL for shader pipelines with compile-time metaprogramming.
+
+namespace std.graphics.solid {
+
+    import std.graphics.vectors.*
+    import std.graphics.color.*
+    import std.graphics.matrix.*
+    import std.graphics.render.*
+
+    // -----------------------------------------------------------------
+    //  SolidScript annotations and shader types
+    // -----------------------------------------------------------------
+
+    /// Annotation marker for SolidScript DSL blocks.
+    /// Usage: @Solid("vertex") fn my_vs(...) -> ... { ... }
+    const SOLID_ANNOTATION: string = "Solid"
+
+    // -----------------------------------------------------------------
+    //  Vertex shader type
+    //  Input: vertex attributes. Output: clip-space position + varyings.
+    // -----------------------------------------------------------------
+
+    type VSInput = struct {
+        position: float3
+        normal:   float3
+        uv:       float2
+    }
+
+    type VSOutput = struct {
+        position:    float4
+        world_pos:   float3
+        world_normal: float3
+        uv:          float2
+    }
+
+    type VertexShader = fn(VSInput) -> VSOutput
+
+    // -----------------------------------------------------------------
+    //  Fragment shader type
+    //  Input: interpolated varyings. Output: final color.
+    // -----------------------------------------------------------------
+
+    type FSInput = struct {
+        frag_pos:    float3
+        frag_normal: float3
+        frag_uv:     float2
+    }
+
+    type FragmentShader = fn(FSInput) -> ColorRGBA
+
+    // -----------------------------------------------------------------
+    //  Compute shader type
+    //  Runs over a 1D/2D/3D dispatch grid.
+    // -----------------------------------------------------------------
+
+    type DispatchInfo = struct {
+        thread_id:  i32
+        group_id:   i32
+        num_groups: i32
+    }
+
+    type ComputeShader = fn(DispatchInfo) -> void
+
+    // -----------------------------------------------------------------
+    //  Compiled shader stage
+    // -----------------------------------------------------------------
+
+    type ShaderStage = struct {
+        kind:     string
+        source:   string
+    }
+
+    type ShaderProgram = struct {
+        vertex:   ShaderStage
+        fragment: ShaderStage
+    }
+
+    /// Create a shader program from inline source strings
+    fn shader_program(vs_source: string, fs_source: string) -> ShaderProgram {
+        return ShaderProgram {
+            vertex:   ShaderStage { kind: "vertex",   source: vs_source },
+            fragment: ShaderStage { kind: "fragment", source: fs_source }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Default shaders (minimal pass-through)
+    // -----------------------------------------------------------------
+
+    fn default_vertex_shader(input: VSInput) -> VSOutput {
+        return VSOutput {
+            position:     float4_from_float3(input.position, 1.0),
+            world_pos:    input.position,
+            world_normal: input.normal,
+            uv:           input.uv
+        }
+    }
+
+    fn default_fragment_shader(input: FSInput) -> ColorRGBA {
+        return ColorRGBA { r: 1.0, g: 0.0, b: 1.0, a: 1.0 }
+    }
+
+    // -----------------------------------------------------------------
+    //  Render pipeline execution
+    // -----------------------------------------------------------------
+
+    /// Simple software render pipeline:
+    ///   vertex -> primitive assembly -> rasterization -> fragment
+    fn render_pipeline(shader: ShaderProgram, mesh: Mesh, camera: Camera, aspect: f32, width: i32, height: i32) -> ColorRGBA[] {
+        let vp = camera_view_projection(camera, aspect)
+        let model = identity()
+
+        // Transform vertices to clip space
+        let num_verts = mesh_vertex_count(mesh)
+        let mut clip_verts: float4[] = []
+        let mut i: i32 = 0
+        while i < num_verts {
+            let local_pos = float4_from_float3(mesh.vertices[i], 1.0)
+            let world_pos = mul_vec3(model, mesh.vertices[i])
+            let world_norm = mul_vec3(model, mesh.normals[i])
+            let clip = mul_vec(vp, local_pos)
+            clip_verts = clip_verts ++ [clip]
+            i = i + 1
+        }
+
+        // Initialize framebuffer to black
+        let total_px = width * height
+        let mut framebuffer: ColorRGBA[] = []
+        let mut j: i32 = 0
+        while j < total_px {
+            framebuffer = framebuffer ++ [ColorRGBA { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }]
+            j = j + 1
+        }
+
+        // Rasterize triangles
+        let num_tris = mesh_triangle_count(mesh)
+        let mut t: i32 = 0
+        while t < num_tris {
+            let i0 = mesh.indices[t * 3]
+            let i1 = mesh.indices[t * 3 + 1]
+            let i2 = mesh.indices[t * 3 + 2]
+
+            let v0 = perspective_divide(clip_verts[i0])
+            let v1 = perspective_divide(clip_verts[i1])
+            let v2 = perspective_divide(clip_verts[i2])
+
+            // NDC to screen coordinates
+            let sx0 = (v0.x + 1.0) * 0.5 * f32(width)
+            let sy0 = (1.0 - v0.y) * 0.5 * f32(height)
+            let sx1 = (v1.x + 1.0) * 0.5 * f32(width)
+            let sy1 = (1.0 - v1.y) * 0.5 * f32(height)
+            let sx2 = (v2.x + 1.0) * 0.5 * f32(width)
+            let sy2 = (1.0 - v2.y) * 0.5 * f32(height)
+
+            // Calculate bounding box
+            let min_x = i32(floor(if sx0 < sx1 { if sx0 < sx2 { sx0 } else { sx2 } } else { if sx1 < sx2 { sx1 } else { sx2 } }))
+            let max_x = i32(ceil( if sx0 > sx1 { if sx0 > sx2 { sx0 } else { sx2 } } else { if sx1 > sx2 { sx1 } else { sx2 } }))
+            let min_y = i32(floor(if sy0 < sy1 { if sy0 < sy2 { sy0 } else { sy2 } } else { if sy1 < sy2 { sy1 } else { sy2 } }))
+            let max_y = i32(ceil( if sy0 > sy1 { if sy0 > sy2 { sy0 } else { sy2 } } else { if sy1 > sy2 { sy1 } else { sy2 } }))
+
+            // Clamp to screen
+            let cmin_x = if min_x < 0 { 0 } else { min_x }
+            let cmax_x = if max_x > width  { width } else { max_x }
+            let cmin_y = if min_y < 0 { 0 } else { min_y }
+            let cmax_y = if max_y > height { height } else { max_y }
+
+            // Rasterize pixels
+            let mut py: i32 = cmin_y
+            while py < cmax_y {
+                let mut px: i32 = cmin_x
+                while px < cmax_x {
+                    let fp = f32(px) + 0.5
+                    let fy = f32(py) + 0.5
+
+                    // Edge function test (barycentric coordinates)
+                    let w0 = (sx1 - sx0) * (fy - sy0) - (sy1 - sy0) * (fp - sx0)
+                    let w1 = (sx2 - sx1) * (fy - sy1) - (sy2 - sy1) * (fp - sx1)
+                    let w2 = (sx0 - sx2) * (fy - sy2) - (sy0 - sy2) * (fp - sx2)
+
+                    if (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0) {
+                        let area = (sx1 - sx0) * (sy2 - sy0) - (sy1 - sy0) * (sx2 - sx0)
+                        let inv_area = if area == 0.0 { 0.0 } else { 1.0 / area }
+
+                        let b0 = if area == 0.0 { 0.0 } else { ((sx1 - sx2) * (fy - sy2) - (sy1 - sy2) * (fp - sx2)) * inv_area }
+                        let b1 = if area == 0.0 { 0.0 } else { ((sx2 - sx0) * (fy - sy0) - (sy2 - sy0) * (fp - sx0)) * inv_area }
+                        let b2 = if area == 0.0 { 0.0 } else { 1.0 - b0 - b1 }
+
+                        let fwd = normalize(sub(camera.target, camera.position))
+                        let w_n = normalize(add(add(mul(mesh.normals[i0], b0), mul(mesh.normals[i1], b1)), mul(mesh.normals[i2], b2)))
+                        let w_p = add(add(mul(mesh.vertices[i0], b0), mul(mesh.vertices[i1], b1)), mul(mesh.vertices[i2], b2))
+                        let uv = add(add(mul(mesh.uvs[i0], b0), mul(mesh.uvs[i1], b1)), mul(mesh.uvs[i2], b2))
+
+                        // Simple directional light
+                        let light_dir = normalize(float3 { x: 1.0, y: 1.0, z: 1.0 })
+                        let ndotl = dot(w_n, light_dir)
+                        let intensity = if ndotl > 0.0 { ndotl } else { 0.0 }
+
+                        let color = ColorRGBA {
+                            r: intensity * 0.8 + 0.1,
+                            g: intensity * 0.8 + 0.1,
+                            b: intensity * 0.8 + 0.1,
+                            a: 1.0
+                        }
+
+                        let idx = py * width + px
+                        framebuffer[idx] = color
+                    }
+                    px = px + 1
+                }
+                py = py + 1
+            }
+            t = t + 1
+        }
+
+        return framebuffer
+    }
+
+    // -----------------------------------------------------------------
+    //  Metaprogramming: compile SolidScript source to Vex AST
+    //  This is the entry point for the SolidScript compiler.
+    //  At compile time, @Macro can capture the raw source string
+    //  and produce Vex bytecode via this function.
+    // -----------------------------------------------------------------
+
+    /// SolidScript AST node types
+    type SSNode = struct {
+        kind:     string
+        value:    string
+        children: SSNode[]
+    }
+
+    /// Compile SolidScript source string to a Vex AST
+    /// Each line is parsed as a shader operation.
+    fn compile_solid(source: string) -> SSNode[] {
+        let lines = std.string.split(source, "\n")
+        let mut nodes: SSNode[] = []
+        let mut i: i32 = 0
+        while i < lines.size() {
+            let line = std.string.trim(lines[i])
+            if line.size() > 0 && line[0] != '/' {
+                let node = parse_solid_line(line)
+                nodes = nodes ++ [node]
+            }
+            i = i + 1
+        }
+        return nodes
+    }
+
+    /// Parse a single SolidScript DSL line into an AST node
+    fn parse_solid_line(line: string) -> SSNode {
+        if std.string.starts_with(line, "vertex") {
+            return SSNode { kind: "shader_stage", value: "vertex", children: [] }
+        }
+        if std.string.starts_with(line, "fragment") {
+            return SSNode { kind: "shader_stage", value: "fragment", children: [] }
+        }
+        if std.string.starts_with(line, "compute") {
+            return SSNode { kind: "shader_stage", value: "compute", children: [] }
+        }
+        if std.string.starts_with(line, "attribute") {
+            return SSNode { kind: "attribute", value: line, children: [] }
+        }
+        if std.string.starts_with(line, "varying") {
+            return SSNode { kind: "varying", value: line, children: [] }
+        }
+        if std.string.starts_with(line, "uniform") {
+            return SSNode { kind: "uniform", value: line, children: [] }
+        }
+        if std.string.starts_with(line, "main") {
+            return SSNode { kind: "entry", value: "main", children: [] }
+        }
+        return SSNode { kind: "statement", value: line, children: [] }
+    }
+
+    /// Convert AST back to SolidScript source (for debugging/codegen)
+    fn ast_to_solid(nodes: SSNode[]) -> string {
+        let mut result: string = ""
+        let mut i: i32 = 0
+        while i < nodes.size() {
+            if i > 0 { result = result ++ "\n" }
+            result = result ++ nodes[i].value
+            i = i + 1
+        }
+        return result
+    }
+
+} // namespace std.graphics.solid

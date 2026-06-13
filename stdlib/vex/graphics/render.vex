@@ -1,0 +1,257 @@
+// std.graphics.render - Render pipeline types
+// Mesh, Texture, Material, Light, Camera, Scene definitions.
+
+namespace std.graphics.render {
+
+    import std.graphics.vectors.*
+    import std.graphics.color.*
+
+    // -----------------------------------------------------------------
+    //  Mesh
+    // -----------------------------------------------------------------
+
+    type Mesh = struct {
+        vertices:  float3[]
+        normals:   float3[]
+        uvs:       float2[]
+        indices:   u32[]
+    }
+
+    fn mesh_empty() -> Mesh {
+        return Mesh {
+            vertices: [],
+            normals:  [],
+            uvs:      [],
+            indices:  []
+        }
+    }
+
+    fn mesh_triangle() -> Mesh {
+        return Mesh {
+            vertices: [
+                float3 { x: -1.0, y: -1.0, z: 0.0 },
+                float3 { x:  1.0, y: -1.0, z: 0.0 },
+                float3 { x:  0.0, y:  1.0, z: 0.0 }
+            ],
+            normals: [
+                float3 { x: 0.0, y: 0.0, z: 1.0 },
+                float3 { x: 0.0, y: 0.0, z: 1.0 },
+                float3 { x: 0.0, y: 0.0, z: 1.0 }
+            ],
+            uvs: [
+                float2 { x: 0.0, y: 0.0 },
+                float2 { x: 1.0, y: 0.0 },
+                float2 { x: 0.5, y: 1.0 }
+            ],
+            indices: [0u, 1u, 2u]
+        }
+    }
+
+    @Inline
+    fn mesh_vertex_count(m: Mesh) -> i32 {
+        return m.vertices.size()
+    }
+
+    @Inline
+    fn mesh_index_count(m: Mesh) -> i32 {
+        return m.indices.size()
+    }
+
+    @Inline
+    fn mesh_triangle_count(m: Mesh) -> i32 {
+        return m.indices.size() / 3
+    }
+
+    // -----------------------------------------------------------------
+    //  Texture
+    // -----------------------------------------------------------------
+
+    type Texture = struct {
+        width:  i32
+        height: i32
+        data:   ColorRGBA[]
+    }
+
+    /// Create solid-color texture
+    fn texture_solid(width: i32, height: i32, color: ColorRGBA) -> Texture {
+        let total = width * height
+        let mut pixels: ColorRGBA[] = []
+        let mut i: i32 = 0
+        while i < total {
+            pixels = pixels ++ [color]
+            i = i + 1
+        }
+        return Texture { width: width, height: height, data: pixels }
+    }
+
+    /// Sample texture at normalized UV coordinates (bilinear)
+    fn texture_sample(tex: Texture, u: f32, v: f32) -> ColorRGBA {
+        let w = f32(tex.width)
+        let h = f32(tex.height)
+        let px = u * w - 0.5
+        let py = v * h - 0.5
+
+        let x0 = i32(floor(px))
+        let y0 = i32(floor(py))
+        let x1 = x0 + 1
+        let y1 = y0 + 1
+
+        let fx = px - f32(x0)
+        let fy = py - f32(y0)
+
+        let cx0 = if x0 < 0 { 0 } elif x0 >= tex.width { tex.width - 1 } else { x0 }
+        let cy0 = if y0 < 0 { 0 } elif y0 >= tex.height { tex.height - 1 } else { y0 }
+        let cx1 = if x1 < 0 { 0 } elif x1 >= tex.width { tex.width - 1 } else { x1 }
+        let cy1 = if y1 < 0 { 0 } elif y1 >= tex.height { tex.height - 1 } else { y1 }
+
+        let c00 = tex.data[cy0 * tex.width + cx0]
+        let c10 = tex.data[cy0 * tex.width + cx1]
+        let c01 = tex.data[cy1 * tex.width + cx0]
+        let c11 = tex.data[cy1 * tex.width + cx1]
+
+        let top = std.graphics.color.lerp_rgba(c00, c10, fx)
+        let bot = std.graphics.color.lerp_rgba(c01, c11, fx)
+        return std.graphics.color.lerp_rgba(top, bot, fy)
+    }
+
+    // -----------------------------------------------------------------
+    //  Material
+    // -----------------------------------------------------------------
+
+    type Material = struct {
+        ambient:   ColorRGB
+        diffuse:   ColorRGB
+        specular:  ColorRGB
+        shininess: f32
+    }
+
+    fn material_default() -> Material {
+        return Material {
+            ambient:   ColorRGB { r: 0.1, g: 0.1, b: 0.1 },
+            diffuse:   ColorRGB { r: 0.8, g: 0.8, b: 0.8 },
+            specular:  ColorRGB { r: 1.0, g: 1.0, b: 1.0 },
+            shininess: 32.0
+        }
+    }
+
+    fn material_emissive(color: ColorRGB) -> Material {
+        return Material {
+            ambient:   color,
+            diffuse:   ColorRGB { r: 0.0, g: 0.0, b: 0.0 },
+            specular:  ColorRGB { r: 0.0, g: 0.0, b: 0.0 },
+            shininess: 0.0
+        }
+    }
+
+    fn material_rough(color: ColorRGB) -> Material {
+        return Material {
+            ambient:   ColorRGB { r: 0.05, g: 0.05, b: 0.05 },
+            diffuse:   color,
+            specular:  ColorRGB { r: 0.1, g: 0.1, b: 0.1 },
+            shininess: 4.0
+        }
+    }
+
+    fn material_shiny(color: ColorRGB) -> Material {
+        return Material {
+            ambient:   ColorRGB { r: 0.05, g: 0.05, b: 0.05 },
+            diffuse:   color,
+            specular:  ColorRGB { r: 1.0, g: 1.0, b: 1.0 },
+            shininess: 128.0
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Light
+    // -----------------------------------------------------------------
+
+    type Light = struct {
+        position:  float3
+        color:     ColorRGB
+        intensity: f32
+    }
+
+    fn light_directional(dir: float3, color: ColorRGB) -> Light {
+        return Light {
+            position:  std.graphics.vectors.normalize(dir),
+            color:     color,
+            intensity: 1.0
+        }
+    }
+
+    fn light_point(pos: float3, color: ColorRGB, intensity: f32) -> Light {
+        return Light {
+            position:  pos,
+            color:     color,
+            intensity: intensity
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Camera
+    // -----------------------------------------------------------------
+
+    type Camera = struct {
+        position: float3
+        target:   float3
+        up:       float3
+        fov:      f32
+        near:     f32
+        far:      f32
+    }
+
+    fn camera_default() -> Camera {
+        return Camera {
+            position: float3 { x: 0.0, y: 0.0, z: 5.0 },
+            target:   float3 { x: 0.0, y: 0.0, z: 0.0 },
+            up:       float3 { x: 0.0, y: 1.0, z: 0.0 },
+            fov:      60.0 * std.math.PI / 180.0,
+            near:     0.1,
+            far:      100.0
+        }
+    }
+
+    fn camera_look_at(cam: Camera) -> std.graphics.matrix.matrix4x4 {
+        return std.graphics.matrix.look_at(cam.position, cam.target, cam.up)
+    }
+
+    fn camera_projection(cam: Camera, aspect: f32) -> std.graphics.matrix.matrix4x4 {
+        return std.graphics.matrix.perspective(cam.fov, aspect, cam.near, cam.far)
+    }
+
+    fn camera_view_projection(cam: Camera, aspect: f32) -> std.graphics.matrix.matrix4x4 {
+        let view = camera_look_at(cam)
+        let proj = camera_projection(cam, aspect)
+        return std.graphics.matrix.mul(proj, view)
+    }
+
+    // -----------------------------------------------------------------
+    //  Scene
+    // -----------------------------------------------------------------
+
+    type Scene = struct {
+        meshes:    Mesh[]
+        materials: Material[]
+        lights:    Light[]
+        camera:    Camera
+    }
+
+    fn scene_empty() -> Scene {
+        return Scene {
+            meshes:    [],
+            materials: [],
+            lights:    [],
+            camera:    camera_default()
+        }
+    }
+
+    fn scene_add_mesh(scene: Scene, mesh: Mesh, material: Material) {
+        scene.meshes = scene.meshes ++ [mesh]
+        scene.materials = scene.materials ++ [material]
+    }
+
+    fn scene_add_light(scene: Scene, light: Light) {
+        scene.lights = scene.lights ++ [light]
+    }
+
+} // namespace std.graphics.render

@@ -1,0 +1,119 @@
+// std.crypto.vex - Cryptographic primitives for Vex
+// Hashing, UUID generation, base64 encoding.
+
+namespace std.crypto {
+
+    // -----------------------------------------------------------------
+    //  Hashing (SHA-256 via FFI al plugin nativo)
+    // -----------------------------------------------------------------
+
+    type Hash256 = struct {
+        bytes: u8[32]  // 32 bytes = 256 bits
+    }
+
+    @Extern("vesta_crypto:vsha256")
+    fn sha256(data: u8[]) -> Hash256
+
+    @Inline
+    fn sha256_string(s: string) -> Hash256 {
+        // Convert string to bytes and hash
+        let bytes: u8[] = []
+        let mut i: i32 = 0
+        while i < s.size() {
+            bytes = bytes ++ [u8(s[i])]
+            i = i + 1
+        }
+        return sha256(bytes)
+    }
+
+    /// Convert hash to hex string
+    fn hash_to_hex(h: Hash256) -> string {
+        let hex_chars: string = "0123456789abcdef"
+        let mut result: string = ""
+        let mut i: i32 = 0
+        while i < 32 {
+            let b = h.bytes[i]
+            result = result ++ hex_chars[i32(b >> 4)]
+            result = result ++ hex_chars[i32(b & 0x0F)]
+            i = i + 1
+        }
+        return result
+    }
+
+    // -----------------------------------------------------------------
+    //  UUID v4 (random)
+    // -----------------------------------------------------------------
+
+    type UUID = struct {
+        bytes: u8[16]
+    }
+
+    /// Generate a random UUID (v4)
+    @Extern("vesta_crypto:vuuid_v4")
+    fn uuid_v4() -> UUID
+
+    fn uuid_to_string(u: UUID) -> string {
+        let hex_chars: string = "0123456789abcdef"
+        let mut result: string = ""
+        let mut i: i32 = 0
+        while i < 16 {
+            if i == 4 || i == 6 || i == 8 || i == 10 { result = result ++ "-" }
+            let b = u.bytes[i]
+            result = result ++ hex_chars[i32(b >> 4)]
+            result = result ++ hex_chars[i32(b & 0x0F)]
+            i = i + 1
+        }
+        return result
+    }
+
+    // -----------------------------------------------------------------
+    //  Base64 encoding/decoding
+    // -----------------------------------------------------------------
+
+    const BASE64_CHARS: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+    fn base64_encode(data: u8[]) -> string {
+        let mut result: string = ""
+        let n = data.size()
+        let mut i: i32 = 0
+        while i < n {
+            let a = i32(data[i]); i = i + 1
+            let b = if i < n { i32(data[i]) } else { 0 }; i = i + 1
+            let c = if i < n { i32(data[i]) } else { 0 }; i = i + 1
+
+            let triple = (a << 16) | (b << 8) | c
+
+            result = result ++ BASE64_CHARS[(triple >> 18) & 0x3F]
+            result = result ++ BASE64_CHARS[(triple >> 12) & 0x3F]
+            result = result ++ (if i - 1 > n { "=" } else { BASE64_CHARS[(triple >> 6) & 0x3F] })
+            result = result ++ (if i > n     { "=" } else { BASE64_CHARS[triple & 0x3F] })
+        }
+        return result
+    }
+
+    // -----------------------------------------------------------------
+    //  FNV-1a hash (non-cryptographic, for hash tables)
+    // -----------------------------------------------------------------
+
+    @Inline
+    fn fnv1a(data: u8[]) -> u64 {
+        let mut hash: u64 = 14695981039346656037
+        for b in data {
+            hash = hash ^ u64(b)
+            hash = hash * 1099511628211
+        }
+        return hash
+    }
+
+    @Inline
+    fn fnv1a_string(s: string) -> u64 {
+        let bytes: u8[] = []
+        let mut i: i32 = 0
+        while i < s.size() {
+            bytes = bytes ++ [u8(s[i])]
+            i = i + 1
+        }
+        return fnv1a(bytes)
+    }
+
+} // namespace std.crypto

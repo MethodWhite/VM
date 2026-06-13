@@ -1,0 +1,115 @@
+// std.physics.core - Core vector types and math for physics
+// Vec2, Vec3 with common geometric operations.
+
+namespace std.physics {
+
+    type Vec2 = struct {
+        x: f64
+        y: f64
+    }
+
+    type Vec3 = struct {
+        x: f64
+        y: f64
+        z: f64
+    }
+
+    @Inline
+    fn vec2(x: f64, y: f64) -> Vec2 {
+        return Vec2 { x: x, y: y }
+    }
+
+    @Inline
+    fn vec3(x: f64, y: f64, z: f64) -> Vec3 {
+        return Vec3 { x: x, y: y, z: z }
+    }
+
+    @Inline
+    fn v2_add(a: Vec2, b: Vec2) -> Vec2 {
+        return Vec2 { x: a.x + b.x, y: a.y + b.y }
+    }
+
+    @Inline
+    fn v2_sub(a: Vec2, b: Vec2) -> Vec2 {
+        return Vec2 { x: a.x - b.x, y: a.y - b.y }
+    }
+
+    @Inline
+    fn v2_scale(v: Vec2, s: f64) -> Vec2 {
+        return Vec2 { x: v.x * s, y: v.y * s }
+    }
+
+    @Inline
+    fn v2_dot(a: Vec2, b: Vec2) -> f64 {
+        return a.x * b.x + a.y * b.y
+    }
+
+    @Inline
+    fn v2_cross(a: Vec2, b: Vec2) -> f64 {
+        return a.x * b.y - a.y * b.x
+    }
+
+    @Inline
+    fn v2_length(v: Vec2) -> f64 {
+        return sqrt(v.x * v.x + v.y * v.y)
+    }
+
+    @Inline
+    fn v2_normalize(v: Vec2) -> Vec2 {
+        let len = v2_length(v)
+        if len == 0.0 { return v }
+        return v2_scale(v, 1.0 / len)
+    }
+
+    @Inline
+    fn v2_lerp(a: Vec2, b: Vec2, t: f64) -> Vec2 {
+        return v2_add(a, v2_scale(v2_sub(b, a), t))
+    }
+
+    @Inline
+    fn v3_add(a: Vec3, b: Vec3) -> Vec3 {
+        return Vec3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }
+    }
+
+    @Inline
+    fn v3_sub(a: Vec3, b: Vec3) -> Vec3 {
+        return Vec3 { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }
+    }
+
+    @Inline
+    fn v3_scale(v: Vec3, s: f64) -> Vec3 {
+        return Vec3 { x: v.x * s, y: v.y * s, z: v.z * s }
+    }
+
+    @Inline
+    fn v3_dot(a: Vec3, b: Vec3) -> f64 {
+        return a.x * b.x + a.y * b.y + a.z * b.z
+    }
+
+    @Inline
+    fn v3_cross(a: Vec3, b: Vec3) -> Vec3 {
+        return Vec3 {
+            x: a.y * b.z - a.z * b.y,
+            y: a.z * b.x - a.x * b.z,
+            z: a.x * b.y - a.y * b.x
+        }
+    }
+
+    @Inline
+    fn v3_length(v: Vec3) -> f64 {
+        return sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+    }
+
+    @Inline
+    fn v3_normalize(v: Vec3) -> Vec3 {
+        let len = v3_length(v)
+        if len == 0.0 { return v }
+        return v3_scale(v, 1.0 / len)
+    }
+
+    @Inline
+    fn v3_lerp(a: Vec3, b: Vec3, t: f64) -> Vec3 {
+        return v3_add(a, v3_scale(v3_sub(b, a), t))
+    }
+
+} // namespace std.physics

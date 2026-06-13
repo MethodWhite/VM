@@ -1,0 +1,37 @@
+// std.chemistry.thermo - Thermodynamics
+// Equations of state, kinetic theory, and thermodynamic state tracking.
+
+namespace std.chemistry {
+
+    type ThermodynamicState = struct {
+        temperature: f64,
+        pressure: f64,
+        volume: f64,
+        moles: f64,
+        internal_energy: f64,
+        entropy: f64,
+        enthalpy: f64,
+        gibbs: f64
+    }
+
+    const R: f64 = 0.082057
+
+    const KB: f64 = 8.617333262e-5
+
+    fn ideal_gas_law(n: f64, T: f64, V: f64) -> f64 {
+        if V <= 0.0 { return 0.0 }
+        return n * R * T / V
+    }
+
+    fn kinetic_energy(temperature: f64, dof: i32) -> f64 {
+        return f64(dof) * 0.5 * KB * temperature
+    }
+
+    fn van_der_waals_pressure(n: f64, T: f64, V: f64, a: f64, b: f64) -> f64 {
+        if V <= 0.0 { return 0.0 }
+        let v_over_n = V / n
+        if v_over_n <= b { return 0.0 }
+        return n * R * T / (V - n * b) - a * n * n / (V * V)
+    }
+
+} // namespace std.chemistry

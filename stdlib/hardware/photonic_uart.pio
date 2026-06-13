@@ -1,0 +1,109 @@
+;
+; photonic_uart.pio
+; PIO UART receiver for the photonic controller.
+;
+; Samples an asynchronous serial line (8N1) at 8× oversampling.
+; Each received byte is pushed into the RX FIFO and can be
+; transferred to a ring buffer via DMA.
+;
+; Protocol at the byte level:
+;   Start bit (0) + 8 data bits (LSB first) + Stop bit (1)
+;
+; Pin:
+;   IN base pin – UART RX (input with pull-up)
+;
+
+.program photonic_uart
+
+    wait 0 pin 0            ; wait for start bit (falling edge)
+
+    ; Delay 1.5 bit periods (12 cycles @ 8×) to centre on first data bit.
+    ; The wait consumed 1 cycle, so we need 11 more.
+    mov x, 10
+sync:
+    jmp x--, sync           ; 11 cycles
+
+    ; Sample 8 data bits, one every 8 cycles
+    set x, 7                ; bit counter (8 bits)
+bitloop:
+    in pins, 1              ; sample data bit
+    nop [5]                 ; wait 6 cycles
+    jmp x--, bitloop        ; 1 cycle (total 8 per bit)
+
+    push noblock            ; push byte to RX FIFO
+
+% c-sdk {
+
+#include "hardware/pio.h"
+#include "hardware/clocks.h"
+
+/* ---------------------------------------------------------------
+ * UART receiver handle
+ * ------------------------------------------------------------ */
+typedef struct {
+    PIO    pio;
+    uint   sm;
+    uint   offset;
+    uint   rx_pin;
+    uint   baud;
+} photonic_uart_rx_t;
+
+/* ---------------------------------------------------------------
+ * Initialise the PIO UART receiver.
+ *
+ *   rx_pin – GPIO number for RX (input, pull-up enabled)
+ *   baud   – target baud rate (e.g. 115200)
+ * ------------------------------------------------------------ */
+static inline void photonic_uart_rx_init(photonic_uart_rx_t *u,
+                                         PIO pio, uint sm,
+                                         uint rx_pin, uint baud)
+{
+    u->pio    = pio;
+    u->sm     = sm;
+    u->rx_pin = rx_pin;
+    u->baud   = baud;
+
+    uint off = pio_add_program(pio, &photonic_uart_program);
+    u->offset = off;
+
+    pio_sm_claim(pio, sm);
+    pio_gpio_init(pio, rx_pin);
+    gpio_pull_up(rx_pin);
+    gpio_set_function(rx_pin, GPIO_FUNC_PIOx( (pio == pio1) ? 1 : 0 ));
+
+    // Clock divider: sysclk / (8 × baud)
+    uint32_t sys_hz = clock_get_hz(clk_sys);
+    float div = (float)sys_hz / (8.0f * (float)baud);
+    if (div < 1.0f) div = 1.0f;
+
+    pio_sm_config c = photonic_uart_program_get_default_config(off);
+    sm_config_set_in_pins(&c, rx_pin);
+    sm_config_set_in_shift(&c, false, true, 8);  // shift right, autopush at 8 bits
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, off, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+/* ---------------------------------------------------------------
+ * Non-blocking read of a single byte from the PIO UART FIFO.
+ * Returns true if a byte was available.
+ * ------------------------------------------------------------ */
+static inline bool photonic_uart_read_byte(photonic_uart_rx_t *u,
+                                           uint8_t *byte)
+{
+    if (pio_sm_is_rx_fifo_empty(u->pio, u->sm))
+        return false;
+    *byte = (uint8_t)pio_sm_get(u->pio, u->sm);
+    return true;
+}
+
+/* ---------------------------------------------------------------
+ * Return the DREQ number to use for DMA transfers from the UART RX FIFO.
+ * ------------------------------------------------------------ */
+static inline uint photonic_uart_get_dreq(photonic_uart_rx_t *u)
+{
+    return pio_get_dreq(u->pio, u->sm, false);  // false = RX
+}
+
+%}

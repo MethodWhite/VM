@@ -1,0 +1,52 @@
+// std.log.vex - Structured logging for Vex
+
+namespace std.log {
+
+    type LogLevel = i32
+    const DEBUG   : LogLevel = 0
+    const INFO    : LogLevel = 1
+    const WARN    : LogLevel = 2
+    const ERROR   : LogLevel = 3
+    const FATAL   : LogLevel = 4
+
+    type Logger = struct {
+        name:       string
+        min_level:  LogLevel
+        timestamps: bool
+    }
+
+    fn logger(name: string) -> Logger {
+        return Logger { name: name, min_level: INFO, timestamps: true }
+    }
+
+    fn set_level(logger: Logger, level: LogLevel) {
+        logger.min_level = level
+    }
+
+    fn log(logger: Logger, level: LogLevel, message: string) {
+        if level < logger.min_level { return }
+
+        let level_names: string[] = ["DEBUG", "INFO", "WARN", "ERROR", "FATAL"]
+        let lbl = if level >= 0 && level < 5 { level_names[level] } else { "?" }
+
+        let mut prefix: string = ""
+        if logger.timestamps {
+            let now = std.time.now()
+            prefix = prefix ++ std.time.format(now) ++ " "
+        }
+        prefix = prefix ++ "[" ++ lbl ++ "] " ++ logger.name ++ ": "
+
+        std.io.println(prefix ++ message)
+
+        if level >= FATAL {
+            std.system.exit(1)
+        }
+    }
+
+    @Inline fn debug(logger: Logger, msg: string)   { log(logger, DEBUG, msg) }
+    @Inline fn info(logger: Logger, msg: string)    { log(logger, INFO,  msg) }
+    @Inline fn warn(logger: Logger, msg: string)    { log(logger, WARN,  msg) }
+    @Inline fn error(logger: Logger, msg: string)   { log(logger, ERROR, msg) }
+    @Inline fn fatal(logger: Logger, msg: string)   { log(logger, FATAL, msg) }
+
+} // namespace std.log

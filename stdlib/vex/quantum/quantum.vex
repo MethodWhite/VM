@@ -1,0 +1,206 @@
+// std.quantum.vex - Quantum computing types and operations for Vex
+
+namespace std.quantum {
+
+    // -----------------------------------------------------------------
+    //  Types
+    // -----------------------------------------------------------------
+
+    type Complex = struct {
+        re: f64
+        im: f64
+    }
+
+    type Qubit = struct {
+        index:     i32
+        amplitude: Complex
+    }
+
+    type GateType = enum {
+        Hadamard
+        PauliX
+        PauliY
+        PauliZ
+        CNOT
+        SWAP
+        Toffoli
+        Phase
+        T
+        S
+        Rx
+        Ry
+        Rz
+    }
+
+    type Gate = struct {
+        gate_type: GateType
+        targets:   i32[]
+        parameters: f64[]
+    }
+
+    type Measurement = struct {
+        qubit:      i32
+        result:     bool
+        probability: f64
+    }
+
+    type QuantumCircuit = struct {
+        n_qubits:     i32
+        gates:        Gate[]
+        measurements: Measurement[]
+    }
+
+    // -----------------------------------------------------------------
+    //  Constants
+    // -----------------------------------------------------------------
+
+    const PI : f64 = 3.14159265358979323846
+    const TAU : f64 = 6.28318530717958647693
+    const SQRT2_INV : f64 = 0.70710678118654752440
+
+    // -----------------------------------------------------------------
+    //  Gate constructors
+    // -----------------------------------------------------------------
+
+    fn create_circuit(n_qubits: i32) -> QuantumCircuit {
+        return QuantumCircuit {
+            n_qubits = n_qubits,
+            gates = [],
+            measurements = []
+        }
+    }
+
+    fn _add_gate(circuit: &QuantumCircuit, gt: GateType, targets: i32[], params: f64[]) -> &QuantumCircuit {
+        circuit.gates = circuit.gates ++ [Gate { gate_type = gt, targets = targets, parameters = params }]
+        return circuit
+    }
+
+    @Inline
+    fn h(circuit: &QuantumCircuit, qubit: i32) -> &QuantumCircuit {
+        return _add_gate(circuit, GateType.Hadamard, [qubit], [])
+    }
+
+    @Inline
+    fn x(circuit: &QuantumCircuit, qubit: i32) -> &QuantumCircuit {
+        return _add_gate(circuit, GateType.PauliX, [qubit], [])
+    }
+
+    @Inline
+    fn y(circuit: &QuantumCircuit, qubit: i32) -> &QuantumCircuit {
+        return _add_gate(circuit, GateType.PauliY, [qubit], [])
+    }
+
+    @Inline
+    fn z(circuit: &QuantumCircuit, qubit: i32) -> &QuantumCircuit {
+        return _add_gate(circuit, GateType.PauliZ, [qubit], [])
+    }
+
+    @Inline
+    fn cx(circuit: &QuantumCircuit, control: i32, target: i32) -> &QuantumCircuit {
+        return _add_gate(circuit, GateType.CNOT, [control, target], [])
+    }
+
+    @Inline
+    fn swap(circuit: &QuantumCircuit, q1: i32, q2: i32) -> &QuantumCircuit {
+        return _add_gate(circuit, GateType.SWAP, [q1, q2], [])
+    }
+
+    @Inline
+    fn toffoli(circuit: &QuantumCircuit, c1: i32, c2: i32, target: i32) -> &QuantumCircuit {
+        return _add_gate(circuit, GateType.Toffoli, [c1, c2, target], [])
+    }
+
+    @Inline
+    fn phase(circuit: &QuantumCircuit, qubit: i32, angle: f64) -> &QuantumCircuit {
+        return _add_gate(circuit, GateType.Phase, [qubit], [angle])
+    }
+
+    @Inline
+    fn t(circuit: &QuantumCircuit, qubit: i32) -> &QuantumCircuit {
+        return _add_gate(circuit, GateType.T, [qubit], [])
+    }
+
+    @Inline
+    fn s(circuit: &QuantumCircuit, qubit: i32) -> &QuantumCircuit {
+        return _add_gate(circuit, GateType.S, [qubit], [])
+    }
+
+    @Inline
+    fn rx(circuit: &QuantumCircuit, qubit: i32, angle: f64) -> &QuantumCircuit {
+        return _add_gate(circuit, GateType.Rx, [qubit], [angle])
+    }
+
+    @Inline
+    fn ry(circuit: &QuantumCircuit, qubit: i32, angle: f64) -> &QuantumCircuit {
+        return _add_gate(circuit, GateType.Ry, [qubit], [angle])
+    }
+
+    @Inline
+    fn rz(circuit: &QuantumCircuit, qubit: i32, angle: f64) -> &QuantumCircuit {
+        return _add_gate(circuit, GateType.Rz, [qubit], [angle])
+    }
+
+    // -----------------------------------------------------------------
+    //  Measurement and simulation
+    // -----------------------------------------------------------------
+
+    @Inline
+    fn measure(circuit: &QuantumCircuit, qubit: i32) -> &QuantumCircuit {
+        circuit.measurements = circuit.measurements ++ [Measurement { qubit = qubit, result = false, probability = 0.0 }]
+        return circuit
+    }
+
+    @Extern("vesta_quantum:vquantum_run_simulator")
+    fn run_simulator(circuit: QuantumCircuit) -> Measurement[]
+
+    @Extern("vesta_quantum:vquantum_statevector")
+    fn statevector(circuit: QuantumCircuit) -> f64[]
+
+    // -----------------------------------------------------------------
+    //  Utility: complex helpers
+    // -----------------------------------------------------------------
+
+    @Inline
+    fn complex(re: f64, im: f64) -> Complex {
+        return Complex { re = re, im = im }
+    }
+
+    @Inline
+    fn cadd(a: Complex, b: Complex) -> Complex {
+        return Complex { re = a.re + b.re, im = a.im + b.im }
+    }
+
+    @Inline
+    fn csub(a: Complex, b: Complex) -> Complex {
+        return Complex { re = a.re - b.re, im = a.im - b.im }
+    }
+
+    @Inline
+    fn cmul(a: Complex, b: Complex) -> Complex {
+        return Complex {
+            re = a.re * b.re - a.im * b.im,
+            im = a.re * b.im + a.im * b.re
+        }
+    }
+
+    @Inline
+    fn cscale(a: Complex, s: f64) -> Complex {
+        return Complex { re = a.re * s, im = a.im * s }
+    }
+
+    @Inline
+    fn cnorm(a: Complex) -> f64 {
+        return a.re * a.re + a.im * a.im
+    }
+
+    @Inline
+    fn cmag(a: Complex) -> f64 {
+        return sqrt(a.re * a.re + a.im * a.im)
+    }
+
+    @Inline
+    fn conj(a: Complex) -> Complex {
+        return Complex { re = a.re, im = -a.im }
+    }
+
+} // namespace std.quantum

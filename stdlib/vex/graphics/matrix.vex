@@ -1,0 +1,316 @@
+// std.graphics.matrix - 4x4 matrix math for 3D graphics
+// Column-major storage: m.data[col*4 + row]
+
+namespace std.graphics.matrix {
+
+    type matrix4x4 = struct {
+        data: f32[16]
+    }
+
+    // -----------------------------------------------------------------
+    //  Construction
+    // -----------------------------------------------------------------
+
+    @Inline
+    fn matrix4x4(
+        m00: f32, m01: f32, m02: f32, m03: f32,
+        m10: f32, m11: f32, m12: f32, m13: f32,
+        m20: f32, m21: f32, m22: f32, m23: f32,
+        m30: f32, m31: f32, m32: f32, m33: f32
+    ) -> matrix4x4 {
+        return matrix4x4 {
+            data: [
+                m00, m01, m02, m03,
+                m10, m11, m12, m13,
+                m20, m21, m22, m23,
+                m30, m31, m32, m33
+            ]
+        }
+    }
+
+    @Inline
+    fn identity() -> matrix4x4 {
+        return matrix4x4 {
+            data: [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0
+            ]
+        }
+    }
+
+    /// Zero matrix
+    @Inline
+    fn zero() -> matrix4x4 {
+        return matrix4x4 {
+            data: [
+                0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0
+            ]
+        }
+    }
+
+    /// Get element at (row, col)
+    @Inline
+    fn get(m: matrix4x4, row: i32, col: i32) -> f32 {
+        return m.data[col * 4 + row]
+    }
+
+    /// Set element at (row, col)
+    fn set(m: matrix4x4, row: i32, col: i32, v: f32) {
+        m.data[col * 4 + row] = v
+    }
+
+    // -----------------------------------------------------------------
+    //  Basic operations
+    // -----------------------------------------------------------------
+
+    @Inline
+    fn transpose(m: matrix4x4) -> matrix4x4 {
+        return matrix4x4 {
+            data: [
+                m.data[0], m.data[4], m.data[8],  m.data[12],
+                m.data[1], m.data[5], m.data[9],  m.data[13],
+                m.data[2], m.data[6], m.data[10], m.data[14],
+                m.data[3], m.data[7], m.data[11], m.data[15]
+            ]
+        }
+    }
+
+    /// Multiply two 4x4 matrices
+    fn mul(a: matrix4x4, b: matrix4x4) -> matrix4x4 {
+        let mut result = zero()
+        let mut col: i32 = 0
+        while col < 4 {
+            let mut row: i32 = 0
+            while row < 4 {
+                let mut sum: f32 = 0.0
+                let mut k: i32 = 0
+                while k < 4 {
+                    sum = sum + get(a, row, k) * get(b, k, col)
+                    k = k + 1
+                }
+                set(result, row, col, sum)
+                row = row + 1
+            }
+            col = col + 1
+        }
+        return result
+    }
+
+    /// Transform float4 by matrix (m * v)
+    fn mul_vec(m: matrix4x4, v: std.graphics.vectors.float4) -> std.graphics.vectors.float4 {
+        let x = m.data[0] * v.x + m.data[4] * v.y + m.data[8]  * v.z + m.data[12] * v.w
+        let y = m.data[1] * v.x + m.data[5] * v.y + m.data[9]  * v.z + m.data[13] * v.w
+        let z = m.data[2] * v.x + m.data[6] * v.y + m.data[10] * v.z + m.data[14] * v.w
+        let w = m.data[3] * v.x + m.data[7] * v.y + m.data[11] * v.z + m.data[15] * v.w
+        return std.graphics.vectors.float4 { x: x, y: y, z: z, w: w }
+    }
+
+    /// Transform float3 by matrix (m * v, w=1.0)
+    fn mul_vec3(m: matrix4x4, v: std.graphics.vectors.float3) -> std.graphics.vectors.float3 {
+        let x = m.data[0] * v.x + m.data[4] * v.y + m.data[8]  * v.z + m.data[12]
+        let y = m.data[1] * v.x + m.data[5] * v.y + m.data[9]  * v.z + m.data[13]
+        let z = m.data[2] * v.x + m.data[6] * v.y + m.data[10] * v.z + m.data[14]
+        return std.graphics.vectors.float3 { x: x, y: y, z: z }
+    }
+
+    // -----------------------------------------------------------------
+    //  Determinant and inverse
+    // -----------------------------------------------------------------
+
+    fn determinant(m: matrix4x4) -> f32 {
+        let a00 = m.data[0];  let a01 = m.data[1];  let a02 = m.data[2];  let a03 = m.data[3]
+        let a10 = m.data[4];  let a11 = m.data[5];  let a12 = m.data[6];  let a13 = m.data[7]
+        let a20 = m.data[8];  let a21 = m.data[9];  let a22 = m.data[10]; let a23 = m.data[11]
+        let a30 = m.data[12]; let a31 = m.data[13]; let a32 = m.data[14]; let a33 = m.data[15]
+
+        let b00 = a00 * a11 - a01 * a10
+        let b01 = a00 * a12 - a02 * a10
+        let b02 = a00 * a13 - a03 * a10
+        let b03 = a01 * a12 - a02 * a11
+        let b04 = a01 * a13 - a03 * a11
+        let b05 = a02 * a13 - a03 * a12
+        let b06 = a20 * a31 - a21 * a30
+        let b07 = a20 * a32 - a22 * a30
+        let b08 = a20 * a33 - a23 * a30
+        let b09 = a21 * a32 - a22 * a31
+        let b10 = a21 * a33 - a23 * a31
+        let b11 = a22 * a33 - a23 * a32
+
+        return b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06
+    }
+
+    fn inverse(m: matrix4x4) -> matrix4x4 {
+        let a00 = m.data[0];  let a01 = m.data[1];  let a02 = m.data[2];  let a03 = m.data[3]
+        let a10 = m.data[4];  let a11 = m.data[5];  let a12 = m.data[6];  let a13 = m.data[7]
+        let a20 = m.data[8];  let a21 = m.data[9];  let a22 = m.data[10]; let a23 = m.data[11]
+        let a30 = m.data[12]; let a31 = m.data[13]; let a32 = m.data[14]; let a33 = m.data[15]
+
+        let b00 = a00 * a11 - a01 * a10
+        let b01 = a00 * a12 - a02 * a10
+        let b02 = a00 * a13 - a03 * a10
+        let b03 = a01 * a12 - a02 * a11
+        let b04 = a01 * a13 - a03 * a11
+        let b05 = a02 * a13 - a03 * a12
+        let b06 = a20 * a31 - a21 * a30
+        let b07 = a20 * a32 - a22 * a30
+        let b08 = a20 * a33 - a23 * a30
+        let b09 = a21 * a32 - a22 * a31
+        let b10 = a21 * a33 - a23 * a31
+        let b11 = a22 * a33 - a23 * a32
+
+        let det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06
+        if det == 0.0 { return identity() }
+
+        let inv_det = 1.0 / det
+
+        return matrix4x4 {
+            data: [
+                ( a11 * b11 - a12 * b10 + a13 * b09) * inv_det,
+                (-a01 * b11 + a02 * b10 - a03 * b09) * inv_det,
+                ( a31 * b05 - a32 * b04 + a33 * b03) * inv_det,
+                (-a21 * b05 + a22 * b04 - a23 * b03) * inv_det,
+
+                (-a10 * b11 + a12 * b08 - a13 * b07) * inv_det,
+                ( a00 * b11 - a02 * b08 + a03 * b07) * inv_det,
+                (-a30 * b05 + a32 * b02 - a33 * b01) * inv_det,
+                ( a20 * b05 - a22 * b02 + a23 * b01) * inv_det,
+
+                ( a10 * b10 - a11 * b08 + a13 * b06) * inv_det,
+                (-a00 * b10 + a01 * b08 - a03 * b06) * inv_det,
+                ( a30 * b04 - a31 * b02 + a33 * b00) * inv_det,
+                (-a20 * b04 + a21 * b02 - a23 * b00) * inv_det,
+
+                (-a10 * b09 + a11 * b07 - a12 * b06) * inv_det,
+                ( a00 * b09 - a01 * b07 + a02 * b06) * inv_det,
+                (-a30 * b03 + a31 * b01 - a32 * b00) * inv_det,
+                ( a20 * b03 - a21 * b01 + a22 * b00) * inv_det
+            ]
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Transform matrices
+    // -----------------------------------------------------------------
+
+    @Inline
+    fn translate(tx: f32, ty: f32, tz: f32) -> matrix4x4 {
+        return matrix4x4 {
+            data: [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                tx,  ty,  tz,  1.0
+            ]
+        }
+    }
+
+    @Inline
+    fn rotate_x(angle: f32) -> matrix4x4 {
+        let c = cos(angle)
+        let s = sin(angle)
+        return matrix4x4 {
+            data: [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, c,   s,   0.0,
+                0.0, -s,  c,   0.0,
+                0.0, 0.0, 0.0, 1.0
+            ]
+        }
+    }
+
+    @Inline
+    fn rotate_y(angle: f32) -> matrix4x4 {
+        let c = cos(angle)
+        let s = sin(angle)
+        return matrix4x4 {
+            data: [
+                c,   0.0, -s,  0.0,
+                0.0, 1.0, 0.0, 0.0,
+                s,   0.0, c,   0.0,
+                0.0, 0.0, 0.0, 1.0
+            ]
+        }
+    }
+
+    @Inline
+    fn rotate_z(angle: f32) -> matrix4x4 {
+        let c = cos(angle)
+        let s = sin(angle)
+        return matrix4x4 {
+            data: [
+                c,   s,   0.0, 0.0,
+                -s,  c,   0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0
+            ]
+        }
+    }
+
+    @Inline
+    fn scale(sx: f32, sy: f32, sz: f32) -> matrix4x4 {
+        return matrix4x4 {
+            data: [
+                sx,  0.0, 0.0, 0.0,
+                0.0, sy,  0.0, 0.0,
+                0.0, 0.0, sz,  0.0,
+                0.0, 0.0, 0.0, 1.0
+            ]
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Projection and view matrices
+    // -----------------------------------------------------------------
+
+    fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> matrix4x4 {
+        let f = 1.0 / tan(fov_y * 0.5)
+        let range_inv = 1.0 / (near - far)
+        return matrix4x4 {
+            data: [
+                f / aspect, 0.0, 0.0, 0.0,
+                0.0, f, 0.0, 0.0,
+                0.0, 0.0, (near + far) * range_inv, -1.0,
+                0.0, 0.0, 2.0 * near * far * range_inv, 0.0
+            ]
+        }
+    }
+
+    fn look_at(eye: std.graphics.vectors.float3, target: std.graphics.vectors.float3, up: std.graphics.vectors.float3) -> matrix4x4 {
+        let fwd = std.graphics.vectors.normalize(std.graphics.vectors.sub(target, eye))
+        let right = std.graphics.vectors.normalize(std.graphics.vectors.cross(fwd, up))
+        let new_up = std.graphics.vectors.cross(right, fwd)
+
+        return matrix4x4 {
+            data: [
+                right.x, new_up.x, -fwd.x, 0.0,
+                right.y, new_up.y, -fwd.y, 0.0,
+                right.z, new_up.z, -fwd.z, 0.0,
+                -std.graphics.vectors.dot(right, eye),
+                -std.graphics.vectors.dot(new_up, eye),
+                std.graphics.vectors.dot(fwd, eye),
+                1.0
+            ]
+        }
+    }
+
+    @Inline
+    fn ortho(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> matrix4x4 {
+        let rml = right - left
+        let tmb = top - bottom
+        let fmn = far - near
+        return matrix4x4 {
+            data: [
+                2.0 / rml, 0.0, 0.0, 0.0,
+                0.0, 2.0 / tmb, 0.0, 0.0,
+                0.0, 0.0, -2.0 / fmn, 0.0,
+                -(right + left) / rml, -(top + bottom) / tmb, -(far + near) / fmn, 1.0
+            ]
+        }
+    }
+
+} // namespace std.graphics.matrix

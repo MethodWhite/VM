@@ -1,0 +1,93 @@
+// std.physics.collision - Collision detection primitives
+// AABB, Sphere, Ray tests with closest-point queries.
+
+namespace std.physics {
+
+    type AABB = struct {
+        min: Vec3
+        max: Vec3
+    }
+
+    type Sphere = struct {
+        center: Vec3
+        radius: f64
+    }
+
+    type Ray = struct {
+        origin: Vec3
+        direction: Vec3
+    }
+
+    type CollisionInfo = struct {
+        collided: bool
+        point: Vec3
+        normal: Vec3
+        penetration: f64
+    }
+
+    @Inline
+    fn aabb_create(min: Vec3, max: Vec3) -> AABB {
+        return AABB { min: min, max: max }
+    }
+
+    @Inline
+    fn sphere_create(center: Vec3, radius: f64) -> Sphere {
+        return Sphere { center: center, radius: radius }
+    }
+
+    fn aabb_vs_aabb(a: AABB, b: AABB) -> bool {
+        if a.max.x < b.min.x || a.min.x > b.max.x { return false }
+        if a.max.y < b.min.y || a.min.y > b.max.y { return false }
+        if a.max.z < b.min.z || a.min.z > b.max.z { return false }
+        return true
+    }
+
+    fn sphere_vs_sphere(a: Sphere, b: Sphere) -> bool {
+        let diff = v3_sub(a.center, b.center)
+        let dist_sq = v3_dot(diff, diff)
+        let rad_sum = a.radius + b.radius
+        return dist_sq <= rad_sum * rad_sum
+    }
+
+    fn aabb_vs_sphere(aabb: AABB, sphere: Sphere) -> bool {
+        let cx = if sphere.center.x < aabb.min.x { aabb.min.x } else { if sphere.center.x > aabb.max.x { aabb.max.x } else { sphere.center.x } }
+        let cy = if sphere.center.y < aabb.min.y { aabb.min.y } else { if sphere.center.y > aabb.max.y { aabb.max.y } else { sphere.center.y } }
+        let cz = if sphere.center.z < aabb.min.z { aabb.min.z } else { if sphere.center.z > aabb.max.z { aabb.max.z } else { sphere.center.z } }
+        let dx = sphere.center.x - cx
+        let dy = sphere.center.y - cy
+        let dz = sphere.center.z - cz
+        return dx * dx + dy * dy + dz * dz <= sphere.radius * sphere.radius
+    }
+
+    fn ray_vs_aabb(ray: Ray, aabb: AABB) -> f64 {
+        let inv_dir_x = 1.0 / ray.direction.x
+        let inv_dir_y = 1.0 / ray.direction.y
+        let inv_dir_z = 1.0 / ray.direction.z
+        let t1 = (aabb.min.x - ray.origin.x) * inv_dir_x
+        let t2 = (aabb.max.x - ray.origin.x) * inv_dir_x
+        let t3 = (aabb.min.y - ray.origin.y) * inv_dir_y
+        let t4 = (aabb.max.y - ray.origin.y) * inv_dir_y
+        let t5 = (aabb.min.z - ray.origin.z) * inv_dir_z
+        let t6 = (aabb.max.z - ray.origin.z) * inv_dir_z
+        let tmin = max(max(min(t1, t2), min(t3, t4)), min(t5, t6))
+        let tmax = min(min(max(t1, t2), max(t3, t4)), max(t5, t6))
+        if tmax < 0.0 || tmin > tmax { return -1.0 }
+        if tmin < 0.0 { return tmax }
+        return tmin
+    }
+
+    fn ray_vs_sphere(ray: Ray, sphere: Sphere) -> f64 {
+        let oc = v3_sub(ray.origin, sphere.center)
+        let a = v3_dot(ray.direction, ray.direction)
+        let b = 2.0 * v3_dot(oc, ray.direction)
+        let c = v3_dot(oc, oc) - sphere.radius * sphere.radius
+        let disc = b * b - 4.0 * a * c
+        if disc < 0.0 { return -1.0 }
+        let t1 = (-b - sqrt(disc)) / (2.0 * a)
+        let t2 = (-b + sqrt(disc)) / (2.0 * a)
+        if t1 >= 0.0 { return t1 }
+        if t2 >= 0.0 { return t2 }
+        return -1.0
+    }
+
+} // namespace std.physics

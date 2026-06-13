@@ -1,0 +1,75 @@
+// std.io.vex - File and console I/O for Vex
+
+namespace std.io {
+
+    // File modes
+    const MODE_READ   : i32 = 0
+    const MODE_WRITE  : i32 = 1
+    const MODE_APPEND : i32 = 2
+
+    type File = struct {
+        handle: i64
+        path:   string
+        mode:   i32
+    }
+
+    /// Open a file. Returns null handle on failure.
+    @Extern("vesta_io:vfile_open")
+    fn open(path: string, mode: i32) -> File
+
+    /// Close a file
+    @Extern("vesta_io:vfile_close")
+    fn close(file: File)
+
+    /// Read entire file into string
+    @Extern("vesta_io:vfile_read_all")
+    fn read_all(path: string) -> string
+
+    /// Write string to file
+    @Extern("vesta_io:vfile_write")
+    fn write(file: File, content: string) -> bool
+
+    /// Write string to file path (open + write + close)
+    fn write_all(path: string, content: string) -> bool {
+        let f = open(path, MODE_WRITE)
+        if f.handle == 0 { return false }
+        let ok = write(f, content)
+        close(f)
+        return ok
+    }
+
+    /// Check if file exists
+    @Extern("vesta_io:vfile_exists")
+    fn exists(path: string) -> bool
+
+    /// Delete file
+    @Extern("vesta_io:vfile_delete")
+    fn delete(path: string) -> bool
+
+    /// Read line from stdin
+    @Extern("vesta_io:vreadln")
+    fn read_line() -> string
+
+    /// Print to stdout (without newline)
+    @Extern("vesta_io:vprint")
+    fn print(s: string)
+
+    /// Print line to stdout
+    @Inline
+    fn println(s: string) {
+        print(s ++ "\n")
+    }
+
+    /// Format a value as string
+    @Extern("vesta_io:vformat")
+    fn format(value: f64, decimals: i32) -> string
+
+    /// Read entire binary file into byte array
+    @Extern("vesta_io:vfile_read_binary")
+    fn read_binary(path: string) -> u8[]
+
+    /// Write byte array to file
+    @Extern("vesta_io:vfile_write_binary")
+    fn write_binary(path: string, data: u8[]) -> bool
+
+} // namespace std.io

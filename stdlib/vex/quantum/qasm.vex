@@ -1,0 +1,106 @@
+// qasm.vex - Vex → OpenQASM 2.0/3.0 compiler
+// Genera código cuántico ejecutable en IBM Qiskit, AWS Braket, etc.
+
+namespace std.qasm {
+
+    fn gate_name(g: std.quantum.Gate) -> string {
+        let t = g.type
+        if t == std.quantum.GateType.Hadamard  { return "h" }
+        if t == std.quantum.GateType.PauliX    { return "x" }
+        if t == std.quantum.GateType.PauliY    { return "y" }
+        if t == std.quantum.GateType.PauliZ    { return "z" }
+        if t == std.quantum.GateType.CNOT      { return "cx" }
+        if t == std.quantum.GateType.SWAP      { return "swap" }
+        if t == std.quantum.GateType.Toffoli   { return "ccx" }
+        if t == std.quantum.GateType.Phase     { return "p(" ++ format(g.params[0], 6) ++ ")" }
+        if t == std.quantum.GateType.T         { return "t" }
+        if t == std.quantum.GateType.S         { return "s" }
+        if t == std.quantum.GateType.Rx        { return "rx(" ++ format(g.params[0], 6) ++ ")" }
+        if t == std.quantum.GateType.Ry        { return "ry(" ++ format(g.params[0], 6) ++ ")" }
+        if t == std.quantum.GateType.Rz        { return "rz(" ++ format(g.params[0], 6) ++ ")" }
+        return "// unknown gate"
+    }
+
+    fn emit_qasm2(circuit: std.quantum.QuantumCircuit) -> string {
+        let mut qasm: string = ""
+        qasm = qasm ++ "OPENQASM 2.0;\n"
+        qasm = qasm ++ "include \"qelib1.inc\";\n"
+        qasm = qasm ++ "qreg q[" ++ format(f64(circuit.n_qubits), 0) ++ "];\n"
+        qasm = qasm ++ "creg c[" ++ format(f64(circuit.n_qubits), 0) ++ "];\n\n"
+
+        for gate in circuit.gates {
+            let name = gate_name(gate)
+            let targets: string = ""
+            let mut i: i32 = 0
+            while i < gate.targets.size() {
+                if i > 0 { targets = targets ++ ", " }
+                targets = targets ++ "q[" ++ format(f64(gate.targets[i]), 0) ++ "]"
+                i = i + 1
+            }
+            qasm = qasm ++ name ++ " " ++ targets ++ ";\n"
+        }
+
+        qasm = qasm ++ "\n"
+        for m in circuit.measurements {
+            qasm = qasm ++ "measure q[" ++ format(f64(m.qubit), 0) ++ "] -> c[" ++ format(f64(m.qubit), 0) ++ "];\n"
+        }
+
+        return qasm
+    }
+
+    fn emit_qasm3(circuit: std.quantum.QuantumCircuit) -> string {
+        let mut qasm: string = ""
+        qasm = qasm ++ "OPENQASM 3.0;\n"
+        qasm = qasm ++ "include \"stdgates.inc\";\n\n"
+        qasm = qasm ++ "qubit[" ++ format(f64(circuit.n_qubits), 0) ++ "] q;\n"
+        qasm = qasm ++ "bit[" ++ format(f64(circuit.n_qubits), 0) ++ "] c;\n\n"
+
+        for gate in circuit.gates {
+            let name = gate_name(gate)
+            let targets: string = ""
+            let mut i: i32 = 0
+            while i < gate.targets.size() {
+                if i > 0 { targets = targets ++ ", " }
+                targets = targets ++ "q[" ++ format(f64(gate.targets[i]), 0) ++ "]"
+                i = i + 1
+            }
+            qasm = qasm ++ name ++ " " ++ targets ++ ";\n"
+        }
+
+        qasm = qasm ++ "\n"
+        for m in circuit.measurements {
+            qasm = qasm ++ "c[" ++ format(f64(m.qubit), 0) ++ "] = measure q[" ++ format(f64(m.qubit), 0) ++ "];\n"
+        }
+
+        return qasm
+    }
+
+    /// Export circuit to Qiskit Python code
+    fn emit_qiskit(circuit: std.quantum.QuantumCircuit) -> string {
+        let mut py: string = ""
+        py = py ++ "from qiskit import QuantumCircuit, execute, Aer\n"
+        py = py ++ "from qiskit.visualization import plot_histogram\n\n"
+        py = py ++ "qc = QuantumCircuit(" ++ format(f64(circuit.n_qubits), 0) ++ ", " ++ format(f64(circuit.n_qubits), 0) ++ ")\n\n"
+
+        for gate in circuit.gates {
+            let name = gate_name(gate)
+            let targets: string = ""
+            let mut i: i32 = 0
+            while i < gate.targets.size() {
+                if i > 0 { targets = targets ++ ", " }
+                targets = targets ++ format(f64(gate.targets[i]), 0)
+                i = i + 1
+            }
+            py = py ++ "qc." ++ name ++ "(" ++ targets ++ ")\n"
+        }
+
+        py = py ++ "\n# Ejecutar simulador\n"
+        py = py ++ "backend = Aer.get_backend('statevector_simulator')\n"
+        py = py ++ "job = execute(qc, backend)\n"
+        py = py ++ "result = job.result()\n"
+        py = py ++ "counts = result.get_counts()\n"
+        py = py ++ "print(counts)\n"
+        return py
+    }
+
+} // namespace std.qasm

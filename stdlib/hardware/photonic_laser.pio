@@ -1,0 +1,169 @@
+;
+; photonic_laser.pio
+; PIO program for driving up to 4 laser diodes with precise PWM timing.
+;
+; Protocol (per SM FIFO, one 32-bit word):
+;   [15:0]  = on_cycles  – clock cycles pin is HIGH (0 = skip, min pulse = 2 cycles)
+;   [31:16] = off_cycles – clock cycles pin is LOW  (0 = skip, min gap = 2 cycles)
+;
+; The SM uses non-blocking pull so the laser continues with the last
+; parameters until a new word is written.  This allows glitch-free updates.
+;
+; Pin map (SET pin):
+;   One GPIO per SM (laser 0 … laser 3 on PIO0; laser 4 on PIO1).
+;
+; Synchronisation:
+;   All lasers are started together by enabling SMs in quick succession.
+;   For cycle-accurate sync, preload every SM via pio_sm_put() then
+;   set all SM enables simultaneously.
+;
+
+.program photonic_laser
+
+.wrap_target
+    pull noblock            ; grab new word (or keep old)
+    out y, 16               ; Y = on_cycles  (bits 15:0)
+    out x, 16               ; X = off_cycles (bits 31:16)
+
+    jmp !y, off             ; on_cycles == 0 → skip on-pulse
+
+    set pins, 1             ; laser ON
+on_loop:
+    jmp y--, on_loop        ; hold high for Y+1 cycles
+
+off:
+    set pins, 0             ; laser OFF
+
+    jmp !x, .wrap           ; off_cycles == 0 → skip off-pulse
+off_loop:
+    jmp x--, off_loop       ; hold low for X+1 cycles
+.wrap
+
+
+% c-sdk {
+
+#include "hardware/pio.h"
+#include "hardware/irq.h"
+#include "hardware/clocks.h"
+
+/* ---------------------------------------------------------------
+ * Laser channel descriptor
+ * ------------------------------------------------------------ */
+typedef struct {
+    PIO    pio;
+    uint   sm;
+    uint   offset;
+    uint   gpio;
+    uint   pio_idx;       /* 0 or 1 */
+} laser_channel_t;
+
+/* ---------------------------------------------------------------
+ * Initialise a single laser channel.
+ * Loads the PIO program, claims the SM, and sets the GPIO as output.
+ * ------------------------------------------------------------ */
+static inline void laser_channel_init(laser_channel_t *ch,
+                                      PIO pio, uint sm, uint gpio)
+{
+    ch->pio  = pio;
+    ch->sm   = sm;
+    ch->gpio = gpio;
+    ch->pio_idx = (pio == pio0) ? 0 : 1;
+
+    uint off = pio_add_program(pio, &photonic_laser_program);
+    ch->offset = off;
+
+    pio_sm_claim(pio, sm);
+    pio_gpio_init(pio, gpio);
+    gpio_set_function(gpio, GPIO_FUNC_PIOx(ch->pio_idx));
+    gpio_set_dir(gpio, true);
+
+    pio_sm_config c = photonic_laser_program_get_default_config(off);
+    sm_config_set_set_pins(&c, gpio, 1);
+    // Disable autopush/pull – we control data flow manually
+    sm_config_set_out_shift(&c, false, false, 32);
+    sm_config_set_in_shift(&c, false, false, 32);
+
+    pio_sm_init(pio, sm, off, &c);
+    // Start with laser OFF (on = 0, off = 1)
+    pio_sm_put(pio, sm, 1u << 16);   /* on=0, off=1 */
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+/* ---------------------------------------------------------------
+ * Fire a laser (or update its PWM parameters).
+ *
+ *   on_cycles  – number of sysclk cycles pin stays high
+ *                (0 to 65535; 0 means skip the on-pulse)
+ *   off_cycles – number of sysclk cycles pin stays low
+ *                (0 to 65535; 0 means skip the off-pulse)
+ *
+ * The combined word is pushed to the SM FIFO; the SM picks it
+ * up at the next pull noblock (after the current cycle finishes).
+ * ------------------------------------------------------------ */
+static inline void laser_fire(laser_channel_t *ch,
+                              uint16_t on_cycles, uint16_t off_cycles)
+{
+    uint32_t word = ((uint32_t)off_cycles << 16) | (uint32_t)on_cycles;
+    pio_sm_put(ch->pio, ch->sm, word);
+}
+
+/* ---------------------------------------------------------------
+ * Turn a laser off.
+ * Pushes a word with on=0, off=65535 so the pin stays low.
+ * ------------------------------------------------------------ */
+static inline void laser_off(laser_channel_t *ch)
+{
+    uint32_t word = (65535u << 16) | 0u;
+    pio_sm_put(ch->pio, ch->sm, word);
+}
+
+/* ---------------------------------------------------------------
+ * Synchronised start for all lasers listed in an array.
+ *
+ * 1) Disable every SM
+ * 2) Push the desired (on, off) word to each
+ * 3) Enable all SMs at once → simultaneous firing
+ * ------------------------------------------------------------ */
+static inline void laser_sync_fire(laser_channel_t *channels,
+                                   uint16_t on_cycles, uint16_t off_cycles,
+                                   uint count)
+{
+    uint32_t word = ((uint32_t)off_cycles << 16) | (uint32_t)on_cycles;
+    for (uint i = 0; i < count; i++) {
+        pio_sm_set_enabled(channels[i].pio, channels[i].sm, false);
+    }
+    for (uint i = 0; i < count; i++) {
+        // Drain stale data so the next put is consumed immediately
+        pio_sm_clear_fifos(channels[i].pio, channels[i].sm);
+        pio_sm_put(channels[i].pio, channels[i].sm, word);
+    }
+    for (uint i = 0; i < count; i++) {
+        pio_sm_restart(channels[i].pio, channels[i].sm);
+        pio_sm_clkdiv_restart(channels[i].pio, channels[i].sm);
+    }
+    for (uint i = 0; i < count; i++) {
+        pio_sm_set_enabled(channels[i].pio, channels[i].sm, true);
+    }
+}
+
+/* ---------------------------------------------------------------
+ * Convert a nanosecond duration to sysclk cycles for the PIO.
+ *
+ *   ns  – desired pulse width in nanoseconds
+ *   clk – system clock frequency in Hz
+ *
+ * Returns the value to write in the on_cycles field.
+ * Note: the PIO program uses the formula:
+ *   pulse_cycles = on_cycles + 1   (when on_cycles > 0)
+ * Minimum non-zero pulse: 3 cycles (on_cycles = 1).
+ * ------------------------------------------------------------ */
+static inline uint16_t ns_to_cycles(uint32_t ns, uint32_t clk)
+{
+    uint64_t tmp = (uint64_t)ns * clk;
+    uint32_t cycles = (uint32_t)(tmp / 1000000000ull);
+    if (cycles == 0) return 0;
+    if (cycles <= 3)  return 1;       /* clamp to minimum non-zero pulse */
+    return (uint16_t)(cycles - 1);    /* compensate for set+loop overhead */
+}
+
+%}

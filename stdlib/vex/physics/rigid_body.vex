@@ -1,0 +1,66 @@
+// std.physics.rigid_body - Rigid body dynamics
+// Newtonian motion with integration and impulse resolution.
+
+namespace std.physics {
+
+    type RigidBody = struct {
+        position: Vec3
+        rotation: Vec3
+        velocity: Vec3
+        angular_velocity: Vec3
+        mass: f64
+        inertia: f64
+        force_accum: Vec3
+        torque_accum: Vec3
+        restitution: f64
+        friction: f64
+        is_static: bool
+    }
+
+    fn rigid_body_create(mass: f64, pos: Vec3) -> RigidBody {
+        return RigidBody {
+            position: pos,
+            rotation: vec3(0.0, 0.0, 0.0),
+            velocity: vec3(0.0, 0.0, 0.0),
+            angular_velocity: vec3(0.0, 0.0, 0.0),
+            mass: mass,
+            inertia: mass * 0.5,
+            force_accum: vec3(0.0, 0.0, 0.0),
+            torque_accum: vec3(0.0, 0.0, 0.0),
+            restitution: 0.5,
+            friction: 0.3,
+            is_static: mass <= 0.0
+        }
+    }
+
+    fn rigid_body_apply_force(body: RigidBody, force: Vec3) {
+        body.force_accum = v3_add(body.force_accum, force)
+    }
+
+    fn rigid_body_apply_impulse(body: RigidBody, impulse: Vec3, contact: Vec3) {
+        if body.is_static { return }
+        let rel = v3_sub(contact, body.position)
+        body.velocity = v3_add(body.velocity, v3_scale(impulse, 1.0 / body.mass))
+        body.angular_velocity = v3_add(
+            body.angular_velocity,
+            v3_scale(v3_cross(rel, impulse), 1.0 / body.inertia)
+        )
+    }
+
+    fn rigid_body_integrate(body: RigidBody, dt: f64) {
+        if body.is_static { return }
+        let inv_mass = 1.0 / body.mass
+        let accel = v3_scale(body.force_accum, inv_mass)
+        body.velocity = v3_add(body.velocity, v3_scale(accel, dt))
+        body.position = v3_add(body.position, v3_scale(body.velocity, dt))
+        let ang_accel = v3_scale(body.torque_accum, 1.0 / body.inertia)
+        body.angular_velocity = v3_add(body.angular_velocity, v3_scale(ang_accel, dt))
+        body.rotation = v3_add(body.rotation, v3_scale(body.angular_velocity, dt))
+    }
+
+    fn rigid_body_clear_forces(body: RigidBody) {
+        body.force_accum = vec3(0.0, 0.0, 0.0)
+        body.torque_accum = vec3(0.0, 0.0, 0.0)
+    }
+
+} // namespace std.physics

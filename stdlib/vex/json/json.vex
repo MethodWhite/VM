@@ -1,0 +1,247 @@
+// std.json.vex - JSON parser and serializer in pure Vex
+// Filosofía: hand-rolled, zero dependencies, eficiente.
+
+namespace std.json {
+
+    type JsonValue = struct {
+        kind:   i32     // 0=null 1=bool 2=number 3=string 4=array 5=object
+        b:      bool
+        n:      f64
+        s:      string
+        items:  JsonValue[]
+        fields: JsonField[]
+    }
+
+    type JsonField = struct {
+        key:   string
+        value: JsonValue
+    }
+
+    // -----------------------------------------------------------------
+    //  Constructors
+    // -----------------------------------------------------------------
+
+    @Inline fn json_null()              -> JsonValue { return JsonValue { kind: 0, b: false, n: 0.0, s: "", items: [], fields: [] } }
+    @Inline fn json_bool(v: bool)       -> JsonValue { return JsonValue { kind: 1, b: v,    n: 0.0, s: "", items: [], fields: [] } }
+    @Inline fn json_number(v: f64)      -> JsonValue { return JsonValue { kind: 2, b: false, n: v, s: "", items: [], fields: [] } }
+    @Inline fn json_int(v: i64)         -> JsonValue { return JsonValue { kind: 2, b: false, n: f64(v), s: "", items: [], fields: [] } }
+    @Inline fn json_string(v: string)   -> JsonValue { return JsonValue { kind: 3, b: false, n: 0.0, s: v, items: [], fields: [] } }
+
+    fn json_array(items: JsonValue[]) -> JsonValue {
+        return JsonValue { kind: 4, b: false, n: 0.0, s: "", items: items, fields: [] }
+    }
+
+    fn json_object(fields: JsonField[]) -> JsonValue {
+        return JsonValue { kind: 5, b: false, n: 0.0, s: "", items: [], fields: fields }
+    }
+
+    @Inline fn json_field(key: string, value: JsonValue) -> JsonField {
+        return JsonField { key: key, value: value }
+    }
+
+    // -----------------------------------------------------------------
+    //  Accessors
+    // -----------------------------------------------------------------
+
+    @Inline fn is_null(v: JsonValue)  -> bool { return v.kind == 0 }
+    @Inline fn is_bool(v: JsonValue)   -> bool { return v.kind == 1 }
+    @Inline fn is_number(v: JsonValue) -> bool { return v.kind == 2 }
+    @Inline fn is_string(v: JsonValue) -> bool { return v.kind == 3 }
+    @Inline fn is_array(v: JsonValue)  -> bool { return v.kind == 4 }
+    @Inline fn is_object(v: JsonValue) -> bool { return v.kind == 5 }
+
+    fn get_field(obj: JsonValue, key: string) -> JsonValue {
+        if obj.kind != 5 { return json_null() }
+        for f in obj.fields {
+            if f.key == key { return f.value }
+        }
+        return json_null()
+    }
+
+    @Inline fn get_items(arr: JsonValue) -> JsonValue[] {
+        if arr.kind != 4 { return [] }
+        return arr.items
+    }
+
+    // -----------------------------------------------------------------
+    //  Serializer
+    // -----------------------------------------------------------------
+
+    fn serialize(val: JsonValue) -> string {
+        if val.kind == 0 { return "null" }
+        if val.kind == 1 { return if val.b { "true" } else { "false" } }
+        if val.kind == 2 {
+            // Simple number formatting
+            let s = std.string.format(val.n, 6)
+            // Remove trailing zeros
+            while s.size() > 1 && s[s.size()-1] == '0' && s[s.size()-2] != '.' {
+                s = s[0..s.size()-1]
+            }
+            return s
+        }
+        if val.kind == 3 {
+            let mut escaped: string = "\""
+            let mut i: i32 = 0
+            while i < val.s.size() {
+                let c = val.s[i]
+                if c == '"' { escaped = escaped ++ "\\\"" }
+                elif c == '\\' { escaped = escaped ++ "\\\\" }
+                elif c == '\n' { escaped = escaped ++ "\\n" }
+                elif c == '\t' { escaped = escaped ++ "\\t" }
+                else { escaped = escaped ++ c }
+                i = i + 1
+            }
+            return escaped ++ "\""
+        }
+        if val.kind == 4 {
+            let mut result: string = "["
+            let mut i: i32 = 0
+            while i < val.items.size() {
+                if i > 0 { result = result ++ "," }
+                result = result ++ serialize(val.items[i])
+                i = i + 1
+            }
+            return result ++ "]"
+        }
+        if val.kind == 5 {
+            let mut result: string = "{"
+            let mut i: i32 = 0
+            while i < val.fields.size() {
+                if i > 0 { result = result ++ "," }
+                result = result ++ "\"" ++ val.fields[i].key ++ "\":" ++ serialize(val.fields[i].value)
+                i = i + 1
+            }
+            return result ++ "}"
+        }
+        return "null"
+    }
+
+    // -----------------------------------------------------------------
+    //  Parser (recursive descent)
+    // -----------------------------------------------------------------
+
+    type ParserState = struct {
+        input: string
+        pos:   i32
+    }
+
+    fn skip_ws(st: ParserState) {
+        while st.pos < st.input.size() {
+            let c = st.input[st.pos]
+            if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+                st.pos = st.pos + 1
+            } else { break }
+        }
+    }
+
+    fn parse_string(st: ParserState) -> string {
+        skip_ws(st)
+        if st.pos >= st.input.size() || st.input[st.pos] != '"' { return "" }
+        st.pos = st.pos + 1  // skip opening quote
+        let mut result: string = ""
+        while st.pos < st.input.size() {
+            let c = st.input[st.pos]
+            if c == '"' { st.pos = st.pos + 1; break }
+            if c == '\\' {
+                st.pos = st.pos + 1
+                if st.pos < st.input.size() {
+                    let esc = st.input[st.pos]
+                    if esc == '"' { result = result ++ "\"" }
+                    elif esc == '\\' { result = result ++ "\\" }
+                    elif esc == 'n' { result = result ++ "\n" }
+                    elif esc == 't' { result = result ++ "\t" }
+                    else { result = result ++ esc }
+                }
+            } else {
+                result = result ++ c
+            }
+            st.pos = st.pos + 1
+        }
+        return result
+    }
+
+    fn parse_number(st: ParserState) -> f64 {
+        skip_ws(st)
+        let mut num_str: string = ""
+        let start = st.pos
+        if st.pos < st.input.size() && st.input[st.pos] == '-' {
+            num_str = num_str ++ "-"; st.pos = st.pos + 1
+        }
+        while st.pos < st.input.size() {
+            let c = st.input[st.pos]
+            if c >= '0' && c <= '9' { num_str = num_str ++ c; st.pos = st.pos + 1 }
+            elif c == '.' { num_str = num_str ++ c; st.pos = st.pos + 1 }
+            else { break }
+        }
+        if num_str.size() == 0 || num_str == "-" { return 0.0 }
+        return f64(i64(num_str))  // simplified: Vex should handle this
+    }
+
+    // Forward declaration
+    fn parse_value(st: ParserState) -> JsonValue
+
+    fn parse_array(st: ParserState) -> JsonValue {
+        skip_ws(st)
+        if st.pos >= st.input.size() || st.input[st.pos] != '[' { return json_null() }
+        st.pos = st.pos + 1
+        let mut items: JsonValue[] = []
+        skip_ws(st)
+        if st.pos < st.input.size() && st.input[st.pos] == ']' {
+            st.pos = st.pos + 1
+            return json_array(items)
+        }
+        while true {
+            let val = parse_value(st)
+            items = items ++ [val]
+            skip_ws(st)
+            if st.pos >= st.input.size() { break }
+            if st.input[st.pos] == ']' { st.pos = st.pos + 1; break }
+            if st.input[st.pos] == ',' { st.pos = st.pos + 1 }
+        }
+        return json_array(items)
+    }
+
+    fn parse_object(st: ParserState) -> JsonValue {
+        skip_ws(st)
+        if st.pos >= st.input.size() || st.input[st.pos] != '{' { return json_null() }
+        st.pos = st.pos + 1
+        let mut fields: JsonField[] = []
+        skip_ws(st)
+        if st.pos < st.input.size() && st.input[st.pos] == '}' {
+            st.pos = st.pos + 1
+            return json_object(fields)
+        }
+        while true {
+            let key = parse_string(st)
+            skip_ws(st)
+            if st.pos < st.input.size() && st.input[st.pos] == ':' { st.pos = st.pos + 1 }
+            let val = parse_value(st)
+            fields = fields ++ [JsonField { key: key, value: val }]
+            skip_ws(st)
+            if st.pos >= st.input.size() { break }
+            if st.input[st.pos] == '}' { st.pos = st.pos + 1; break }
+            if st.input[st.pos] == ',' { st.pos = st.pos + 1 }
+        }
+        return json_object(fields)
+    }
+
+    fn parse_value(st: ParserState) -> JsonValue {
+        skip_ws(st)
+        if st.pos >= st.input.size() { return json_null() }
+        let c = st.input[st.pos]
+        if c == '"' { return json_string(parse_string(st)) }
+        if c == '{' { return parse_object(st) }
+        if c == '[' { return parse_array(st) }
+        if c == 't' { st.pos = st.pos + 4; return json_bool(true) }  // true
+        if c == 'f' { st.pos = st.pos + 5; return json_bool(false) } // false
+        if c == 'n' { st.pos = st.pos + 4; return json_null() }      // null
+        if c == '-' || (c >= '0' && c <= '9') { return json_number(parse_number(st)) }
+        return json_null()
+    }
+
+    fn parse(input: string) -> JsonValue {
+        let st = ParserState { input: input, pos: 0 }
+        return parse_value(st)
+    }
+
+} // namespace std.json

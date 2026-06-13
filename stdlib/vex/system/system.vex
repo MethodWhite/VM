@@ -1,0 +1,45 @@
+// std.system.vex - System information and process control
+
+namespace std.system {
+
+    type SystemInfo = struct {
+        os_name:      string
+        os_version:   string
+        cpu_count:    i32
+        memory_mb:    i64
+        hostname:     string
+        vex_version:  string
+    }
+
+    @Extern("vesta_io:vsys_info")
+    fn sys_info() -> SystemInfo
+
+    /// Get environment variable value
+    @Extern("vesta_io:venv_get")
+    fn env_get(name: string) -> string
+
+    /// Set environment variable
+    @Extern("vesta_io:venv_set")
+    fn env_set(name: string, value: string) -> bool
+
+    /// Execute shell command and return output
+    @Extern("vesta_io:vshell_exec")
+    fn shell(cmd: string) -> string
+
+    /// Exit process with code
+    @Extern("vesta_io:vexit")
+    fn exit(code: i32)
+
+    /// Get current working directory
+    @Extern("vesta_io:vcwd")
+    fn cwd() -> string
+
+    /// List directory contents
+    @Extern("vesta_io:vlist_dir")
+    fn list_dir(path: string) -> string[]
+
+    /// Create directory
+    @Extern("vesta_io:vmkdir")
+    fn mkdir(path: string) -> bool
+
+} // namespace std.system

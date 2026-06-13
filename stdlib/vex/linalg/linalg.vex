@@ -1,0 +1,187 @@
+// std.linalg.vex - Linear algebra library for Vex
+// Vectors, matrices, decompositions for JEPA and machine learning.
+
+namespace std.linalg {
+
+    // -----------------------------------------------------------------
+    //  Vector operations
+    // -----------------------------------------------------------------
+
+    @Inline
+    fn vadd(a: f64[], b: f64[]) -> f64[] {
+        let n = if a.size() < b.size() { a.size() } else { b.size() }
+        let mut result: f64[] = []
+        let mut i: i32 = 0
+        while i < n {
+            result = result ++ [a[i] + b[i]]
+            i = i + 1
+        }
+        return result
+    }
+
+    @Inline
+    fn vsub(a: f64[], b: f64[]) -> f64[] {
+        let n = if a.size() < b.size() { a.size() } else { b.size() }
+        let mut result: f64[] = []
+        let mut i: i32 = 0
+        while i < n {
+            result = result ++ [a[i] - b[i]]
+            i = i + 1
+        }
+        return result
+    }
+
+    @Inline
+    fn vscale(v: f64[], s: f64) -> f64[] {
+        let mut result: f64[] = []
+        for x in v { result = result ++ [x * s] }
+        return result
+    }
+
+    @Inline
+    fn vdot(a: f64[], b: f64[]) -> f64 {
+        let n = if a.size() < b.size() { a.size() } else { b.size() }
+        let mut sum: f64 = 0.0
+        let mut i: i32 = 0
+        while i < n {
+            sum = sum + a[i] * b[i]
+            i = i + 1
+        }
+        return sum
+    }
+
+    @Inline
+    fn vnorm(v: f64[]) -> f64 {
+        return sqrt(vdot(v, v))
+    }
+
+    @Inline
+    fn vnormalize(v: f64[]) -> f64[] {
+        let n = vnorm(v)
+        if n == 0.0 { return v }
+        return vscale(v, 1.0 / n)
+    }
+
+    // -----------------------------------------------------------------
+    //  Matrix type
+    // -----------------------------------------------------------------
+
+    type Matrix = struct {
+        data: f64[]
+        rows: i32
+        cols: i32
+    }
+
+    fn mat_zeros(rows: i32, cols: i32) -> Matrix {
+        let mut data: f64[] = []
+        let total = rows * cols
+        let mut i: i32 = 0
+        while i < total {
+            data = data ++ [0.0]
+            i = i + 1
+        }
+        return Matrix { data: data, rows: rows, cols: cols }
+    }
+
+    fn mat_eye(n: i32) -> Matrix {
+        let mut m = mat_zeros(n, n)
+        let mut i: i32 = 0
+        while i < n {
+            m.data[i * n + i] = 1.0
+            i = i + 1
+        }
+        return m
+    }
+
+    @Inline
+    fn mat_get(m: Matrix, r: i32, c: i32) -> f64 {
+        return m.data[r * m.cols + c]
+    }
+
+    @Inline
+    fn mat_set(m: Matrix, r: i32, c: i32, v: f64) {
+        m.data[r * m.cols + c] = v
+    }
+
+    fn mat_mul(a: Matrix, b: Matrix) -> Matrix {
+        if a.cols != b.rows { return mat_zeros(0, 0) }
+        let mut result = mat_zeros(a.rows, b.cols)
+        let mut i: i32 = 0
+        while i < a.rows {
+            let mut j: i32 = 0
+            while j < b.cols {
+                let mut sum: f64 = 0.0
+                let mut k: i32 = 0
+                while k < a.cols {
+                    sum = sum + mat_get(a, i, k) * mat_get(b, k, j)
+                    k = k + 1
+                }
+                mat_set(result, i, j, sum)
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return result
+    }
+
+    fn mat_transpose(m: Matrix) -> Matrix {
+        let mut result = mat_zeros(m.cols, m.rows)
+        let mut i: i32 = 0
+        while i < m.rows {
+            let mut j: i32 = 0
+            while j < m.cols {
+                mat_set(result, j, i, mat_get(m, i, j))
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return result
+    }
+
+    /// Convert vector to column matrix
+    @Inline
+    fn vec_to_mat(v: f64[]) -> Matrix {
+        let n = v.size()
+        let mut m = mat_zeros(n, 1)
+        let mut i: i32 = 0
+        while i < n {
+            m.data[i] = v[i]
+            i = i + 1
+        }
+        return m
+    }
+
+    // -----------------------------------------------------------------
+    //  JEPA-specific operations
+    // -----------------------------------------------------------------
+
+    /// Cosine similarity between two embedding vectors
+    @Inline
+    fn cosine_sim(a: f64[], b: f64[]) -> f64 {
+        let na = vnorm(a)
+        let nb = vnorm(b)
+        if na == 0.0 || nb == 0.0 { return 0.0 }
+        return vdot(a, b) / (na * nb)
+    }
+
+    /// L2 distance between embedding vectors
+    @Inline
+    fn l2_dist(a: f64[], b: f64[]) -> f64 {
+        return vnorm(vsub(a, b))
+    }
+
+    /// Project vector onto subspace (linear layer equivalent)
+    fn linear_transform(input: f64[], weights: Matrix, bias: f64[]) -> f64[] {
+        let m = vec_to_mat(input)
+        let result_mat = mat_mul(weights, m)
+        let n = result_mat.rows
+        let mut result: f64[] = []
+        let mut i: i32 = 0
+        while i < n {
+            result = result ++ [result_mat.data[i] + (if i < bias.size() { bias[i] } else { 0.0 })]
+            i = i + 1
+        }
+        return result
+    }
+
+} // namespace std.linalg

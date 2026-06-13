@@ -1,0 +1,119 @@
+// std.chemistry.smiles - Simplified SMILES parser
+// Parses common SMILES patterns into Molecule structures.
+
+namespace std.chemistry {
+
+    fn is_upper(c: string) -> bool {
+        return c >= 'A' && c <= 'Z'
+    }
+
+    fn is_lower(c: string) -> bool {
+        return c >= 'a' && c <= 'z'
+    }
+
+    fn is_digit(c: string) -> bool {
+        return c >= '0' && c <= '9'
+    }
+
+    fn find_ring_open(nums: i32[], num: i32) -> i32 {
+        let mut i: i32 = 0
+        while i < nums.size() {
+            if nums[i] == num { return i }
+            i = i + 1
+        }
+        return -1
+    }
+
+    fn smiles_parse(smiles: string) -> Molecule {
+        let mut atoms: Atom[] = []
+        let mut bonds: Bond[] = []
+        let mut current: i32 = -1
+        let mut branch_stack: i32[] = []
+        let mut ring_nums: i32[] = []
+        let mut ring_atoms: i32[] = []
+        let mut last_bond: i32 = 1
+        let mut i: i32 = 0
+        let len = smiles.size()
+
+        while i < len {
+            let c = smiles[i]
+
+            if c == 'C' || c == 'N' || c == 'O' || c == 'S' || c == 'P' ||
+               c == 'B' || c == 'F' || c == 'H' || c == 'K' || c == 'c' {
+                let mut symbol: string
+                if c == 'c' {
+                    symbol = "C"
+                } else {
+                    symbol = c
+                }
+
+                if is_upper(c) && i + 1 < len && is_lower(smiles[i + 1]) {
+                    symbol = symbol ++ smiles[i + 1]
+                    i = i + 1
+                }
+
+                let el = get_element(symbol)
+                let atom = Atom { element: el, position: [0.0, 0.0, 0.0], charge: 0.0 }
+                let idx = atoms.size()
+                atoms = atoms ++ [atom]
+
+                if current >= 0 {
+                    let bond = Bond { atom1: current, atom2: idx, order: last_bond, length: 0.0 }
+                    bonds = bonds ++ [bond]
+                }
+
+                current = idx
+                last_bond = 1
+            } else if c == '=' {
+                last_bond = 2
+            } else if c == '#' {
+                last_bond = 3
+            } else if c == '-' {
+                last_bond = 1
+            } else if c == '(' {
+                branch_stack = branch_stack ++ [current]
+            } else if c == ')' {
+                let n = branch_stack.size()
+                if n > 0 {
+                    current = branch_stack[n - 1]
+                    let mut new_stack: i32[] = []
+                    let mut j: i32 = 0
+                    while j < n - 1 {
+                        new_stack = new_stack ++ [branch_stack[j]]
+                        j = j + 1
+                    }
+                    branch_stack = new_stack
+                }
+            } else if is_digit(c) {
+                let ring_num = i32(c) - 48
+                let found = find_ring_open(ring_nums, ring_num)
+                if found >= 0 {
+                    let other = ring_atoms[found]
+                    let bond = Bond { atom1: other, atom2: current, order: last_bond, length: 0.0 }
+                    bonds = bonds ++ [bond]
+                    let mut new_nums: i32[] = []
+                    let mut new_atoms: i32[] = []
+                    let mut j: i32 = 0
+                    while j < ring_nums.size() {
+                        if j != found {
+                            new_nums = new_nums ++ [ring_nums[j]]
+                            new_atoms = new_atoms ++ [ring_atoms[j]]
+                        }
+                        j = j + 1
+                    }
+                    ring_nums = new_nums
+                    ring_atoms = new_atoms
+                } else {
+                    ring_nums = ring_nums ++ [ring_num]
+                    ring_atoms = ring_atoms ++ [current]
+                }
+                last_bond = 1
+            }
+
+            i = i + 1
+        }
+
+        return Molecule { name: "", atoms: atoms, bonds: bonds, formula: "" }
+    }
+
+} // namespace std.chemistry

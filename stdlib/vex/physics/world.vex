@@ -1,0 +1,70 @@
+// std.physics.world - Physics world simulation
+// Manages rigid bodies, gravity, and stepping.
+
+namespace std.physics {
+
+    type PhysicsWorld = struct {
+        bodies: RigidBody[]
+        gravity: Vec3
+        substeps: i32
+    }
+
+    fn world_create(gravity: Vec3) -> PhysicsWorld {
+        return PhysicsWorld {
+            bodies: [],
+            gravity: gravity,
+            substeps: 4
+        }
+    }
+
+    fn world_add_body(world: PhysicsWorld, body: RigidBody) {
+        world.bodies = world.bodies ++ [body]
+    }
+
+    fn world_step(world: PhysicsWorld, dt: f64) {
+        let sub_dt = dt / f64(world.substeps)
+        let mut s: i32 = 0
+        while s < world.substeps {
+            let mut i: i32 = 0
+            while i < world.bodies.size() {
+                let body = world.bodies[i]
+                if !body.is_static {
+                    rigid_body_apply_force(body, v3_scale(world.gravity, body.mass))
+                    rigid_body_integrate(body, sub_dt)
+                    rigid_body_clear_forces(body)
+                }
+                i = i + 1
+            }
+            s = s + 1
+        }
+    }
+
+    fn world_ray_cast(world: PhysicsWorld, ray: Ray) -> CollisionInfo {
+        let mut closest = CollisionInfo {
+            collided: false,
+            point: vec3(0.0, 0.0, 0.0),
+            normal: vec3(0.0, 0.0, 0.0),
+            penetration: 0.0
+        }
+        let mut min_t: f64 = 1.0 / 0.0
+        let mut i: i32 = 0
+        while i < world.bodies.size() {
+            let body = world.bodies[i]
+            let aabb = AABB {
+                min: v3_sub(body.position, vec3(0.5, 0.5, 0.5)),
+                max: v3_add(body.position, vec3(0.5, 0.5, 0.5))
+            }
+            let t = ray_vs_aabb(ray, aabb)
+            if t >= 0.0 && t < min_t {
+                min_t = t
+                closest.collided = true
+                closest.point = v3_add(ray.origin, v3_scale(ray.direction, t))
+                closest.normal = v3_normalize(v3_sub(closest.point, body.position))
+                closest.penetration = 0.0
+            }
+            i = i + 1
+        }
+        return closest
+    }
+
+} // namespace std.physics

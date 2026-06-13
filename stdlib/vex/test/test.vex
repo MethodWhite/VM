@@ -1,0 +1,129 @@
+// std.test.vex - Testing framework for Vex
+// Assertions, benchmarks, test runner.
+
+namespace std.test {
+
+    // -----------------------------------------------------------------
+    //  Assertions
+    // -----------------------------------------------------------------
+
+    type TestResult = struct {
+        name:    string
+        passed:  bool
+        message: string
+        time_ms: f64
+    }
+
+    fn assert(condition: bool, message: string) -> TestResult {
+        let st = std.time.stopwatch_start()
+        if condition {
+            return TestResult {
+                name: "assert", passed: true,
+                message: "OK", time_ms: stopwatch_elapsed_ms(st)
+            }
+        } else {
+            return TestResult {
+                name: "assert", passed: false,
+                message: message, time_ms: stopwatch_elapsed_ms(st)
+            }
+        }
+    }
+
+    @Inline
+    fn assert_eq_i64(a: i64, b: i64) -> TestResult {
+        return assert(a == b, "expected " ++ std.io.format(f64(a), 0) ++ " got " ++ std.io.format(f64(b), 0))
+    }
+
+    @Inline
+    fn assert_eq_f64(a: f64, b: f64, epsilon: f64) -> TestResult {
+        let diff = if a > b { a - b } else { b - a }
+        return assert(diff < epsilon, "values differ by " ++ std.io.format(diff, 6))
+    }
+
+    @Inline
+    fn assert_true(v: bool) -> TestResult {
+        return assert(v, "expected true, got false")
+    }
+
+    @Inline
+    fn assert_false(v: bool) -> TestResult {
+        return assert(!v, "expected false, got true")
+    }
+
+    @Inline
+    fn assert_null(v: std.json.JsonValue) -> TestResult {
+        return assert(v.kind == 0, "expected null")
+    }
+
+    // -----------------------------------------------------------------
+    //  Test runner
+    // -----------------------------------------------------------------
+
+    type TestSuite = struct {
+        name:    string
+        results: TestResult[]
+    }
+
+    fn suite(name: string) -> TestSuite {
+        return TestSuite { name: name, results: [] }
+    }
+
+    fn add_result(suite: TestSuite, result: TestResult) {
+        suite.results = suite.results ++ [result]
+    }
+
+    fn run_suite(suite: TestSuite) -> i32 {
+        println("")
+        println("=== " ++ suite.name ++ " ===")
+        let mut passed: i32 = 0
+        let mut failed: i32 = 0
+        for r in suite.results {
+            let status = if r.passed { "PASS" } else { "FAIL" }
+            println("  [" ++ status ++ "] " ++ r.name ++ " (" ++ std.io.format(r.time_ms, 2) ++ "ms)")
+            if !r.passed {
+                println("        " ++ r.message)
+                failed = failed + 1
+            } else {
+                passed = passed + 1
+            }
+        }
+        println("")
+        println("Result: " ++ std.io.format(f64(passed), 0) ++ "/" ++ std.io.format(f64(passed + failed), 0) ++ " passed")
+        return if failed > 0 { 1 } else { 0 }
+    }
+
+    // -----------------------------------------------------------------
+    //  Benchmark
+    // -----------------------------------------------------------------
+
+    type BenchResult = struct {
+        name:        string
+        iterations:  i32
+        total_time_ms: f64
+        avg_us:      f64
+    }
+
+    fn bench(name: string, iterations: i32, f: fn() -> ()) -> BenchResult {
+        let sw = std.time.stopwatch_start()
+        let mut i: i32 = 0
+        while i < iterations {
+            f()
+            i = i + 1
+        }
+        let total = std.time.stopwatch_elapsed_ms(sw)
+        return BenchResult {
+            name: name,
+            iterations: iterations,
+            total_time_ms: total,
+            avg_us: total * 1000.0 / f64(iterations)
+        }
+    }
+
+    fn print_bench(result: BenchResult) {
+        println("BENCH " ++ result.name ++ ": "
+            ++ std.io.format(result.avg_us, 2) ++ " us/op ("
+            ++ std.io.format(result.total_time_ms, 2) ++ " ms for "
+            ++ std.io.format(f64(result.iterations), 0) ++ " iters)")
+    }
+
+} // namespace std.test

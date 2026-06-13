@@ -1,0 +1,39 @@
+// std.optim.vex - Gradient-based optimizers for neural network training
+
+namespace std.optim {
+
+    type Optimizer = struct {
+        learning_rate: f64,
+        beta1: f64,
+        beta2: f64,
+        epsilon: f64,
+        m: f64[][],
+        v: f64[][],
+        t: i32
+    }
+
+    fn sgd(lr: f64) -> Optimizer {
+        return Optimizer {
+            learning_rate: lr,
+            beta1: 0.0,
+            beta2: 0.0,
+            epsilon: 0.0,
+            m: [],
+            v: [],
+            t: 0
+        }
+    }
+
+    fn adam(lr: f64) -> Optimizer {
+        return Optimizer {
+            learning_rate: lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+            m: [],
+            v: [],
+            t: 0
+        }
+    }
+
+} // namespace std.optim

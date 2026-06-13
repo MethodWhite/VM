@@ -1,0 +1,134 @@
+// tests/photonic/test_photonic.vex
+//
+// Test suite for vesta_photonic.so
+// Tests: emit, resonance, collapse_intensity, jepa_embed, jepa_predict
+//
+// Compile and run:
+//   vm --vex tests/photonic/test_photonic.vex -o /tmp/test_photonic
+//   vm --run /tmp/test_photonic.velb
+//
+// Expected: returns 42 (all tests pass)
+
+import std.photonic.*
+
+fn test_emit() -> i32 {
+    println("  [test_emit] emitting LASER_R (650nm)...")
+    let fb = emit(LASER_R)
+    println("    feedback voltage: " + f32_to_str(fb) + " mV")
+
+    println("  [test_emit] emitting LASER_G (532nm)...")
+    fb = emit(LASER_G)
+    println("    feedback voltage: " + f32_to_str(fb) + " mV")
+
+    println("  [test_emit] emitting LASER_B (450nm)...")
+    fb = emit(LASER_B)
+    println("    feedback voltage: " + f32_to_str(fb) + " mV")
+
+    return 0
+}
+
+fn test_resonance() -> i32 {
+    println("  [test_resonance] measuring resonance at LASER_R...")
+    let res = resonance(LASER_R)
+    println("    resonance: " + i32_to_str(res) + " (0..1000)")
+    if res < 0 {
+        println("    FAIL: negative resonance")
+        return 1
+    }
+    if res > 1000 {
+        println("    FAIL: resonance out of range (>1000)")
+        return 1
+    }
+    println("    PASS: resonance in valid range")
+    return 0
+}
+
+fn test_collapse_intensity() -> i32 {
+    println("  [test_collapse_intensity] collapsing zero intensity...")
+    let bit = collapse_intensity(0)
+    if bit {
+        println("    FAIL: zero intensity collapsed to true")
+        return 1
+    }
+    println("    PASS: zero intensity -> false")
+
+    println("  [test_collapse_intensity] collapsing max intensity...")
+    bit = collapse_intensity(0xFFFF)
+    if !bit {
+        println("    FAIL: max intensity collapsed to false")
+        return 1
+    }
+    println("    PASS: max intensity -> true")
+
+    return 0
+}
+
+fn test_jepa() -> i32 {
+    println("  [test_jepa] embedding LASER_R pattern...")
+    let latent = jepa_embed(LASER_R)
+    println("    latent: 0x" + u64_to_hex(latent))
+
+    println("  [test_jepa] predicting next pattern from latent...")
+    let predicted = jepa_predict(latent)
+    println("    predicted color code: " + u32_to_str(predicted))
+
+    println("  [test_jepa] computing critic loss...")
+    let loss = jepa_critic(predicted, LASER_G)
+    println("    loss: " + f32_to_str(loss))
+
+    return 0
+}
+
+i32 main() {
+    println("=== test_photonic: vesta_photonic test suite ===")
+    println("")
+
+    i32 failed = 0
+
+    println("--- test_emit ---")
+    if test_emit() != 0 {
+        println("FAIL: test_emit")
+        failed = failed + 1
+    } else {
+        println("OK: test_emit")
+    }
+    println("")
+
+    println("--- test_resonance ---")
+    if test_resonance() != 0 {
+        println("FAIL: test_resonance")
+        failed = failed + 1
+    } else {
+        println("OK: test_resonance")
+    }
+    println("")
+
+    println("--- test_collapse_intensity ---")
+    if test_collapse_intensity() != 0 {
+        println("FAIL: test_collapse_intensity")
+        failed = failed + 1
+    } else {
+        println("OK: test_collapse_intensity")
+    }
+    println("")
+
+    println("--- test_jepa ---")
+    if test_jepa() != 0 {
+        println("FAIL: test_jepa")
+        failed = failed + 1
+    } else {
+        println("OK: test_jepa")
+    }
+    println("")
+
+    println("=== Results: " + i32_to_str(failed) + " failures ===")
+    if failed == 0 {
+        println("ALL TESTS PASSED")
+        laser_off()
+        return 42
+    } else {
+        println("SOME TESTS FAILED")
+        laser_off()
+        return 1
+    }
+}

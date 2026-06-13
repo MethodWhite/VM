@@ -1,0 +1,65 @@
+// std.time.vex - Time and timing utilities for Vex
+
+namespace std.time {
+
+    type Timestamp = struct {
+        seconds: i64
+        nanos:   i32
+    }
+
+    @Extern("vesta_io:vtime_now")
+    fn now() -> Timestamp
+
+    @Inline
+    fn now_ms() -> i64 {
+        let t = now()
+        return t.seconds * 1000 + i64(t.nanos) / 1000000
+    }
+
+    @Inline
+    fn now_us() -> i64 {
+        let t = now()
+        return t.seconds * 1000000 + i64(t.nanos) / 1000
+    }
+
+    @Extern("vesta_io:vtime_sleep_ms")
+    fn sleep(ms: i32)
+
+    /// Measure execution time of a closure
+    @Inline
+    fn measure(f: fn() -> ()) -> f64 {
+        let start = now_us()
+        f()
+        let end = now_us()
+        return f64(end - start) / 1000.0  // milliseconds
+    }
+
+    type Stopwatch = struct {
+        start_time: i64  // microseconds
+    }
+
+    @Inline
+    fn stopwatch_start() -> Stopwatch {
+        return Stopwatch { start_time: now_us() }
+    }
+
+    @Inline
+    fn stopwatch_elapsed_ms(sw: Stopwatch) -> f64 {
+        return f64(now_us() - sw.start_time) / 1000.0
+    }
+
+    @Inline
+    fn stopwatch_elapsed_us(sw: Stopwatch) -> i64 {
+        return now_us() - sw.start_time
+    }
+
+    @Inline
+    fn stopwatch_reset(sw: Stopwatch) {
+        sw.start_time = now_us()
+    }
+
+    /// Format timestamp to ISO 8601 string
+    @Extern("vesta_io:vtime_format")
+    fn format(t: Timestamp) -> string
+
+} // namespace std.time

@@ -1,0 +1,92 @@
+// std.result.vex - Result/Option types (Rust-style error handling)
+// Filosofía: sin excepciones, errores como valores.
+
+namespace std.result {
+
+    // -----------------------------------------------------------------
+    //  Option type
+    // -----------------------------------------------------------------
+
+    type Option<T> = struct {
+        has_value: bool
+        value:     T
+    }
+
+    fn some<T>(val: T) -> Option<T> {
+        return Option<T> { has_value: true, value: val }
+    }
+
+    fn none<T>() -> Option<T> {
+        return Option<T> { has_value: false }
+    }
+
+    @Inline
+    fn is_some<T>(opt: Option<T>) -> bool { return opt.has_value }
+
+    @Inline
+    fn is_none<T>(opt: Option<T>) -> bool { return !opt.has_value }
+
+    fn unwrap<T>(opt: Option<T>, default_val: T) -> T {
+        if opt.has_value { return opt.value }
+        return default_val
+    }
+
+    fn expect<T>(opt: Option<T>, msg: string) -> T {
+        if !opt.has_value {
+            std.log.fatal(std.log.logger("result"), "unwrap failed: " ++ msg)
+        }
+        return opt.value
+    }
+
+    // -----------------------------------------------------------------
+    //  Result type
+    // -----------------------------------------------------------------
+
+    type Result<T, E> = struct {
+        is_ok:  bool
+        value:  T
+        error:  E
+    }
+
+    fn ok<T, E>(val: T) -> Result<T, E> {
+        return Result<T, E> { is_ok: true, value: val }
+    }
+
+    fn err<T, E>(err_val: E) -> Result<T, E> {
+        return Result<T, E> { is_ok: false, error: err_val }
+    }
+
+    @Inline
+    fn is_ok<T, E>(r: Result<T, E>) -> bool { return r.is_ok }
+
+    @Inline
+    fn is_err<T, E>(r: Result<T, E>) -> bool { return !r.is_ok }
+
+    fn unwrap_or<T, E>(r: Result<T, E>, default_val: T) -> T {
+        if r.is_ok { return r.value }
+        return default_val
+    }
+
+    fn unwrap_or_else<T, E>(r: Result<T, E>, fallback: fn(E) -> T) -> T {
+        if r.is_ok { return r.value }
+        return fallback(r.error)
+    }
+
+    // -----------------------------------------------------------------
+    //  Common error types
+    // -----------------------------------------------------------------
+
+    type StringError = string
+
+    fn string_err(msg: string) -> StringError { return msg }
+
+    fn to_string_err(e: StringError) -> string { return e }
+
+    // Convenience aliases for common patterns
+    type StrResult<T> = Result<T, StringError>
+
+    fn ok_str<T>(val: T) -> StrResult<T> { return ok<T, StringError>(val) }
+
+    fn err_str<T>(msg: string) -> StrResult<T> { return err<T, StringError>(msg) }
+
+} // namespace std.result

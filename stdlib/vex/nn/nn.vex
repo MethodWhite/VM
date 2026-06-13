@@ -1,0 +1,155 @@
+// std.nn.vex - Neural network primitives for Vex
+
+namespace std.nn {
+
+    fn relu(x: f64) -> f64 {
+        return if x > 0.0 { x } else { 0.0 }
+    }
+
+    fn leaky_relu(x: f64, alpha: f64) -> f64 {
+        return if x > 0.0 { x } else { alpha * x }
+    }
+
+    fn sigmoid(x: f64) -> f64 {
+        return 1.0 / (1.0 + exp(-x))
+    }
+
+    fn tanh(x: f64) -> f64 {
+        let ex = exp(2.0 * x)
+        return (ex - 1.0) / (ex + 1.0)
+    }
+
+    fn gelu(x: f64) -> f64 {
+        return 0.5 * x * (1.0 + erf(x / sqrt(2.0)))
+    }
+
+    fn softmax(x: f64[]) -> f64[] {
+        let mut max_val = x[0]
+        for v in x { if v > max_val { max_val = v } }
+        let mut sum: f64 = 0.0
+        let mut result: f64[] = []
+        for v in x {
+            let e = exp(v - max_val)
+            sum = sum + e
+            result = result ++ [e]
+        }
+        if sum == 0.0 { return x }
+        let mut i: i32 = 0
+        while i < result.size() { result[i] = result[i] / sum; i = i + 1 }
+        return result
+    }
+
+    fn softplus(x: f64) -> f64 {
+        return log(1.0 + exp(x))
+    }
+
+    fn swish(x: f64, beta: f64) -> f64 {
+        return x * sigmoid(beta * x)
+    }
+
+    fn mse_loss(pred: f64[], target: f64[]) -> f64 {
+        let n = if pred.size() < target.size() { pred.size() } else { target.size() }
+        let mut sum: f64 = 0.0
+        let mut i: i32 = 0
+        while i < n {
+            let d = pred[i] - target[i]
+            sum = sum + d * d
+            i = i + 1
+        }
+        return sum / f64(n)
+    }
+
+    fn cross_entropy(pred: f64[], target: f64[]) -> f64 {
+        let sm = softmax(pred)
+        let n = if sm.size() < target.size() { sm.size() } else { target.size() }
+        let mut sum: f64 = 0.0
+        let mut i: i32 = 0
+        while i < n {
+            if target[i] > 0.0 {
+                sum = sum - target[i] * log(if sm[i] > 0.0 { sm[i] } else { 1e-15 })
+            }
+            i = i + 1
+        }
+        return sum
+    }
+
+    fn binary_cross_entropy(pred: f64, target: f64) -> f64 {
+        let p = if pred < 1e-15 { 1e-15 } else { if pred > 1.0 - 1e-15 { 1.0 - 1e-15 } else { pred } }
+        return -(target * log(p) + (1.0 - target) * log(1.0 - p))
+    }
+
+    fn xavier_init(fan_in: i32, fan_out: i32) -> f64 {
+        let limit = sqrt(6.0 / f64(fan_in + fan_out))
+        return limit
+    }
+
+    fn he_init(fan_in: i32, fan_out: i32) -> f64 {
+        return sqrt(2.0 / f64(fan_in))
+    }
+
+    type DenseLayer = struct {
+        weights: f64[][],
+        bias: f64[],
+        activation: fn(f64) -> f64
+    }
+
+    fn dense_layer_create(input_size: i32, output_size: i32, activation: fn(f64) -> f64) -> DenseLayer {
+        let limit = sqrt(6.0 / f64(input_size + output_size))
+        let mut weights: f64[][] = []
+        let mut bias: f64[] = []
+        let mut seed: f64 = 12345.0
+        let mut i: i32 = 0
+        while i < output_size {
+            let mut row: f64[] = []
+            let mut j: i32 = 0
+            while j < input_size {
+                seed = seed * 1103515245.0 + 12345.0
+                let r = (floor(seed / 65536.0) % 32768.0) / 16384.0 - 1.0
+                row = row ++ [r * limit]
+                j = j + 1
+            }
+            weights = weights ++ [row]
+            bias = bias ++ [0.0]
+            i = i + 1
+        }
+        return DenseLayer { weights: weights, bias: bias, activation: activation }
+    }
+
+    fn dense_layer_forward(layer: DenseLayer, input: f64[]) -> f64[] {
+        let mut output: f64[] = []
+        let mut i: i32 = 0
+        while i < layer.weights.size() {
+            let mut sum: f64 = 0.0
+            let mut j: i32 = 0
+            while j < input.size() {
+                sum = sum + layer.weights[i][j] * input[j]
+                j = j + 1
+            }
+            sum = sum + layer.bias[i]
+            output = output ++ [layer.activation(sum)]
+            i = i + 1
+        }
+        return output
+    }
+
+    type Model = struct {
+        layers: DenseLayer[]
+    }
+
+    fn model_create() -> Model {
+        return Model { layers: [] }
+    }
+
+    fn model_add(model: Model, layer: DenseLayer) {
+        model.layers = model.layers ++ [layer]
+    }
+
+    fn model_forward(model: Model, input: f64[]) -> f64[] {
+        let mut current = input
+        for layer in model.layers {
+            current = dense_layer_forward(layer, current)
+        }
+        return current
+    }
+
+} // namespace std.nn

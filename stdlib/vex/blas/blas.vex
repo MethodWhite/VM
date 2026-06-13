@@ -1,0 +1,73 @@
+// std.blas.vex - Native BLAS/LAPACK bindings for Vex
+// Self-contained double-precision linear algebra routines.
+
+namespace std.blas {
+
+    // -----------------------------------------------------------------
+    //  Level 1 BLAS (vector-vector operations)
+    // -----------------------------------------------------------------
+
+    @Extern("vesta_blas:vblas_dot")
+    fn dot(n: i32, x: f64[], y: f64[]) -> f64
+
+    @Extern("vesta_blas:vblas_axpy")
+    fn axpy(n: i32, alpha: f64, x: f64[], y: f64[])
+
+    @Extern("vesta_blas:vblas_nrm2")
+    fn nrm2(n: i32, x: f64[]) -> f64
+
+    @Extern("vesta_blas:vblas_asum")
+    fn asum(n: i32, x: f64[]) -> f64
+
+    @Extern("vesta_blas:vblas_iamax")
+    fn iamax(n: i32, x: f64[]) -> i32
+
+    @Extern("vesta_blas:vblas_scal")
+    fn scal(n: i32, alpha: f64, x: f64[])
+
+    @Extern("vesta_blas:vblas_copy")
+    fn copy(n: i32, x: f64[], y: f64[])
+
+    @Extern("vesta_blas:vblas_swap")
+    fn swap(n: i32, x: f64[], y: f64[])
+
+    // -----------------------------------------------------------------
+    //  Level 2 BLAS (matrix-vector operations)
+    // -----------------------------------------------------------------
+
+    @Extern("vesta_blas:vblas_gemv")
+    fn gemv(m: i32, n: i32, alpha: f64, a: f64[], x: f64[], beta: f64, y: f64[])
+
+    // -----------------------------------------------------------------
+    //  Level 3 BLAS (matrix-matrix operations)
+    // -----------------------------------------------------------------
+
+    @Extern("vesta_blas:vblas_gemm")
+    fn gemm(m: i32, n: i32, k: i32, alpha: f64, a: f64[], b: f64[], beta: f64, c: f64[])
+
+    // -----------------------------------------------------------------
+    //  LAPACK-style decompositions
+    // -----------------------------------------------------------------
+
+    @Extern("vesta_blas:vblas_qr")
+    fn qr(m: i32, n: i32, a: f64[], q: f64[], r: f64[]) -> i32
+
+    @Extern("vesta_blas:vblas_cholesky")
+    fn cholesky(n: i32, a: f64[], l: f64[]) -> i32
+
+    @Extern("vesta_blas:vblas_svd")
+    fn svd(m: i32, n: i32, a: f64[], u: f64[], s: f64[], vt: f64[]) -> i32
+
+    @Extern("vesta_blas:vblas_eig")
+    fn eig(n: i32, a: f64[], eigenvalues: f64[], eigenvectors: f64[]) -> i32
+
+    // -----------------------------------------------------------------
+    //  Neural network primitives
+    // -----------------------------------------------------------------
+
+    @Extern("vesta_blas:vblas_conv2d")
+    fn conv2d(in_c: i32, in_h: i32, in_w: i32, out_c: i32,
+              k_h: i32, k_w: i32, stride: i32, pad: i32,
+              input: f64[], kernel: f64[], output: f64[]) -> i32
+
+} // namespace std.blas

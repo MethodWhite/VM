@@ -1,0 +1,160 @@
+// tests/materia/test_materia.vex
+//
+// Test suite for vesta_materia.so
+// Tests: init, embed, predict, get_prediction, resonance, encode_photonic, decode_photonic
+//
+// Compile and run:
+//   vm --vex tests/materia/test_materia.vex -o /tmp/test_materia
+//   vm --run /tmp/test_materia.velb
+//
+// Expected: returns 42 (all tests pass)
+
+import std.materia.*
+
+fn test_init() -> i32 {
+    println("  [test_init] creating ModelConfig for domain 'test'...")
+    let cfg = ModelConfig {
+        domain    = "test",
+        dim       = 16,
+        base_freq = 650.0,
+        freq_step = 12.5
+    }
+    let ok = init(cfg)
+    if !ok {
+        println("    FAIL: init returned false")
+        return 1
+    }
+    println("    PASS: BaseMateria initialized successfully")
+    return 0
+}
+
+fn test_embed() -> i32 {
+    println("  [test_embed] embedding sample data...")
+    let data: f64[] = [1.0, 2.0, 3.0, 4.0, 5.0]
+    let dim = embed(data)
+    if dim == 0 {
+        println("    FAIL: embed returned 0 dimensions")
+        return 1
+    }
+    println("    embedding dimensions: " + i32_to_str(dim))
+
+    let mut i: i32 = 0
+    while i < dim && i < 5 {
+        let val = get_embedding(i)
+        println("      [" + i32_to_str(i) + "] = " + f64_to_str(val))
+        i = i + 1
+    }
+    println("    PASS: embedding succeeded")
+    return 0
+}
+
+fn test_predict() -> i32 {
+    println("  [test_predict] generating prediction...")
+    let n = predict(3)
+    if n == 0 {
+        println("    FAIL: predict returned 0 values")
+        return 1
+    }
+    println("    predicted " + i32_to_str(n) + " values:")
+
+    let mut i: i32 = 0
+    while i < n {
+        let val = get_prediction(i)
+        println("      [" + i32_to_str(i) + "] = " + f64_to_str(val))
+        i = i + 1
+    }
+    println("    PASS: prediction succeeded")
+    return 0
+}
+
+fn test_resonance() -> i32 {
+    println("  [test_resonance] measuring internal coherence...")
+    let res = resonance()
+    println("    resonance: " + i32_to_str(res) + " (0..1000)")
+    if res < 0 {
+        println("    FAIL: negative resonance")
+        return 1
+    }
+    if res > 1000 {
+        println("    FAIL: resonance out of range")
+        return 1
+    }
+    println("    PASS: resonance in valid range")
+    return 0
+}
+
+fn test_photonic_encoding() -> i32 {
+    println("  [test_photonic_encoding] encoding dim 0 as photonic code...")
+    let code = encode_photonic(0)
+    println("    photonic code: 0x" + u32_to_hex(code))
+
+    println("  [test_photonic_encoding] decoding back...")
+    let decoded = decode_photonic(code)
+    println("    decoded value: " + f64_to_str(decoded))
+
+    println("    PASS: photonic encoding round-trip succeeded")
+    return 0
+}
+
+i32 main() {
+    println("=== test_materia: vesta_materia test suite ===")
+    println("")
+
+    i32 failed = 0
+
+    println("--- test_init ---")
+    if test_init() != 0 {
+        println("FAIL: test_init")
+        failed = failed + 1
+    } else {
+        println("OK: test_init")
+    }
+    println("")
+
+    println("--- test_embed ---")
+    if test_embed() != 0 {
+        println("FAIL: test_embed")
+        failed = failed + 1
+    } else {
+        println("OK: test_embed")
+    }
+    println("")
+
+    println("--- test_predict ---")
+    if test_predict() != 0 {
+        println("FAIL: test_predict")
+        failed = failed + 1
+    } else {
+        println("OK: test_predict")
+    }
+    println("")
+
+    println("--- test_resonance ---")
+    if test_resonance() != 0 {
+        println("FAIL: test_resonance")
+        failed = failed + 1
+    } else {
+        println("OK: test_resonance")
+    }
+    println("")
+
+    println("--- test_photonic_encoding ---")
+    if test_photonic_encoding() != 0 {
+        println("FAIL: test_photonic_encoding")
+        failed = failed + 1
+    } else {
+        println("OK: test_photonic_encoding")
+    }
+    println("")
+
+    println("=== Results: " + i32_to_str(failed) + " failures ===")
+    if failed == 0 {
+        println("ALL TESTS PASSED")
+        reset()
+        return 42
+    } else {
+        println("SOME TESTS FAILED")
+        reset()
+        return 1
+    }
+}

@@ -1,0 +1,516 @@
+// solid_macro.vex — SolidScript-to-Vex transpiler via @Macro
+//
+// Provides the @Solid macro annotation that transforms SolidScript DSL
+// blocks into equivalent Vex AST at compile-time using std.graphics types.
+//
+// SolidScript is a shader DSL embedded in Vex.  Each block type
+// (vertex/fragment/compute/material/pipeline) is parsed and rewritten
+// into Vex runtime code that constructs the corresponding std.graphics
+// shader object.
+//
+// Usage:
+//   import std.graphics.solid_macro
+//
+//   @Solid vertex {
+//       input:  { position: float3, normal: float3, uv: float2 }
+//       output: { position: float4, color: float3 }
+//       uniform: { model: matrix4x4, view: matrix4x4, proj: matrix4x4 }
+//
+//       fn main() {
+//           output.position = proj * view * model * float4(input.position, 1.0)
+//           output.color = float3(0.5, 0.8, 1.0)
+//       }
+//   }
+//
+//   @Solid fragment {
+//       input:  { position: float4, color: float3, normal: float3, uv: float2 }
+//       output: { color: float4 }
+//       uniform: { light_dir: float3, ambient: float3 }
+//
+//       fn main() {
+//           let n = normalize(input.normal)
+//           let diff = max(dot(n, light_dir), 0.0)
+//           output.color = float4(ambient + diff * input.color, 1.0)
+//       }
+//   }
+
+namespace std.graphics.solid_macro {
+
+    // =================================================================
+    //  comptime helper state
+    // =================================================================
+
+    comptime auto solid_shader_counter = 0
+
+    // =================================================================
+    //  @Solid macro — main entry point
+    // =================================================================
+    //
+    // Transforms a SolidScript block into a Vex shader definition.
+    // Called at compile-time; returns Vex code that is injected into
+    // the call site.
+    //
+    // The macro accepts a block type ("vertex", "fragment", "compute",
+    // "material", "pipeline") and a body string containing the
+    // SolidScript source.  It:
+    //   1. Parses the input/output/uniform declarations
+    //   2. Parses the main function body
+    //   3. Emits equivalent Vex code constructing a std.graphics shader
+    //
+    // Internal comptime helper functions do the parsing/emission.
+
+    // ----------------------------------------------------------------
+    //  Parsing helpers (compile-time string processing)
+    // ----------------------------------------------------------------
+
+    /// Extract the first token from a string (space/comma/colon/brace delimited)
+    @Macro
+    comptime string solid_next_token(comptime string s) {
+        return solid_internal_next_token(s)
+    }
+
+    comptime string solid_internal_next_token(comptime string s) {
+        comptime var string acc = ""
+        comptime var i64 i = 0
+        comptime var i64 len = comptime_strlen(s)
+        while i < len {
+            comptime string ch = comptime_substr(s, i, 1)
+            if ch == " " || ch == "," || ch == ":" || ch == "{" || ch == "}" || ch == "\n" || ch == "\t" || ch == "\r" {
+                if comptime_strlen(acc) > 0 { return acc }
+            } else {
+                acc = acc + ch
+            }
+            i = i + 1
+        }
+        return acc
+    }
+
+    /// Skip whitespace and delimiters, return remaining string
+    comptime string solid_skip_delim(comptime string s) {
+        comptime var i64 i = 0
+        comptime var i64 len = comptime_strlen(s)
+        while i < len {
+            comptime string ch = comptime_substr(s, i, 1)
+            if ch != " " && ch != "," && ch != ":" && ch != "{" && ch != "}" && ch != "\n" && ch != "\t" && ch != "\r" {
+                return comptime_substr(s, i, len - i)
+            }
+            i = i + 1
+        }
+        return ""
+    }
+
+    /// Remove leading token + delimiter from string
+    comptime string solid_after_token(comptime string s) {
+        comptime string tok = solid_internal_next_token(s)
+        comptime var i64 i = 0
+        comptime var i64 len = comptime_strlen(s)
+        comptime var bool found = false
+        while i < len {
+            comptime string ch = comptime_substr(s, i, 1)
+            if ch != " " && ch != "," && ch != ":" && ch != "{" && ch != "}" && ch != "\n" && ch != "\t" && ch != "\r" {
+                if !found { found = true }
+            } else {
+                if found { return comptime_substr(s, i, len - i) }
+            }
+            i = i + 1
+        }
+        return ""
+    }
+
+    /// Parse a field declaration "name: type" -> "name:type"
+    comptime string solid_parse_field(comptime string s) {
+        comptime string name = solid_internal_next_token(s)
+        comptime string rest = solid_after_token(s)
+        comptime string rest2 = solid_skip_delim(rest)
+        comptime string type_name = solid_internal_next_token(rest2)
+        return name + ":" + type_name
+    }
+
+    /// Emit a ShaderField[] from a field list string
+    @Macro
+    comptime string solid_emit_fields(comptime string fields_src) {
+        comptime var string result = "["
+        comptime var string rest = fields_src
+        comptime var bool first = true
+        while comptime_strlen(rest) > 0 {
+            comptime string field = solid_parse_field(rest)
+            if !first { result = result + ", " }
+            comptime var i64 colon_pos = 0
+            comptime var i64 flen = comptime_strlen(field)
+            while colon_pos < flen {
+                if comptime_substr(field, colon_pos, 1) == ":" { break }
+                colon_pos = colon_pos + 1
+            }
+            comptime string fname = comptime_substr(field, 0, colon_pos)
+            comptime string ftype_str = comptime_substr(field, colon_pos + 1, flen - colon_pos - 1)
+            comptime string type_enum = "SHADER_FLOAT4"
+            if ftype_str == "float2" { type_enum = "SHADER_FLOAT2" }
+            else if ftype_str == "float3" { type_enum = "SHADER_FLOAT3" }
+            else if ftype_str == "matrix4x4" { type_enum = "SHADER_MATRIX4X4" }
+            result = result + "ShaderField { name: \"" + fname + "\", type: ShaderFieldType." + type_enum + " }"
+            first = false
+            comptime string after = solid_after_token(rest)
+            rest = solid_skip_delim(after)
+        }
+        return result + "]"
+    }
+
+    /// Check if string starts with a given prefix
+    comptime bool solid_starts_with(comptime string s, comptime string prefix) {
+        comptime i64 slen = comptime_strlen(s)
+        comptime i64 plen = comptime_strlen(prefix)
+        if slen < plen { return false }
+        comptime i64 i = 0
+        while i < plen {
+            if comptime_substr(s, i, 1) != comptime_substr(prefix, i, 1) { return false }
+            i = i + 1
+        }
+        return true
+    }
+
+    /// Find a keyword in the body and extract its content
+    comptime string solid_extract_section(comptime string body, comptime string keyword) {
+        comptime var i64 i = 0
+        comptime var i64 len = comptime_strlen(body)
+        while i < len {
+            comptime string sub = comptime_substr(body, i, len - i)
+            if solid_starts_with(sub, keyword) {
+                comptime var i64 j = i + comptime_strlen(keyword)
+                while j < len {
+                    comptime string ch = comptime_substr(body, j, 1)
+                    if ch == "{" {
+                        comptime var i64 depth = 1
+                        comptime var i64 k = j + 1
+                        while k < len && depth > 0 {
+                            comptime string c2 = comptime_substr(body, k, 1)
+                            if c2 == "{" { depth = depth + 1 }
+                            else if c2 == "}" { depth = depth - 1 }
+                            k = k + 1
+                        }
+                        return comptime_substr(body, j + 1, k - j - 2)
+                    }
+                    if ch != " " && ch != "\n" && ch != "\t" && ch != "\r" { break }
+                    j = j + 1
+                }
+            }
+            i = i + 1
+        }
+        return ""
+    }
+
+    /// Extract the "input: { ... }" block
+    comptime string solid_extract_input(comptime string body) {
+        return solid_extract_section(body, "input:")
+    }
+
+    /// Extract the "output: { ... }" block
+    comptime string solid_extract_output(comptime string body) {
+        return solid_extract_section(body, "output:")
+    }
+
+    /// Extract the "uniform: { ... }" block
+    comptime string solid_extract_uniform(comptime string body) {
+        return solid_extract_section(body, "uniform:")
+    }
+
+    /// Extract the "workgroup: { ... }" block (for compute)
+    comptime string solid_extract_workgroup(comptime string body) {
+        return solid_extract_section(body, "workgroup:")
+    }
+
+    /// Extract the main function body
+    comptime string solid_extract_main(comptime string body) {
+        comptime string candidate = solid_extract_section(body, "main()")
+        if comptime_strlen(candidate) > 0 { return candidate }
+        candidate = solid_extract_section(body, "void main()")
+        if comptime_strlen(candidate) > 0 { return candidate }
+        candidate = solid_extract_section(body, "fn main()")
+        return candidate
+    }
+
+    // ----------------------------------------------------------------
+    //  Code emission helpers
+    // ----------------------------------------------------------------
+
+    /// Emit a vertex shader definition from SolidScript body
+    @Macro
+    comptime string solid_emit_vertex(comptime string body) {
+        comptime string input_src = solid_extract_input(body)
+        comptime string output_src = solid_extract_output(body)
+        comptime string uniform_src = solid_extract_uniform(body)
+        comptime string main_src = solid_extract_main(body)
+
+        comptime string input_fields = solid_emit_fields(input_src)
+        comptime string output_fields = solid_emit_fields(output_src)
+        comptime string uniform_fields = solid_emit_fields(uniform_src)
+
+        comptime string processed_body = solid_transform_body(main_src, "vertex")
+
+        solid_shader_counter = solid_shader_counter + 1
+        comptime string var_name = "_solid_vs_" + to_str(solid_shader_counter)
+
+        return var_name + " = VertexShader {\n\
+            input_layout: " + input_fields + ",\n\
+            output_layout: " + output_fields + ",\n\
+            uniforms: " + uniform_fields + ",\n\
+            source: \"\"\"" + processed_body + "\"\"\"\n\
+        }"
+    }
+
+    /// Emit a fragment shader definition
+    @Macro
+    comptime string solid_emit_fragment(comptime string body) {
+        comptime string input_src = solid_extract_input(body)
+        comptime string output_src = solid_extract_output(body)
+        comptime string uniform_src = solid_extract_uniform(body)
+        comptime string main_src = solid_extract_main(body)
+
+        comptime string input_fields = solid_emit_fields(input_src)
+        comptime string output_fields = solid_emit_fields(output_src)
+        comptime string uniform_fields = solid_emit_fields(uniform_src)
+        comptime string processed_body = solid_transform_body(main_src, "fragment")
+
+        solid_shader_counter = solid_shader_counter + 1
+        comptime string var_name = "_solid_fs_" + to_str(solid_shader_counter)
+
+        return var_name + " = FragmentShader {\n\
+            input_layout: " + input_fields + ",\n\
+            output_layout: " + output_fields + ",\n\
+            uniforms: " + uniform_fields + ",\n\
+            source: \"\"\"" + processed_body + "\"\"\"\n\
+        }"
+    }
+
+    /// Emit a compute shader definition
+    @Macro
+    comptime string solid_emit_compute(comptime string body) {
+        comptime string uniform_src = solid_extract_uniform(body)
+        comptime string workgroup_src = solid_extract_workgroup(body)
+        comptime string main_src = solid_extract_main(body)
+
+        comptime string uniform_fields = solid_emit_fields(uniform_src)
+        comptime string processed_body = solid_transform_body(main_src, "compute")
+
+        comptime var string wg_size = "1, 1, 1"
+        if comptime_strlen(workgroup_src) > 0 {
+            comptime string cleaned = comptime_replace_all(workgroup_src, " ", "")
+            wg_size = cleaned
+        }
+
+        solid_shader_counter = solid_shader_counter + 1
+        comptime string var_name = "_solid_cs_" + to_str(solid_shader_counter)
+
+        return var_name + " = ComputeShader {\n\
+            uniforms: " + uniform_fields + ",\n\
+            workgroup_size: [" + wg_size + "],\n\
+            source: \"\"\"" + processed_body + "\"\"\"\n\
+        }"
+    }
+
+    /// Emit a material definition from SolidScript body
+    @Macro
+    comptime string solid_emit_material(comptime string body) {
+        comptime string vs_src = solid_extract_section(body, "vertex:")
+        comptime string fs_src = solid_extract_section(body, "fragment:")
+        comptime string props_src = solid_extract_section(body, "properties:")
+
+        solid_shader_counter = solid_shader_counter + 1
+        comptime string var_name = "_solid_mat_" + to_str(solid_shader_counter)
+
+        comptime string vs_name = "_solid_mat_vs_" + to_str(solid_shader_counter)
+        comptime string fs_name = "_solid_mat_fs_" + to_str(solid_shader_counter)
+
+        comptime var string vs_emit = vs_name + " = VertexShader { input_layout: [ShaderField{name:\"position\",type:ShaderFieldType.SHADER_FLOAT3}], output_layout: [ShaderField{name:\"position\",type:ShaderFieldType.SHADER_FLOAT4},ShaderField{name:\"color\",type:ShaderFieldType.SHADER_FLOAT3}], uniforms: [ShaderField{name:\"model\",type:ShaderFieldType.SHADER_MATRIX4X4}], source: \"\"\"output.position = model * float4(input.position, 1.0); output.color = float3(1,1,1);\"\"\" }"
+        if comptime_strlen(vs_src) > 0 {
+            vs_emit = solid_emit_vertex(vs_src)
+        }
+
+        comptime var string fs_emit = fs_name + " = FragmentShader { input_layout: [ShaderField{name:\"position\",type:ShaderFieldType.SHADER_FLOAT4},ShaderField{name:\"color\",type:ShaderFieldType.SHADER_FLOAT3}], output_layout: [ShaderField{name:\"color\",type:ShaderFieldType.SHADER_FLOAT4}], uniforms: [], source: \"\"\"output.color = float4(input.color, 1.0);\"\"\" }"
+        if comptime_strlen(fs_src) > 0 {
+            fs_emit = solid_emit_fragment(fs_src)
+        }
+
+        comptime string albedo = "float3_make(0.8, 0.8, 0.8)"
+        comptime string roughness = "0.5"
+        comptime string metallic = "0.0"
+        comptime string ao = "1.0"
+
+        if comptime_strlen(props_src) > 0 {
+            comptime string props_clean = comptime_replace_all(props_src, " ", "")
+            comptime var i64 i = 0
+            comptime var i64 plen = comptime_strlen(props_clean)
+            while i < plen {
+                if comptime_substr(props_clean, i, 7) == "albedo:" {
+                    comptime var i64 j = i + 7
+                    comptime var string val = ""
+                    while j < plen && comptime_substr(props_clean, j, 1) != "," && comptime_substr(props_clean, j, 1) != "}" {
+                        val = val + comptime_substr(props_clean, j, 1)
+                        j = j + 1
+                    }
+                    if comptime_strlen(val) > 0 { albedo = val }
+                }
+                if comptime_substr(props_clean, i, 10) == "roughness:" {
+                    comptime var i64 j = i + 10
+                    comptime var string val = ""
+                    while j < plen && comptime_substr(props_clean, j, 1) != "," && comptime_substr(props_clean, j, 1) != "}" {
+                        val = val + comptime_substr(props_clean, j, 1)
+                        j = j + 1
+                    }
+                    if comptime_strlen(val) > 0 { roughness = val }
+                }
+                if comptime_substr(props_clean, i, 9) == "metallic:" {
+                    comptime var i64 j = i + 9
+                    comptime var string val = ""
+                    while j < plen && comptime_substr(props_clean, j, 1) != "," && comptime_substr(props_clean, j, 1) != "}" {
+                        val = val + comptime_substr(props_clean, j, 1)
+                        j = j + 1
+                    }
+                    if comptime_strlen(val) > 0 { metallic = val }
+                }
+                i = i + 1
+            }
+        }
+
+        return vs_emit + ";\n    " + fs_emit + ";\n    " + var_name + " = Material {\n\
+            vertex_shader: " + vs_name + ",\n\
+            fragment_shader: " + fs_name + ",\n\
+            albedo: " + albedo + ",\n\
+            roughness: " + roughness + ",\n\
+            metallic: " + metallic + ",\n\
+            ambient_occlusion: " + ao + "\n\
+        }"
+    }
+
+    /// Emit a pipeline config from SolidScript body
+    @Macro
+    comptime string solid_emit_pipeline(comptime string body) {
+        comptime string stages_src = solid_extract_section(body, "stages:")
+        comptime string viewport_src = solid_extract_section(body, "viewport:")
+
+        comptime var string stages = "[\"vertex\", \"fragment\"]"
+        if comptime_strlen(stages_src) > 0 {
+            comptime string cleaned = comptime_replace_all(stages_src, " ", "")
+            cleaned = comptime_replace_all(cleaned, ",", "\", \"")
+            stages = "[\"" + cleaned + "\"]"
+        }
+
+        comptime var string vpw = "800"
+        comptime var string vph = "600"
+        if comptime_strlen(viewport_src) > 0 {
+            comptime string cleaned = comptime_replace_all(viewport_src, " ", "")
+            comptime var i64 xpos = 0
+            comptime var i64 vlen = comptime_strlen(cleaned)
+            while xpos < vlen && comptime_substr(cleaned, xpos, 1) != "x" { xpos = xpos + 1 }
+            if xpos < vlen {
+                vpw = comptime_substr(cleaned, 0, xpos)
+                comptime string rest = comptime_substr(cleaned, xpos + 1, vlen - xpos - 1)
+                comptime var i64 comma_pos = 0
+                while comma_pos < comptime_strlen(rest) && comptime_substr(rest, comma_pos, 1) != "," { comma_pos = comma_pos + 1 }
+                if comma_pos > 0 {
+                    vph = comptime_substr(rest, 0, comma_pos)
+                } else {
+                    vph = rest
+                }
+            }
+        }
+
+        solid_shader_counter = solid_shader_counter + 1
+        comptime string var_name = "_solid_pipe_" + to_str(solid_shader_counter)
+
+        return var_name + " = PipelineConfig {\n\
+            name: \"pipeline_" + to_str(solid_shader_counter) + "\",\n\
+            enabled_stages: " + stages + ",\n\
+            viewport_width: " + vpw + ",\n\
+            viewport_height: " + vph + ",\n\
+            depth_test: true,\n\
+            cull_backfaces: true\n\
+        }"
+    }
+
+    /// Transform SolidScript body: replace SolidScript syntax with Vex calls
+    comptime string solid_transform_body(comptime string body, comptime string stage) {
+        comptime string result = comptime_replace_all(body, "output.position =", "let _out_pos =")
+        result = comptime_replace_all(result, "output.color =", "let _out_col =")
+        result = comptime_replace_all(result, "output.normal =", "let _out_nrm =")
+        result = comptime_replace_all(result, "input.position", "_in_pos")
+        result = comptime_replace_all(result, "input.normal", "_in_nrm")
+        result = comptime_replace_all(result, "input.uv", "_in_uv")
+        result = comptime_replace_all(result, "input.color", "_in_col")
+        return result
+    }
+
+    // =================================================================
+    //  @Solid macro dispatcher
+    // =================================================================
+    //
+    // The main entry point.  Usage:
+    //   @Solid vertex { ... }
+    //   @Solid fragment { ... }
+    //   @Solid compute { ... }
+    //   @Solid material { ... }
+    //   @Solid pipeline { ... }
+    //
+    // Each call emits a Vex variable declaration of the appropriate
+    // shader/pipeline type.
+    // =================================================================
+
+    @Macro
+    comptime string Solid(comptime string block_type, comptime string body) {
+        comptime var string result = ""
+
+        if block_type == "vertex" {
+            result = solid_emit_vertex(body)
+        } else if block_type == "fragment" {
+            result = solid_emit_fragment(body)
+        } else if block_type == "compute" {
+            result = solid_emit_compute(body)
+        } else if block_type == "material" {
+            result = solid_emit_material(body)
+        } else if block_type == "pipeline" {
+            result = solid_emit_pipeline(body)
+        } else {
+            result = "// ERROR: unknown SolidScript block type '" + block_type + "'"
+        }
+
+        return "let " + result + ";"
+    }
+
+    // =================================================================
+    //  comptime string utilities (internal)
+    // =================================================================
+
+    comptime string comptime_replace_all(comptime string s, comptime string from, comptime string to) {
+        comptime var string result = ""
+        comptime var i64 i = 0
+        comptime var i64 slen = comptime_strlen(s)
+        comptime var i64 flen = comptime_strlen(from)
+        while i < slen {
+            comptime var bool match = true
+            comptime var i64 j = 0
+            while j < flen && i + j < slen {
+                if comptime_substr(s, i + j, 1) != comptime_substr(from, j, 1) { match = false; break }
+                j = j + 1
+            }
+            if match && j == flen {
+                result = result + to
+                i = i + flen
+            } else {
+                result = result + comptime_substr(s, i, 1)
+                i = i + 1
+            }
+        }
+        return result
+    }
+
+    comptime i64 comptime_strlen(comptime string s) {
+        comptime var i64 n = 0
+        comptime var bool done = false
+        while !done {
+            comptime string ch = comptime_substr(s, n, 1)
+            if ch == "" { done = true }
+            else { n = n + 1 }
+        }
+        return n
+    }
+
+} // namespace std.graphics.solid_macro

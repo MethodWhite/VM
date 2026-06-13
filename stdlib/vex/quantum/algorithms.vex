@@ -1,0 +1,311 @@
+// std.quantum.algorithms.vex - Quantum algorithms built on std.quantum
+
+namespace std.quantum.algorithms {
+
+    import std.quantum.*
+
+    // -----------------------------------------------------------------
+    //  GHZ State Preparation
+    // -----------------------------------------------------------------
+
+    /// Prepare an n-qubit Greenberger-Horne-Zeilinger (GHZ) state:
+    ///   |000...0> + |111...1>  (normalized)
+    fn ghz_state(n: i32) -> QuantumCircuit {
+        let mut c = create_circuit(n)
+        c = h(c, 0)
+        let mut i: i32 = 1
+        while i < n {
+            c = cx(c, 0, i)
+            i = i + 1
+        }
+        let mut j: i32 = 0
+        while j < n {
+            c = measure(c, j)
+            j = j + 1
+        }
+        return c
+    }
+
+    // -----------------------------------------------------------------
+    //  Bell State Preparation
+    // -----------------------------------------------------------------
+
+    /// Create a Bell state: (|00> + |11>) / sqrt(2)
+    fn bell_state() -> QuantumCircuit {
+        let mut c = create_circuit(2)
+        c = h(c, 0)
+        c = cx(c, 0, 1)
+        c = measure(c, 0)
+        c = measure(c, 1)
+        return c
+    }
+
+    // -----------------------------------------------------------------
+    //  Quantum Teleportation
+    // -----------------------------------------------------------------
+
+    /// Quantum teleportation circuit: teleports the state of qubit 0
+    /// to qubit 2 using an entangled pair (qubits 1 and 2).
+    fn quantum_teleportation() -> QuantumCircuit {
+        let mut c = create_circuit(3)
+
+        // Create entangled pair between q1 and q2
+        c = h(c, 1)
+        c = cx(c, 1, 2)
+
+        // Apply teleportation protocol
+        c = cx(c, 0, 1)
+        c = h(c, 0)
+
+        // Measure q0 and q1
+        c = measure(c, 0)
+        c = measure(c, 1)
+
+        // Apply corrective gates based on measurements
+        c = cx(c, 1, 2)   // if q1 == 1, apply X on q2
+        c = cz(c, 0, 2)   // if q0 == 1, apply Z on q2
+
+        c = measure(c, 2)
+        return c
+    }
+
+    /// Controlled-Z gate helper
+    fn cz(circuit: &QuantumCircuit, control: i32, target: i32) -> &QuantumCircuit {
+        circuit = h(circuit, target)
+        circuit = cx(circuit, control, target)
+        circuit = h(circuit, target)
+        return circuit
+    }
+
+    // -----------------------------------------------------------------
+    //  Quantum Fourier Transform
+    // -----------------------------------------------------------------
+
+    /// Apply the Quantum Fourier Transform to a subset of qubits.
+    fn qft(circuit: &QuantumCircuit, qubits: i32[]) -> &QuantumCircuit {
+        let n = qubits.size()
+        let mut i: i32 = 0
+        while i < n {
+            circuit = h(circuit, qubits[i])
+            let mut j: i32 = 1
+            let mut k: i32 = i + 1
+            while k < n {
+                let angle = PI / f64(1 << j)
+                circuit = cp(circuit, qubits[k], qubits[i], angle)
+                j = j + 1
+                k = k + 1
+            }
+            i = i + 1
+        }
+        // Swap qubits for correct output order
+        let mut l: i32 = 0
+        while l < n / 2 {
+            circuit = swap(circuit, qubits[l], qubits[n - 1 - l])
+            l = l + 1
+        }
+        return circuit
+    }
+
+    /// Controlled phase gate: applies phase(angle) to target if control == 1
+    fn cp(circuit: &QuantumCircuit, control: i32, target: i32, angle: f64) -> &QuantumCircuit {
+        let half = angle * 0.5
+        circuit = rz(circuit, target, half)
+        circuit = cx(circuit, control, target)
+        circuit = rz(circuit, target, -half)
+        circuit = cx(circuit, control, target)
+        return circuit
+    }
+
+    // -----------------------------------------------------------------
+    //  Grover's Search Algorithm
+    // -----------------------------------------------------------------
+
+    /// Grover's search algorithm for finding a target state in an
+    /// unstructured database of n_qubits.
+    fn grover_search(n_qubits: i32, target_state: i32) -> QuantumCircuit {
+        let mut c = create_circuit(n_qubits)
+        let n_iterations = i32(sqrt(f64(1 << n_qubits)))
+
+        // Initialize superposition
+        let mut i: i32 = 0
+        while i < n_qubits {
+            c = h(c, i)
+            i = i + 1
+        }
+
+        // Grover iterations
+        let mut iter: i32 = 0
+        while iter < n_iterations {
+            c = grover_oracle(c, target_state)
+            c = grover_diffusion(c, n_qubits)
+            iter = iter + 1
+        }
+
+        // Measure all qubits
+        let mut j: i32 = 0
+        while j < n_qubits {
+            c = measure(c, j)
+            j = j + 1
+        }
+        return c
+    }
+
+    /// Oracle that marks the target state with a phase flip
+    fn grover_oracle(circuit: &QuantumCircuit, target_state: i32) -> &QuantumCircuit {
+        let n = circuit.n_qubits
+        let mut i: i32 = 0
+        while i < n {
+            if (target_state >> i) & 1 == 0 {
+                circuit = x(circuit, i)
+            }
+            i = i + 1
+        }
+        // Multi-controlled Z gate
+        if n == 1 {
+            circuit = z(circuit, 0)
+        } else if n == 2 {
+            circuit = h(circuit, 1)
+            circuit = cx(circuit, 0, 1)
+            circuit = h(circuit, 1)
+        } else {
+            circuit = h(circuit, n - 1)
+            circuit = cx(circuit, 0, n - 1)
+            circuit = h(circuit, n - 1)
+        }
+        // Undo X gates
+        let mut j: i32 = 0
+        while j < n {
+            if (target_state >> j) & 1 == 0 {
+                circuit = x(circuit, j)
+            }
+            j = j + 1
+        }
+        return circuit
+    }
+
+    /// Grover diffusion operator (inversion about the mean)
+    fn grover_diffusion(circuit: &QuantumCircuit, n_qubits: i32) -> &QuantumCircuit {
+        let mut i: i32 = 0
+        while i < n_qubits {
+            circuit = h(circuit, i)
+            circuit = x(circuit, i)
+            i = i + 1
+        }
+        circuit = h(circuit, n_qubits - 1)
+        circuit = cx(circuit, 0, n_qubits - 1)
+        circuit = h(circuit, n_qubits - 1)
+        let mut j: i32 = 0
+        while j < n_qubits {
+            circuit = x(circuit, j)
+            circuit = h(circuit, j)
+            j = j + 1
+        }
+        return circuit
+    }
+
+    // -----------------------------------------------------------------
+    //  Deutsch-Jozsa Algorithm
+    // -----------------------------------------------------------------
+
+    /// Determine if a function is constant or balanced.
+    /// oracle_type = 0 for constant, 1 for balanced.
+    fn deutsch_jozsa(oracle_type: i32) -> QuantumCircuit {
+        let n: i32 = 3
+        let mut c = create_circuit(n)
+
+        c = x(c, n - 1)
+
+        let mut i: i32 = 0
+        while i < n {
+            c = h(c, i)
+            i = i + 1
+        }
+
+        if oracle_type != 0 {
+            let mut j: i32 = 0
+            while j < n - 1 {
+                c = cx(c, j, n - 1)
+                j = j + 1
+            }
+        }
+
+        let mut k: i32 = 0
+        while k < n - 1 {
+            c = h(c, k)
+            k = k + 1
+        }
+
+        let mut m: i32 = 0
+        while m < n - 1 {
+            c = measure(c, m)
+            m = m + 1
+        }
+        return c
+    }
+
+    // -----------------------------------------------------------------
+    //  Quantum Phase Estimation
+    // -----------------------------------------------------------------
+
+    /// Quantum Phase Estimation circuit.
+    fn quantum_phase_estimation(unitary: i32, n_qubits: i32) -> QuantumCircuit {
+        let n_counting = n_qubits / 2
+        let n_target = n_qubits - n_counting
+        let mut c = create_circuit(n_qubits)
+
+        let mut i: i32 = 0
+        while i < n_counting {
+            c = h(c, i)
+            i = i + 1
+        }
+
+        let mut p: i32 = 0
+        while p < n_counting {
+            let mut t: i32 = 0
+            while t < n_target {
+                let target_idx = n_counting + t
+                c = cx(c, p, target_idx)
+                t = t + 1
+            }
+            p = p + 1
+        }
+
+        let mut counting_qubits: i32[] = []
+        let mut q: i32 = 0
+        while q < n_counting {
+            counting_qubits = counting_qubits ++ [q]
+            q = q + 1
+        }
+        c = inverse_qft(c, counting_qubits)
+
+        let mut r: i32 = 0
+        while r < n_counting {
+            c = measure(c, r)
+            r = r + 1
+        }
+        return c
+    }
+
+    /// Inverse QFT
+    fn inverse_qft(circuit: &QuantumCircuit, qubits: i32[]) -> &QuantumCircuit {
+        let n = qubits.size()
+        let mut l: i32 = 0
+        while l < n / 2 {
+            circuit = swap(circuit, qubits[l], qubits[n - 1 - l])
+            l = l + 1
+        }
+        let mut i: i32 = n - 1
+        while i >= 0 {
+            let mut k: i32 = n - 1
+            while k > i {
+                let angle = -PI / f64(1 << (k - i))
+                circuit = cp(circuit, qubits[k], qubits[i], angle)
+                k = k - 1
+            }
+            circuit = h(circuit, qubits[i])
+            i = i - 1
+        }
+        return circuit
+    }
+
+} // namespace std.quantum.algorithms

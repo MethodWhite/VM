@@ -1,0 +1,263 @@
+// std.chemistry.core - Periodic table and core types
+// Core data structures for molecular modeling.
+
+namespace std.chemistry {
+
+    type Element = struct {
+        symbol: string,
+        name: string,
+        atomic_number: i32,
+        atomic_mass: f64,
+        covalent_radius: f64,
+        electronegativity: f64,
+        ionization_energy: f64,
+        electron_config: string
+    }
+
+    type Atom = struct {
+        element: Element,
+        position: f64[],
+        charge: f64
+    }
+
+    type Bond = struct {
+        atom1: i32,
+        atom2: i32,
+        order: i32,
+        length: f64
+    }
+
+    type Molecule = struct {
+        name: string,
+        atoms: Atom[],
+        bonds: Bond[],
+        formula: string
+    }
+
+    fn get_element(symbol: string) -> Element {
+        if symbol == "H" {
+            return Element { symbol: "H", name: "Hydrogen", atomic_number: 1, atomic_mass: 1.008, covalent_radius: 31.0, electronegativity: 2.20, ionization_energy: 13.598, electron_config: "1s1" }
+        }
+        if symbol == "He" {
+            return Element { symbol: "He", name: "Helium", atomic_number: 2, atomic_mass: 4.003, covalent_radius: 28.0, electronegativity: 0.0, ionization_energy: 24.587, electron_config: "1s2" }
+        }
+        if symbol == "Li" {
+            return Element { symbol: "Li", name: "Lithium", atomic_number: 3, atomic_mass: 6.941, covalent_radius: 128.0, electronegativity: 0.98, ionization_energy: 5.392, electron_config: "[He]2s1" }
+        }
+        if symbol == "Be" {
+            return Element { symbol: "Be", name: "Beryllium", atomic_number: 4, atomic_mass: 9.012, covalent_radius: 96.0, electronegativity: 1.57, ionization_energy: 9.323, electron_config: "[He]2s2" }
+        }
+        if symbol == "B" {
+            return Element { symbol: "B", name: "Boron", atomic_number: 5, atomic_mass: 10.811, covalent_radius: 84.0, electronegativity: 2.04, ionization_energy: 8.298, electron_config: "[He]2s2 2p1" }
+        }
+        if symbol == "C" {
+            return Element { symbol: "C", name: "Carbon", atomic_number: 6, atomic_mass: 12.011, covalent_radius: 76.0, electronegativity: 2.55, ionization_energy: 11.260, electron_config: "[He]2s2 2p2" }
+        }
+        if symbol == "N" {
+            return Element { symbol: "N", name: "Nitrogen", atomic_number: 7, atomic_mass: 14.007, covalent_radius: 71.0, electronegativity: 3.04, ionization_energy: 14.534, electron_config: "[He]2s2 2p3" }
+        }
+        if symbol == "O" {
+            return Element { symbol: "O", name: "Oxygen", atomic_number: 8, atomic_mass: 15.999, covalent_radius: 66.0, electronegativity: 3.44, ionization_energy: 13.618, electron_config: "[He]2s2 2p4" }
+        }
+        if symbol == "F" {
+            return Element { symbol: "F", name: "Fluorine", atomic_number: 9, atomic_mass: 18.998, covalent_radius: 57.0, electronegativity: 3.98, ionization_energy: 17.423, electron_config: "[He]2s2 2p5" }
+        }
+        if symbol == "Ne" {
+            return Element { symbol: "Ne", name: "Neon", atomic_number: 10, atomic_mass: 20.180, covalent_radius: 58.0, electronegativity: 0.0, ionization_energy: 21.565, electron_config: "[He]2s2 2p6" }
+        }
+        if symbol == "Na" {
+            return Element { symbol: "Na", name: "Sodium", atomic_number: 11, atomic_mass: 22.990, covalent_radius: 166.0, electronegativity: 0.93, ionization_energy: 5.139, electron_config: "[Ne]3s1" }
+        }
+        if symbol == "Mg" {
+            return Element { symbol: "Mg", name: "Magnesium", atomic_number: 12, atomic_mass: 24.305, covalent_radius: 141.0, electronegativity: 1.31, ionization_energy: 7.647, electron_config: "[Ne]3s2" }
+        }
+        if symbol == "Al" {
+            return Element { symbol: "Al", name: "Aluminium", atomic_number: 13, atomic_mass: 26.982, covalent_radius: 121.0, electronegativity: 1.61, ionization_energy: 5.986, electron_config: "[Ne]3s2 3p1" }
+        }
+        if symbol == "Si" {
+            return Element { symbol: "Si", name: "Silicon", atomic_number: 14, atomic_mass: 28.086, covalent_radius: 111.0, electronegativity: 1.90, ionization_energy: 8.152, electron_config: "[Ne]3s2 3p2" }
+        }
+        if symbol == "P" {
+            return Element { symbol: "P", name: "Phosphorus", atomic_number: 15, atomic_mass: 30.974, covalent_radius: 107.0, electronegativity: 2.19, ionization_energy: 10.487, electron_config: "[Ne]3s2 3p3" }
+        }
+        if symbol == "S" {
+            return Element { symbol: "S", name: "Sulfur", atomic_number: 16, atomic_mass: 32.066, covalent_radius: 105.0, electronegativity: 2.58, ionization_energy: 10.360, electron_config: "[Ne]3s2 3p4" }
+        }
+        if symbol == "Cl" {
+            return Element { symbol: "Cl", name: "Chlorine", atomic_number: 17, atomic_mass: 35.453, covalent_radius: 102.0, electronegativity: 3.16, ionization_energy: 12.968, electron_config: "[Ne]3s2 3p5" }
+        }
+        if symbol == "Ar" {
+            return Element { symbol: "Ar", name: "Argon", atomic_number: 18, atomic_mass: 39.948, covalent_radius: 106.0, electronegativity: 0.0, ionization_energy: 15.760, electron_config: "[Ne]3s2 3p6" }
+        }
+        if symbol == "K" {
+            return Element { symbol: "K", name: "Potassium", atomic_number: 19, atomic_mass: 39.098, covalent_radius: 203.0, electronegativity: 0.82, ionization_energy: 4.341, electron_config: "[Ar]4s1" }
+        }
+        if symbol == "Ca" {
+            return Element { symbol: "Ca", name: "Calcium", atomic_number: 20, atomic_mass: 40.078, covalent_radius: 176.0, electronegativity: 1.00, ionization_energy: 6.113, electron_config: "[Ar]4s2" }
+        }
+        return get_element("H")
+    }
+
+    fn get_element_by_number(n: i32) -> Element {
+        if n == 1 { return get_element("H") }
+        if n == 2 { return get_element("He") }
+        if n == 3 { return get_element("Li") }
+        if n == 4 { return get_element("Be") }
+        if n == 5 { return get_element("B") }
+        if n == 6 { return get_element("C") }
+        if n == 7 { return get_element("N") }
+        if n == 8 { return get_element("O") }
+        if n == 9 { return get_element("F") }
+        if n == 10 { return get_element("Ne") }
+        if n == 11 { return get_element("Na") }
+        if n == 12 { return get_element("Mg") }
+        if n == 13 { return get_element("Al") }
+        if n == 14 { return get_element("Si") }
+        if n == 15 { return get_element("P") }
+        if n == 16 { return get_element("S") }
+        if n == 17 { return get_element("Cl") }
+        if n == 18 { return get_element("Ar") }
+        if n == 19 { return get_element("K") }
+        if n == 20 { return get_element("Ca") }
+        return get_element("H")
+    }
+
+    fn list_elements() -> Element[] {
+        return [
+            get_element("H"), get_element("He"), get_element("Li"), get_element("Be"),
+            get_element("B"), get_element("C"), get_element("N"), get_element("O"),
+            get_element("F"), get_element("Ne"), get_element("Na"), get_element("Mg"),
+            get_element("Al"), get_element("Si"), get_element("P"), get_element("S"),
+            get_element("Cl"), get_element("Ar"), get_element("K"), get_element("Ca")
+        ]
+    }
+
+    fn molecule_create(name: string) -> Molecule {
+        return Molecule { name: name, atoms: [], bonds: [], formula: "" }
+    }
+
+    fn molecule_add_atom(mol: Molecule, atom: Atom) -> i32 {
+        let idx = mol.atoms.size()
+        mol.atoms = mol.atoms ++ [atom]
+        return idx
+    }
+
+    fn molecule_add_bond(mol: Molecule, atom1: i32, atom2: i32, order: i32) {
+        let dx = mol.atoms[atom1].position[0] - mol.atoms[atom2].position[0]
+        let dy = mol.atoms[atom1].position[1] - mol.atoms[atom2].position[1]
+        let dz = mol.atoms[atom1].position[2] - mol.atoms[atom2].position[2]
+        let length = sqrt(dx * dx + dy * dy + dz * dz)
+        let bond = Bond { atom1: atom1, atom2: atom2, order: order, length: length }
+        mol.bonds = mol.bonds ++ [bond]
+    }
+
+    fn int_to_string(n: i32) -> string {
+        if n == 0 { return "0" }
+        let mut rev: string = ""
+        let mut num = n
+        while num > 0 {
+            rev = rev ++ char(48 + num % 10)
+            num = num / 10
+        }
+        let mut result: string = ""
+        let mut i = rev.size() - 1
+        while i >= 0 {
+            result = result ++ rev[i]
+            i = i - 1
+        }
+        return result
+    }
+
+    fn molecule_formula(mol: Molecule) -> string {
+        let n = mol.atoms.size()
+        let mut symbols: string[] = []
+        let mut counts: i32[] = []
+        let mut i: i32 = 0
+        while i < n {
+            let sym = mol.atoms[i].element.symbol
+            let mut found = -1
+            let mut j: i32 = 0
+            while j < symbols.size() {
+                if symbols[j] == sym {
+                    found = j
+                    break
+                }
+                j = j + 1
+            }
+            if found >= 0 {
+                counts[found] = counts[found] + 1
+            } else {
+                symbols = symbols ++ [sym]
+                counts = counts ++ [1]
+            }
+            i = i + 1
+        }
+
+        let mut result: string = ""
+        let mut ci: i32 = -1
+        let mut hi: i32 = -1
+        let mut oi: i32 = -1
+        let mut ni: i32 = -1
+        i = 0
+        while i < symbols.size() {
+            if symbols[i] == "C" { ci = i }
+            if symbols[i] == "H" { hi = i }
+            if symbols[i] == "O" { oi = i }
+            if symbols[i] == "N" { ni = i }
+            i = i + 1
+        }
+
+        if ci >= 0 {
+            result = result ++ "C"
+            if counts[ci] > 1 { result = result ++ int_to_string(counts[ci]) }
+        }
+        if hi >= 0 {
+            result = result ++ "H"
+            if counts[hi] > 1 { result = result ++ int_to_string(counts[hi]) }
+        }
+        if ni >= 0 {
+            result = result ++ "N"
+            if counts[ni] > 1 { result = result ++ int_to_string(counts[ni]) }
+        }
+        if oi >= 0 {
+            result = result ++ "O"
+            if counts[oi] > 1 { result = result ++ int_to_string(counts[oi]) }
+        }
+
+        i = 0
+        while i < symbols.size() {
+            if i != ci && i != hi && i != ni && i != oi {
+                result = result ++ symbols[i]
+                if counts[i] > 1 { result = result ++ int_to_string(counts[i]) }
+            }
+            i = i + 1
+        }
+
+        return result
+    }
+
+    fn molecule_mass(mol: Molecule) -> f64 {
+        let mut total: f64 = 0.0
+        for atom in mol.atoms {
+            total = total + atom.element.atomic_mass
+        }
+        return total
+    }
+
+    fn molecule_center(mol: Molecule) -> f64[] {
+        let n = mol.atoms.size()
+        if n == 0 { return [0.0, 0.0, 0.0] }
+        let mut cx: f64 = 0.0
+        let mut cy: f64 = 0.0
+        let mut cz: f64 = 0.0
+        for atom in mol.atoms {
+            let p = atom.position
+            cx = cx + (if p.size() > 0 { p[0] } else { 0.0 })
+            cy = cy + (if p.size() > 1 { p[1] } else { 0.0 })
+            cz = cz + (if p.size() > 2 { p[2] } else { 0.0 })
+        }
+        let nn = f64(n)
+        return [cx / nn, cy / nn, cz / nn]
+    }
+
+} // namespace std.chemistry

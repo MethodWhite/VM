@@ -1,0 +1,280 @@
+// std.biology.pdb - Protein structure parsing and analysis
+// PDB format parser, spatial calculations, and structural alignment.
+
+namespace std.biology {
+
+    type PDBAtom = struct {
+        serial: i32,
+        name: string,
+        res_name: string,
+        chain_id: string,
+        res_seq: i32,
+        x: f64, y: f64, z: f64,
+        occupancy: f64,
+        temp_factor: f64,
+        element: string
+    }
+
+    type PDBModel = struct {
+        atoms: PDBAtom[],
+        residues: i32,
+        chains: string[]
+    }
+
+    type ContactPair = struct {
+        res1: i32,
+        res2: i32
+    }
+
+    fn pdb_parse_atom_name(line: string) -> string {
+        if line.size() < 16 { return "" }
+        let mut name: string = ""
+        let mut i: i32 = 12
+        while i < 16 && i < line.size() {
+            if line[i] != ' ' { name = name ++ line[i] }
+            i = i + 1
+        }
+        if name.size() == 0 {
+            i = 12
+            while i < 16 && i < line.size() {
+                name = name ++ line[i]
+                i = i + 1
+            }
+        }
+        return name
+    }
+
+    fn pdb_parse_float(s: string) -> f64 {
+        let n = s.size()
+        if n == 0 { return 0.0 }
+        let mut result: f64 = 0.0
+        let mut sign: f64 = 1.0
+        let mut i: i32 = 0
+        let mut frac: bool = false
+        let mut div: f64 = 1.0
+
+        if s[i] == '-' { sign = -1.0; i = i + 1 }
+        else if s[i] == '+' { i = i + 1 }
+
+        while i < n {
+            let c = s[i]
+            if c == '.' {
+                frac = true
+                div = 10.0
+            } else if c >= '0' && c <= '9' {
+                if frac {
+                    result = result + f64(i32(c) - 48) / div
+                    div = div * 10.0
+                } else {
+                    result = result * 10.0 + f64(i32(c) - 48)
+                }
+            }
+            i = i + 1
+        }
+
+        return result * sign
+    }
+
+    fn pdb_parse_int(s: string) -> i32 {
+        let n = s.size()
+        if n == 0 { return 0 }
+        let mut result: i32 = 0
+        let mut sign: i32 = 1
+        let mut i: i32 = 0
+        if s[i] == '-' { sign = -1; i = i + 1 }
+        else if s[i] == '+' { i = i + 1 }
+        while i < n {
+            let c = s[i]
+            if c >= '0' && c <= '9' {
+                result = result * 10 + i32(c) - 48
+            }
+            i = i + 1
+        }
+        return result * sign
+    }
+
+    fn pdb_parse(pdb_text: string) -> PDBModel {
+        let mut atoms: PDBAtom[] = []
+        let mut chains: string[] = []
+        let mut residues: i32 = 0
+        let mut prev_res: i32 = -1
+        let mut prev_chain: string = ""
+
+        let text_len = pdb_text.size()
+        let mut line_start: i32 = 0
+        let mut line_idx: i32 = 0
+
+        while line_start < text_len {
+            let mut line_end = line_start
+            while line_end < text_len && pdb_text[line_end] != '\n' {
+                line_end = line_end + 1
+            }
+
+            let line_len = line_end - line_start
+            if line_len >= 6 {
+                let mut record: string = ""
+                let mut ri: i32 = 0
+                while ri < 6 && line_start + ri < text_len {
+                    record = record ++ pdb_text[line_start + ri]
+                    ri = ri + 1
+                }
+
+                if record == "ATOM  " || record == "HETATM" {
+                    let line_str: string = pdb_text[line_start..line_end]
+
+                    let serial_str: string = line_str[6..11]
+                    let serial = pdb_parse_int(serial_str)
+
+                    let name = pdb_parse_atom_name(line_str)
+
+                    let res_name: string
+                    if line_str.size() >= 20 {
+                        res_name = line_str[17..20]
+                    } else {
+                        res_name = ""
+                    }
+
+                    let chain_id: string
+                    if line_str.size() >= 22 {
+                        chain_id = line_str[21..22]
+                    } else {
+                        chain_id = ""
+                    }
+
+                    let res_seq_str: string
+                    if line_str.size() >= 26 {
+                        res_seq_str = line_str[22..26]
+                    } else {
+                        res_seq_str = ""
+                    }
+                    let res_seq = pdb_parse_int(res_seq_str)
+
+                    let x_str: string = line_str[30..38]
+                    let y_str: string = line_str[38..46]
+                    let z_str: string = line_str[46..54]
+                    let x = pdb_parse_float(x_str)
+                    let y = pdb_parse_float(y_str)
+                    let z = pdb_parse_float(z_str)
+
+                    let occ_str: string
+                    if line_str.size() >= 60 {
+                        occ_str = line_str[54..60]
+                    } else {
+                        occ_str = ""
+                    }
+                    let occupancy = pdb_parse_float(occ_str)
+
+                    let tf_str: string
+                    if line_str.size() >= 66 {
+                        tf_str = line_str[60..66]
+                    } else {
+                        tf_str = ""
+                    }
+                    let temp_factor = pdb_parse_float(tf_str)
+
+                    let element: string
+                    if line_str.size() >= 78 {
+                        element = line_str[76..78]
+                    } else {
+                        element = ""
+                    }
+
+                    if res_seq != prev_res || chain_id != prev_chain {
+                        residues = residues + 1
+                        prev_res = res_seq
+                        prev_chain = chain_id
+                    }
+
+                    let mut chain_found = false
+                    let mut ci: i32 = 0
+                    while ci < chains.size() {
+                        if chains[ci] == chain_id { chain_found = true; break }
+                        ci = ci + 1
+                    }
+                    if !chain_found && chain_id.size() > 0 {
+                        chains = chains ++ [chain_id]
+                    }
+
+                    atoms = atoms ++ [PDBAtom {
+                        serial: serial,
+                        name: name,
+                        res_name: res_name,
+                        chain_id: chain_id,
+                        res_seq: res_seq,
+                        x: x, y: y, z: z,
+                        occupancy: occupancy,
+                        temp_factor: temp_factor,
+                        element: element
+                    }]
+                }
+            }
+
+            line_start = line_end + 1
+            line_idx = line_idx + 1
+        }
+
+        return PDBModel { atoms: atoms, residues: residues, chains: chains }
+    }
+
+    fn pdb_center_of_mass(model: PDBModel) -> f64[] {
+        let n = model.atoms.size()
+        if n == 0 { return [0.0, 0.0, 0.0] }
+        let mut cx: f64 = 0.0
+        let mut cy: f64 = 0.0
+        let mut cz: f64 = 0.0
+        let mut i: i32 = 0
+        while i < n {
+            cx = cx + model.atoms[i].x
+            cy = cy + model.atoms[i].y
+            cz = cz + model.atoms[i].z
+            i = i + 1
+        }
+        let nn = f64(n)
+        return [cx / nn, cy / nn, cz / nn]
+    }
+
+    fn pdb_distance(a: PDBAtom, b: PDBAtom) -> f64 {
+        let dx = a.x - b.x
+        let dy = a.y - b.y
+        let dz = a.z - b.z
+        return sqrt(dx * dx + dy * dy + dz * dz)
+    }
+
+    fn pdb_rmsd(model1: PDBModel, model2: PDBModel) -> f64 {
+        let n1 = model1.atoms.size()
+        let n2 = model2.atoms.size()
+        let n = if n1 < n2 { n1 } else { n2 }
+        if n == 0 { return 0.0 }
+        let mut sum_sq: f64 = 0.0
+        let mut i: i32 = 0
+        while i < n {
+            let a1 = model1.atoms[i]
+            let a2 = model2.atoms[i]
+            let dx = a1.x - a2.x
+            let dy = a1.y - a2.y
+            let dz = a1.z - a2.z
+            sum_sq = sum_sq + dx * dx + dy * dy + dz * dz
+            i = i + 1
+        }
+        return sqrt(sum_sq / f64(n))
+    }
+
+    fn pdb_find_contacts(model: PDBModel, cutoff: f64) -> ContactPair[] {
+        let n = model.atoms.size()
+        let mut result: ContactPair[] = []
+        let mut i: i32 = 0
+        while i < n {
+            let mut j: i32 = i + 1
+            while j < n {
+                let d = pdb_distance(model.atoms[i], model.atoms[j])
+                if d <= cutoff {
+                    result = result ++ [ContactPair { res1: model.atoms[i].res_seq, res2: model.atoms[j].res_seq }]
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return result
+    }
+
+} // namespace std.biology

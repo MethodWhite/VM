@@ -1,0 +1,225 @@
+// std.biology.phylogeny - Phylogenetic tree construction and I/O
+// UPGMA clustering, Newick format export, tree data structures.
+
+namespace std.biology {
+
+    type PhyloNode = struct {
+        name: string,
+        distance: f64,
+        children: PhyloNode[],
+        is_leaf: bool
+    }
+
+    type PhyloTree = struct {
+        root: PhyloNode,
+        leaf_count: i32
+    }
+
+    fn phylo_node_create(name: string) -> PhyloNode {
+        return PhyloNode { name: name, distance: 0.0, children: [], is_leaf: true }
+    }
+
+    fn phylo_tree_create(root: PhyloNode) -> PhyloTree {
+        return PhyloTree { root: root, leaf_count: phylo_count_leaves(root) }
+    }
+
+    fn phylo_count_leaves(node: PhyloNode) -> i32 {
+        if node.is_leaf { return 1 }
+        let mut count: i32 = 0
+        let mut i: i32 = 0
+        while i < node.children.size() {
+            count = count + phylo_count_leaves(node.children[i])
+            i = i + 1
+        }
+        return count
+    }
+
+    fn phylo_add_child(parent: PhyloNode, child: PhyloNode) {
+        parent.children = parent.children ++ [child]
+        parent.is_leaf = false
+    }
+
+    fn f64_to_string(val: f64) -> string {
+        if val == 0.0 { return "0.0" }
+        let mut abs_val: f64 = if val < 0.0 { -val } else { val }
+
+        let int_part: i32 = i32(abs_val)
+        let frac_part: f64 = abs_val - f64(int_part)
+
+        let mut int_str: string = ""
+        if int_part == 0 {
+            int_str = "0"
+        } else {
+            let mut rev: string = ""
+            let mut n = int_part
+            while n > 0 {
+                rev = rev ++ char(48 + n % 10)
+                n = n / 10
+            }
+            let mut ri: i32 = rev.size() - 1
+            while ri >= 0 {
+                int_str = int_str ++ rev[ri]
+                ri = ri - 1
+            }
+        }
+
+        let mut frac_str: string = ""
+        let mut f = frac_part
+        let mut digits: i32 = 0
+        while digits < 6 {
+            f = f * 10.0
+            let d = i32(f)
+            frac_str = frac_str ++ char(48 + d)
+            f = f - f64(d)
+            if f < 0.000001 { break }
+            digits = digits + 1
+        }
+
+        if frac_str.size() > 0 {
+            if val < 0.0 { return "-" ++ int_str ++ "." ++ frac_str }
+            return int_str ++ "." ++ frac_str
+        }
+        if val < 0.0 { return "-" ++ int_str }
+        return int_str
+    }
+
+    fn phylo_newick_node(node: PhyloNode) -> string {
+        if node.is_leaf {
+            return node.name ++ ":" ++ f64_to_string(node.distance)
+        }
+        let mut result: string = "("
+        let n = node.children.size()
+        let mut i: i32 = 0
+        while i < n {
+            if i > 0 { result = result ++ "," }
+            result = result ++ phylo_newick_node(node.children[i])
+            i = i + 1
+        }
+        result = result ++ ")"
+        if node.name.size() > 0 {
+            result = result ++ node.name
+        }
+        result = result ++ ":" ++ f64_to_string(node.distance)
+        return result
+    }
+
+    fn phylo_newick(tree: PhyloTree) -> string {
+        return phylo_newick_node(tree.root) ++ ";"
+    }
+
+    fn phylo_upgma(dist_matrix: f64[][], names: string[]) -> PhyloTree {
+        let n = names.size()
+        if n == 0 {
+            let root = PhyloNode { name: "", distance: 0.0, children: [], is_leaf: true }
+            return PhyloTree { root: root, leaf_count: 0 }
+        }
+        if n == 1 {
+            let root = PhyloNode { name: names[0], distance: 0.0, children: [], is_leaf: true }
+            return PhyloTree { root: root, leaf_count: 1 }
+        }
+
+        let max_clusters = 2 * n - 1
+
+        let mut d: f64[] = []
+        let mut i: i32 = 0
+        while i < max_clusters * max_clusters {
+            d = d ++ [0.0]
+            i = i + 1
+        }
+
+        i = 0
+        while i < n {
+            let mut j: i32 = 0
+            while j < n {
+                d[i * max_clusters + j] = dist_matrix[i][j]
+                j = j + 1
+            }
+            i = i + 1
+        }
+
+        let mut cluster_nodes: PhyloNode[] = []
+        let mut cluster_sizes: i32[] = []
+        let mut is_active: bool[] = []
+
+        i = 0
+        while i < n {
+            cluster_nodes = cluster_nodes ++ [PhyloNode { name: names[i], distance: 0.0, children: [], is_leaf: true }]
+            cluster_sizes = cluster_sizes ++ [1]
+            is_active = is_active ++ [true]
+            i = i + 1
+        }
+
+        let mut active_count = n
+        let mut next_idx = n
+
+        while active_count > 1 {
+            let mut min_val: f64 = 1e100
+            let mut mini: i32 = -1
+            let mut minj: i32 = -1
+
+            i = 0
+            while i < next_idx {
+                if is_active[i] {
+                    let mut j: i32 = i + 1
+                    while j < next_idx {
+                        if is_active[j] {
+                            let val = d[i * max_clusters + j]
+                            if val < min_val {
+                                min_val = val
+                                mini = i
+                                minj = j
+                            }
+                        }
+                        j = j + 1
+                    }
+                }
+                i = i + 1
+            }
+
+            let parent = PhyloNode {
+                name: "",
+                distance: min_val / 2.0,
+                children: [cluster_nodes[mini], cluster_nodes[minj]],
+                is_leaf: false
+            }
+
+            cluster_nodes = cluster_nodes ++ [parent]
+            let combined_size = cluster_sizes[mini] + cluster_sizes[minj]
+            cluster_sizes = cluster_sizes ++ [combined_size]
+            is_active = is_active ++ [true]
+
+            let parent_idx = next_idx
+            let s_i = f64(cluster_sizes[mini])
+            let s_j = f64(cluster_sizes[minj])
+            let s_total = f64(combined_size)
+
+            i = 0
+            while i < parent_idx {
+                if is_active[i] {
+                    let d_i = d[mini * max_clusters + i]
+                    let d_j = d[minj * max_clusters + i]
+                    let new_dist = (s_i * d_i + s_j * d_j) / s_total
+                    d[parent_idx * max_clusters + i] = new_dist
+                    d[i * max_clusters + parent_idx] = new_dist
+                }
+                i = i + 1
+            }
+
+            is_active[mini] = false
+            is_active[minj] = false
+
+            next_idx = next_idx + 1
+            active_count = active_count - 1
+        }
+
+        let mut root_idx: i32 = 0
+        i = 0
+        while i < next_idx {
+            if is_active[i] { root_idx = i; break }
+            i = i + 1
+        }
+
+        return PhyloTree { root: cluster_nodes[root_idx], leaf_count: n }
+    }
+
+} // namespace std.biology

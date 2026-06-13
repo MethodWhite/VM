@@ -1,0 +1,222 @@
+// std.biology.sequence - DNA/RNA/Protein sequence operations
+// Nucleotide sequence manipulation, transcription, translation, and analysis.
+
+namespace std.biology {
+
+    type Nucleotide = enum { A, C, G, T, U }
+    type AminoAcid = enum { Ala, Arg, Asn, Asp, Cys, Gln, Glu, Gly, His, Ile, Leu, Lys, Met, Phe, Pro, Ser, Thr, Trp, Tyr, Val, STOP }
+    type SequenceType = enum { DNA, RNA, Protein }
+    type Sequence = struct {
+        id: string,
+        description: string,
+        seq_type: SequenceType,
+        nucleotides: string,
+        length: i32
+    }
+
+    fn sequence_create(id: string, seq: string, seq_type: SequenceType) -> Sequence {
+        return Sequence {
+            id: id,
+            description: "",
+            seq_type: seq_type,
+            nucleotides: seq,
+            length: i32(seq.size())
+        }
+    }
+
+    fn sequence_reverse(seq: Sequence) -> Sequence {
+        let n = seq.length
+        let mut rev: string = ""
+        let mut i: i32 = n - 1
+        while i >= 0 {
+            rev = rev ++ seq.nucleotides[i]
+            i = i - 1
+        }
+        return Sequence {
+            id: seq.id,
+            description: seq.description,
+            seq_type: seq.seq_type,
+            nucleotides: rev,
+            length: n
+        }
+    }
+
+    fn sequence_complement(seq: Sequence) -> Sequence {
+        let n = seq.length
+        let mut comp: string = ""
+        let mut i: i32 = 0
+        while i < n {
+            let b = seq.nucleotides[i]
+            if b == 'T' || b == 'U' {
+                comp = comp ++ 'A'
+            } else if b == 'A' {
+                if seq.seq_type == SequenceType.RNA {
+                    comp = comp ++ 'U'
+                } else {
+                    comp = comp ++ 'T'
+                }
+            } else if b == 'C' {
+                comp = comp ++ 'G'
+            } else if b == 'G' {
+                comp = comp ++ 'C'
+            } else {
+                comp = comp ++ b
+            }
+            i = i + 1
+        }
+        return Sequence {
+            id: seq.id,
+            description: seq.description,
+            seq_type: seq.seq_type,
+            nucleotides: comp,
+            length: n
+        }
+    }
+
+    fn sequence_reverse_complement(seq: Sequence) -> Sequence {
+        return sequence_reverse(sequence_complement(seq))
+    }
+
+    fn sequence_transcribe(seq: Sequence) -> Sequence {
+        let n = seq.length
+        let mut rna: string = ""
+        let mut i: i32 = 0
+        while i < n {
+            let b = seq.nucleotides[i]
+            if b == 'T' {
+                rna = rna ++ 'U'
+            } else {
+                rna = rna ++ b
+            }
+            i = i + 1
+        }
+        return Sequence {
+            id: seq.id,
+            description: seq.description,
+            seq_type: SequenceType.RNA,
+            nucleotides: rna,
+            length: n
+        }
+    }
+
+    fn codon_to_aa(codon: string) -> string {
+        if codon == "GCU" || codon == "GCC" || codon == "GCA" || codon == "GCG" { return "A" }
+        if codon == "CGU" || codon == "CGC" || codon == "CGA" || codon == "CGG" || codon == "AGA" || codon == "AGG" { return "R" }
+        if codon == "AAU" || codon == "AAC" { return "N" }
+        if codon == "GAU" || codon == "GAC" { return "D" }
+        if codon == "UGU" || codon == "UGC" { return "C" }
+        if codon == "CAA" || codon == "CAG" { return "Q" }
+        if codon == "GAA" || codon == "GAG" { return "E" }
+        if codon == "GGU" || codon == "GGC" || codon == "GGA" || codon == "GGG" { return "G" }
+        if codon == "CAU" || codon == "CAC" { return "H" }
+        if codon == "AUU" || codon == "AUC" || codon == "AUA" { return "I" }
+        if codon == "UUA" || codon == "UUG" || codon == "CUU" || codon == "CUC" || codon == "CUA" || codon == "CUG" { return "L" }
+        if codon == "AAA" || codon == "AAG" { return "K" }
+        if codon == "AUG" { return "M" }
+        if codon == "UUU" || codon == "UUC" { return "F" }
+        if codon == "CCU" || codon == "CCC" || codon == "CCA" || codon == "CCG" { return "P" }
+        if codon == "UCU" || codon == "UCC" || codon == "UCA" || codon == "UCG" || codon == "AGU" || codon == "AGC" { return "S" }
+        if codon == "ACU" || codon == "ACC" || codon == "ACA" || codon == "ACG" { return "T" }
+        if codon == "UGG" { return "W" }
+        if codon == "UAU" || codon == "UAC" { return "Y" }
+        if codon == "GUU" || codon == "GUC" || codon == "GUA" || codon == "GUG" { return "V" }
+        if codon == "UAA" || codon == "UAG" || codon == "UGA" { return "*" }
+        return "X"
+    }
+
+    fn sequence_translate(seq: Sequence) -> string {
+        let s: string
+        if seq.seq_type == SequenceType.DNA {
+            let mut rna: string = ""
+            let mut i: i32 = 0
+            while i < seq.length {
+                let b = seq.nucleotides[i]
+                if b == 'T' { rna = rna ++ 'U' } else { rna = rna ++ b }
+                i = i + 1
+            }
+            s = rna
+        } else {
+            s = seq.nucleotides
+        }
+        let n = s.size()
+        let mut result: string = ""
+        let mut i: i32 = 0
+        while i + 2 < n {
+            let codon: string = s[i] ++ s[i + 1] ++ s[i + 2]
+            let aa = codon_to_aa(codon)
+            if aa == "*" { return result }
+            result = result ++ aa
+            i = i + 3
+        }
+        return result
+    }
+
+    fn sequence_gc_content(seq: Sequence) -> f64 {
+        let s = seq.nucleotides
+        let n = s.size()
+        if n == 0 { return 0.0 }
+        let mut gc: i32 = 0
+        let mut total: i32 = 0
+        let mut i: i32 = 0
+        while i < n {
+            let b = s[i]
+            if b == 'G' || b == 'C' { gc = gc + 1 }
+            if b == 'A' || b == 'T' || b == 'U' || b == 'G' || b == 'C' { total = total + 1 }
+            i = i + 1
+        }
+        if total == 0 { return 0.0 }
+        return f64(gc) / f64(total) * 100.0
+    }
+
+    fn sequence_melting_temp(seq: Sequence) -> f64 {
+        let s = seq.nucleotides
+        let n = s.size()
+        if n == 0 { return 0.0 }
+        let mut at: i32 = 0
+        let mut gc: i32 = 0
+        let mut i: i32 = 0
+        while i < n {
+            let b = s[i]
+            if b == 'A' || b == 'T' || b == 'U' { at = at + 1 }
+            else if b == 'G' || b == 'C' { gc = gc + 1 }
+            i = i + 1
+        }
+        let total = at + gc
+        if total < 14 {
+            return f64(2 * at + 4 * gc)
+        }
+        return 64.9 + 41.0 * f64(gc) / f64(total)
+    }
+
+    fn sequence_subsequence(seq: Sequence, start: i32, end: i32) -> Sequence {
+        let sub = seq.nucleotides[start..end]
+        return Sequence {
+            id: seq.id,
+            description: seq.description,
+            seq_type: seq.seq_type,
+            nucleotides: sub,
+            length: i32(sub.size())
+        }
+    }
+
+    fn sequence_find_motif(seq: Sequence, motif: string) -> i32[] {
+        let s = seq.nucleotides
+        let n = s.size()
+        let m = motif.size()
+        let mut result: i32[] = []
+        if m == 0 || m > n { return result }
+        let mut i: i32 = 0
+        while i <= n - m {
+            let mut match: bool = true
+            let mut j: i32 = 0
+            while j < m {
+                if s[i + j] != motif[j] { match = false; break }
+                j = j + 1
+            }
+            if match { result = result ++ [i] }
+            i = i + 1
+        }
+        return result
+    }
+
+} // namespace std.biology

@@ -1,0 +1,120 @@
+// std.net.vex - Networking primitives for Vex
+// HTTP client, URL parsing, basic socket operations.
+
+namespace std.net {
+
+    // -----------------------------------------------------------------
+    //  URL parsing
+    // -----------------------------------------------------------------
+
+    type URL = struct {
+        scheme:   string   // "http", "https", "tcp", etc.
+        host:     string
+        port:     i32      // 0 = default for scheme
+        path:     string
+        query:    string   // after '?'
+        fragment: string   // after '#'
+        full:     string   // original URL string
+    }
+
+    fn parse_url(url_str: string) -> URL {
+        let mut result = URL { full: url_str }
+        let s = url_str
+
+        // Extract scheme
+        let colon = s.find("://")
+        if colon >= 0 {
+            result.scheme = s[0..colon]
+            s = s[colon + 3..]
+        }
+
+        // Extract host + port
+        let path_start = s.find("/")
+        let host_part = if path_start >= 0 { s[0..path_start] } else { s }
+        let port_colon = host_part.find(":")
+        if port_colon >= 0 {
+            result.host = host_part[0..port_colon]
+            result.port = i32(host_part[port_colon + 1..])
+        } else {
+            result.host = host_part
+            if result.scheme == "https" { result.port = 443 }
+            elif result.scheme == "http" { result.port = 80 }
+            else { result.port = 0 }
+        }
+
+        // Default port for scheme
+        if result.port == 0 {
+            if result.scheme == "https" { result.port = 443 }
+            elif result.scheme == "http" { result.port = 80 }
+        }
+
+        // Extract path + query + fragment
+        if path_start >= 0 {
+            let rest = s[path_start..]
+            let hash = rest.find("#")
+            let qmark = rest.find("?")
+            if hash >= 0 {
+                result.fragment = rest[hash + 1..]
+                rest = rest[0..hash]
+            }
+            if qmark >= 0 && (hash < 0 || qmark < hash) {
+                result.query = rest[qmark + 1..]
+                result.path = rest[0..qmark]
+            } else {
+                result.path = rest
+            }
+        }
+
+        return result
+    }
+
+    // -----------------------------------------------------------------
+    //  HTTP
+    // -----------------------------------------------------------------
+
+    type HttpResponse = struct {
+        status_code: i32
+        status_text: string
+        headers:     string[]
+        body:        string
+    }
+
+    /// HTTP GET request
+    @Extern("vesta_net:vhttp_get")
+    fn http_get(url: string) -> HttpResponse
+
+    /// HTTP POST request
+    @Extern("vesta_net:vhttp_post")
+    fn http_post(url: string, body: string, content_type: string) -> HttpResponse
+
+    // -----------------------------------------------------------------
+    //  DNS resolution
+    // -----------------------------------------------------------------
+
+    @Extern("vesta_net:vdns_resolve")
+    fn resolve_hostname(host: string) -> string
+
+    // -----------------------------------------------------------------
+    //  TCP socket (low-level, for VDP protocol)
+    // -----------------------------------------------------------------
+
+    type TCPConnection = struct {
+        fd:      i64
+        host:    string
+        port:    i32
+        connected: bool
+    }
+
+    @Extern("vesta_net:vtcp_connect")
+    fn tcp_connect(host: string, port: i32) -> TCPConnection
+
+    @Extern("vesta_net:vtcp_send")
+    fn tcp_send(conn: TCPConnection, data: u8[]) -> i32
+
+    @Extern("vesta_net:vtcp_receive")
+    fn tcp_receive(conn: TCPConnection, max_bytes: i32) -> u8[]
+
+    @Extern("vesta_net:vtcp_close")
+    fn tcp_close(conn: TCPConnection)
+
+} // namespace std.net

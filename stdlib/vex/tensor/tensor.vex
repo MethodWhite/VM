@@ -1,0 +1,303 @@
+// std.tensor.vex - N-dimensional array (tensor) library for ML workloads
+
+namespace std.tensor {
+
+    type Tensor = struct {
+        data: f64[],
+        shape: i32[],
+        strides: i32[],
+        ndim: i32
+    }
+
+    fn _numel(shape: i32[]) -> i32 {
+        let mut n: i32 = 1
+        for s in shape { n = n * s }
+        return n
+    }
+
+    fn _strides(shape: i32[]) -> i32[] {
+        let n = shape.size()
+        let mut s: i32[] = []
+        let mut i: i32 = 0
+        while i < n { s = s ++ [0]; i = i + 1 }
+        if n > 0 {
+            s[n - 1] = 1
+            let mut i = n - 2
+            while i >= 0 {
+                s[i] = s[i + 1] * shape[i + 1]
+                i = i - 1
+            }
+        }
+        return s
+    }
+
+    fn _flat_idx(s: i32[], indices: i32[]) -> i32 {
+        let mut idx: i32 = 0
+        let mut i: i32 = 0
+        while i < indices.size() {
+            idx = idx + indices[i] * s[i]
+            i = i + 1
+        }
+        return idx
+    }
+
+    fn _indices(flat: i32, s: i32[], nd: i32) -> i32[] {
+        let mut rem = flat
+        let mut idx: i32[] = []
+        let mut i: i32 = 0
+        while i < nd {
+            idx = idx ++ [rem / s[i]]
+            rem = rem % s[i]
+            i = i + 1
+        }
+        return idx
+    }
+
+    fn zeros(shape: i32[]) -> Tensor {
+        let total = _numel(shape)
+        let mut data: f64[] = []
+        let mut i: i32 = 0
+        while i < total { data = data ++ [0.0]; i = i + 1 }
+        return Tensor { data: data, shape: shape, strides: _strides(shape), ndim: shape.size() }
+    }
+
+    fn ones(shape: i32[]) -> Tensor {
+        let total = _numel(shape)
+        let mut data: f64[] = []
+        let mut i: i32 = 0
+        while i < total { data = data ++ [1.0]; i = i + 1 }
+        return Tensor { data: data, shape: shape, strides: _strides(shape), ndim: shape.size() }
+    }
+
+    fn full(shape: i32[], value: f64) -> Tensor {
+        let total = _numel(shape)
+        let mut data: f64[] = []
+        let mut i: i32 = 0
+        while i < total { data = data ++ [value]; i = i + 1 }
+        return Tensor { data: data, shape: shape, strides: _strides(shape), ndim: shape.size() }
+    }
+
+    fn eye(n: i32) -> Tensor {
+        let mut t = zeros([n, n])
+        let mut i: i32 = 0
+        while i < n { t.data[i * n + i] = 1.0; i = i + 1 }
+        return t
+    }
+
+    fn get(t: Tensor, indices: i32[]) -> f64 {
+        return t.data[_flat_idx(t.strides, indices)]
+    }
+
+    fn set(t: Tensor, indices: i32[], value: f64) {
+        t.data[_flat_idx(t.strides, indices)] = value
+    }
+
+    fn reshape(t: Tensor, new_shape: i32[]) -> Tensor {
+        if _numel(t.shape) != _numel(new_shape) { return zeros([0]) }
+        return Tensor { data: t.data, shape: new_shape, strides: _strides(new_shape), ndim: new_shape.size() }
+    }
+
+    fn slice(t: Tensor, dim: i32, start: i32, end: i32) -> Tensor {
+        let n = t.ndim
+        let mut new_shape: i32[] = []
+        let mut i: i32 = 0
+        while i < n {
+            new_shape = new_shape ++ [if i == dim { end - start } else { t.shape[i] }]
+            i = i + 1
+        }
+        let ns = _strides(new_shape)
+        let total = _numel(new_shape)
+        let mut data: f64[] = []
+        let mut fi: i32 = 0
+        while fi < total {
+            let idx = _indices(fi, ns, n)
+            idx[dim] = start + idx[dim]
+            data = data ++ [t.data[_flat_idx(t.strides, idx)]]
+            fi = fi + 1
+        }
+        return Tensor { data: data, shape: new_shape, strides: ns, ndim: n }
+    }
+
+    fn _broadcast_shape(a: i32[], b: i32[]) -> i32[] {
+        let na = a.size()
+        let nb = b.size()
+        let nd = if na > nb { na } else { nb }
+        let mut result: i32[] = []
+        let mut i: i32 = nd - 1
+        while i >= 0 {
+            let ai = if i >= (nd - na) { a[i - (nd - na)] } else { 1 }
+            let bi = if i >= (nd - nb) { b[i - (nd - nb)] } else { 1 }
+            if ai == 1 {
+                result = [bi] ++ result
+            } else {
+                if bi == 1 {
+                    result = [ai] ++ result
+                } else {
+                    if ai == bi {
+                        result = [ai] ++ result
+                    } else {
+                        return [0]
+                    }
+                }
+            }
+            i = i - 1
+        }
+        return result
+    }
+
+    fn _broadcast(t: Tensor, shape: i32[]) -> Tensor {
+        let target_nd = shape.size()
+        let n = t.ndim
+        let total = _numel(shape)
+        let ns = _strides(shape)
+        let mut data: f64[] = []
+        let mut fi: i32 = 0
+        while fi < total {
+            let idx = _indices(fi, ns, target_nd)
+            let mut old_idx: i32[] = []
+            let mut j: i32 = 0
+            while j < n {
+                let ti = target_nd - n + j
+                if t.shape[j] == 1 {
+                    old_idx = old_idx ++ [0]
+                } else {
+                    old_idx = old_idx ++ [idx[ti]]
+                }
+                j = j + 1
+            }
+            data = data ++ [t.data[_flat_idx(t.strides, old_idx)]]
+            fi = fi + 1
+        }
+        return Tensor { data: data, shape: shape, strides: ns, ndim: target_nd }
+    }
+
+    fn _elementwise(a: Tensor, b: Tensor, op: i32) -> Tensor {
+        let shape = _broadcast_shape(a.shape, b.shape)
+        let ta = _broadcast(a, shape)
+        let tb = _broadcast(b, shape)
+        let total = _numel(shape)
+        let mut data: f64[] = []
+        let mut i: i32 = 0
+        while i < total {
+            let v = if op == 0 { ta.data[i] + tb.data[i] }
+                    else { if op == 1 { ta.data[i] - tb.data[i] }
+                           else { ta.data[i] * tb.data[i] } }
+            data = data ++ [v]
+            i = i + 1
+        }
+        return Tensor { data: data, shape: shape, strides: _strides(shape), ndim: shape.size() }
+    }
+
+    fn add(a: Tensor, b: Tensor) -> Tensor {
+        return _elementwise(a, b, 0)
+    }
+
+    fn sub(a: Tensor, b: Tensor) -> Tensor {
+        return _elementwise(a, b, 1)
+    }
+
+    fn mul(a: Tensor, b: Tensor) -> Tensor {
+        return _elementwise(a, b, 2)
+    }
+
+    fn matmul(a: Tensor, b: Tensor) -> Tensor {
+        if a.ndim != 2 || b.ndim != 2 { return zeros([0, 0]) }
+        let m = a.shape[0]
+        let k = a.shape[1]
+        let k2 = b.shape[0]
+        let n = b.shape[1]
+        if k != k2 { return zeros([0, 0]) }
+        let mut result = zeros([m, n])
+        let mut i: i32 = 0
+        while i < m {
+            let mut j: i32 = 0
+            while j < n {
+                let mut sum: f64 = 0.0
+                let mut p: i32 = 0
+                while p < k {
+                    sum = sum + a.data[i * k + p] * b.data[p * n + j]
+                    p = p + 1
+                }
+                result.data[i * n + j] = sum
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return result
+    }
+
+    fn transpose(t: Tensor) -> Tensor {
+        if t.ndim != 2 { return t }
+        let rows = t.shape[0]
+        let cols = t.shape[1]
+        let mut result = zeros([cols, rows])
+        let mut i: i32 = 0
+        while i < rows {
+            let mut j: i32 = 0
+            while j < cols {
+                result.data[j * rows + i] = t.data[i * cols + j]
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return result
+    }
+
+    fn sum(t: Tensor, dim: i32) -> Tensor {
+        if dim < 0 || dim >= t.ndim { return zeros([0]) }
+        let n = t.ndim
+        if n == 1 {
+            let mut s: f64 = 0.0
+            for v in t.data { s = s + v }
+            return Tensor { data: [s], shape: [1], strides: [1], ndim: 1 }
+        }
+        let mut new_shape: i32[] = []
+        let mut i: i32 = 0
+        while i < n {
+            if i != dim { new_shape = new_shape ++ [t.shape[i]] }
+            i = i + 1
+        }
+        let ns = _strides(new_shape)
+        let total = _numel(new_shape)
+        let dim_size = t.shape[dim]
+        let mut data: f64[] = []
+        let mut fi: i32 = 0
+        while fi < total {
+            let nidx = _indices(fi, ns, new_shape.size())
+            let mut s: f64 = 0.0
+            let mut d: i32 = 0
+            while d < dim_size {
+                let mut old_idx: i32[] = []
+                let mut ii: i32 = 0
+                let mut ni: i32 = 0
+                while ii < n {
+                    if ii == dim {
+                        old_idx = old_idx ++ [d]
+                    } else {
+                        old_idx = old_idx ++ [nidx[ni]]
+                        ni = ni + 1
+                    }
+                    ii = ii + 1
+                }
+                s = s + t.data[_flat_idx(t.strides, old_idx)]
+                d = d + 1
+            }
+            data = data ++ [s]
+            fi = fi + 1
+        }
+        return Tensor { data: data, shape: new_shape, strides: ns, ndim: new_shape.size() }
+    }
+
+    fn mean(t: Tensor, dim: i32) -> Tensor {
+        let r = sum(t, dim)
+        let d = f64(t.shape[dim])
+        let mut i: i32 = 0
+        while i < r.data.size() { r.data[i] = r.data[i] / d; i = i + 1 }
+        return r
+    }
+
+    fn broadcast_to(t: Tensor, shape: i32[]) -> Tensor {
+        return _broadcast(t, shape)
+    }
+
+} // namespace std.tensor

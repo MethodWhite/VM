@@ -1,0 +1,166 @@
+// std.math.vex - Extended math library for Vex
+// Provides trigonometric, statistical, and random functions.
+
+namespace std.math {
+
+    // -----------------------------------------------------------------
+    //  Constants
+    // -----------------------------------------------------------------
+
+    const PI      : f64 = 3.14159265358979323846
+    const E       : f64 = 2.71828182845904523536
+    const TAU     : f64 = 6.28318530717958647693
+    const PHI     : f64 = 1.61803398874989484820  // golden ratio
+    const INF     : f64 = 1.0 / 0.0
+    const NAN_VAL : f64 = 0.0 / 0.0
+
+    // -----------------------------------------------------------------
+    //  Trigonometry
+    // -----------------------------------------------------------------
+
+    @Extern("vesta_math:vmath_sin")
+    fn sin(x: f64) -> f64
+
+    @Extern("vesta_math:vmath_cos")
+    fn cos(x: f64) -> f64
+
+    @Extern("vesta_math:vmath_tan")
+    fn tan(x: f64) -> f64
+
+    @Extern("vesta_math:vmath_asin")
+    fn asin(x: f64) -> f64
+
+    @Extern("vesta_math:vmath_acos")
+    fn acos(x: f64) -> f64
+
+    @Extern("vesta_math:vmath_atan2")
+    fn atan2(y: f64, x: f64) -> f64
+
+    @Inline
+    fn deg_to_rad(deg: f64) -> f64 { return deg * PI / 180.0 }
+
+    @Inline
+    fn rad_to_deg(rad: f64) -> f64 { return rad * 180.0 / PI }
+
+    @Inline
+    fn hypot(a: f64, b: f64) -> f64 { return sqrt(a * a + b * b) }
+
+    // -----------------------------------------------------------------
+    //  Statistics
+    // -----------------------------------------------------------------
+
+    fn mean(data: f64[]) -> f64 {
+        if data.size() == 0 { return 0.0 }
+        let mut sum: f64 = 0.0
+        for v in data { sum = sum + v }
+        return sum / f64(data.size())
+    }
+
+    fn variance(data: f64[]) -> f64 {
+        if data.size() < 2 { return 0.0 }
+        let mu = mean(data)
+        let mut sum_sq: f64 = 0.0
+        for v in data {
+            let diff = v - mu
+            sum_sq = sum_sq + diff * diff
+        }
+        return sum_sq / f64(data.size() - 1)
+    }
+
+    fn stddev(data: f64[]) -> f64 {
+        return sqrt(variance(data))
+    }
+
+    fn min(data: f64[]) -> f64 {
+        if data.size() == 0 { return 0.0 }
+        let mut result = data[0]
+        for v in data { if v < result { result = v } }
+        return result
+    }
+
+    fn max(data: f64[]) -> f64 {
+        if data.size() == 0 { return 0.0 }
+        let mut result = data[0]
+        for v in data { if v > result { result = v } }
+        return result
+    }
+
+    fn normalize(data: f64[]) -> f64[] {
+        let mn = min(data)
+        let mx = max(data)
+        let range = mx - mn
+        if range == 0.0 { return data }
+        let mut result: f64[] = []
+        for v in data {
+            result = result ++ [(v - mn) / range]
+        }
+        return result
+    }
+
+    fn softmax(data: f64[]) -> f64[] {
+        let mut sum: f64 = 0.0
+        let mut result: f64[] = []
+        for v in data {
+            let e = exp(v)
+            sum = sum + e
+            result = result ++ [e]
+        }
+        if sum == 0.0 { return data }
+        let mut i: i32 = 0
+        while i < result.size() {
+            result[i] = result[i] / sum
+            i = i + 1
+        }
+        return result
+    }
+
+    // -----------------------------------------------------------------
+    //  Probability distributions
+    // -----------------------------------------------------------------
+
+    /// Gaussian (normal) PDF
+    fn gaussian_pdf(x: f64, mu: f64, sigma: f64) -> f64 {
+        if sigma <= 0.0 { return 0.0 }
+        let z = (x - mu) / sigma
+        return exp(-0.5 * z * z) / (sigma * sqrt(TAU))
+    }
+
+    /// Sigmoid / logistic function
+    fn sigmoid(x: f64) -> f64 {
+        return 1.0 / (1.0 + exp(-x))
+    }
+
+    /// Clamp value between lo and hi
+    @Inline
+    fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
+        if x < lo { return lo }
+        if x > hi { return hi }
+        return x
+    }
+
+    /// Linear interpolation
+    @Inline
+    fn lerp(a: f64, b: f64, t: f64) -> f64 {
+        return a + (b - a) * t
+    }
+
+    // -----------------------------------------------------------------
+    //  Transcental functions (extern to native plugin)
+    // -----------------------------------------------------------------
+
+    @Extern("vesta_math:vmath_exp")
+    fn exp(x: f64) -> f64
+
+    @Extern("vesta_math:vmath_erf")
+    fn erf(x: f64) -> f64
+
+    // -----------------------------------------------------------------
+    //  Hyperbolic
+    // -----------------------------------------------------------------
+
+    fn tanh(x: f64) -> f64 {
+        let ex = exp(2.0 * x)
+        return (ex - 1.0) / (ex + 1.0)
+    }
+
+} // namespace std.math

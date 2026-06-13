@@ -1,0 +1,199 @@
+// std.signal.vex - Signal processing library for Vex
+// Fourier transforms, filters, correlation for photonic interferometry.
+
+namespace std.signal {
+
+    // -----------------------------------------------------------------
+    //  Complex number type
+    // -----------------------------------------------------------------
+
+    type Complex = struct { re: f64, im: f64 }
+
+    @Inline
+    fn complex(re: f64, im: f64) -> Complex {
+        return Complex { re: re, im: im }
+    }
+
+    @Inline
+    fn cadd(a: Complex, b: Complex) -> Complex {
+        return Complex { re: a.re + b.re, im: a.im + b.im }
+    }
+
+    @Inline
+    fn csub(a: Complex, b: Complex) -> Complex {
+        return Complex { re: a.re - b.re, im: a.im - b.im }
+    }
+
+    @Inline
+    fn cmul(a: Complex, b: Complex) -> Complex {
+        return Complex {
+            re: a.re * b.re - a.im * b.im,
+            im: a.re * b.im + a.im * b.re
+        }
+    }
+
+    @Inline
+    fn cmag(c: Complex) -> f64 {
+        return sqrt(c.re * c.re + c.im * c.im)
+    }
+
+    @Inline
+    fn cphase(c: Complex) -> f64 {
+        return atan2(c.im, c.re)
+    }
+
+    // -----------------------------------------------------------------
+    //  Fourier Transform (naive O(n²), para señales pequeñas)
+    // -----------------------------------------------------------------
+
+    type Spectrum = struct {
+        frequencies: f64[]  // frequency bins
+        magnitudes:  f64[]  // magnitude per bin
+        phases:      f64[]  // phase per bin
+        n:           i32    // number of bins
+    }
+
+    /// Discrete Fourier Transform (DFT)
+    fn dft(signal: f64[]) -> Spectrum {
+        let n = signal.size()
+        let mut mags: f64[] = []
+        let mut phs:  f64[] = []
+        let mut freqs: f64[] = []
+
+        let mut k: i32 = 0
+        while k < n {
+            let mut sum_re: f64 = 0.0
+            let mut sum_im: f64 = 0.0
+            let mut t: i32 = 0
+            while t < n {
+                let angle = -2.0 * std.math.PI * f64(k) * f64(t) / f64(n)
+                sum_re = sum_re + signal[t] * cos(angle)
+                sum_im = sum_im + signal[t] * sin(angle)
+                t = t + 1
+            }
+            mags  = mags  ++ [sqrt(sum_re * sum_re + sum_im * sum_im)]
+            phs   = phs   ++ [atan2(sum_im, sum_re)]
+            freqs = freqs ++ [f64(k)]
+            k = k + 1
+        }
+
+        return Spectrum {
+            frequencies: freqs,
+            magnitudes:  mags,
+            phases:      phs,
+            n:           n
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Filters
+    // -----------------------------------------------------------------
+
+    /// Simple moving average filter
+    fn moving_average(data: f64[], window: i32) -> f64[] {
+        if window <= 1 { return data }
+        let n = data.size()
+        let mut result: f64[] = []
+        let mut i: i32 = 0
+        while i < n {
+            let mut sum: f64 = 0.0
+            let mut count: i32 = 0
+            let mut j = i - window / 2
+            while j <= i + window / 2 {
+                if j >= 0 && j < n {
+                    sum = sum + data[j]
+                    count = count + 1
+                }
+                j = j + 1
+            }
+            result = result ++ [sum / f64(count)]
+            i = i + 1
+        }
+        return result
+    }
+
+    /// Simple high-pass filter: y[n] = x[n] - x[n-1]
+    fn highpass(data: f64[]) -> f64[] {
+        if data.size() < 2 { return data }
+        let mut result: f64[] = [0.0]
+        let mut i: i32 = 1
+        while i < data.size() {
+            result = result ++ [data[i] - data[i - 1]]
+            i = i + 1
+        }
+        return result
+    }
+
+    /// Envelope detection (Hilbert-style via abs + lowpass)
+    fn envelope(data: f64[], smoothing: i32) -> f64[] {
+        let mut rectified: f64[] = []
+        for v in data { rectified = rectified ++ [abs(v)] }
+        return moving_average(rectified, smoothing)
+    }
+
+    // -----------------------------------------------------------------
+    //  Correlation
+    // -----------------------------------------------------------------
+
+    /// Cross-correlation between two signals
+    fn cross_correlate(a: f64[], b: f64[]) -> f64[] {
+        let n = a.size()
+        let m = b.size()
+        if n == 0 || m == 0 { return [] }
+
+        let mut result: f64[] = []
+        let mut shift = -(m - 1)
+        while shift < n {
+            let mut sum: f64 = 0.0
+            let mut count: i32 = 0
+            let mut i: i32 = 0
+            while i < m {
+                let ai = shift + i
+                if ai >= 0 && ai < n {
+                    sum = sum + a[ai] * b[i]
+                    count = count + 1
+                }
+                i = i + 1
+            }
+            result = result ++ [if count > 0 { sum / f64(count) } else { 0.0 }]
+            shift = shift + 1
+        }
+        return result
+    }
+
+    /// Auto-correlation (find periodicity)
+    fn auto_correlate(signal: f64[]) -> f64[] {
+        return cross_correlate(signal, signal)
+    }
+
+    // -----------------------------------------------------------------
+    //  Photonic-specific signal processing
+    // -----------------------------------------------------------------
+
+    /// Demodulate self-mixing interferometry signal.
+    /// The feedback voltage from the laser contains the interference
+    /// pattern encoded as amplitude modulation.
+    fn demodulate_self_mixing(feedback: f64[], carrier_nm: f64) -> f64[] {
+        // Simple AM demodulation: abs + lowpass
+        let rectified: f64[] = []
+        for v in feedback { rectified = rectified ++ [abs(v)] }
+        return moving_average(rectified, 5)
+    }
+
+    /// Detect resonance peaks in a frequency sweep.
+    /// Returns the frequencies (nm) with highest resonance.
+    fn find_resonances(sweep: Spectrum, threshold: f64) -> f64[] {
+        let mut peaks: f64[] = []
+        let mut i: i32 = 1
+        while i < sweep.n - 1 {
+            if sweep.magnitudes[i] > threshold
+                && sweep.magnitudes[i] > sweep.magnitudes[i - 1]
+                && sweep.magnitudes[i] > sweep.magnitudes[i + 1] {
+                peaks = peaks ++ [sweep.frequencies[i]]
+            }
+            i = i + 1
+        }
+        return peaks
+    }
+
+} // namespace std.signal

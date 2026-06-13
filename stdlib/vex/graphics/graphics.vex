@@ -1,0 +1,584 @@
+// std.graphics.vex - Core graphics types and renderer for VestaVM
+// Provides float2/float3/float4/matrix4x4, shader types, and pipeline.
+
+namespace std.graphics {
+
+    // -----------------------------------------------------------------
+    //  Shader math types
+    // -----------------------------------------------------------------
+
+    type float2 = struct { f32 x; f32 y; }
+    type float3 = struct { f32 x; f32 y; f32 z; }
+    type float4 = struct { f32 x; f32 y; f32 z; f32 w; }
+
+    type matrix4x4 = struct {
+        f32 m00; f32 m01; f32 m02; f32 m03;
+        f32 m10; f32 m11; f32 m12; f32 m13;
+        f32 m20; f32 m21; f32 m22; f32 m23;
+        f32 m30; f32 m31; f32 m32; f32 m33;
+    }
+
+    // -----------------------------------------------------------------
+    //  float2 constructors & ops
+    // -----------------------------------------------------------------
+
+    @Inline
+    fn float2_make(x: f32, y: f32) -> float2 { return float2 { x, y } }
+
+    @Inline
+    fn float2_add(a: float2, b: float2) -> float2 {
+        return float2 { x: a.x + b.x, y: a.y + b.y }
+    }
+
+    @Inline
+    fn float2_sub(a: float2, b: float2) -> float2 {
+        return float2 { x: a.x - b.x, y: a.y - b.y }
+    }
+
+    @Inline
+    fn float2_scale(v: float2, s: f32) -> float2 {
+        return float2 { x: v.x * s, y: v.y * s }
+    }
+
+    @Inline
+    fn float2_dot(a: float2, b: float2) -> f32 { return a.x*b.x + a.y*b.y }
+
+    // -----------------------------------------------------------------
+    //  float3 constructors & ops
+    // -----------------------------------------------------------------
+
+    @Inline
+    fn float3_make(x: f32, y: f32, z: f32) -> float3 { return float3 { x, y, z } }
+
+    @Inline
+    fn float3_add(a: float3, b: float3) -> float3 {
+        return float3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }
+    }
+
+    @Inline
+    fn float3_sub(a: float3, b: float3) -> float3 {
+        return float3 { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }
+    }
+
+    @Inline
+    fn float3_scale(v: float3, s: f32) -> float3 {
+        return float3 { x: v.x * s, y: v.y * s, z: v.z * s }
+    }
+
+    @Inline
+    fn float3_dot(a: float3, b: float3) -> f32 { return a.x*b.x + a.y*b.y + a.z*b.z }
+
+    @Inline
+    fn float3_cross(a: float3, b: float3) -> float3 {
+        return float3 {
+            x: a.y*b.z - a.z*b.y,
+            y: a.z*b.x - a.x*b.z,
+            z: a.x*b.y - a.y*b.x
+        }
+    }
+
+    @Inline
+    fn float3_length(v: float3) -> f32 { return sqrt(float3_dot(v, v)) }
+
+    @Inline
+    fn float3_normalize(v: float3) -> float3 {
+        let len = float3_length(v)
+        if len == 0.0 { return v }
+        return float3_scale(v, 1.0 / len)
+    }
+
+    // -----------------------------------------------------------------
+    //  float4 constructors & ops
+    // -----------------------------------------------------------------
+
+    @Inline
+    fn float4_make(x: f32, y: f32, z: f32, w: f32) -> float4 {
+        return float4 { x, y, z, w }
+    }
+
+    @Inline
+    fn float4_from_float3(v: float3, w: f32) -> float4 {
+        return float4 { x: v.x, y: v.y, z: v.z, w }
+    }
+
+    @Inline
+    fn float4_add(a: float4, b: float4) -> float4 {
+        return float4 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z, w: a.w + b.w }
+    }
+
+    // -----------------------------------------------------------------
+    //  matrix4x4 constructors & ops
+    // -----------------------------------------------------------------
+
+    @Inline
+    fn mat4_identity() -> matrix4x4 {
+        return matrix4x4 {
+            m00:1,m01:0,m02:0,m03:0,
+            m10:0,m11:1,m12:0,m13:0,
+            m20:0,m21:0,m22:1,m23:0,
+            m30:0,m31:0,m32:0,m33:1
+        }
+    }
+
+    @Inline
+    fn mat4_zero() -> matrix4x4 {
+        return matrix4x4 {
+            m00:0,m01:0,m02:0,m03:0,
+            m10:0,m11:0,m12:0,m13:0,
+            m20:0,m21:0,m22:0,m23:0,
+            m30:0,m31:0,m32:0,m33:0
+        }
+    }
+
+    @Inline
+    fn mat4_mul_scalar(m: matrix4x4, s: f32) -> matrix4x4 {
+        return matrix4x4 {
+            m00:m.m00*s, m01:m.m01*s, m02:m.m02*s, m03:m.m03*s,
+            m10:m.m10*s, m11:m.m11*s, m12:m.m12*s, m13:m.m13*s,
+            m20:m.m20*s, m21:m.m21*s, m22:m.m22*s, m23:m.m23*s,
+            m30:m.m30*s, m31:m.m31*s, m32:m.m32*s, m33:m.m33*s
+        }
+    }
+
+    @Inline
+    fn mat4_mul(a: matrix4x4, b: matrix4x4) -> matrix4x4 {
+        return matrix4x4 {
+            m00: a.m00*b.m00 + a.m01*b.m10 + a.m02*b.m20 + a.m03*b.m30,
+            m01: a.m00*b.m01 + a.m01*b.m11 + a.m02*b.m21 + a.m03*b.m31,
+            m02: a.m00*b.m02 + a.m01*b.m12 + a.m02*b.m22 + a.m03*b.m32,
+            m03: a.m00*b.m03 + a.m01*b.m13 + a.m02*b.m23 + a.m03*b.m33,
+
+            m10: a.m10*b.m00 + a.m11*b.m10 + a.m12*b.m20 + a.m13*b.m30,
+            m11: a.m10*b.m01 + a.m11*b.m11 + a.m12*b.m21 + a.m13*b.m31,
+            m12: a.m10*b.m02 + a.m11*b.m12 + a.m12*b.m22 + a.m13*b.m32,
+            m13: a.m10*b.m03 + a.m11*b.m13 + a.m12*b.m23 + a.m13*b.m33,
+
+            m20: a.m20*b.m00 + a.m21*b.m10 + a.m22*b.m20 + a.m23*b.m30,
+            m21: a.m20*b.m01 + a.m21*b.m11 + a.m22*b.m21 + a.m23*b.m31,
+            m22: a.m20*b.m02 + a.m21*b.m12 + a.m22*b.m22 + a.m23*b.m32,
+            m23: a.m20*b.m03 + a.m21*b.m13 + a.m22*b.m23 + a.m23*b.m33,
+
+            m30: a.m30*b.m00 + a.m31*b.m10 + a.m32*b.m20 + a.m33*b.m30,
+            m31: a.m30*b.m01 + a.m31*b.m11 + a.m32*b.m21 + a.m33*b.m31,
+            m32: a.m30*b.m02 + a.m31*b.m12 + a.m32*b.m22 + a.m33*b.m32,
+            m33: a.m30*b.m03 + a.m31*b.m13 + a.m32*b.m23 + a.m33*b.m33
+        }
+    }
+
+    @Inline
+    fn mat4_mul_float4(m: matrix4x4, v: float4) -> float4 {
+        return float4 {
+            x: m.m00*v.x + m.m01*v.y + m.m02*v.z + m.m03*v.w,
+            y: m.m10*v.x + m.m11*v.y + m.m12*v.z + m.m13*v.w,
+            z: m.m20*v.x + m.m21*v.y + m.m22*v.z + m.m23*v.w,
+            w: m.m30*v.x + m.m31*v.y + m.m32*v.z + m.m33*v.w
+        }
+    }
+
+    @Inline
+    fn mat4_translate(m: matrix4x4, tx: f32, ty: f32, tz: f32) -> matrix4x4 {
+        let t = mat4_identity()
+        t.m03 = tx; t.m13 = ty; t.m23 = tz
+        return mat4_mul(m, t)
+    }
+
+    @Inline
+    fn mat4_scale(m: matrix4x4, sx: f32, sy: f32, sz: f32) -> matrix4x4 {
+        let s = mat4_identity()
+        s.m00 = sx; s.m11 = sy; s.m22 = sz
+        return mat4_mul(m, s)
+    }
+
+    @Inline
+    fn mat4_perspective(fov_deg: f32, aspect: f32, near: f32, far: f32) -> matrix4x4 {
+        let f = 1.0 / tan(fov_deg * 3.14159265 / 360.0)
+        let nf = 1.0 / (near - far)
+        return matrix4x4 {
+            m00: f/aspect, m01:0, m02: 0,                     m03: 0,
+            m10: 0,        m11:f, m12: 0,                     m13: 0,
+            m20: 0,        m21:0, m22: (far+near)*nf,         m23: 2*far*near*nf,
+            m30: 0,        m31:0, m32: -1.0,                  m33: 0
+        }
+    }
+
+    @Inline
+    fn mat4_lookat(eye: float3, target: float3, up: float3) -> matrix4x4 {
+        let f = float3_normalize(float3_sub(target, eye))
+        let s = float3_normalize(float3_cross(f, up))
+        let u = float3_cross(s, f)
+        return matrix4x4 {
+            m00: s.x, m01: s.y, m02: s.z, m03: -float3_dot(s, eye),
+            m10: u.x, m11: u.y, m12: u.z, m13: -float3_dot(u, eye),
+            m20:-f.x, m21:-f.y, m22:-f.z, m23:  float3_dot(f, eye),
+            m30: 0,   m31: 0,   m32: 0,   m33: 1
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Shader type enums
+    // -----------------------------------------------------------------
+
+    type ShaderFieldType = enum {
+        SHADER_FLOAT2,
+        SHADER_FLOAT3,
+        SHADER_FLOAT4,
+        SHADER_MATRIX4X4,
+        SHADER_SAMPLER2D,
+        SHADER_INT,
+        SHADER_FLOAT
+    }
+
+    type ShaderField = struct {
+        string      name
+        ShaderFieldType type
+    }
+
+    // -----------------------------------------------------------------
+    //  Shader definitions
+    // -----------------------------------------------------------------
+
+    type VertexInput = struct {
+        float3 position
+        float3 normal
+        float2 uv
+    }
+
+    type VertexOutput = struct {
+        float4 position
+        float3 color
+        float3 normal
+        float2 uv
+    }
+
+    type VertexShader = struct {
+        ShaderField[] input_layout
+        ShaderField[] output_layout
+        ShaderField[] uniforms
+        string        source          // original SolidScript source
+    }
+
+    type FragmentInput = struct {
+        float4 position
+        float3 color
+        float3 normal
+        float2 uv
+    }
+
+    type FragmentOutput = struct {
+        float4 color
+    }
+
+    type FragmentShader = struct {
+        ShaderField[] input_layout
+        ShaderField[] output_layout
+        ShaderField[] uniforms
+        string        source
+    }
+
+    type ComputeShader = struct {
+        ShaderField[] uniforms
+        i32[]         workgroup_size
+        string        source
+    }
+
+    type Material = struct {
+        VertexShader   vertex_shader
+        FragmentShader fragment_shader
+        float3         albedo
+        f32            roughness
+        f32            metallic
+        f32            ambient_occlusion
+    }
+
+    // -----------------------------------------------------------------
+    //  Pipeline configuration
+    // -----------------------------------------------------------------
+
+    type PipelineConfig = struct {
+        string name
+        string[] enabled_stages   // "vertex", "fragment", "compute"
+        i32 viewport_width
+        i32 viewport_height
+        bool depth_test
+        bool cull_backfaces
+    }
+
+    // -----------------------------------------------------------------
+    //  Scene types
+    // -----------------------------------------------------------------
+
+    type Mesh = struct {
+        float3[] vertices
+        float3[] normals
+        float2[] uvs
+        i32[]    indices
+    }
+
+    type Camera = struct {
+        float3 position
+        float3 target
+        float3 up
+        f32    fov
+        f32    aspect_ratio
+        f32    near_plane
+        f32    far_plane
+    }
+
+    type Scene = struct {
+        Mesh[]   meshes
+        Camera   camera
+        float3   ambient_light
+    }
+
+    type FrameBuffer = struct {
+        f32[]    pixels   // RGBA float per pixel
+        i32      width
+        i32      height
+    }
+
+    // -----------------------------------------------------------------
+    //  Mesh factories
+    // -----------------------------------------------------------------
+
+    fn create_triangle() -> Mesh {
+        return Mesh {
+            vertices: [
+                float3_make( 0.0,  0.5, 0.0),
+                float3_make(-0.5, -0.5, 0.0),
+                float3_make( 0.5, -0.5, 0.0)
+            ],
+            normals: [
+                float3_make(0, 0, 1),
+                float3_make(0, 0, 1),
+                float3_make(0, 0, 1)
+            ],
+            uvs: [
+                float2_make(0.5, 1.0),
+                float2_make(0.0, 0.0),
+                float2_make(1.0, 0.0)
+            ],
+            indices: [0, 1, 2]
+        }
+    }
+
+    fn create_quad() -> Mesh {
+        return Mesh {
+            vertices: [
+                float3_make(-0.5, -0.5, 0.0),
+                float3_make( 0.5, -0.5, 0.0),
+                float3_make( 0.5,  0.5, 0.0),
+                float3_make(-0.5,  0.5, 0.0)
+            ],
+            normals: [
+                float3_make(0, 0, 1),
+                float3_make(0, 0, 1),
+                float3_make(0, 0, 1),
+                float3_make(0, 0, 1)
+            ],
+            uvs: [
+                float2_make(0, 0),
+                float2_make(1, 0),
+                float2_make(1, 1),
+                float2_make(0, 1)
+            ],
+            indices: [0, 1, 2, 0, 2, 3]
+        }
+    }
+
+    fn create_cube() -> Mesh {
+        let hs: f32 = 0.5
+        return Mesh {
+            vertices: [
+                float3_make(-hs, -hs,  hs), float3_make( hs, -hs,  hs),
+                float3_make( hs,  hs,  hs), float3_make(-hs,  hs,  hs),
+                float3_make(-hs, -hs, -hs), float3_make(-hs,  hs, -hs),
+                float3_make( hs,  hs, -hs), float3_make( hs, -hs, -hs),
+                float3_make(-hs,  hs, -hs), float3_make(-hs,  hs,  hs),
+                float3_make( hs,  hs,  hs), float3_make( hs,  hs, -hs),
+                float3_make(-hs, -hs, -hs), float3_make( hs, -hs, -hs),
+                float3_make( hs, -hs,  hs), float3_make(-hs, -hs,  hs),
+                float3_make( hs, -hs, -hs), float3_make( hs,  hs, -hs),
+                float3_make( hs,  hs,  hs), float3_make( hs, -hs,  hs),
+                float3_make(-hs, -hs, -hs), float3_make(-hs, -hs,  hs),
+                float3_make(-hs,  hs,  hs), float3_make(-hs,  hs, -hs)
+            ],
+            normals: [
+                float3_make(0,0,1), float3_make(0,0,1),
+                float3_make(0,0,1), float3_make(0,0,1),
+                float3_make(0,0,-1),float3_make(0,0,-1),
+                float3_make(0,0,-1),float3_make(0,0,-1),
+                float3_make(0,1,0), float3_make(0,1,0),
+                float3_make(0,1,0), float3_make(0,1,0),
+                float3_make(0,-1,0),float3_make(0,-1,0),
+                float3_make(0,-1,0),float3_make(0,-1,0),
+                float3_make(1,0,0), float3_make(1,0,0),
+                float3_make(1,0,0), float3_make(1,0,0),
+                float3_make(-1,0,0),float3_make(-1,0,0),
+                float3_make(-1,0,0),float3_make(-1,0,0)
+            ],
+            uvs: [
+                float2_make(0,0),float2_make(1,0),
+                float2_make(1,1),float2_make(0,1),
+                float2_make(1,0),float2_make(1,1),
+                float2_make(0,1),float2_make(0,0),
+                float2_make(0,1),float2_make(0,0),
+                float2_make(1,0),float2_make(1,1),
+                float2_make(1,1),float2_make(0,1),
+                float2_make(0,0),float2_make(1,0),
+                float2_make(0,0),float2_make(0,1),
+                float2_make(1,1),float2_make(1,0),
+                float2_make(0,0),float2_make(1,0),
+                float2_make(1,1),float2_make(0,1)
+            ],
+            indices: [
+                0,1,2,0,2,3, 4,5,6,4,6,7,
+                8,9,10,8,10,11, 12,13,14,12,14,15,
+                16,17,18,16,18,19, 20,21,22,20,22,23
+            ]
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Software rasterizer (placeholder — real impl uses JIT SIMD)
+    // -----------------------------------------------------------------
+
+    @Extern("vesta_graphics:render_pipeline")
+    fn render_pipeline(scene: Scene) -> FrameBuffer
+
+    @Extern("vesta_graphics:compile_shader")
+    fn compile_shader(source: string, stage: string) -> i32
+
+    @Extern("vesta_graphics:set_uniform")
+    fn set_uniform(shader_id: i32, name: string, data: f32[]) -> bool
+
+    /// Return total pixel count of a framebuffer
+    @Inline
+    fn framebuffer_size(fb: FrameBuffer) -> i32 {
+        return fb.width * fb.height
+    }
+
+    // -----------------------------------------------------------------
+    //  Ray tracing types and intersection
+    // -----------------------------------------------------------------
+
+    type Ray = struct {
+        float3 origin
+        float3 direction
+    }
+
+    type RayHit = struct {
+        bool hit
+        float3 point
+        float3 normal
+        f32 t
+        i32 material_index
+    }
+
+    fn ray_triangle_intersect(ray: Ray, v0: float3, v1: float3, v2: float3) -> RayHit {
+        let epsilon: f32 = 0.0000001
+        let edge1 = float3_sub(v1, v0)
+        let edge2 = float3_sub(v2, v0)
+        let h = float3_cross(ray.direction, edge2)
+        let a = float3_dot(edge1, h)
+        if a > -epsilon && a < epsilon {
+            return RayHit { hit: false, point: float3_make(0,0,0), normal: float3_make(0,0,0), t: 0, material_index: -1 }
+        }
+        let f = 1.0 / a
+        let s = float3_sub(ray.origin, v0)
+        let u = f * float3_dot(s, h)
+        if u < 0.0 || u > 1.0 {
+            return RayHit { hit: false, point: float3_make(0,0,0), normal: float3_make(0,0,0), t: 0, material_index: -1 }
+        }
+        let q = float3_cross(s, edge1)
+        let v = f * float3_dot(ray.direction, q)
+        if v < 0.0 || u + v > 1.0 {
+            return RayHit { hit: false, point: float3_make(0,0,0), normal: float3_make(0,0,0), t: 0, material_index: -1 }
+        }
+        let t = f * float3_dot(edge2, q)
+        if t > epsilon {
+            let point = float3_add(float3_add(v0, float3_scale(edge1, u)), float3_scale(edge2, v))
+            let normal = float3_normalize(float3_cross(edge1, edge2))
+            return RayHit { hit: true, point: point, normal: normal, t: t, material_index: 0 }
+        }
+        return RayHit { hit: false, point: float3_make(0,0,0), normal: float3_make(0,0,0), t: 0, material_index: -1 }
+    }
+
+    fn ray_mesh_intersect(ray: Ray, mesh: Mesh) -> RayHit {
+        let mut best = RayHit { hit: false, point: float3_make(0,0,0), normal: float3_make(0,0,0), t: 999999.0, material_index: -1 }
+        let num_tris = mesh.indices.size() / 3
+        let mut i: i32 = 0
+        while i < num_tris {
+            let i0 = mesh.indices[i * 3]
+            let i1 = mesh.indices[i * 3 + 1]
+            let i2 = mesh.indices[i * 3 + 2]
+            let hit = ray_triangle_intersect(ray, mesh.vertices[i0], mesh.vertices[i1], mesh.vertices[i2])
+            if hit.hit && hit.t < best.t {
+                best = hit
+            }
+            i = i + 1
+        }
+        if !best.hit {
+            best.t = 0.0
+        }
+        return best
+    }
+
+    fn render_raytrace(scene: Scene, width: i32, height: i32) -> float4[] {
+        let total = width * height
+        let mut pixels: float4[] = []
+        let mut i: i32 = 0
+        while i < total {
+            pixels = pixels ++ [float4_make(0, 0, 0, 1)]
+            i = i + 1
+        }
+
+        let cam = scene.camera
+        let fwd = float3_normalize(float3_sub(cam.target, cam.position))
+        let right = float3_normalize(float3_cross(fwd, cam.up))
+        let up = float3_cross(right, fwd)
+        let fov_scale = 1.0 / tan(cam.fov * 3.14159265 / 360.0)
+        let aspect = f32(width) / f32(height)
+
+        let mut py: i32 = 0
+        while py < height {
+            let mut px: i32 = 0
+            while px < width {
+                let u = (f32(px) + 0.5) / f32(width) * 2.0 - 1.0
+                let v = (f32(py) + 0.5) / f32(height) * 2.0 - 1.0
+                let dir = float3_normalize(float3_add(float3_add(float3_scale(right, u * fov_scale * aspect), float3_scale(up, v * fov_scale)), fwd))
+                let ray = Ray { origin: cam.position, direction: dir }
+
+                let mut best_t: f32 = 999999.0
+                let mut best_normal = float3_make(0, 0, 0)
+
+                let num_meshes = scene.meshes.size()
+                let mut mi: i32 = 0
+                while mi < num_meshes {
+                    let hit = ray_mesh_intersect(ray, scene.meshes[mi])
+                    if hit.hit && hit.t < best_t {
+                        best_t = hit.t
+                        best_normal = hit.normal
+                    }
+                    mi = mi + 1
+                }
+
+                let color: float4
+                if best_t < 999998.0 {
+                    let light_dir = float3_normalize(float3_make(1.0, 1.0, 1.0))
+                    let ndotl = float3_dot(best_normal, light_dir)
+                    let intensity = if ndotl > 0.0 { ndotl } else { 0.0 }
+                    color = float4_make(intensity * 0.8 + 0.1, intensity * 0.8 + 0.1, intensity * 0.8 + 0.1, 1.0)
+                } else {
+                    color = float4_make(0.05, 0.05, 0.15, 1.0)
+                }
+
+                pixels[py * width + px] = color
+                px = px + 1
+            }
+            py = py + 1
+        }
+
+        return pixels
+    }
+
+} // namespace std.graphics

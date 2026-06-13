@@ -1,0 +1,178 @@
+// std.chemistry.md - Molecular dynamics engine
+// Force field potentials, energy computation, and integration.
+
+namespace std.chemistry {
+
+    type ForceField = struct {
+        bond_k: f64[],
+        bond_eq: f64[],
+        angle_k: f64[],
+        angle_eq: f64[],
+        epsilon: f64,
+        sigma: f64
+    }
+
+    @Extern("vesta_math:vmath_acos")
+    fn acos(x: f64) -> f64
+
+    fn force_field_default() -> ForceField {
+        return ForceField {
+            bond_k: [],
+            bond_eq: [],
+            angle_k: [],
+            angle_eq: [],
+            epsilon: 0.15,
+            sigma: 3.5
+        }
+    }
+
+    fn compute_bond_energy(mol: Molecule, ff: ForceField) -> f64 {
+        let mut energy: f64 = 0.0
+        let n = mol.bonds.size()
+        let mut i: i32 = 0
+        while i < n {
+            let bond = mol.bonds[i]
+            let a1 = bond.atom1
+            let a2 = bond.atom2
+            let dx = mol.atoms[a1].position[0] - mol.atoms[a2].position[0]
+            let dy = mol.atoms[a1].position[1] - mol.atoms[a2].position[1]
+            let dz = mol.atoms[a1].position[2] - mol.atoms[a2].position[2]
+            let r = sqrt(dx * dx + dy * dy + dz * dz)
+            let k = if i < ff.bond_k.size() { ff.bond_k[i] } else { 300.0 }
+            let r0 = if i < ff.bond_eq.size() { ff.bond_eq[i] } else { 1.5 }
+            let dr = r - r0
+            energy = energy + 0.5 * k * dr * dr
+            i = i + 1
+        }
+        return energy
+    }
+
+    fn compute_angle_energy(mol: Molecule, ff: ForceField) -> f64 {
+        let mut energy: f64 = 0.0
+        let nb = mol.bonds.size()
+        let mut ai: i32 = 0
+        while ai < nb {
+            let b1 = mol.bonds[ai]
+            let mut aj: i32 = ai + 1
+            while aj < nb {
+                let b2 = mol.bonds[aj]
+                let mut center: i32 = -1
+                let mut left: i32 = -1
+                let mut right: i32 = -1
+                if b1.atom1 == b2.atom1 { center = b1.atom1; left = b1.atom2; right = b2.atom2 }
+                if b1.atom1 == b2.atom2 { center = b1.atom1; left = b1.atom2; right = b2.atom1 }
+                if b1.atom2 == b2.atom1 { center = b1.atom2; left = b1.atom1; right = b2.atom2 }
+                if b1.atom2 == b2.atom2 { center = b1.atom2; left = b1.atom1; right = b2.atom1 }
+                if center >= 0 {
+                    let ax = mol.atoms[left].position[0] - mol.atoms[center].position[0]
+                    let ay = mol.atoms[left].position[1] - mol.atoms[center].position[1]
+                    let az = mol.atoms[left].position[2] - mol.atoms[center].position[2]
+                    let bx = mol.atoms[right].position[0] - mol.atoms[center].position[0]
+                    let by = mol.atoms[right].position[1] - mol.atoms[center].position[1]
+                    let bz = mol.atoms[right].position[2] - mol.atoms[center].position[2]
+                    let dot = ax * bx + ay * by + az * bz
+                    let na = sqrt(ax * ax + ay * ay + az * az)
+                    let nbv = sqrt(bx * bx + by * by + bz * bz)
+                    if na > 0.0 && nbv > 0.0 {
+                        let cos_theta = dot / (na * nbv)
+                        let clamped = if cos_theta > 1.0 { 1.0 } else { if cos_theta < -1.0 { -1.0 } else { cos_theta } }
+                        let theta = acos(clamped)
+                        let k = if ai < ff.angle_k.size() { ff.angle_k[ai] } else { 50.0 }
+                        let t0 = if ai < ff.angle_eq.size() { ff.angle_eq[ai] } else { 1.911 }
+                        let dt = theta - t0
+                        energy = energy + 0.5 * k * dt * dt
+                    }
+                }
+                aj = aj + 1
+            }
+            ai = ai + 1
+        }
+        return energy
+    }
+
+    fn compute_lj_energy(mol: Molecule, ff: ForceField) -> f64 {
+        let mut energy: f64 = 0.0
+        let eps = ff.epsilon
+        let sig = ff.sigma
+        let n = mol.atoms.size()
+        let mut i: i32 = 0
+        while i < n {
+            let mut j: i32 = i + 1
+            while j < n {
+                let dx = mol.atoms[i].position[0] - mol.atoms[j].position[0]
+                let dy = mol.atoms[i].position[1] - mol.atoms[j].position[1]
+                let dz = mol.atoms[i].position[2] - mol.atoms[j].position[2]
+                let r = sqrt(dx * dx + dy * dy + dz * dz)
+                if r > 0.0 {
+                    let sr = sig / r
+                    let sr6 = sr * sr * sr * sr * sr * sr
+                    let sr12 = sr6 * sr6
+                    energy = energy + 4.0 * eps * (sr12 - sr6)
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return energy
+    }
+
+    fn compute_total_energy(mol: Molecule, ff: ForceField) -> f64 {
+        return compute_bond_energy(mol, ff) + compute_angle_energy(mol, ff) + compute_lj_energy(mol, ff)
+    }
+
+    fn compute_forces(mol: Molecule, ff: ForceField) -> f64[][] {
+        let n = mol.atoms.size()
+        let mut forces: f64[][] = []
+        let dh: f64 = 0.001
+        let mut i: i32 = 0
+        while i < n {
+            let x0 = mol.atoms[i].position[0]
+            let y0 = mol.atoms[i].position[1]
+            let z0 = mol.atoms[i].position[2]
+
+            mol.atoms[i].position[0] = x0 + dh
+            let epx = compute_total_energy(mol, ff)
+            mol.atoms[i].position[0] = x0 - dh
+            let enx = compute_total_energy(mol, ff)
+            mol.atoms[i].position[0] = x0
+            let fx = -(epx - enx) / (2.0 * dh)
+
+            mol.atoms[i].position[1] = y0 + dh
+            let epy = compute_total_energy(mol, ff)
+            mol.atoms[i].position[1] = y0 - dh
+            let eny = compute_total_energy(mol, ff)
+            mol.atoms[i].position[1] = y0
+            let fy = -(epy - eny) / (2.0 * dh)
+
+            mol.atoms[i].position[2] = z0 + dh
+            let epz = compute_total_energy(mol, ff)
+            mol.atoms[i].position[2] = z0 - dh
+            let enz = compute_total_energy(mol, ff)
+            mol.atoms[i].position[2] = z0
+            let fz = -(epz - enz) / (2.0 * dh)
+
+            forces = forces ++ [[fx, fy, fz]]
+            i = i + 1
+        }
+        return forces
+    }
+
+    fn md_step(mol: Molecule, forces: f64[][], dt: f64, velocities: f64[][]) {
+        let n = mol.atoms.size()
+        let mut i: i32 = 0
+        while i < n {
+            let mass = mol.atoms[i].element.atomic_mass
+            if mass > 0.0 {
+                let inv_mass = 1.0 / mass
+                velocities[i][0] = velocities[i][0] + forces[i][0] * inv_mass * dt
+                velocities[i][1] = velocities[i][1] + forces[i][1] * inv_mass * dt
+                velocities[i][2] = velocities[i][2] + forces[i][2] * inv_mass * dt
+            }
+            mol.atoms[i].position[0] = mol.atoms[i].position[0] + velocities[i][0] * dt
+            mol.atoms[i].position[1] = mol.atoms[i].position[1] + velocities[i][1] * dt
+            mol.atoms[i].position[2] = mol.atoms[i].position[2] + velocities[i][2] * dt
+            i = i + 1
+        }
+    }
+
+} // namespace std.chemistry

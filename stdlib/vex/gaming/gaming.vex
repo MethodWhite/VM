@@ -1,0 +1,317 @@
+// std.gaming - Game engine framework
+// Entity Component System, transforms, input, audio, scene management.
+
+namespace std.gaming {
+
+    // -----------------------------------------------------------------
+    //  Constants
+    // -----------------------------------------------------------------
+
+    const PI: f64 = 3.14159265358979323846
+
+    // -----------------------------------------------------------------
+    //  Entity Component System
+    // -----------------------------------------------------------------
+
+    type EntityID = i32
+
+    type Component = struct {
+        entity: EntityID,
+        type_id: i32,
+        data: f64[]
+    }
+
+    type ECSWorld = struct {
+        next_entity: EntityID,
+        components: Component[][],
+        entities: EntityID[]
+    }
+
+    fn ecs_create() -> ECSWorld {
+        return ECSWorld {
+            next_entity: 0,
+            components: [],
+            entities: []
+        }
+    }
+
+    fn ecs_create_entity(world: ECSWorld) -> EntityID {
+        let id = world.next_entity
+        world.entities = world.entities ++ [id]
+        world.next_entity = world.next_entity + 1
+        return id
+    }
+
+    fn ecs_destroy_entity(world: ECSWorld, entity: EntityID) {
+        let mut remaining: EntityID[] = []
+        for e in world.entities {
+            if e != entity {
+                remaining = remaining ++ [e]
+            }
+        }
+        world.entities = remaining
+
+        let mut ti: i32 = 0
+        while ti < world.components.size() {
+            let comps = world.components[ti]
+            let mut keep: Component[] = []
+            for c in comps {
+                if c.entity != entity {
+                    keep = keep ++ [c]
+                }
+            }
+            world.components[ti] = keep
+            ti = ti + 1
+        }
+    }
+
+    fn ecs_add_component(world: ECSWorld, entity: EntityID, type_id: i32, data: f64[]) {
+        while world.components.size() <= type_id {
+            world.components = world.components ++ [[]]
+        }
+        let comp = Component { entity: entity, type_id: type_id, data: data }
+        world.components[type_id] = world.components[type_id] ++ [comp]
+    }
+
+    fn ecs_get_component(world: ECSWorld, entity: EntityID, type_id: i32) -> Component {
+        if type_id < world.components.size() {
+            for c in world.components[type_id] {
+                if c.entity == entity {
+                    return c
+                }
+            }
+        }
+        return Component { entity: -1, type_id: type_id, data: [] }
+    }
+
+    fn ecs_has_component(world: ECSWorld, entity: EntityID, type_id: i32) -> bool {
+        if type_id < world.components.size() {
+            for c in world.components[type_id] {
+                if c.entity == entity {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    fn ecs_query(world: ECSWorld, type_ids: i32[]) -> EntityID[] {
+        let mut result: EntityID[] = []
+        for e in world.entities {
+            let mut has_all = true
+            let mut ti: i32 = 0
+            while ti < type_ids.size() && has_all {
+                if !ecs_has_component(world, e, type_ids[ti]) {
+                    has_all = false
+                }
+                ti = ti + 1
+            }
+            if has_all {
+                result = result ++ [e]
+            }
+        }
+        return result
+    }
+
+    // -----------------------------------------------------------------
+    //  Transform Component
+    // -----------------------------------------------------------------
+
+    type Transform = struct {
+        position: f64[3],
+        rotation: f64[3],
+        scale: f64[3]
+    }
+
+    fn transform_identity() -> Transform {
+        return Transform {
+            position: [0.0, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0],
+            scale: [1.0, 1.0, 1.0]
+        }
+    }
+
+    fn transform_translate(t: Transform, x: f64, y: f64, z: f64) {
+        t.position[0] = x
+        t.position[1] = y
+        t.position[2] = z
+    }
+
+    fn transform_rotate(t: Transform, axis: i32, angle: f64) {
+        t.rotation[axis] = angle
+    }
+
+    // -----------------------------------------------------------------
+    //  Input
+    // -----------------------------------------------------------------
+
+    type InputState = struct {
+        keys: bool[],
+        mouse_x: f64,
+        mouse_y: f64,
+        mouse_buttons: bool[3]
+    }
+
+    fn input_init() -> InputState {
+        let mut keys: bool[] = []
+        let mut i: i32 = 0
+        while i < 256 {
+            keys = keys ++ [false]
+            i = i + 1
+        }
+        return InputState {
+            keys: keys,
+            mouse_x: 0.0,
+            mouse_y: 0.0,
+            mouse_buttons: [false, false, false]
+        }
+    }
+
+    fn input_is_key_down(input: InputState, key: i32) -> bool {
+        return input.keys[key]
+    }
+
+    fn input_is_mouse_down(input: InputState, button: i32) -> bool {
+        if button >= 0 && button < 3 {
+            return input.mouse_buttons[button]
+        }
+        return false
+    }
+
+    // -----------------------------------------------------------------
+    //  Audio
+    // -----------------------------------------------------------------
+
+    type AudioClip = struct {
+        samples: f64[],
+        sample_rate: i32,
+        channels: i32,
+        duration: f64
+    }
+
+    fn audio_sine(freq: f64, duration: f64, sample_rate: i32) -> AudioClip {
+        let num_samples = i32(duration * f64(sample_rate))
+        let mut samples: f64[] = []
+        let mut i: i32 = 0
+        while i < num_samples {
+            let t = f64(i) / f64(sample_rate)
+            samples = samples ++ [sin(2.0 * PI * freq * t)]
+            i = i + 1
+        }
+        return AudioClip {
+            samples: samples,
+            sample_rate: sample_rate,
+            channels: 1,
+            duration: duration
+        }
+    }
+
+    fn audio_square(freq: f64, duration: f64, sample_rate: i32) -> AudioClip {
+        let num_samples = i32(duration * f64(sample_rate))
+        let mut samples: f64[] = []
+        let mut i: i32 = 0
+        while i < num_samples {
+            let t = f64(i) / f64(sample_rate)
+            let phase = sin(2.0 * PI * freq * t)
+            samples = samples ++ [if phase >= 0.0 { 1.0 } else { -1.0 }]
+            i = i + 1
+        }
+        return AudioClip {
+            samples: samples,
+            sample_rate: sample_rate,
+            channels: 1,
+            duration: duration
+        }
+    }
+
+    fn audio_noise(duration: f64, sample_rate: i32) -> AudioClip {
+        let num_samples = i32(duration * f64(sample_rate))
+        let mut samples: f64[] = []
+        let mut state: i32 = 12345
+        let mut i: i32 = 0
+        while i < num_samples {
+            state = state * 1103515245 + 12345
+            let r = f64(state & 2147483647) / 2147483648.0
+            samples = samples ++ [r * 2.0 - 1.0]
+            i = i + 1
+        }
+        return AudioClip {
+            samples: samples,
+            sample_rate: sample_rate,
+            channels: 1,
+            duration: duration
+        }
+    }
+
+    fn audio_mix(a: AudioClip, b: AudioClip, volume_a: f64, volume_b: f64) -> AudioClip {
+        let max_len = if a.samples.size() > b.samples.size() { a.samples.size() } else { b.samples.size() }
+        let sr = if a.sample_rate > b.sample_rate { a.sample_rate } else { b.sample_rate }
+        let ch = if a.channels > b.channels { a.channels } else { b.channels }
+        let mut samples: f64[] = []
+        let mut i: i32 = 0
+        while i < max_len {
+            let sa = if i < a.samples.size() { a.samples[i] * volume_a } else { 0.0 }
+            let sb = if i < b.samples.size() { b.samples[i] * volume_b } else { 0.0 }
+            samples = samples ++ [sa + sb]
+            i = i + 1
+        }
+        return AudioClip {
+            samples: samples,
+            sample_rate: sr,
+            channels: ch,
+            duration: f64(max_len) / f64(sr)
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Scene Management
+    // -----------------------------------------------------------------
+
+    type SceneNode = struct {
+        name: string,
+        entity: EntityID,
+        children: SceneNode[],
+        parent: i32
+    }
+
+    type Scene = struct {
+        nodes: SceneNode[],
+        root_nodes: i32[]
+    }
+
+    fn scene_create() -> Scene {
+        return Scene {
+            nodes: [],
+            root_nodes: []
+        }
+    }
+
+    fn scene_add_node(scene: Scene, name: string, entity: EntityID, parent_index: i32) -> i32 {
+        let idx = scene.nodes.size()
+        let node = SceneNode {
+            name: name,
+            entity: entity,
+            children: [],
+            parent: parent_index
+        }
+        scene.nodes = scene.nodes ++ [node]
+        if parent_index >= 0 {
+            scene.nodes[parent_index].children = scene.nodes[parent_index].children ++ [idx]
+        } else {
+            scene.root_nodes = scene.root_nodes ++ [idx]
+        }
+        return idx
+    }
+
+    fn scene_find_node(scene: Scene, name: string) -> i32 {
+        let mut i: i32 = 0
+        while i < scene.nodes.size() {
+            if scene.nodes[i].name == name {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+} // namespace std.gaming

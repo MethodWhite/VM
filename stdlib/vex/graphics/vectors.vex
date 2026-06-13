@@ -1,0 +1,232 @@
+// std.graphics.vectors - Vector math types and operations
+// Provides float2, float3, float4 with common geometric operations.
+
+namespace std.graphics.vectors {
+
+    // -----------------------------------------------------------------
+    //  float2 - 2D vector
+    // -----------------------------------------------------------------
+
+    type float2 = struct {
+        x: f32
+        y: f32
+    }
+
+    @Inline
+    fn float2(x: f32, y: f32) -> float2 {
+        return float2 { x: x, y: y }
+    }
+
+    @Inline
+    fn add(a: float2, b: float2) -> float2 {
+        return float2 { x: a.x + b.x, y: a.y + b.y }
+    }
+
+    @Inline
+    fn sub(a: float2, b: float2) -> float2 {
+        return float2 { x: a.x - b.x, y: a.y - b.y }
+    }
+
+    @Inline
+    fn mul(a: float2, s: f32) -> float2 {
+        return float2 { x: a.x * s, y: a.y * s }
+    }
+
+    @Inline
+    fn div(a: float2, s: f32) -> float2 {
+        return float2 { x: a.x / s, y: a.y / s }
+    }
+
+    @Inline
+    fn dot(a: float2, b: float2) -> f32 {
+        return a.x * b.x + a.y * b.y
+    }
+
+    @Inline
+    fn length(a: float2) -> f32 {
+        return sqrt(a.x * a.x + a.y * a.y)
+    }
+
+    @Inline
+    fn normalize(a: float2) -> float2 {
+        let len = length(a)
+        if len == 0.0 { return a }
+        return div(a, len)
+    }
+
+    @Inline
+    fn lerp(a: float2, b: float2, t: f32) -> float2 {
+        return add(a, mul(sub(b, a), t))
+    }
+
+    @Inline
+    fn neg(a: float2) -> float2 {
+        return float2 { x: -a.x, y: -a.y }
+    }
+
+    // -----------------------------------------------------------------
+    //  float3 - 3D vector
+    // -----------------------------------------------------------------
+
+    type float3 = struct {
+        x: f32
+        y: f32
+        z: f32
+    }
+
+    @Inline
+    fn float3(x: f32, y: f32, z: f32) -> float3 {
+        return float3 { x: x, y: y, z: z }
+    }
+
+    @Inline
+    fn add(a: float3, b: float3) -> float3 {
+        return float3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }
+    }
+
+    @Inline
+    fn sub(a: float3, b: float3) -> float3 {
+        return float3 { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }
+    }
+
+    @Inline
+    fn mul(a: float3, s: f32) -> float3 {
+        return float3 { x: a.x * s, y: a.y * s, z: a.z * s }
+    }
+
+    @Inline
+    fn div(a: float3, s: f32) -> float3 {
+        return float3 { x: a.x / s, y: a.y / s, z: a.z / s }
+    }
+
+    @Inline
+    fn dot(a: float3, b: float3) -> f32 {
+        return a.x * b.x + a.y * b.y + a.z * b.z
+    }
+
+    @Inline
+    fn cross(a: float3, b: float3) -> float3 {
+        return float3 {
+            x: a.y * b.z - a.z * b.y,
+            y: a.z * b.x - a.x * b.z,
+            z: a.x * b.y - a.y * b.x
+        }
+    }
+
+    @Inline
+    fn length(a: float3) -> f32 {
+        return sqrt(a.x * a.x + a.y * a.y + a.z * a.z)
+    }
+
+    @Inline
+    fn normalize(a: float3) -> float3 {
+        let len = length(a)
+        if len == 0.0 { return a }
+        return div(a, len)
+    }
+
+    @Inline
+    fn reflect(v: float3, n: float3) -> float3 {
+        let d = dot(v, n)
+        return sub(v, mul(n, 2.0 * d))
+    }
+
+    @Inline
+    fn refract(v: float3, n: float3, eta: f32) -> float3 {
+        let d = dot(v, n)
+        let k = 1.0 - eta * eta * (1.0 - d * d)
+        if k < 0.0 { return float3 { x: 0.0, y: 0.0, z: 0.0 } }
+        return sub(mul(v, eta), mul(n, eta * d + sqrt(k)))
+    }
+
+    @Inline
+    fn lerp(a: float3, b: float3, t: f32) -> float3 {
+        return add(a, mul(sub(b, a), t))
+    }
+
+    @Inline
+    fn neg(a: float3) -> float3 {
+        return float3 { x: -a.x, y: -a.y, z: -a.z }
+    }
+
+    // -----------------------------------------------------------------
+    //  float4 - 4D homogeneous vector
+    // -----------------------------------------------------------------
+
+    type float4 = struct {
+        x: f32
+        y: f32
+        z: f32
+        w: f32
+    }
+
+    @Inline
+    fn float4(x: f32, y: f32, z: f32, w: f32) -> float4 {
+        return float4 { x: x, y: y, z: z, w: w }
+    }
+
+    @Inline
+    fn float4_from_float3(v: float3, w: f32) -> float4 {
+        return float4 { x: v.x, y: v.y, z: v.z, w: w }
+    }
+
+    @Inline
+    fn to_float3(v: float4) -> float3 {
+        return float3 { x: v.x, y: v.y, z: v.z }
+    }
+
+    @Inline
+    fn add(a: float4, b: float4) -> float4 {
+        return float4 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z, w: a.w + b.w }
+    }
+
+    @Inline
+    fn sub(a: float4, b: float4) -> float4 {
+        return float4 { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z, w: a.w - b.w }
+    }
+
+    @Inline
+    fn mul(a: float4, s: f32) -> float4 {
+        return float4 { x: a.x * s, y: a.y * s, z: a.z * s, w: a.w * s }
+    }
+
+    @Inline
+    fn div(a: float4, s: f32) -> float4 {
+        return float4 { x: a.x / s, y: a.y / s, z: a.z / s, w: a.w / s }
+    }
+
+    @Inline
+    fn dot(a: float4, b: float4) -> f32 {
+        return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
+    }
+
+    @Inline
+    fn length(a: float4) -> f32 {
+        return sqrt(a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w)
+    }
+
+    @Inline
+    fn normalize(a: float4) -> float4 {
+        let len = length(a)
+        if len == 0.0 { return a }
+        return div(a, len)
+    }
+
+    /// Perspective divide: returns (x/w, y/w, z/w)
+    @Inline
+    fn perspective_divide(v: float4) -> float3 {
+        if v.w == 0.0 { return float3 { x: 0.0, y: 0.0, z: 0.0 } }
+        return float3 { x: v.x / v.w, y: v.y / v.w, z: v.z / v.w }
+    }
+
+    @Inline
+    fn lerp(a: float4, b: float4, t: f32) -> float4 {
+        return add(a, mul(sub(b, a), t))
+    }
+
+    @Inline
+    fn neg(a: float4) -> float4 {
+        return float4 { x: -a.x, y: -a.y, z: -a.z, w: -a.w }
+    }
+
+} // namespace std.graphics.vectors

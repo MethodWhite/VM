@@ -1,0 +1,260 @@
+// std.graphics.color - Color types and operations
+// ColorRGB, ColorRGBA with spaces conversions and blending.
+
+namespace std.graphics.color {
+
+    // -----------------------------------------------------------------
+    //  ColorRGB
+    // -----------------------------------------------------------------
+
+    type ColorRGB = struct {
+        r: f32
+        g: f32
+        b: f32
+    }
+
+    @Inline
+    fn ColorRGB(r: f32, g: f32, b: f32) -> ColorRGB {
+        return ColorRGB { r: r, g: g, b: b }
+    }
+
+    @Inline
+    fn black() -> ColorRGB { return ColorRGB { r: 0.0, g: 0.0, b: 0.0 } }
+
+    @Inline
+    fn white() -> ColorRGB { return ColorRGB { r: 1.0, g: 1.0, b: 1.0 } }
+
+    @Inline
+    fn red() -> ColorRGB { return ColorRGB { r: 1.0, g: 0.0, b: 0.0 } }
+
+    @Inline
+    fn green() -> ColorRGB { return ColorRGB { r: 0.0, g: 1.0, b: 0.0 } }
+
+    @Inline
+    fn blue() -> ColorRGB { return ColorRGB { r: 0.0, g: 0.0, b: 1.0 } }
+
+    // -----------------------------------------------------------------
+    //  ColorRGBA
+    // -----------------------------------------------------------------
+
+    type ColorRGBA = struct {
+        r: f32
+        g: f32
+        b: f32
+        a: f32
+    }
+
+    @Inline
+    fn ColorRGBA(r: f32, g: f32, b: f32, a: f32) -> ColorRGBA {
+        return ColorRGBA { r: r, g: g, b: b, a: a }
+    }
+
+    @Inline
+    fn to_rgba(c: ColorRGB, a: f32) -> ColorRGBA {
+        return ColorRGBA { r: c.r, g: c.g, b: c.b, a: a }
+    }
+
+    @Inline
+    fn to_rgb(c: ColorRGBA) -> ColorRGB {
+        return ColorRGB { r: c.r, g: c.g, b: c.b }
+    }
+
+    @Inline
+    fn clamp_channel(x: f32) -> f32 {
+        if x < 0.0 { return 0.0 }
+        if x > 1.0 { return 1.0 }
+        return x
+    }
+
+    @Inline
+    fn clamp_rgb(c: ColorRGB) -> ColorRGB {
+        return ColorRGB {
+            r: clamp_channel(c.r),
+            g: clamp_channel(c.g),
+            b: clamp_channel(c.b)
+        }
+    }
+
+    @Inline
+    fn clamp_rgba(c: ColorRGBA) -> ColorRGBA {
+        return ColorRGBA {
+            r: clamp_channel(c.r),
+            g: clamp_channel(c.g),
+            b: clamp_channel(c.b),
+            a: clamp_channel(c.a)
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Color space conversions
+    // -----------------------------------------------------------------
+
+    /// Linear to sRGB (gamma encoding)
+    @Inline
+    fn linear_to_srgb_channel(c: f32) -> f32 {
+        if c <= 0.0031308 {
+            return 12.92 * c
+        }
+        return 1.055 * pow(c, 1.0 / 2.4) - 0.055
+    }
+
+    @Inline
+    fn linear_to_srgb(c: ColorRGB) -> ColorRGB {
+        return ColorRGB {
+            r: linear_to_srgb_channel(c.r),
+            g: linear_to_srgb_channel(c.g),
+            b: linear_to_srgb_channel(c.b)
+        }
+    }
+
+    /// sRGB to linear (gamma decoding)
+    @Inline
+    fn srgb_to_linear_channel(c: f32) -> f32 {
+        if c <= 0.04045 {
+            return c / 12.92
+        }
+        return pow((c + 0.055) / 1.055, 2.4)
+    }
+
+    @Inline
+    fn srgb_to_linear(c: ColorRGB) -> ColorRGB {
+        return ColorRGB {
+            r: srgb_to_linear_channel(c.r),
+            g: srgb_to_linear_channel(c.g),
+            b: srgb_to_linear_channel(c.b)
+        }
+    }
+
+    /// RGB to HSV
+    fn rgb_to_hsv(c: ColorRGB) -> ColorRGB {
+        let mx = if c.r > c.g { if c.r > c.b { c.r } else { c.b } } else { if c.g > c.b { c.g } else { c.b } }
+        let mn = if c.r < c.g { if c.r < c.b { c.r } else { c.b } } else { if c.g < c.b { c.g } else { c.b } }
+        let delta = mx - mn
+
+        let mut h: f32 = 0.0
+        let s: f32 = if mx == 0.0 { 0.0 } else { delta / mx }
+        let v: f32 = mx
+
+        if delta != 0.0 {
+            if mx == c.r {
+                h = (c.g - c.b) / delta + (if c.g < c.b { 6.0 } else { 0.0 })
+            } elif mx == c.g {
+                h = (c.b - c.r) / delta + 2.0
+            } else {
+                h = (c.r - c.g) / delta + 4.0
+            }
+            h = h / 6.0
+        }
+
+        return ColorRGB { r: h, g: s, b: v }
+    }
+
+    /// HSV to RGB
+    fn hsv_to_rgb(c: ColorRGB) -> ColorRGB {
+        let h = c.r
+        let s = c.g
+        let v = c.b
+
+        if s == 0.0 {
+            return ColorRGB { r: v, g: v, b: v }
+        }
+
+        let h6 = h * 6.0
+        let sector = i32(floor(h6))
+        let frac = h6 - f32(sector)
+        let p = v * (1.0 - s)
+        let q = v * (1.0 - s * frac)
+        let t = v * (1.0 - s * (1.0 - frac))
+
+        if sector == 0 || sector == 6 { return ColorRGB { r: v, g: t, b: p } }
+        if sector == 1 { return ColorRGB { r: q, g: v, b: p } }
+        if sector == 2 { return ColorRGB { r: p, g: v, b: t } }
+        if sector == 3 { return ColorRGB { r: p, g: q, b: v } }
+        if sector == 4 { return ColorRGB { r: t, g: p, b: v } }
+        return ColorRGB { r: v, g: p, b: q }
+    }
+
+    // -----------------------------------------------------------------
+    //  Color blending
+    // -----------------------------------------------------------------
+
+    @Inline
+    fn lerp(a: ColorRGB, b: ColorRGB, t: f32) -> ColorRGB {
+        return ColorRGB {
+            r: a.r + (b.r - a.r) * t,
+            g: a.g + (b.g - a.g) * t,
+            b: a.b + (b.b - a.b) * t
+        }
+    }
+
+    @Inline
+    fn lerp_rgba(a: ColorRGBA, b: ColorRGBA, t: f32) -> ColorRGBA {
+        return ColorRGBA {
+            r: a.r + (b.r - a.r) * t,
+            g: a.g + (b.g - a.g) * t,
+            b: a.b + (b.b - a.b) * t,
+            a: a.a + (b.a - a.a) * t
+        }
+    }
+
+    /// Alpha blending: result = src * src.a + dst * (1 - src.a)
+    @Inline
+    fn alpha_blend(src: ColorRGBA, dst: ColorRGBA) -> ColorRGBA {
+        let out_a = src.a + dst.a * (1.0 - src.a)
+        if out_a == 0.0 { return ColorRGBA { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } }
+        return ColorRGBA {
+            r: (src.r * src.a + dst.r * dst.a * (1.0 - src.a)) / out_a,
+            g: (src.g * src.a + dst.g * dst.a * (1.0 - src.a)) / out_a,
+            b: (src.b * src.a + dst.b * dst.a * (1.0 - src.a)) / out_a,
+            a: out_a
+        }
+    }
+
+    /// Additive blending
+    @Inline
+    fn additive_blend(src: ColorRGBA, dst: ColorRGBA) -> ColorRGBA {
+        return clamp_rgba(ColorRGBA {
+            r: src.r + dst.r,
+            g: src.g + dst.g,
+            b: src.b + dst.b,
+            a: src.a + dst.a
+        })
+    }
+
+    /// Multiply blend
+    @Inline
+    fn multiply_blend(src: ColorRGB, dst: ColorRGB) -> ColorRGB {
+        return ColorRGB {
+            r: src.r * dst.r,
+            g: src.g * dst.g,
+            b: src.b * dst.b
+        }
+    }
+
+    /// Screen blend
+    @Inline
+    fn screen_blend(src: ColorRGB, dst: ColorRGB) -> ColorRGB {
+        return ColorRGB {
+            r: 1.0 - (1.0 - src.r) * (1.0 - dst.r),
+            g: 1.0 - (1.0 - src.g) * (1.0 - dst.g),
+            b: 1.0 - (1.0 - src.b) * (1.0 - dst.b)
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Common color constants
+    // -----------------------------------------------------------------
+
+    const COLOR_BLACK:      ColorRGB = ColorRGB { r: 0.0, g: 0.0, b: 0.0 }
+    const COLOR_WHITE:      ColorRGB = ColorRGB { r: 1.0, g: 1.0, b: 1.0 }
+    const COLOR_RED:        ColorRGB = ColorRGB { r: 1.0, g: 0.0, b: 0.0 }
+    const COLOR_GREEN:      ColorRGB = ColorRGB { r: 0.0, g: 1.0, b: 0.0 }
+    const COLOR_BLUE:       ColorRGB = ColorRGB { r: 0.0, g: 0.0, b: 1.0 }
+    const COLOR_YELLOW:     ColorRGB = ColorRGB { r: 1.0, g: 1.0, b: 0.0 }
+    const COLOR_CYAN:       ColorRGB = ColorRGB { r: 0.0, g: 1.0, b: 1.0 }
+    const COLOR_MAGENTA:    ColorRGB = ColorRGB { r: 1.0, g: 0.0, b: 1.0 }
+    const COLOR_ORANGE:     ColorRGB = ColorRGB { r: 1.0, g: 0.5, b: 0.0 }
+    const COLOR_PURPLE:     ColorRGB = ColorRGB { r: 0.5, g: 0.0, b: 0.5 }
+    const COLOR_TRANSPARENT: ColorRGBA = ColorRGBA { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+
+} // namespace std.graphics.color

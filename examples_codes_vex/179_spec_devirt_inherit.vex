@@ -1,0 +1,58 @@
+// Regresion de la devirtualizacion especulativa (TAREA 2 / C2):
+// el dispatch polimorfico de interfaz (CALLITF) se reescribe en un
+// guard-chain por tipo + fallback al dispatch original.
+//
+// Cubre dos casos en un solo programa:
+//   - Circle y Rect IMPLEMENTAN area() directamente -> son candidatos
+//     del guard-chain (fast path: CALL directo inlineado).
+//   - ColoredCircle HEREDA area() de Circle (no la declara) -> NO es
+//     candidato -> su dispatch cae al FALLBACK (CALLITF original).
+//
+// El fallback ejercita el path vrt_callitf -> vrt_run_method_in_interp,
+// que antes dejaba el FrameHeader del pool sin inicializar
+// (around_chain/has_saved_regs) y corrompia el heap al RET (delete[]
+// de un puntero basura).  Este ejemplo valida que el fallback despacha
+// correctamente tanto en interp como en JIT.
+//
+//   Circle(5).area  = 5*5 = 25
+//   Rect(4,6).area  = 4*6 = 24
+//   ColoredCircle(7).area = 7*7 = 49  (heredado de Circle, via fallback)
+//   resultado = 25 + 24 + 49 = 98
+
+interface Shape { public i32 area(); }
+
+class Circle : Shape {
+    public i32 r;
+    public Circle(i32 rr) { this.r = rr; }
+    public i32 area() { return this.r * this.r; }
+}
+
+class Rect : Shape {
+    public i32 w; public i32 h;
+    public Rect(i32 ww, i32 hh) { this.w = ww; this.h = hh; }
+    public i32 area() { return this.w * this.h; }
+}
+
+class ColoredCircle : Circle {
+    public i32 color;
+    public ColoredCircle(i32 rr, i32 cc) { super(rr); this.color = cc; }
+}
+
+class Bench {
+    public Bench() {}
+    public i32 run() {
+        Shape[3] s;
+        s[0] = new Circle(5);
+        s[1] = new Rect(4, 6);
+        s[2] = new ColoredCircle(7, 1);
+        i32 acc = 0;
+        i32 i = 0;
+        while (i < 3) { acc = acc + s[i].area(); i = i + 1; }
+        return acc;
+    }
+}
+
+i32 main() {
+    Bench b = new Bench();
+    return b.run();
+}

@@ -315,6 +315,19 @@ namespace vesta_rt {
  * El offset exacto se valida via static_assert en abi_checks.cpp.
  */
 #define VESTA_CLASSINFO_STATIC_DATA_OFFSET 96
+/* Offsets de los campos de dispatch de interfaz (itables) en ClassInfo.
+ * Anyadidos al FINAL de la struct -> los offsets anteriores quedan intactos.
+ * El JIT/AOT recorre @c itables (array de ItableEntry de 24 bytes:
+ * iface@0, methods@8, count@16) comparando @c iface contra el ClassInfo* de
+ * la interfaz (resuelto en compile-time del JIT) y carga @c methods[idx].
+ * Validados con static_assert en abi_checks.cpp. */
+#define VESTA_CLASSINFO_ITABLES_OFFSET     248
+#define VESTA_CLASSINFO_ITABLE_COUNT_OFFSET 256
+/* Layout de ItableEntry (24 bytes). */
+#define VESTA_ITABLE_ENTRY_SIZE            24
+#define VESTA_ITABLE_IFACE_OFFSET          0
+#define VESTA_ITABLE_METHODS_OFFSET        8
+#define VESTA_ITABLE_COUNT_OFFSET          16
 #define VESTA_METHODINFO_JIT_CODE_OFFSET   104
 /* Offset del puntero advice_chain (cadena AOP BEFORE/AFTER/AROUND).
  * Si != NULL, el inline dispatch JIT debe caer al slow path para que

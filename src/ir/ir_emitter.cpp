@@ -2392,6 +2392,61 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             break;
         }
 
+        case IrOp::CALLITF: {
+            // Dispatch de interfaz via itable.  Estructura identica a CALLM
+            // pero el segundo operando es el ItfCallParams (no un MethodInfo*)
+            // y emitimos `callitf r1, r13`.  El interp resuelve la itable de la
+            // clase concreta (indice O(1) tras warmup) leyendo los params.
+            //
+            // Layout de operands:
+            //   operands[0] = obj (host_ptr a ObjectHeader)
+            //   operands[1] = params_ptr (ItfCallParams en stack)
+            //   operands[2..] = args declarados (retbuf SRET como [2] si aplica)
+            if (ins.operands.size() < 2) break;
+            const uint32_t   call_pos     = lin_pos_of(ctx, bb.id, idx);
+            std::vector<int> regs_to_save = live_regs_through_call(ctx, call_pos, ins.dst);
+
+            emit_save_all_gc_aware(ctx, call_pos, regs_to_save);
+            std::string r_obj        = ctx.load_src(ins.operands[0], 0);
+            std::string r_params_src = ctx.load_src(ins.operands[1], 1);
+
+            // Mover el ItfCallParams* a r13 (SCRATCH2), que sobrevive el
+            // marshalling de args (mismo patron que CALLM con el MethodInfo*).
+            ctx.out << "    mov r13, " << r_params_src << "\n";
+
+            // Calling convention identica a CALLVIRT/CALLM: r1 = this, args en
+            // r2..  (retbuf SRET en r2 si aplica, tratado como primer arg).
+            const size_t nargs = ins.operands.size() > 2
+                                  ? std::min(ins.operands.size() - 2, (size_t)11) : 0;
+            std::vector<std::pair<int, std::string>> moves;
+            std::vector<std::pair<int, ir::IrValueId>> spilled_args;
+            moves.reserve(nargs + 1);
+            moves.emplace_back(1, r_obj);
+            for (size_t ai = 0; ai < nargs; ++ai) {
+                ir::IrValueId v = ins.operands[ai + 2];
+                int target_reg  = static_cast<int>(ai + 2);
+                if (v != IR_NO_VALUE && ctx.alloc.spill_map.count(v)) {
+                    spilled_args.emplace_back(target_reg, v);
+                } else {
+                    moves.emplace_back(target_reg, ctx.load_src(v, 0));
+                }
+            }
+            emit_parallel_arg_moves(ctx, std::move(moves));
+            for (auto &pa : spilled_args) {
+                emit_load_spilled_arg(ctx, pa.first, pa.second);
+            }
+
+            ctx.out << "    mov r15, " << (nargs + 1) << "\n";
+            ctx.out << "    callitf r1, r13\n";
+            if (ins.dst != IR_NO_VALUE) {
+                std::string rd = ctx.dst_of(ins.dst);
+                emit_mov_if_needed(ctx, rd, "r0");
+                ctx.store_spilled(ins.dst);
+            }
+            emit_restore_all_gc_aware(ctx, call_pos, regs_to_save);
+            break;
+        }
+
         case IrOp::CALLN: {
             const uint32_t   call_pos     = lin_pos_of(ctx, bb.id, idx);
             std::vector<int> regs_to_save = live_regs_through_call(ctx, call_pos, ins.dst);
@@ -2751,6 +2806,24 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             ctx.out << "    mov r1, " << r_cls << "\n";
             ctx.out << "    mov r15, 1\n";
             ctx.out << "    newobj r1\n";
+            if (ins.dst != IR_NO_VALUE)
+                emit_mov_if_needed(ctx, ctx.reg_of(ins.dst), "r0");
+            emit_restore_live_regs(ctx, call_pos, regs_to_save);
+            break;
+        }
+
+        case IrOp::NEWOBJS: {
+            // raw_asm-elim: variante SharedHeap de NEWOBJ (Phase Z.6).  Mismo
+            // patron (save_live_regs por la GC + mov r1, cls + newobjs r1 +
+            // dst=r0), pero usa el opcode `newobjs` que aloca en el SharedHeap.
+            if (ins.operands.empty()) break;
+            const uint32_t   call_pos     = lin_pos_of(ctx, bb.id, idx);
+            std::vector<int> regs_to_save = live_regs_through_call(ctx, call_pos, ins.dst);
+            std::string r_cls = ctx.reg_of(ins.operands[0]);
+            emit_save_live_regs(ctx, call_pos, regs_to_save);
+            ctx.out << "    mov r1, " << r_cls << "\n";
+            ctx.out << "    mov r15, 1\n";
+            ctx.out << "    newobjs r1\n";
             if (ins.dst != IR_NO_VALUE)
                 emit_mov_if_needed(ctx, ctx.reg_of(ins.dst), "r0");
             emit_restore_live_regs(ctx, call_pos, regs_to_save);
@@ -3512,13 +3585,36 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             //          R0 = init_pc o 0 si fallo).
             // imm=1 -> unloadmod (libera el slot, R0 = 1 ok / 0 not_found).
             if (ins.operands.size() < 2 || ins.dst == IR_NO_VALUE) break;
-            const char *mnem = (ins.imm == 0) ? "loadmod" : "unloadmod";
-            std::string r_path = ctx.load_src(ins.operands[0], 0);
-            std::string r_len  = ctx.load_src(ins.operands[1], 1);
-            std::string r_dst  = ctx.dst_of(ins.dst);
-            ctx.out << "    " << mnem << " " << r_path << ", " << r_len << "\n";
-            if (r_dst != "r0") ctx.out << "    mov " << r_dst << ", r0\n";
-            ctx.store_spilled(ins.dst);
+            if (ins.imm == 0) {
+                // loadmod EJECUTA el __module_init del modulo cargado como una
+                // sub-llamada (convencion CALLVM: push ret + jump al init_pc).
+                // Ese __module_init clobbea CUALQUIER registro del caller (su
+                // regalloc usa r0..r14 libremente).  Por eso hay que salvar los
+                // registros vivos-a-traves como en cualquier CALL (igual que
+                // CALLSUPER).  Sin esto, un valor que el caller mantiene en un
+                // registro a traves del loadmod (e.g. un const CSE-ado) se
+                // corrompe -- bug latente destapado al pasar __module_init de
+                // RAW_ASM (set fijo de regs) a IR estructurado (regalloc libre).
+                const uint32_t   call_pos     = lin_pos_of(ctx, bb.id, idx);
+                std::vector<int> regs_to_save = live_regs_through_call(ctx, call_pos, ins.dst);
+                emit_save_all_gc_aware(ctx, call_pos, regs_to_save);
+                std::string r_path = ctx.load_src(ins.operands[0], 0);
+                std::string r_len  = ctx.load_src(ins.operands[1], 1);
+                ctx.out << "    loadmod " << r_path << ", " << r_len << "\n";
+                std::string r_dst  = ctx.dst_of(ins.dst);
+                if (r_dst != "r0") ctx.out << "    mov " << r_dst << ", r0\n";
+                ctx.store_spilled(ins.dst);
+                emit_restore_all_gc_aware(ctx, call_pos, regs_to_save);
+            } else {
+                // unloadmod solo delega en una funcion C (unregister) que NO
+                // clobbea registros VM; basta el patron simple.
+                std::string r_path = ctx.load_src(ins.operands[0], 0);
+                std::string r_len  = ctx.load_src(ins.operands[1], 1);
+                std::string r_dst  = ctx.dst_of(ins.dst);
+                ctx.out << "    unloadmod " << r_path << ", " << r_len << "\n";
+                if (r_dst != "r0") ctx.out << "    mov " << r_dst << ", r0\n";
+                ctx.store_spilled(ins.dst);
+            }
             break;
         }
         case IrOp::DLOPEN: {
@@ -3712,6 +3808,13 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
                         << ", " << ctx.reg_of(ins.operands[0]) << "\n";
                 ctx.store_spilled(ins.dst);
             }
+            break;
+        case IrOp::SETMETHDBG:
+            // setmethdbg r_method, r_params -> registra debug info (file:line)
+            // del MethodInfo* en r_method usando SetMethDebugParams en r_params.
+            if (ins.operands.size() >= 2)
+                ctx.out << "    setmethdbg " << ctx.reg_of(ins.operands[0])
+                        << ", " << ctx.reg_of(ins.operands[1]) << "\n";
             break;
         case IrOp::CALLSUPER: {
             // Signature: operands[0] = v_cls (ClassInfo* host_ptr del super),

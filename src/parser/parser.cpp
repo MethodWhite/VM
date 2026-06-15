@@ -59,6 +59,7 @@ namespace vm {
         {"findmethod",{"findmethod",OpArity::TWO}},
         {"findfield", {"findfield", OpArity::TWO}},
         {"callm",     {"callm",     OpArity::TWO}},
+        {"callitf",   {"callitf",   OpArity::TWO}},
         {"proceed",   {"proceed",   OpArity::ZERO}},
         // addadvice toma 3 operandos textualmente: r_target, r_advice, kind.
         // El emisor empaqueta r_target en reg1 (lo de byte2), r_advice en

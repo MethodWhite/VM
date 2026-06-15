@@ -124,6 +124,7 @@ namespace loader {
     struct GenericParam;
     struct AdviceEntry;
     struct LookupSlot;
+    struct ItableEntry;
 
     // -------------------------------------------------------------------------
     //  Programacion de aspectos (AOP)
@@ -277,6 +278,34 @@ namespace loader {
     } MethodInfo;
 
     // -------------------------------------------------------------------------
+    //  ItableEntry - tabla de metodos de una interfaz para una clase concreta
+    //
+    //  Dispatch de interfaz tipo "itable" (estilo vtable de C++ para
+    //  interfaces).  Cada clase concreta que implementa interfaces lleva un
+    //  array @c ClassInfo::itables con una entrada por interfaz; cada entrada
+    //  mapea el indice de un metodo de la interfaz (orden de declaracion de la
+    //  interfaz) al @c MethodInfo* concreto de la clase.  Asi el dispatch
+    //  @c iface_var.metodo() resuelve a @c itable.methods[idx] -- un indice
+    //  O(1), sin lookup por nombre por iteracion (a diferencia de
+    //  findmethod+callm).
+    //
+    //  Las itables se construyen LAZY (la primera vez que se despacha sobre un
+    //  par clase/interfaz) via @c ClassRegistry::get_or_build_itable, que hace
+    //  el unico name-match por par (cls, iface) y lo cachea aqui para siempre.
+    //
+    //  Layout fijo (ABI): el JIT/AOT recorre @c itables comparando @c iface
+    //  contra el @c ClassInfo* de la interfaz (resuelto en compile-time del
+    //  JIT) y luego carga @c methods[idx].  Offsets verificados con
+    //  static_assert en @c abi_checks.cpp.
+    // -------------------------------------------------------------------------
+    typedef struct ItableEntry {
+        ClassInfo  *iface;    ///< +0  ClassInfo* de la interfaz implementada
+        MethodInfo **methods; ///< +8  metodos concretos, indexados como iface->methods[]
+        uint32_t    count;    ///< +16 numero de metodos de la interfaz
+        uint32_t    _pad;     ///< +20 alineacion (reservado, debe ser 0)
+    } ItableEntry;            ///< sizeof == 24
+
+    // -------------------------------------------------------------------------
     //  ClassInfo - descriptor completo de una clase
     // -------------------------------------------------------------------------
     typedef struct ClassInfo {
@@ -335,6 +364,17 @@ namespace loader {
         LookupSlot  *method_lookup_table;
         uint32_t     method_lookup_mask;
         uint32_t     _mlpad;       ///< alineacion (reservado, debe ser 0)
+
+        // --- dispatch de interfaz (itables) ---
+        /// Array de @c ItableEntry, una por interfaz para la que ya se ha
+        /// despachado al menos una vez sobre esta clase.  Construido LAZY por
+        /// @c ClassRegistry::get_or_build_itable y cacheado aqui.  NULL hasta
+        /// el primer dispatch de interfaz; los offsets de estos dos campos son
+        /// ABI (VESTA_CLASSINFO_ITABLES_OFFSET / ..._ITABLE_COUNT_OFFSET) y se
+        /// verifican con static_assert en abi_checks.cpp.
+        ItableEntry *itables;       ///< offset 248
+        uint32_t     itable_count;  ///< offset 256
+        uint32_t     _itpad;        ///< offset 260 (alineacion, reservado)
     } ClassInfo;
 
     // -------------------------------------------------------------------------

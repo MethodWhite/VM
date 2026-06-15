@@ -35,11 +35,13 @@ namespace jit {
     uint8_t *vreg_compile(const ir::IrFunction &fn, CodeCache &cc,
                           const CallResolver &resolve_call,
                           const VregEntries &ent,
-                          const CallResolver &resolve_native) {
+                          const CallResolver &resolve_native,
+                          const CallResolver &resolve_symbol) {
         /* 1. Seleccionar MachineIR de vregs (VM_ABI).  Si la funcion usa un
          *    op fuera del subset soportado, abortar -> fallback. */
         MFunction mf;
-        if (!vreg_select(fn, mf, AbiKind::VM, resolve_call, ent, resolve_native))
+        if (!vreg_select(fn, mf, AbiKind::VM, resolve_call, ent, resolve_native,
+                         resolve_symbol))
             return nullptr;
 
         const TargetRegInfo &tri = target_x86_64_vm_abi();
@@ -107,6 +109,7 @@ namespace jit {
                               const CallResolver &resolve_call,
                               const VregEntries &ent,
                               const CallResolver &resolve_native,
+                              const CallResolver &resolve_symbol,
                               uint32_t header_block,
                               uint8_t **osr_entry_out,
                               const std::vector<uint32_t> *required_captures) {
@@ -115,7 +118,8 @@ namespace jit {
         /* 1-3: identico a vreg_compile (selector + intervals + regalloc +
          * verificador adversarial de GC roots). */
         MFunction mf;
-        if (!vreg_select(fn, mf, AbiKind::VM, resolve_call, ent, resolve_native))
+        if (!vreg_select(fn, mf, AbiKind::VM, resolve_call, ent, resolve_native,
+                         resolve_symbol))
             return nullptr;
         const TargetRegInfo &tri = target_x86_64_vm_abi();
         IntervalResult ivs = build_intervals(mf, tri);

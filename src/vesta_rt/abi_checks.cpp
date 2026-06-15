@@ -216,6 +216,24 @@ static_assert(offsetof(loader::ClassInfo, static_data)
               == VESTA_CLASSINFO_STATIC_DATA_OFFSET,
               "ABI drift: offsetof(ClassInfo, static_data) != VESTA_CLASSINFO_STATIC_DATA_OFFSET");
 
+/* itables (dispatch de interfaz) -- campos al final de ClassInfo */
+static_assert(offsetof(loader::ClassInfo, itables)
+              == VESTA_CLASSINFO_ITABLES_OFFSET,
+              "ABI drift: offsetof(ClassInfo, itables) != VESTA_CLASSINFO_ITABLES_OFFSET");
+
+static_assert(offsetof(loader::ClassInfo, itable_count)
+              == VESTA_CLASSINFO_ITABLE_COUNT_OFFSET,
+              "ABI drift: offsetof(ClassInfo, itable_count) != VESTA_CLASSINFO_ITABLE_COUNT_OFFSET");
+
+static_assert(sizeof(loader::ItableEntry) == VESTA_ITABLE_ENTRY_SIZE,
+              "ABI drift: sizeof(ItableEntry) != VESTA_ITABLE_ENTRY_SIZE");
+static_assert(offsetof(loader::ItableEntry, iface) == VESTA_ITABLE_IFACE_OFFSET,
+              "ABI drift: offsetof(ItableEntry, iface) != VESTA_ITABLE_IFACE_OFFSET");
+static_assert(offsetof(loader::ItableEntry, methods) == VESTA_ITABLE_METHODS_OFFSET,
+              "ABI drift: offsetof(ItableEntry, methods) != VESTA_ITABLE_METHODS_OFFSET");
+static_assert(offsetof(loader::ItableEntry, count) == VESTA_ITABLE_COUNT_OFFSET,
+              "ABI drift: offsetof(ItableEntry, count) != VESTA_ITABLE_COUNT_OFFSET");
+
 static_assert(offsetof(loader::MethodInfo, jit_code)
               == VESTA_METHODINFO_JIT_CODE_OFFSET,
               "ABI drift: offsetof(MethodInfo, jit_code) != VESTA_METHODINFO_JIT_CODE_OFFSET");

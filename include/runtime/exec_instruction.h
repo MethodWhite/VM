@@ -960,6 +960,11 @@ namespace runtime {
     /** @brief CALLM: llamada via MethodInfo* directo (sin vtable lookup); util para
      *         dispatch dinamico (interfaces, reflexion).  Recorre advice_chain igual que CALLVIRT. */
     void exec_instr_callm(ProcessVM *vm, const DecodedInstr &instr);
+    /** @brief CALLITF: dispatch de interfaz via itable.  Lee un ItfCallParams
+     *         (r_params) con nombre de interfaz + metodo + indice + count, resuelve
+     *         el MethodInfo* concreto via la itable lazy de la clase del receptor
+     *         (indice O(1) tras warmup) y despacha como CALLM (con advice_chain). */
+    void exec_instr_callitf(ProcessVM *vm, const DecodedInstr &instr);
     /** @brief PROCEED: dentro de un advice @Around, invoca el target original via
      *         frame.proceed_target con la calling convention actual (r1=this, args en r2..). */
     void exec_instr_proceed(ProcessVM *vm, const DecodedInstr &instr);

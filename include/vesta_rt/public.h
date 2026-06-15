@@ -372,6 +372,31 @@ uint64_t vrt_callvirt_ic(vrt_proc *proc, uint8_t *obj_payload,
 uint64_t vrt_callm(vrt_proc *proc, uint8_t *obj_payload, void *method);
 
 /**
+ * @brief Dispatch de interfaz via itable (CALLITF desde JIT).
+ *
+ * Lee el @c ItfCallParams (32 bytes en vm_mem en @p params_addr) con el nombre
+ * de la interfaz, el nombre del metodo, su indice y el numero de metodos;
+ * resuelve la interfaz (find_class) y el @c MethodInfo* concreto via la itable
+ * lazy de la clase del receptor (@c ClassRegistry::resolve_itable_method), y
+ * despacha (si el metodo tiene @c jit_code -> @c enter_jit; si no -> mini-interp
+ * sincronico).  Es el SLOW PATH/fallback del inline de CALLITF en el JIT.
+ *
+ * Calling convention identica a CALLVIRT/CALLM: el caller staged R1=this,
+ * R2..=args, R15=argc+1 en @c proc->registers antes de invocar.
+ *
+ * @param proc         proceso actual.
+ * @param obj_payload  host_ptr al payload del objeto receiver.
+ * @param params_addr  VM addr del @c ItfCallParams.
+ * @param ic_slot_addr host addr de un slot de 8 bytes (cache del call site); si
+ *                     != 0, se escribe ahi el @c ClassInfo* de la interfaz
+ *                     resuelto, para que el inline de CALLITF lo lea en los
+ *                     dispatch siguientes (0 = sin cache).
+ * @return valor de retorno del metodo (de @c proc->registers.regs[0]).
+ */
+uint64_t vrt_callitf(vrt_proc *proc, uint8_t *obj_payload, uint64_t params_addr,
+                     uint64_t ic_slot_addr);
+
+/**
  * @brief Invocacion de closure (CALLCLOSURE desde JIT).
  *
  * Equivalente runtime de @c callclosure / @c callrawclosure: invoca

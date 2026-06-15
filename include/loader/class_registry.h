@@ -64,6 +64,7 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -216,6 +217,47 @@ namespace loader {
         }
 
         // -------------------------------------------------------------
+        // Dispatch de interfaz (itables)
+        // -------------------------------------------------------------
+
+        /**
+         * @brief Devuelve (creando LAZY si hace falta) la @c ItableEntry de
+         *        @p iface para la clase @p cls, dimensionada a @p count slots.
+         *
+         * Como las interfaces NO registran sus metodos en runtime, la entry se
+         * crea con @p count slots a nullptr; cada slot se rellena por nombre en
+         * @c resolve_itable_method la primera vez que se despacha ese indice.
+         * Se cachea en @c cls->itables para siempre.
+         *
+         * Thread-safety: el fast path (entrada ya creada) es lock-free (lee un
+         * unico puntero @c cls->itables, 8B alineado = atomico en x86/ARM64, y
+         * recorre el array NULL-terminado hasta @c iface==0).  La creacion
+         * serializa con @c itable_mutex_ y publica el array con barrera release
+         * (los arrays viejos se retienen en los pools, asi un lector con el
+         * puntero viejo sigue siendo correcto).
+         *
+         * @return Puntero estable a la @c ItableEntry, o nullptr si los
+         *         argumentos son nulos.
+         */
+        ItableEntry *get_or_build_itable(ClassInfo *cls, ClassInfo *iface, uint32_t count);
+
+        /**
+         * @brief Resuelve el @c MethodInfo* concreto para el metodo de indice
+         *        @p method_index de la interfaz @p iface sobre la clase @p cls.
+         *
+         * Crea/obtiene la itable (dimensionada a @p count) y, si el slot
+         * @p method_index aun no esta resuelto, lo rellena por nombre
+         * (@p method_name) y lo cachea (escritura idempotente, lock-free).  Tras
+         * el primer dispatch de cada indice, las consultas son un indice puro.
+         *
+         * @return El @c MethodInfo* concreto, o nullptr si no se encuentra
+         *         (programa mal-formado).
+         */
+        MethodInfo *resolve_itable_method(ClassInfo *cls, ClassInfo *iface,
+                                          uint32_t count, uint32_t method_index,
+                                          const char *method_name, size_t name_len);
+
+        // -------------------------------------------------------------
         // Iteracion (para reflexion / debug)
         // -------------------------------------------------------------
 
@@ -245,6 +287,15 @@ namespace loader {
         std::vector<std::unique_ptr<char[]>>         string_pool_;
         std::vector<std::unique_ptr<LookupSlot[]>>   lookup_arrays_;
         std::vector<std::unique_ptr<AdviceEntry>>    advice_pool_;
+
+        /// Pools de las itables construidas lazy (ver get_or_build_itable).
+        /// Los arrays viejos NO se liberan al crecer (RCU-style: un lector
+        /// lock-free puede tener el puntero viejo); se liberan todos en el
+        /// destructor del registry.
+        std::vector<std::unique_ptr<ItableEntry[]>>  itable_arrays_;
+        std::vector<std::unique_ptr<MethodInfo *[]>> itable_method_arrays_;
+        /// Serializa el build lazy de itables (el fast path es lock-free).
+        std::mutex                                   itable_mutex_;
 
         // Helpers internos.
         stringx     intern_string(const std::string &s);

@@ -184,6 +184,7 @@ namespace ir {
         {"tailcall",   IrOp::TAILCALL},
         {"callvirt",   IrOp::CALLVIRT},
         {"callm",      IrOp::CALLM},
+        {"callitf",    IrOp::CALLITF},
         {"callclosure",IrOp::CALLCLOSURE},
         {"make_closure",IrOp::MAKE_CLOSURE},
         {"make_variant",IrOp::MAKE_VARIANT},
@@ -297,6 +298,8 @@ namespace ir {
         {"addadvice",        IrOp::ADDADVICE},
         {"findmethod",       IrOp::FINDMETHOD},
         {"findfield",        IrOp::FINDFIELD},
+        {"setmethdbg",       IrOp::SETMETHDBG},
+        {"newobjs",          IrOp::NEWOBJS},
         {"callsuper",        IrOp::CALLSUPER},
         {"proceed",          IrOp::PROCEED},
         // ensamblador incrustado
@@ -673,6 +676,22 @@ namespace ir {
                 o << ", " << ins.imm << "(";
                 for (size_t i = 1; i < ins.operands.size(); i++) {
                     if (i > 1) o << ", ";
+                    print_val(o, fn, ins.operands[i]);
+                }
+                o << ")";
+                break;
+
+            case IrOp::CALLITF:
+                // callitf.T %obj, %params @"Iface\x1fmetodo", idx=K(args...)
+                o << " ";
+                if (!ins.operands.empty()) print_val(o, fn, ins.operands[0]);
+                o << ", ";
+                if (ins.operands.size() > 1) print_val(o, fn, ins.operands[1]);
+                o << " @\"" << ins.func_name << "\""
+                  << ", idx=" << (ins.imm & 0xFFFFFFFFULL)
+                  << ", count=" << (ins.imm >> 32) << "(";
+                for (size_t i = 2; i < ins.operands.size(); i++) {
+                    if (i > 2) o << ", ";
                     print_val(o, fn, ins.operands[i]);
                 }
                 o << ")";

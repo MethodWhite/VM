@@ -795,6 +795,7 @@ namespace Assembly::Bytecode {
         {"findmethod",{{0x00, 0xCD, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
         {"findfield", {{0x00, 0xCF, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
         {"callm",     {{0x00, 0xFD, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
+        {"callitf",   {{0x00, 0xAE, InstrSizeMode::FIXED_4, AddressingMode::REG, emit_instr_reg}}},
         {"proceed",   {{0x00, 0xFE, InstrSizeMode::FIXED_2, AddressingMode::NONE, nullptr}}},
         // addadvice: 3 operandos (r_target, r_advice, kind imm).  Usa
         // emit_instr_addadvice (mismo patron que jumptable: byte2 con dos

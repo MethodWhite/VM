@@ -1,0 +1,34 @@
+// Regresion vreg (2026-06-09): objeto GC (host_ptr) vivo LOOP-CARRIED a
+// traves de un CALLVIRT.  El inline dispatch de CALLVIRT del path vreg
+// cargaba method->jit_code en un registro que el regalloc podia asignar
+// a arg0 (RCX en Win64 / RDI en SysV); el `mov arg0, proc` previo al call
+// lo machacaba -> se llamaba a `proc` en vez de a jit_code -> SIGSEGV.
+// Antes estaba enmascarado porque ningun programa del corpus compilaba
+// este patron por vreg; al reescribir __new_X a IR + portar NEWOBJ al
+// vreg, main paso a compilar entero y lo destapo.  Aqui el objeto se pasa
+// como parametro a una funcion con loop + callvirt (el repro mas directo).
+// Esperado: 4 + (10 * 3) = 34.
+
+class Acc {
+    public i32 n;
+    public Acc() { this.n = 4; }
+    public i32 add(i32 d) {
+        this.n = this.n + d;
+        return this.n;
+    }
+}
+
+i32 hammer(Acc a) {
+    i32 last = 0;
+    i32 i = 0;
+    while (i < 10) {
+        last = a.add(3);   // objeto `a` vivo loop-carried a traves del callvirt
+        i = i + 1;
+    }
+    return last;
+}
+
+i32 main() {
+    Acc a = new Acc();
+    return hammer(a);
+}

@@ -263,6 +263,21 @@ namespace ir {
                          ///< MethodInfo* directo; usado para invocacion polimorfica sobre
                          ///< tipo interfaz y para reflexion runtime donde la vtable_idx no
                          ///< es conocida en compile time)
+        CALLITF  = 0x8A, ///< %dst = callitf.T %obj, %params(%a, ...)  (dispatch de
+                         ///< interfaz via itable).  Reemplaza el findmethod+callm para
+                         ///< llamadas polimorficas sobre un tipo INTERFAZ estatico.
+                         ///< El receptor (operands[0]) es el objeto; operands[1] es un
+                         ///< puntero a un @c ItfCallParams (32 bytes, construido por el
+                         ///< frontend) usado SOLO por el interp (el JIT lo ignora y usa
+                         ///< los campos del IR op directamente).  operands[2..] = args
+                         ///< (retbuf SRET como operands[2] si aplica).  Campos del IR:
+                         ///<   @c func_name = "InterfazNombre\x1fmetodoNombre"
+                         ///<   @c imm = (count << 32) | method_index
+                         ///< donde method_index es la posicion del metodo en la
+                         ///< declaracion de la interfaz y count su numero de metodos.
+                         ///< El interp ejecuta el bytecode @c callitf (dispatch via la
+                         ///< itable lazy de la clase concreta); el JIT inlinea el scan
+                         ///< de itables + call directo a method->jit_code.
         CALLCLOSURE = 0x86, ///< %dst = callclosure.T %fn_ptr, %env(%a, ...)
                             ///< Llamada a closure inline.  Identico a CALLIND pero ademas
                             ///< coloca @c env en R14 antes del @c callvm fn_ptr.  Si la
@@ -476,6 +491,8 @@ namespace ir {
         FINDFIELD         = 0x7A, ///< %dst = findfield %params        (lookup FieldInfo* by name)
         CALLSUPER         = 0x7B, ///< %dst = callsuper %method, args  (invoca super.method())
         PROCEED           = 0x7C, ///< %dst = proceed                  (re-invoca target dentro de @Around)
+        SETMETHDBG        = 0x7D, ///< setmethdbg %method, %params     (registra debug info file:line de un MethodInfo*)
+        NEWOBJS           = 0x7E, ///< %dst = newobjs %class_ptr        (allojar objeto en SharedHeap, Phase Z.6)
 
         // ---- distribucion (0xD0-0xDF) ----
         MSGSEND   = 0xD0, ///< %dst = msgsend %pid, %buf_addr, %len -> bool (1=ok)
@@ -644,6 +661,8 @@ namespace ir {
      *   CALL/TAILCALL: dst, func_name, operands[]
      *   CALLIND:       dst, func_ptr, operands[]
      *   CALLVIRT:      dst, operands[0]=obj, imm=vtbl_idx, operands[1..]=args
+     *   CALLITF:       dst, operands[0]=obj, operands[1]=params_ptr, operands[2..]=args,
+     *                  func_name="Iface\x1fmetodo", imm=(count<<32)|method_index
      *   CALLN:         dst, func_name (formato "lib:func"), operands[]
      *   ALLOCA:        dst, type, imm=count
      *   LOAD:          dst, type, operands[0]=ptr
@@ -772,6 +791,31 @@ namespace ir {
     // =========================================================================
 
     /**
+     * @brief Candidato de devirtualizacion especulativa (TAREA 2 / C2).
+     *
+     * Describe uno de los <=K tipos concretos que el pase
+     * @c ir_pass_spec_devirt convierte en una rama del guard-chain que
+     * reemplaza un dispatch dinamico (CALLITF/CALLVIRT/CALLM):
+     *
+     *     cls = load[obj]
+     *     if (cls == cls_value) r = call callee_ir_name(obj, args...)  // fast
+     *     ... (mas candidatos) ...
+     *     else                  r = <dispatch original>                // fallback
+     *
+     * El lowering (que conoce los implementors via el type checker) crea
+     * un candidato por implementor inlineable y lo registra en
+     * @c IrFunction::spec_devirt_sites, keyed por el @c dst del call.  El
+     * @c cls_value es un SSA value loop-invariante definido en el entry
+     * (resuelto via slot-cache lazy con @c findclass); el guard compara el
+     * class_ptr del objeto contra el.
+     */
+    struct DevirtCandidate {
+        IrValueId   cls_value;       ///< SSA value con el ClassInfo* del tipo.
+        std::string callee_ir_name;   ///< nombre IR del metodo concreto a llamar
+                                      ///< directo en el fast path (e.g. "Circle__area").
+    };
+
+    /**
      * @brief Funcion completa en forma SSA.
      *
      * Contiene el grafo de bloques basicos y el pool de valores.
@@ -837,6 +881,25 @@ namespace ir {
          * @c false para todas las IrFunctions regulares.
          */
         bool                     is_macro_compiled = false;
+
+        /**
+         * @brief TAREA 2 (C2): sitios de devirtualizacion especulativa.
+         *
+         * Mapa keyed por el @c dst (SSA, unico y estable) de un call
+         * dinamico (CALLITF/CALLVIRT/CALLM) -> lista de candidatos de tipo
+         * a especular (<=K).  Lo rellena el lowering (que conoce los
+         * implementors via el type checker) y lo CONSUME el pase
+         * @c ir_pass_spec_devirt durante @c ir_optimize (@O2), que
+         * reescribe el call en un guard-chain + fallback.
+         *
+         * Es metadata EFIMERA del pase: se consume antes de serializar la
+         * seccion @c @ir del .velb, por lo que NO se serializa.  Mapa
+         * lateral (en vez de un campo en cada @c IrInstr) para no engordar
+         * la estructura caliente: solo los pocos call sites especulables
+         * tienen entrada.
+         */
+        std::unordered_map<IrValueId, std::vector<DevirtCandidate>>
+            spec_devirt_sites;
 
         /**
          * @brief Crea un nuevo valor SSA en el pool.

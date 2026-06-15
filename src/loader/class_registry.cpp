@@ -18,6 +18,7 @@
 #include "loader/class_registry.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 namespace loader {
@@ -560,6 +561,98 @@ namespace loader {
         if (idx == UINT32_MAX) return nullptr;
         if (idx >= cls->method_count) return nullptr;
         return &cls->methods[idx];
+    }
+
+    // ---------------------------------------------------------------------
+    //  Dispatch de interfaz (itables) -- construccion lazy + relleno por nombre
+    //
+    //  Las interfaces NO registran sus metodos en runtime (sus ClassInfo no
+    //  tienen methods/vtable), asi que la itable NO se construye iterando
+    //  iface->methods.  En su lugar se DIMENSIONA por @p count (que el frontend
+    //  conoce = nº de metodos de la interfaz) con todos los slots a nullptr, y
+    //  cada slot se RELLENA lazy por nombre (resolve_itable_method) la primera
+    //  vez que se despacha ese (clase, indice).  Tras el warmup el dispatch es
+    //  un indice puro (sin lookup por nombre).
+    // ---------------------------------------------------------------------
+    ItableEntry *ClassRegistry::get_or_build_itable(ClassInfo *cls, ClassInfo *iface,
+                                                    uint32_t count) {
+        if (!cls || !iface) return nullptr;
+
+        // Fast path (lock-free): el array de itables es NULL-terminado
+        // (ultima entry con iface==0).  Leemos un unico puntero (8B alineado
+        // = atomico en x86/ARM64) y recorremos hasta el terminador.  Un lector
+        // que tenga el puntero "viejo" (antes de un build concurrente) escanea
+        // el array viejo: si la iface no esta, caera al slow path y la hallara
+        // bajo lock (los arrays viejos se retienen en los pools).
+        if (ItableEntry *arr = cls->itables) {
+            for (ItableEntry *e = arr; e->iface != nullptr; ++e) {
+                if (e->iface == iface) return e;
+            }
+        }
+
+        // Slow path: construir bajo lock con re-check (otro hilo pudo haberla
+        // construido entre el fast path y la adquisicion del lock).
+        std::lock_guard<std::mutex> lk(itable_mutex_);
+        if (ItableEntry *arr = cls->itables) {
+            for (ItableEntry *e = arr; e->iface != nullptr; ++e) {
+                if (e->iface == iface) return e;
+            }
+        }
+
+        // Crear el array methods[] dimensionado a count, TODO a nullptr
+        // (make_unique value-initializa).  Los slots se rellenan lazy por
+        // nombre en resolve_itable_method.
+        MethodInfo **methods = nullptr;
+        if (count > 0) {
+            auto mbuf = std::make_unique<MethodInfo *[]>(count);
+            methods = mbuf.get();
+            itable_method_arrays_.push_back(std::move(mbuf));
+        }
+
+        // Realloc del array de itables: copia de las entradas previas + la
+        // nueva + el terminador NULL.  make_unique value-initializa (zero) las
+        // entradas, asi que el terminador queda {nullptr,nullptr,0,0}.
+        const uint32_t old_n = cls->itable_count;
+        auto nbuf = std::make_unique<ItableEntry[]>(old_n + 2); // +1 nueva +1 terminador
+        for (uint32_t i = 0; i < old_n; ++i) nbuf[i] = cls->itables[i];
+        nbuf[old_n].iface   = iface;
+        nbuf[old_n].methods = methods;
+        nbuf[old_n].count   = count;
+        nbuf[old_n]._pad    = 0;
+        // nbuf[old_n + 1] ya es el terminador {0,0,0,0} por value-init.
+
+        ItableEntry *result = &nbuf[old_n];
+        ItableEntry *pub    = nbuf.get();
+        itable_arrays_.push_back(std::move(nbuf));
+
+        // Publicar: el contenido del array ya esta escrito; barrera release +
+        // store del puntero (RCU-style).  El lector consume via dependencia de
+        // direccion sobre el puntero cargado (ve el contenido del array).
+        std::atomic_thread_fence(std::memory_order_release);
+        cls->itables      = pub;
+        cls->itable_count = old_n + 1; // metadata (el scan hot usa el terminador)
+        return result;
+    }
+
+    MethodInfo *ClassRegistry::resolve_itable_method(ClassInfo *cls, ClassInfo *iface,
+                                                     uint32_t count, uint32_t method_index,
+                                                     const char *method_name,
+                                                     size_t name_len) {
+        ItableEntry *e = get_or_build_itable(cls, iface, count);
+        if (!e || method_index >= e->count || !e->methods) {
+            // Indice fuera de rango (no deberia ocurrir para programas
+            // bien-formados): fallback directo por nombre.
+            return find_method(cls, method_name, name_len);
+        }
+        // Slot ya resuelto -> indice puro (fast path comun tras el warmup).
+        MethodInfo *m = e->methods[method_index];
+        if (m) return m;
+        // Primer dispatch de este (clase, indice): resolver por nombre y
+        // cachear.  Escritura idempotente (mismo MethodInfo* desde cualquier
+        // hilo) de 8B alineada -> thread-safe sin lock.
+        m = find_method(cls, method_name, name_len);
+        e->methods[method_index] = m;
+        return m;
     }
 
 } // namespace loader

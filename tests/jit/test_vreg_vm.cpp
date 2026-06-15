@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 using namespace jit;
 
@@ -84,10 +85,12 @@ static ir::IrInstr conv(ir::IrOp op, ir::IrValueId d, ir::IrValueId s, ir::IrTyp
 /** @brief Compila @p fn en modo VM y la ejecuta con @p px (RBX = &px). */
 static bool jit_vm(const ir::IrFunction &fn, Proxy &px,
                    const CallResolver &resolve = {}, uint64_t callvirt_addr = 0,
-                   const CallResolver &resolve_native = {}) {
+                   const CallResolver &resolve_native = {},
+                   const CallResolver &resolve_symbol = {}) {
     MFunction mf;
     VregEntries ent; ent.callvirt = callvirt_addr;
-    if (!vreg_select(fn, mf, AbiKind::VM, resolve, ent, resolve_native)) return false;
+    if (!vreg_select(fn, mf, AbiKind::VM, resolve, ent, resolve_native,
+                     resolve_symbol)) return false;
     const TargetRegInfo &tri = target_x86_64_vm_abi();
     RegAlloc ra = linear_scan(build_intervals(mf, tri), tri);
     MFunction pf = rewrite_to_physical(mf, ra, tri, AbiKind::VM);
@@ -101,6 +104,25 @@ static bool jit_vm(const ir::IrFunction &fn, Proxy &px,
     cc.commit(code, bytes.size());
     reinterpret_cast<void (*)(void *)>(code)(&px);
     asm volatile("" : : "r"(&cc) : "memory");  // mantener cc viva hasta aqui
+    return true;
+}
+
+/** @brief Como jit_vm pero con un VregEntries completo (cluster strings). */
+static bool jit_vm_ent(const ir::IrFunction &fn, Proxy &px, const VregEntries &ent) {
+    MFunction mf;
+    if (!vreg_select(fn, mf, AbiKind::VM, {}, ent, {}, {})) return false;
+    const TargetRegInfo &tri = target_x86_64_vm_abi();
+    RegAlloc ra = linear_scan(build_intervals(mf, tri), tri);
+    MFunction pf = rewrite_to_physical(mf, ra, tri, AbiKind::VM);
+    X86Encoder enc; std::vector<uint8_t> bytes;
+    if (enc.encode(pf, bytes) == 0 || bytes.empty()) return false;
+    CodeCache cc;
+    uint8_t *code = cc.alloc(bytes.size(), 16);
+    if (!code) return false;
+    std::memcpy(code, bytes.data(), bytes.size());
+    cc.commit(code, bytes.size());
+    reinterpret_cast<void (*)(void *)>(code)(&px);
+    asm volatile("" : : "r"(&cc) : "memory");
     return true;
 }
 
@@ -293,11 +315,500 @@ static void test_vm_callvirt() {
     if (px.regs[0] != 75) std::printf("    regs[0]=%llu\n", (unsigned long long)px.regs[0]);
 }
 
+/* ---- Test STRMAKE (cluster strings) -------------------------------- *
+ * f() = strmake(0x100, 5) -> stub devuelve handle 0x7777 y registra los
+ * args (proc, vm_addr, byte_len).  Fuerza el path JIT REAL con ent.str_make
+ * apuntando al stub. */
+static uint64_t g_strmake_calls = 0;
+static uint64_t g_strmake_vaddr = 0, g_strmake_len = 0;
+extern "C" uint64_t vm_strmake_stub(void *proc, uint64_t vaddr, uint32_t len) {
+    (void)proc;
+    ++g_strmake_calls; g_strmake_vaddr = vaddr; g_strmake_len = len;
+    return 0x7777ULL;  // handle falso
+}
+static void test_vm_strmake() {
+    std::printf("[vm] strmake(0x100, 5) -> stub handle 0x7777\n");
+    ir::IrFunction fn;
+    fn.name = "smk"; fn.ret_type = ir::IrType::I64;
+    auto T = ir::IrType::I64;
+    ir::IrValueId buf = fn.new_value(T), len = fn.new_value(T), h = fn.new_value(T);
+    ir::IrBlockId bb = fn.new_block("e");
+    fn.append(bb, konst(buf, 0x100));
+    fn.append(bb, konst(len, 5));
+    {
+        ir::IrInstr c; c.op = ir::IrOp::STRMAKE; c.type = T; c.dst = h;
+        c.operands = { buf, len }; c.imm = 0; c.is_call_site = true;
+        fn.append(bb, c);
+    }
+    fn.append(bb, ret1(h));
+
+    MFunction mf;
+    VregEntries ent; ent.str_make =
+        reinterpret_cast<uint64_t>(reinterpret_cast<void *>(&vm_strmake_stub));
+    bool ok = vreg_select(fn, mf, AbiKind::VM, {}, ent, {}, {});
+    CHECK(ok, "vreg_select strmake ok");
+    if (!ok) return;
+    const TargetRegInfo &tri = target_x86_64_vm_abi();
+    RegAlloc ra = linear_scan(build_intervals(mf, tri), tri);
+    MFunction pf = rewrite_to_physical(mf, ra, tri, AbiKind::VM);
+    X86Encoder enc; std::vector<uint8_t> bytes;
+    CHECK(enc.encode(pf, bytes) != 0 && !bytes.empty(), "encode strmake");
+    if (bytes.empty()) return;
+    CodeCache cc; uint8_t *code = cc.alloc(bytes.size(), 16);
+    if (!code) { CHECK(false, "code cache strmake"); return; }
+    std::memcpy(code, bytes.data(), bytes.size()); cc.commit(code, bytes.size());
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    g_strmake_calls = 0; g_strmake_vaddr = 0; g_strmake_len = 0;
+    reinterpret_cast<void (*)(void *)>(code)(&px);
+    asm volatile("" : : "r"(&cc) : "memory");
+    CHECK(g_strmake_calls == 1, "strmake llama al runtime 1 vez");
+    CHECK(g_strmake_vaddr == 0x100, "strmake pasa vm_addr correcto");
+    CHECK(g_strmake_len == 5, "strmake pasa byte_len correcto");
+    CHECK(px.regs[0] == 0x7777, "strmake result handle en regs[0]");
+    if (px.regs[0] != 0x7777)
+        std::printf("    regs[0]=%llu\n", (unsigned long long)px.regs[0]);
+}
+
+/* ---- Test STRLEN (cluster strings, 1-arg) -------------------------- *
+ * f(s) = strlen(s).  s en regs[1].  Stub registra el handle y devuelve 99. */
+static uint64_t g_strlen_h = 0;
+extern "C" uint64_t vm_strlen_stub(void *proc, uint64_t h) {
+    (void)proc; g_strlen_h = h; return 99;
+}
+static void test_vm_strlen() {
+    std::printf("[vm] strlen(s): regs[1]=0x55 -> stub -> regs[0]=99\n");
+    ir::IrFunction fn;
+    fn.name = "sln"; fn.ret_type = ir::IrType::I64;
+    auto T = ir::IrType::I64;
+    ir::IrValueId s = fn.new_value(T), r = fn.new_value(T);
+    fn.params = { s };
+    ir::IrBlockId bb = fn.new_block("e");
+    { ir::IrInstr c; c.op = ir::IrOp::STRLEN; c.type = T; c.dst = r;
+      c.operands = { s }; fn.append(bb, c); }
+    fn.append(bb, ret1(r));
+    VregEntries ent; ent.str_len =
+        reinterpret_cast<uint64_t>(reinterpret_cast<void *>(&vm_strlen_stub));
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    px.regs[1] = 0x55; g_strlen_h = 0;
+    CHECK(jit_vm_ent(fn, px, ent), "jit_vm strlen ok");
+    CHECK(g_strlen_h == 0x55, "strlen pasa handle correcto");
+    CHECK(px.regs[0] == 99, "strlen result en regs[0]");
+}
+
+/* ---- Test STRCAT (cluster strings, 2-arg + GC handle) -------------- *
+ * f(s,t) = strcat(s,t).  s,t en regs[1],regs[2].  Stub registra a/b. */
+static uint64_t g_strcat_a = 0, g_strcat_b = 0;
+extern "C" uint64_t vm_strcat_stub(void *proc, uint64_t a, uint64_t b) {
+    (void)proc; g_strcat_a = a; g_strcat_b = b; return 0xC0FFEEULL;
+}
+static void test_vm_strcat() {
+    std::printf("[vm] strcat(s,t): regs[1]=0x11 regs[2]=0x22 -> 0xC0FFEE\n");
+    ir::IrFunction fn;
+    fn.name = "sct"; fn.ret_type = ir::IrType::I64;
+    auto T = ir::IrType::I64;
+    ir::IrValueId s = fn.new_value(T), t = fn.new_value(T), r = fn.new_value(T);
+    fn.params = { s, t };
+    ir::IrBlockId bb = fn.new_block("e");
+    { ir::IrInstr c; c.op = ir::IrOp::STRCAT; c.type = T; c.dst = r;
+      c.operands = { s, t }; c.is_call_site = true; fn.append(bb, c); }
+    fn.append(bb, ret1(r));
+    VregEntries ent; ent.str_cat =
+        reinterpret_cast<uint64_t>(reinterpret_cast<void *>(&vm_strcat_stub));
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    px.regs[1] = 0x11; px.regs[2] = 0x22; g_strcat_a = 0; g_strcat_b = 0;
+    CHECK(jit_vm_ent(fn, px, ent), "jit_vm strcat ok");
+    CHECK(g_strcat_a == 0x11, "strcat pasa arg a correcto");
+    CHECK(g_strcat_b == 0x22, "strcat pasa arg b correcto");
+    CHECK(px.regs[0] == 0xC0FFEEULL, "strcat result handle en regs[0]");
+}
+
+/* ---- Test ADT markers (MAKE_VARIANT/MATCH_VARIANT son no-op) -------- *
+ * f(a,b) = make_variant(); add; match_variant(); -> a+b.  Los markers no
+ * deben perturbar el codegen circundante. */
+static void test_vm_variant_markers() {
+    std::printf("[vm] variant markers: f(40,2) -> regs[0]=42 (markers no-op)\n");
+    ir::IrFunction fn;
+    fn.name = "varm"; fn.ret_type = ir::IrType::I64;
+    auto T = ir::IrType::I64;
+    ir::IrValueId a = fn.new_value(T), b = fn.new_value(T), r = fn.new_value(T);
+    fn.params = { a, b };
+    ir::IrBlockId bb = fn.new_block("e");
+    { ir::IrInstr mk; mk.op = ir::IrOp::MAKE_VARIANT; mk.type = ir::IrType::VOID;
+      mk.dst = ir::IR_NO_VALUE; mk.func_name = "E.V"; mk.imm = 0;
+      mk.operands = { a }; fn.append(bb, mk); }
+    fn.append(bb, bin(ir::IrOp::ADD, r, a, b));
+    { ir::IrInstr mt; mt.op = ir::IrOp::MATCH_VARIANT; mt.type = ir::IrType::VOID;
+      mt.dst = ir::IR_NO_VALUE; mt.func_name = "E"; mt.imm = 1;
+      mt.operands = { a }; fn.append(bb, mt); }
+    fn.append(bb, ret1(r));
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    px.regs[1] = 40; px.regs[2] = 2;
+    VregEntries ent;
+    CHECK(jit_vm_ent(fn, px, ent), "jit_vm variant markers ok");
+    CHECK(px.regs[0] == 42, "markers no-op: f(40,2)==42");
+}
+
+/* ---- Test SMARTPTR_FREE kind 1 (EXTERN_CALLN) ---------------------- *
+ * f(ptr) { smartptr_free.kind=1(ptr) "lib:del" }.  Si ptr!=0 llama al
+ * deleter nativo con ptr en arg0; si ptr==0 NO lo llama (null-safe). */
+static uint64_t g_spnat_ptr = 0; static int g_spnat_calls = 0;
+extern "C" void vm_sp_native_del(uint64_t p) { g_spnat_ptr = p; ++g_spnat_calls; }
+static ir::IrInstr ret_void() {
+    ir::IrInstr i; i.op = ir::IrOp::RET; i.type = ir::IrType::VOID; return i;
+}
+static void test_vm_smartptr_free_extern() {
+    std::printf("[vm] smartptr_free kind=1 (extern): null-safe + arg0=ptr\n");
+    ir::IrFunction fn;
+    fn.name = "spf1"; fn.ret_type = ir::IrType::VOID;
+    ir::IrValueId ptr = fn.new_value(ir::IrType::PTR);
+    fn.values[ptr].is_host_ptr = true;
+    fn.params = { ptr };
+    ir::IrBlockId bb = fn.new_block("e");
+    { ir::IrInstr c; c.op = ir::IrOp::SMARTPTR_FREE; c.type = ir::IrType::VOID;
+      c.dst = ir::IR_NO_VALUE; c.operands = { ptr }; c.imm = 1;
+      c.func_name = "lib:del"; c.is_call_site = true; fn.append(bb, c); }
+    fn.append(bb, ret_void());
+    CallResolver rn = [](const std::string &n) -> uint64_t {
+        return n == "lib:del"
+            ? reinterpret_cast<uint64_t>(reinterpret_cast<void *>(&vm_sp_native_del))
+            : 0;
+    };
+    /* ptr != 0 -> deleter llamado con ptr. */
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    px.regs[1] = 0xDEAD; g_spnat_ptr = 0; g_spnat_calls = 0;
+    CHECK(jit_vm(fn, px, {}, 0, rn), "jit_vm smartptr_free k1 ok");
+    CHECK(g_spnat_calls == 1, "k1: deleter llamado 1 vez (ptr!=0)");
+    CHECK(g_spnat_ptr == 0xDEAD, "k1: deleter recibe ptr en arg0");
+    /* ptr == 0 -> deleter NO llamado. */
+    Proxy px0; std::memset(&px0, 0, sizeof(px0));
+    px0.regs[1] = 0; g_spnat_calls = 0;
+    CHECK(jit_vm(fn, px0, {}, 0, rn), "jit_vm smartptr_free k1 null ok");
+    CHECK(g_spnat_calls == 0, "k1: deleter NO llamado (ptr==0, null-safe)");
+}
+
+/* ---- Test SMARTPTR_FREE kind 2 (VESTA_CALLVM) --------------------- *
+ * f(ptr) { smartptr_free.kind=2(ptr) "del" }.  Si ptr!=0 stage ptr a
+ * regs[1] + call vesta(proc); el deleter lee regs[1]. */
+static uint64_t g_spves_ptr = 0; static int g_spves_calls = 0;
+extern "C" void vm_sp_vesta_del(void *proc) {
+    Proxy *p = static_cast<Proxy *>(proc);
+    g_spves_ptr = p->regs[1]; ++g_spves_calls;
+}
+static void test_vm_smartptr_free_vesta() {
+    std::printf("[vm] smartptr_free kind=2 (vesta): null-safe + regs[1]=ptr\n");
+    ir::IrFunction fn;
+    fn.name = "spf2"; fn.ret_type = ir::IrType::VOID;
+    ir::IrValueId ptr = fn.new_value(ir::IrType::PTR);
+    fn.values[ptr].is_host_ptr = true;
+    fn.params = { ptr };
+    ir::IrBlockId bb = fn.new_block("e");
+    { ir::IrInstr c; c.op = ir::IrOp::SMARTPTR_FREE; c.type = ir::IrType::VOID;
+      c.dst = ir::IR_NO_VALUE; c.operands = { ptr }; c.imm = 2;
+      c.func_name = "del"; c.is_call_site = true; fn.append(bb, c); }
+    fn.append(bb, ret_void());
+    CallResolver rc = [](const std::string &n) -> uint64_t {
+        return n == "del"
+            ? reinterpret_cast<uint64_t>(reinterpret_cast<void *>(&vm_sp_vesta_del))
+            : 0;
+    };
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    px.regs[1] = 0xBEEF; g_spves_ptr = 0; g_spves_calls = 0;
+    CHECK(jit_vm(fn, px, rc), "jit_vm smartptr_free k2 ok");
+    CHECK(g_spves_calls == 1, "k2: deleter llamado 1 vez (ptr!=0)");
+    CHECK(g_spves_ptr == 0xBEEF, "k2: deleter lee ptr de regs[1]");
+    Proxy px0; std::memset(&px0, 0, sizeof(px0));
+    px0.regs[1] = 0; g_spves_calls = 0;
+    CHECK(jit_vm(fn, px0, rc), "jit_vm smartptr_free k2 null ok");
+    CHECK(g_spves_calls == 0, "k2: deleter NO llamado (ptr==0, null-safe)");
+}
+
+/* ---- Test CALLCLOSURE ---------------------------------------------- *
+ * f(arg) = callclosure(fn=0xFACE, env=0xE0, arg).  El stub registra
+ * fn_addr, env, regs[1]=arg, regs[15]=nargs y devuelve 0xABBA. */
+static uint64_t g_clo_fn = 0, g_clo_env = 0, g_clo_arg = 0, g_clo_nargs = 0;
+extern "C" uint64_t vm_callclosure_stub(void *proc, uint64_t fn, uint64_t env) {
+    Proxy *p = static_cast<Proxy *>(proc);
+    g_clo_fn = fn; g_clo_env = env;
+    g_clo_arg = p->regs[1]; g_clo_nargs = p->regs[15];
+    return 0xABBAULL;
+}
+static void test_vm_callclosure() {
+    std::printf("[vm] callclosure(fn=0xFACE, env=0xE0, arg) -> 0xABBA\n");
+    ir::IrFunction fn;
+    fn.name = "clo"; fn.ret_type = ir::IrType::I64;
+    auto T = ir::IrType::I64;
+    ir::IrValueId arg = fn.new_value(T), fnp = fn.new_value(T);
+    ir::IrValueId env = fn.new_value(T), r = fn.new_value(T);
+    fn.params = { arg };
+    ir::IrBlockId bb = fn.new_block("e");
+    fn.append(bb, konst(fnp, 0xFACE));
+    fn.append(bb, konst(env, 0xE0));
+    { ir::IrInstr c; c.op = ir::IrOp::CALLCLOSURE; c.type = T; c.dst = r;
+      c.func_ptr = fnp; c.operands = { env, arg }; c.is_call_site = true;
+      fn.append(bb, c); }
+    fn.append(bb, ret1(r));
+    VregEntries ent; ent.callclosure =
+        reinterpret_cast<uint64_t>(reinterpret_cast<void *>(&vm_callclosure_stub));
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    px.regs[1] = 0x123;
+    g_clo_fn = g_clo_env = g_clo_arg = g_clo_nargs = 0;
+    CHECK(jit_vm_ent(fn, px, ent), "jit_vm callclosure ok");
+    CHECK(g_clo_fn == 0xFACE, "callclosure pasa fn_addr");
+    CHECK(g_clo_env == 0xE0, "callclosure pasa env");
+    CHECK(g_clo_arg == 0x123, "callclosure stage arg en regs[1]");
+    CHECK(g_clo_nargs == 1, "callclosure stage nargs=1 en regs[15]");
+    CHECK(px.regs[0] == 0xABBAULL, "callclosure result en regs[0]");
+}
+
+/* ---- Test READ_VM_REG ---------------------------------------------- *
+ * f() = read_vm_reg(3).  regs[3]=0x1234 -> regs[0]=0x1234. */
+static void test_vm_read_vm_reg() {
+    std::printf("[vm] read_vm_reg(3): regs[3]=0x1234 -> regs[0]=0x1234\n");
+    ir::IrFunction fn;
+    fn.name = "rvr"; fn.ret_type = ir::IrType::I64;
+    auto T = ir::IrType::I64;
+    ir::IrValueId r = fn.new_value(T);
+    ir::IrBlockId bb = fn.new_block("e");
+    { ir::IrInstr c; c.op = ir::IrOp::READ_VM_REG; c.type = T; c.dst = r;
+      c.imm = 3; fn.append(bb, c); }
+    fn.append(bb, ret1(r));
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    px.regs[3] = 0x1234;
+    VregEntries ent;
+    CHECK(jit_vm_ent(fn, px, ent), "jit_vm read_vm_reg ok");
+    CHECK(px.regs[0] == 0x1234, "read_vm_reg(3) -> regs[0]==0x1234");
+}
+
 /** @brief Callee de prueba: pone regs[0]=50 (simula trabajo + clobbea
  *  caller-saved como cualquier funcion C). */
 extern "C" void g_stub(void *proc) {
     Proxy *p = static_cast<Proxy *>(proc);
     p->regs[0] = 50;
+}
+
+/* ===================================================================== *
+ * LOAD_VM / STORE_VM (cobertura vm_mem, 2026-06-09): acceso a memoria del
+ * VM (vaddr, is_host_ptr=false) via page-cache INLINE + fallback al runtime.
+ *
+ * Estrategia de validacion (path JIT REAL, no interp enmascarado):
+ *   - Proxy = buffer crudo dimensionado con kProcVmMemOffset (runtime const,
+ *     resuelto al enlazar abi_checks.cpp).  cached_page_vaddr/host escritos
+ *     por offset; regs@96.
+ *   - vm_read/write_u64 = STUBS propios (no el runtime real, que necesitaria
+ *     un VirtualMemory mapeado) -> el page-miss es determinista.
+ *   - HIT: cached_page = page(vaddr) -> lee/escribe el host buffer SIN llamar
+ *     al stub.  MISS: cache mismatch -> llama al stub con (vaddr[,val]).
+ * ===================================================================== */
+
+/* Stubs del fallback page-miss. */
+static int      g_vmstub_rd_calls = 0;
+static uint64_t g_vmstub_rd_vaddr = 0;
+static uint64_t stub_vm_read_u64(void * /*proc*/, uint64_t vaddr) {
+    ++g_vmstub_rd_calls; g_vmstub_rd_vaddr = vaddr; return 0xCAFEULL;
+}
+static int      g_vmstub_wr_calls = 0;
+static uint64_t g_vmstub_wr_vaddr = 0, g_vmstub_wr_val = 0;
+static void stub_vm_write_u64(void * /*proc*/, uint64_t vaddr, uint64_t val) {
+    ++g_vmstub_wr_calls; g_vmstub_wr_vaddr = vaddr; g_vmstub_wr_val = val;
+}
+
+/** @brief Compila @p fn en VM_ABI con @p ent custom y la ejecuta con RBX=@p proc. */
+static bool jit_vm_mem(const ir::IrFunction &fn, void *proc, VregEntries &ent) {
+    MFunction mf;
+    if (!vreg_select(fn, mf, AbiKind::VM, {}, ent, {}, {})) return false;
+    const TargetRegInfo &tri = target_x86_64_vm_abi();
+    RegAlloc ra = linear_scan(build_intervals(mf, tri), tri);
+    MFunction pf = rewrite_to_physical(mf, ra, tri, AbiKind::VM);
+    X86Encoder enc; std::vector<uint8_t> bytes;
+    if (enc.encode(pf, bytes) == 0 || bytes.empty()) return false;
+    CodeCache cc;
+    uint8_t *code = cc.alloc(bytes.size(), 16);
+    if (!code) return false;
+    std::memcpy(code, bytes.data(), bytes.size());
+    cc.commit(code, bytes.size());
+    reinterpret_cast<void (*)(void *)>(code)(proc);
+    asm volatile("" : : "r"(&cc) : "memory");
+    return true;
+}
+
+static void test_vm_load_vm() {
+    std::printf("[vm] LOAD_VM: page-cache hit (sin runtime) + miss (fallback)\n");
+    /* IR: ldvm(ptr) { v = vm_mem[ptr]; return v; }  ptr.is_host_ptr=false. */
+    ir::IrFunction fn; fn.name = "ldvm"; fn.ret_type = ir::IrType::I64;
+    ir::IrValueId ptr = fn.new_value(ir::IrType::PTR);  // vm-addr (no host)
+    ir::IrValueId v   = fn.new_value(ir::IrType::I64);
+    fn.params = { ptr };
+    ir::IrBlockId bb = fn.new_block("e");
+    { ir::IrInstr i; i.op = ir::IrOp::LOAD; i.type = ir::IrType::I64;
+      i.dst = v; i.operands = { ptr }; fn.append(bb, i); }
+    fn.append(bb, ret1(v));
+
+    const size_t PROC_SZ = static_cast<size_t>(vesta_rt::kProcVmMemOffset) + 512;
+    std::vector<uint8_t> proc(PROC_SZ, 0);
+    auto regs = reinterpret_cast<uint64_t *>(proc.data() + VESTA_PROC_REGISTERS_OFFSET);
+    auto pcv  = reinterpret_cast<uint64_t *>(proc.data() + vesta_rt::kProcVmMemOffset
+                                           + vesta_rt::kVmMemCachedPageVaddrOffset);
+    auto pch  = reinterpret_cast<uint8_t **>(proc.data() + vesta_rt::kProcVmMemOffset
+                                           + vesta_rt::kVmMemCachedPageHostOffset);
+    std::vector<uint8_t> page(4096, 0);
+    const uint64_t vaddr = 0x20040ULL;
+    *reinterpret_cast<uint64_t *>(page.data() + (vaddr & 0xFFF)) = 0x1234567890ULL;
+
+    VregEntries ent; ent.vm_read_u64 = reinterpret_cast<uint64_t>(&stub_vm_read_u64);
+
+    /* HIT: pagina cacheada == page(vaddr). */
+    *pcv = vaddr & ~0xFFFULL;
+    *pch = page.data();
+    regs[1] = vaddr;
+    g_vmstub_rd_calls = 0;
+    CHECK(jit_vm_mem(fn, proc.data(), ent), "LOAD_VM compila/ejecuta (hit)");
+    CHECK(regs[0] == 0x1234567890ULL, "LOAD_VM hit lee del host buffer");
+    CHECK(g_vmstub_rd_calls == 0, "LOAD_VM hit NO llama al runtime");
+    if (regs[0] != 0x1234567890ULL)
+        std::printf("    regs[0]=0x%llx\n", (unsigned long long)regs[0]);
+
+    /* MISS: pagina cacheada != page(vaddr) -> fallback al stub. */
+    *pcv = 0x99000ULL;
+    regs[1] = vaddr; regs[0] = 0;
+    g_vmstub_rd_calls = 0; g_vmstub_rd_vaddr = 0;
+    CHECK(jit_vm_mem(fn, proc.data(), ent), "LOAD_VM compila/ejecuta (miss)");
+    CHECK(g_vmstub_rd_calls == 1, "LOAD_VM miss llama al runtime 1 vez");
+    CHECK(g_vmstub_rd_vaddr == vaddr, "LOAD_VM miss pasa vaddr correcto");
+    CHECK(regs[0] == 0xCAFEULL, "LOAD_VM miss propaga el resultado");
+}
+
+static void test_vm_store_vm() {
+    std::printf("[vm] STORE_VM: page-cache hit (sin runtime) + miss (fallback)\n");
+    /* IR: stvm(ptr, val) { vm_mem[ptr] = val; }  ptr.is_host_ptr=false. */
+    ir::IrFunction fn; fn.name = "stvm"; fn.ret_type = ir::IrType::VOID;
+    ir::IrValueId ptr = fn.new_value(ir::IrType::PTR);
+    ir::IrValueId val = fn.new_value(ir::IrType::I64);
+    fn.params = { ptr, val };
+    ir::IrBlockId bb = fn.new_block("e");
+    { ir::IrInstr i; i.op = ir::IrOp::STORE; i.type = ir::IrType::I64;
+      i.operands = { val, ptr }; fn.append(bb, i); }   // [0]=val, [1]=ptr
+    { ir::IrInstr i; i.op = ir::IrOp::RET; i.type = ir::IrType::VOID;
+      fn.append(bb, i); }
+
+    const size_t PROC_SZ = static_cast<size_t>(vesta_rt::kProcVmMemOffset) + 512;
+    std::vector<uint8_t> proc(PROC_SZ, 0);
+    auto regs = reinterpret_cast<uint64_t *>(proc.data() + VESTA_PROC_REGISTERS_OFFSET);
+    auto pcv  = reinterpret_cast<uint64_t *>(proc.data() + vesta_rt::kProcVmMemOffset
+                                           + vesta_rt::kVmMemCachedPageVaddrOffset);
+    auto pch  = reinterpret_cast<uint8_t **>(proc.data() + vesta_rt::kProcVmMemOffset
+                                           + vesta_rt::kVmMemCachedPageHostOffset);
+    std::vector<uint8_t> page(4096, 0);
+    const uint64_t vaddr = 0x30080ULL;
+
+    VregEntries ent; ent.vm_write_u64 = reinterpret_cast<uint64_t>(&stub_vm_write_u64);
+
+    /* HIT: escribe directo al host buffer, sin runtime. */
+    *pcv = vaddr & ~0xFFFULL;
+    *pch = page.data();
+    regs[1] = vaddr; regs[2] = 0xDEADBEEFULL;
+    g_vmstub_wr_calls = 0;
+    CHECK(jit_vm_mem(fn, proc.data(), ent), "STORE_VM compila/ejecuta (hit)");
+    const uint64_t stored =
+        *reinterpret_cast<uint64_t *>(page.data() + (vaddr & 0xFFF));
+    CHECK(stored == 0xDEADBEEFULL, "STORE_VM hit escribe al host buffer");
+    CHECK(g_vmstub_wr_calls == 0, "STORE_VM hit NO llama al runtime");
+    if (stored != 0xDEADBEEFULL)
+        std::printf("    stored=0x%llx\n", (unsigned long long)stored);
+
+    /* MISS: fallback al stub con (vaddr, val). */
+    *pcv = 0x99000ULL;
+    regs[1] = vaddr; regs[2] = 0xBEEFULL;
+    g_vmstub_wr_calls = 0; g_vmstub_wr_vaddr = 0; g_vmstub_wr_val = 0;
+    CHECK(jit_vm_mem(fn, proc.data(), ent), "STORE_VM compila/ejecuta (miss)");
+    CHECK(g_vmstub_wr_calls == 1, "STORE_VM miss llama al runtime 1 vez");
+    CHECK(g_vmstub_wr_vaddr == vaddr, "STORE_VM miss pasa vaddr correcto");
+    CHECK(g_vmstub_wr_val == 0xBEEFULL, "STORE_VM miss pasa val correcto");
+}
+
+/* ---- Test self-recursion: CALL con func_name==fn.name -> rel32 a code+0 - *
+ * fact(n) = (n < 2) ? n : n * fact(n-1).  fact(5) = 120.  El self-call NO
+ * pasa por el resolver (is_self): emite CALL rel32 al prologue (label del
+ * bloque 0).  El prologue recarga el param de proc->registers (que el caller
+ * acaba de escribir) y monta un frame fresco -> recursion real en JIT. */
+static void test_vm_self_recursion() {
+    std::printf("[vm] fact(5) self-recursivo (CALL rel32 a code+0) -> regs[0]=120\n");
+    ir::IrFunction fn;
+    fn.name = "fact"; fn.ret_type = ir::IrType::I64;
+    auto I64 = ir::IrType::I64;
+    ir::IrValueId n   = fn.new_value(I64);              // param (regs[1])
+    ir::IrValueId c2  = fn.new_value(I64);
+    ir::IrValueId cnd = fn.new_value(ir::IrType::BOOL);
+    ir::IrValueId c1  = fn.new_value(I64);
+    ir::IrValueId nm1 = fn.new_value(I64);
+    ir::IrValueId r   = fn.new_value(I64);
+    ir::IrValueId res = fn.new_value(I64);
+    fn.params = { n };
+
+    ir::IrBlockId b0 = fn.new_block("entry");
+    ir::IrBlockId b1 = fn.new_block("base");
+    ir::IrBlockId b2 = fn.new_block("rec");
+
+    fn.append(b0, konst(c2, 2));
+    fn.append(b0, cmp(ir::IrOp::CMP_LT, cnd, n, c2));
+    fn.append(b0, brc(cnd, b1, b2));
+    fn.append(b1, ret1(n));                              // base: return n
+    fn.append(b2, konst(c1, 1));
+    fn.append(b2, bin(ir::IrOp::SUB, nm1, n, c1));       // n-1
+    {
+        ir::IrInstr c; c.op = ir::IrOp::CALL; c.type = I64; c.dst = r;
+        c.func_name = "fact"; c.operands = { nm1 };      // SELF-call (func_name==fn.name)
+        fn.append(b2, c);
+    }
+    fn.append(b2, bin(ir::IrOp::MUL, res, n, r));        // n * fact(n-1)
+    fn.append(b2, ret1(res));
+
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    px.regs[1] = 5;
+    CHECK(jit_vm(fn, px), "jit_vm ok (self-recursion)");
+    CHECK(px.regs[0] == 120, "fact(5)==120 via self-call rel32");
+    if (px.regs[0] != 120) std::printf("    regs[0]=%llu\n", (unsigned long long)px.regs[0]);
+}
+
+/* ---- Test self-tail-call (TCO): IrOp::TAILCALL -> reuso de frame -------- *
+ * sum_tc(acc, n) = (n==0) ? acc : sum_tc(acc+n, n-1).  Con acc=0, n=100 ->
+ * 5050.  El TAILCALL self emite (en el rewrite) epilogue + jmp a code+0 ->
+ * reusa el frame (O(1) stack).  El RET de la base retorna al caller original. */
+static void test_vm_tailcall_self() {
+    std::printf("[vm] sum_tc(0,100) self-tail-call (TCO frame-reuse) -> regs[0]=5050\n");
+    ir::IrFunction fn;
+    fn.name = "sum_tc"; fn.ret_type = ir::IrType::I64;
+    auto I64 = ir::IrType::I64;
+    ir::IrValueId acc  = fn.new_value(I64);            // param0 (regs[1])
+    ir::IrValueId n    = fn.new_value(I64);            // param1 (regs[2])
+    ir::IrValueId zero = fn.new_value(I64);
+    ir::IrValueId cnd  = fn.new_value(ir::IrType::BOOL);
+    ir::IrValueId one  = fn.new_value(I64);
+    ir::IrValueId acc2 = fn.new_value(I64);
+    ir::IrValueId n2   = fn.new_value(I64);
+    fn.params = { acc, n };
+
+    ir::IrBlockId b0 = fn.new_block("entry");
+    ir::IrBlockId b1 = fn.new_block("base");
+    ir::IrBlockId b2 = fn.new_block("rec");
+
+    fn.append(b0, konst(zero, 0));
+    fn.append(b0, cmp(ir::IrOp::CMP_EQ, cnd, n, zero));
+    fn.append(b0, brc(cnd, b1, b2));
+    fn.append(b1, ret1(acc));                           // base: return acc
+    fn.append(b2, konst(one, 1));
+    fn.append(b2, bin(ir::IrOp::ADD, acc2, acc, n));    // acc + n
+    fn.append(b2, bin(ir::IrOp::SUB, n2, n, one));      // n - 1
+    {
+        ir::IrInstr tc; tc.op = ir::IrOp::TAILCALL; tc.type = I64;
+        tc.func_name = "sum_tc"; tc.operands = { acc2, n2 };  // SELF tail-call
+        fn.append(b2, tc);
+    }
+
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    px.regs[1] = 0; px.regs[2] = 100;
+    CHECK(jit_vm(fn, px), "jit_vm ok (self-tail-call)");
+    CHECK(px.regs[0] == 5050, "sum_tc(0,100)==5050 via TAILCALL frame-reuse");
+    if (px.regs[0] != 5050) std::printf("    regs[0]=%llu\n", (unsigned long long)px.regs[0]);
 }
 
 /* ---- Test 6 (commit 6): GC root vivo a traves de un call --------------- *
@@ -930,6 +1441,131 @@ static void test_vm_divmod_loop() {
                     (long long)px.regs[0], (long long)expect);
 }
 
+/* ---- Test: STR_LIT_ADDR resuelve la direccion via resolve_symbol --------
+ * Fn de 1 bloque: v0 = STR_LIT_ADDR(imm=5); ret v0.  El resolve_symbol mock
+ * mapea "code.s_5" -> una direccion conocida; verificamos que el codigo vreg
+ * pone ESA direccion en regs[0].  Valida (a) el plumbing del resolver al case
+ * nuevo, (b) el codegen `mov dst, imm64(addr)`, (c) que sin resolver el vreg
+ * RECHAZA (fallback), no compila basura. */
+static void test_vm_str_lit_addr() {
+    std::printf("[vm] str_lit_addr: code.s_5 -> direccion resuelta en regs[0]\n");
+    const uint64_t kAddr = 0xCAFEBABE12345678ULL;
+    ir::IrFunction fn;
+    fn.name = "get_str"; fn.ret_type = ir::IrType::PTR;
+    ir::IrValueId v = fn.new_value(ir::IrType::PTR);
+    auto bb = fn.new_block("e");
+    {
+        ir::IrInstr s; s.op = ir::IrOp::STR_LIT_ADDR; s.type = ir::IrType::PTR;
+        s.dst = v; s.imm = 5;
+        fn.append(bb, s);
+    }
+    fn.append(bb, ret1(v));
+
+    CallResolver sym = [&](const std::string &n) -> uint64_t {
+        return n == "code.s_5" ? kAddr : 0;
+    };
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    CHECK(jit_vm(fn, px, {}, 0, {}, sym), "jit_vm ok (str_lit_addr)");
+    CHECK(px.regs[0] == kAddr, "str_lit_addr devuelve la direccion resuelta");
+    if (px.regs[0] != kAddr)
+        std::printf("    regs[0]=0x%llx esperado 0x%llx\n",
+                    (unsigned long long)px.regs[0], (unsigned long long)kAddr);
+
+    /* Sin resolver -> vreg_select debe rechazar (fallback seguro a slots). */
+    Proxy px2; std::memset(&px2, 0, sizeof(px2));
+    CHECK(!jit_vm(fn, px2, {}, 0, {}, {}),
+          "str_lit_addr sin resolver -> fallback (vreg_select false)");
+}
+
+/* ---- Test: LABEL_ADDR resuelve la direccion del label via resolve_symbol --
+ * Analogo a str_lit_addr pero la clave es "code.<func_name>".  Valida (a) el
+ * codegen `mov dst, imm64(addr)`, (b) que func_name vacio -> fallback. */
+static void test_vm_label_addr() {
+    std::printf("[vm] label_addr: code.helper -> direccion resuelta en regs[0]\n");
+    const uint64_t kAddr = 0x00007FFE12340000ULL;
+    ir::IrFunction fn;
+    fn.name = "get_fn"; fn.ret_type = ir::IrType::PTR;
+    ir::IrValueId v = fn.new_value(ir::IrType::PTR);
+    auto bb = fn.new_block("e");
+    {
+        ir::IrInstr s; s.op = ir::IrOp::LABEL_ADDR; s.type = ir::IrType::PTR;
+        s.dst = v; s.func_name = "helper";
+        fn.append(bb, s);
+    }
+    fn.append(bb, ret1(v));
+
+    CallResolver sym = [&](const std::string &n) -> uint64_t {
+        return n == "code.helper" ? kAddr : 0;
+    };
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    CHECK(jit_vm(fn, px, {}, 0, {}, sym), "jit_vm ok (label_addr)");
+    CHECK(px.regs[0] == kAddr, "label_addr devuelve la direccion resuelta");
+    if (px.regs[0] != kAddr)
+        std::printf("    regs[0]=0x%llx esperado 0x%llx\n",
+                    (unsigned long long)px.regs[0], (unsigned long long)kAddr);
+
+    /* func_name vacio -> vreg_select debe rechazar (fallback). */
+    ir::IrFunction fn2;
+    fn2.name = "get_fn2"; fn2.ret_type = ir::IrType::PTR;
+    ir::IrValueId v2 = fn2.new_value(ir::IrType::PTR);
+    auto bb2 = fn2.new_block("e");
+    {
+        ir::IrInstr s; s.op = ir::IrOp::LABEL_ADDR; s.type = ir::IrType::PTR;
+        s.dst = v2;  /* func_name vacio */
+        fn2.append(bb2, s);
+    }
+    fn2.append(bb2, ret1(v2));
+    Proxy px2; std::memset(&px2, 0, sizeof(px2));
+    CHECK(!jit_vm(fn2, px2, {}, 0, {}, sym),
+          "label_addr sin func_name -> fallback (vreg_select false)");
+}
+
+/* ---- Test: GETPROC devuelve el ProcessVM* (RBX en VM_ABI) ---------------
+ * Fn de 1 bloque: v0 = GETPROC; ret v0.  En VM_ABI RBX = &px, asi que el
+ * resultado debe ser la direccion del proxy. */
+static void test_vm_getproc() {
+    std::printf("[vm] getproc: regs[0] == &proc (RBX)\n");
+    ir::IrFunction fn;
+    fn.name = "get_proc"; fn.ret_type = ir::IrType::PTR;
+    ir::IrValueId v = fn.new_value(ir::IrType::PTR);
+    auto bb = fn.new_block("e");
+    {
+        ir::IrInstr s; s.op = ir::IrOp::GETPROC; s.type = ir::IrType::PTR;
+        s.dst = v;
+        fn.append(bb, s);
+    }
+    fn.append(bb, ret1(v));
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    CHECK(jit_vm(fn, px), "jit_vm ok (getproc)");
+    CHECK(px.regs[0] == reinterpret_cast<uint64_t>(&px),
+          "getproc devuelve el ProcessVM* (RBX = &px)");
+    if (px.regs[0] != reinterpret_cast<uint64_t>(&px))
+        std::printf("    regs[0]=0x%llx esperado 0x%llx\n",
+                    (unsigned long long)px.regs[0],
+                    (unsigned long long)reinterpret_cast<uint64_t>(&px));
+}
+
+/* ---- Test: RET void en VM_ABI inicializa regs[0]=0 (exit code) -----------
+ * Una fn `void` con RET sin operando debe dejar regs[0]=0 (no la basura
+ * previa).  Cubre el caso `void main` cuyo R0 es el exit code observable;
+ * sin esto quedaria el ultimo CALL VM_ABI (regresion encontrada con GETPROC
+ * + test_print_formats). */
+static void test_vm_ret_void() {
+    std::printf("[vm] ret void: regs[0] se pone a 0\n");
+    ir::IrFunction fn;
+    fn.name = "voidfn"; fn.ret_type = ir::IrType::VOID;
+    auto bb = fn.new_block("e");
+    { ir::IrInstr r; r.op = ir::IrOp::RET; r.type = ir::IrType::VOID;
+      fn.append(bb, r); }  /* ret sin operando */
+    Proxy px; std::memset(&px, 0, sizeof(px));
+    px.regs[0] = 0xDEADBEEFCAFEULL;  /* basura previa */
+    CHECK(jit_vm(fn, px), "jit_vm ok (ret void)");
+    CHECK(px.regs[0] == 0, "ret void inicializa regs[0]=0");
+    if (px.regs[0] != 0)
+        std::printf("    regs[0]=0x%llx esperado 0\n",
+                    (unsigned long long)px.regs[0]);
+}
+
 int main() {
     std::setbuf(stdout, nullptr);
     /* Forzar el gate de DIV/MOD en vregs para este test (default OFF). */
@@ -943,6 +1579,23 @@ int main() {
     test_vm_divmod_loop();
     test_vm_add();
     test_vm_loop();
+    test_vm_self_recursion();  /* self-call rel32; antes de tests que crashean (callvirt/gc_stackmap) */
+    test_vm_tailcall_self();   /* TCO self-tail-call (frame-reuse) */
+    std::fflush(stdout);
+    test_vm_str_lit_addr();  /* antes del crash pre-existente de gc_stackmap */
+    test_vm_label_addr();
+    test_vm_getproc();
+    test_vm_ret_void();
+    test_vm_load_vm();   /* antes del crash pre-existente de gc_stackmap */
+    test_vm_store_vm();
+    test_vm_strmake();   /* antes del crash pre-existente de gc_stackmap */
+    test_vm_strlen();
+    test_vm_strcat();
+    test_vm_variant_markers();
+    test_vm_read_vm_reg();
+    test_vm_smartptr_free_extern();
+    test_vm_smartptr_free_vesta();
+    test_vm_callclosure();
     test_vm_sext_loop();
     test_vm_call();
     test_vm_callvirt();

@@ -109,6 +109,7 @@ namespace jit {
         // -----------------------------------------------------------------
         callvirt    = &vrt_callvirt;
         callm       = &vrt_callm;
+        callitf     = &vrt_callitf;
         callclosure = &vrt_callclosure;
         calln       = &vrt_calln;
         // Trampoline JIT->interp para CALL/CALLVM cuando la callee es
@@ -186,7 +187,8 @@ namespace jit {
                throw_fatal       && tryenter         && tryleave          &&
                throw_user        && rethrow          &&
                invoke_native     && callvirt         &&
-               callm             && callclosure     && calln            &&
+               callm             && callitf          &&
+               callclosure       && calln            &&
                call_bc_function  &&
                vm_read_u64       && vm_write_u64    &&
                findclass         && newobj          && defclass         &&

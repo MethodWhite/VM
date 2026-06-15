@@ -193,12 +193,25 @@ namespace jit {
             /// (justo debajo de los spill slots) + cursor de asignacion.
             uint32_t alloca_base = 0;
             uint32_t alloca_cursor = 0;
+            /// Fase 2 (ALLOCA_VM): la fn reserva en el VM stack del proceso.
+            /// Hay que salvar el VM-RSP (proc->stack_pointer) al entry y
+            /// restaurarlo en CADA RET, o el VM stack hace leak/overflow entre
+            /// llamadas.  @c vm_rsp_save_off es el offset (negativo desde RBP)
+            /// del slot que guarda el VM-RSP original (un qword debajo del area
+            /// de allocas host, por encima del shadow space Win64).
+            bool     has_vm_alloca = false;
+            int32_t  vm_rsp_save_off = 0;
             MReg     scr0 = MReg::R10;
             MReg     scr1 = MReg::R11;
+            /// MFunction destino: necesario para crear labels intra-expansion
+            /// (LOAD_VM/STORE_VM page-cache) via @c pf->new_label().  Se asigna
+            /// en @c rewrite_to_physical tras construir pf.
+            MFunction *pf = nullptr;
 
             Lowerer(const RegAlloc &r, const TargetRegInfo &t, AbiKind abi,
-                    bool has_calls, uint32_t alloca_total)
-                : ra(r), tri(t), vm_abi(abi == AbiKind::VM) {
+                    bool has_calls, uint32_t alloca_total, bool has_vm_alloca_in)
+                : ra(r), tri(t), vm_abi(abi == AbiKind::VM),
+                  has_vm_alloca(has_vm_alloca_in) {
                 k = static_cast<uint32_t>(ra.callee_saved_used.size());
                 total_saved = k + (vm_abi ? 1u : 0u);  // +1 por el push rbx
                 /* Hoja frameless: una funcion sin CALLs que no spillea ni
@@ -212,13 +225,24 @@ namespace jit {
                  * push/pop de RBX (callee-saved del host que trae ProcessVM*) y
                  * los callee-saved usados; lo unico que desaparece es RBP. */
                 no_frame = !has_calls && ra.num_spill_slots == 0u &&
-                           alloca_total == 0u && !jit_no_frameless()
+                           alloca_total == 0u && !has_vm_alloca
+                           && !jit_no_frameless()
                            && !jit_osr_count();  /* el trigger (1b) anyade un
                               call -> necesita frame con rsp 16-alineado. */
                 /* Las allocas viven debajo de los spill slots. */
                 alloca_base = 8u * total_saved + 8u * ra.num_spill_slots;
                 spill_bytes = static_cast<int32_t>(
                     8u * ra.num_spill_slots + alloca_total);
+                /* Fase 2: reservar un qword para el VM-RSP salvado, debajo del
+                 * area de allocas host y por encima del shadow space.  El
+                 * offset es fijo desde RBP (independiente del shadow/align que
+                 * se anyade despues, que solo crece el frame hacia abajo). */
+                if (has_vm_alloca) {
+                    vm_rsp_save_off = -static_cast<int32_t>(
+                        8u * total_saved + 8u * ra.num_spill_slots
+                        + alloca_total + 8u);
+                    spill_bytes += 8;
+                }
                 if (!no_frame) {
 #if defined(_WIN32)
                     /* Win64: si hay CALLs, reservar 32 bytes de shadow/home
@@ -350,6 +374,19 @@ namespace jit {
                 if (spill_bytes > 0)
                     out.push_back(MInstr::make_unary(MOp::SUB, reg(MReg::RSP),
                                                      MOperand::make_imm32(spill_bytes)));
+                /* Fase 2: salvar el VM-RSP original al slot del frame.  Los
+                 * ALLOCA_VM mas adelante decrementan proc->stack_pointer; el
+                 * epilogue lo restaura desde aqui (si no, el VM stack hace
+                 * leak/overflow entre llamadas).  scr0 (R10) es caller-saved y
+                 * esta libre aqui; RBX ya trae el ProcessVM* (vm_abi). */
+                if (has_vm_alloca) {
+                    out.push_back(MInstr::make_unary(MOp::MOV, reg(scr0),
+                        MOperand::make_mem(MReg::RBX,
+                            VESTA_PROC_STACK_POINTER_OFFSET)));
+                    out.push_back(MInstr::make_unary(MOp::MOV,
+                        MOperand::make_mem(MReg::RBP, vm_rsp_save_off),
+                        reg(scr0)));
+                }
             }
 
             void emit_epilogue(std::vector<MInstr> &out) const {
@@ -362,6 +399,18 @@ namespace jit {
                         out.push_back(pop(static_cast<MReg>(ra.callee_saved_used[i])));
                     if (vm_abi) out.push_back(pop(MReg::RBX));
                     return;
+                }
+                /* Fase 2: restaurar el VM-RSP original ANTES de desmontar el
+                 * frame (RBP/RBX aun validos).  Sin esto los ALLOCA_VM dejarian
+                 * proc->stack_pointer decrementado tras el RET -> leak/overflow
+                 * del VM stack global.  scr0 (R10) es caller-saved (libre). */
+                if (has_vm_alloca) {
+                    out.push_back(MInstr::make_unary(MOp::MOV, reg(scr0),
+                        MOperand::make_mem(MReg::RBP, vm_rsp_save_off)));
+                    out.push_back(MInstr::make_unary(MOp::MOV,
+                        MOperand::make_mem(MReg::RBX,
+                            VESTA_PROC_STACK_POINTER_OFFSET),
+                        reg(scr0)));
                 }
                 /* lea rsp, [rbp - 8*total_saved] -> deshace el sub del frame y
                  * apunta rsp al ultimo registro salvado. */
@@ -462,6 +511,35 @@ namespace jit {
                     return;
                 }
 
+                if (op == MOp::TAILCALL) {
+                    /* TCO con reuso de frame (mismo patron que el frame-swap del
+                     * OSR 2c): proc -> A0 (sobrevive el teardown por ser
+                     * caller-saved; el prologue del callee hace mov rbx,A0) +
+                     * emit_epilogue (desmonta el frame; rsp queda en la return
+                     * address del caller) + jmp al target.  El RET del callee
+                     * retorna al caller original -> pila O(1).  No hay GC entre
+                     * el teardown y la reentrada (sin safepoint/call) -> los args
+                     * en proc->registers (ya escritos) siguen como roots. */
+                    const auto &areg =
+                        tri.arg_regs[static_cast<size_t>(RegClass::GP)];
+                    if (vm_abi && !areg.empty())
+                        out.push_back(MInstr::make_unary(MOp::MOV,
+                            reg(static_cast<MReg>(areg[0])), reg(MReg::RBX)));
+                    emit_epilogue(out);
+                    if (in.src1.kind == MOperandKind::LABEL) {
+                        /* self-tail-call: jmp rel32 a code+0 (label bloque 0). */
+                        MInstr j; j.op = MOp::JMP; j.src1 = in.src1;
+                        out.push_back(j);
+                    } else {
+                        /* cross-fn: mov scr0, addr(imm64) + jmp scr0. */
+                        out.push_back(MInstr::make_unary(MOp::MOV, reg(scr0),
+                                                         in.src1));
+                        MInstr j; j.op = MOp::JMP; j.src1 = reg(scr0);
+                        out.push_back(j);
+                    }
+                    return;
+                }
+
                 if (op == MOp::RET) {
                     emit_epilogue(out);
                     out.push_back(MInstr::make_ret());
@@ -551,6 +629,148 @@ namespace jit {
                     return;
                 }
 
+                if (op == MOp::LOAD_VM || op == MOp::STORE_VM) {
+                    /* Acceso a memoria del VM (vaddr, NO host_ptr).  La memoria
+                     * del VM no es contigua (TLB 3-niveles) -> page-cache INLINE
+                     * de 1 entrada (replica de selector.cpp): si la pagina del
+                     * vaddr coincide con la cacheada en proc->vm_mem y no cruza
+                     * el limite, traduce inline (~hit ~8 instr SIN call); si no,
+                     * CALL a vrt_vm_read/write_u<w>.  scr0/scr1 (R10/R11, reserva-
+                     * dos) son los temporales del hit; areg/val se re-leen de su
+                     * ubicacion canonica (resolve) en el miss -> intactos.  Es
+                     * call-position (el miss clobbea caller-saved) -> los vregs
+                     * vivos a traves ya estan en callee-saved/spill.
+                     * NOTA: vrt_vm_read/write NO disparan GC (solo traducen) ->
+                     * el CALL del miss no es safepoint -> sin stackmap. */
+                    const bool    is_store = (op == MOp::STORE_VM);
+                    const uint8_t width    = is_store
+                        ? static_cast<uint8_t>(in.flags)
+                        : static_cast<uint8_t>(in.flags >> 1);
+                    const bool    sgn      = !is_store && ((in.flags & 1u) != 0u);
+                    /* imm64_idx con la direccion de vrt_vm_read/write_u<w>:
+                     * src2 en LOAD_VM, dst en STORE_VM (operandos libres). */
+                    const MOperand fn_imm = is_store ? in.dst : in.src2;
+                    const MOperand areg   = resolve(in.src1);   // vaddr (canonica)
+                    const MOperand vval   = is_store ? resolve(in.src2)
+                                                     : MOperand{};
+                    /* dst del LOAD: reg fisico o scr0 si spilled. */
+                    const bool dst_spilled = !is_store && in.dst.is_vreg()
+                                          && ra.spilled(in.dst.vreg_id());
+                    MReg pr = MReg::RAX;
+                    if (!is_store)
+                        pr = dst_spilled ? scr0
+                           : static_cast<MReg>(resolve(in.dst).reg);
+
+                    const bool inline_ok =
+                        vesta_rt::kProcVmMemOffset != 0
+                     && vesta_rt::kVmMemCachedPageVaddrOffset >= 0
+                     && vesta_rt::kVmMemCachedPageHostOffset >= 0;
+                    const int32_t page_v = vesta_rt::kProcVmMemOffset
+                                         + vesta_rt::kVmMemCachedPageVaddrOffset;
+                    const int32_t page_h = vesta_rt::kProcVmMemOffset
+                                         + vesta_rt::kVmMemCachedPageHostOffset;
+#if defined(_WIN32)
+                    const MReg A0 = MReg::RCX, A1 = MReg::RDX, A2 = MReg::R8;
+#else
+                    const MReg A0 = MReg::RDI, A1 = MReg::RSI, A2 = MReg::RDX;
+#endif
+                    const MLabelId Lmiss = inline_ok ? pf->new_label()
+                                                     : MLABEL_INVALID;
+                    const MLabelId Ldone = inline_ok ? pf->new_label()
+                                                     : MLABEL_INVALID;
+
+                    if (inline_ok) {
+                        /* --- HIT path --- */
+                        out.push_back(MInstr::make_unary(MOp::MOV, reg(scr1), areg));
+                        out.push_back(MInstr::make_unary(MOp::MOV, reg(scr0), reg(scr1)));
+                        out.push_back(MInstr::make_unary(MOp::AND, reg(scr0),
+                            MOperand::make_imm32(-4096)));
+                        out.push_back(MInstr::make_unary(MOp::CMP, reg(scr0),
+                            MOperand::make_mem(MReg::RBX, page_v)));
+                        out.push_back(MInstr::make_jcc(MCond::NE, Lmiss));
+                        out.push_back(MInstr::make_unary(MOp::AND, reg(scr1),
+                            MOperand::make_imm32(4095)));   // scr1 = offset
+                        if (width > 1) {                    // cross-page check
+                            out.push_back(MInstr::make_unary(MOp::CMP, reg(scr1),
+                                MOperand::make_imm32(4096 -
+                                    static_cast<int32_t>(width))));
+                            out.push_back(MInstr::make_jcc(MCond::A, Lmiss));
+                        }
+                        out.push_back(MInstr::make_unary(MOp::MOV, reg(scr0),
+                            MOperand::make_mem(MReg::RBX, page_h)));  // cached_host
+                        out.push_back(MInstr::make_unary(MOp::ADD, reg(scr0),
+                            reg(scr1)));                    // scr0 = host_ptr
+                        if (is_store) {
+                            MOperand v = vval;
+                            if (v.kind == MOperandKind::MEM) {
+                                out.push_back(MInstr::make_unary(MOp::MOV,
+                                    reg(scr1), v));
+                                v = reg(scr1);
+                            }
+                            v.width = width;                // ancho lo da el reg
+                            out.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_mem(scr0, 0), v));
+                        } else {
+                            MOperand mem = MOperand::make_mem(scr0, 0);
+                            if (width >= 8) {
+                                out.push_back(MInstr::make_unary(MOp::MOV,
+                                    MOperand::make_reg(pr, 8), mem));
+                            } else if (sgn) {
+                                mem.flags = width;          // mem_size override
+                                out.push_back(MInstr::make_unary(MOp::MOVSX,
+                                    MOperand::make_reg(pr, 8), mem));
+                            } else if (width == 4) {
+                                out.push_back(MInstr::make_unary(MOp::MOV,
+                                    MOperand::make_reg(pr, 4), mem));  // zero-ext
+                            } else {
+                                mem.flags = width;
+                                out.push_back(MInstr::make_unary(MOp::MOVZX,
+                                    MOperand::make_reg(pr, 8), mem));
+                            }
+                        }
+                        out.push_back(MInstr::make_jmp(Ldone));
+                        out.push_back(MInstr::make_label_def(Lmiss));
+                    }
+
+                    /* --- FALLBACK CALL (page-miss) ---
+                     * Cargo vaddr (y val) a scratch ANTES de los arg-movs para
+                     * no depender del orden de los arg_regs (robusto ante
+                     * cualquier ubicacion fisica de areg/vval). */
+                    out.push_back(MInstr::make_unary(MOp::MOV, reg(scr1), areg));
+                    if (is_store) {
+                        /* val a scr0 (reg o mem, mov reg,* lo cubre). */
+                        out.push_back(MInstr::make_unary(MOp::MOV, reg(scr0), vval));
+                        out.push_back(MInstr::make_unary(MOp::MOV, reg(A0), reg(MReg::RBX)));
+                        out.push_back(MInstr::make_unary(MOp::MOV, reg(A1), reg(scr1)));
+                        out.push_back(MInstr::make_unary(MOp::MOV, reg(A2), reg(scr0)));
+                        out.push_back(MInstr::make_unary(MOp::MOV, reg(scr0), fn_imm));
+                        MInstr call; call.op = MOp::CALL; call.src1 = reg(scr0);
+                        out.push_back(call);
+                    } else {
+                        out.push_back(MInstr::make_unary(MOp::MOV, reg(A0), reg(MReg::RBX)));
+                        out.push_back(MInstr::make_unary(MOp::MOV, reg(A1), reg(scr1)));
+                        out.push_back(MInstr::make_unary(MOp::MOV, reg(scr0), fn_imm));
+                        MInstr call; call.op = MOp::CALL; call.src1 = reg(scr0);
+                        out.push_back(call);
+                        /* resultado en RAX -> pr (igual que el selector). */
+                        if (sgn && width < 8) {
+                            MOperand src = MOperand::make_reg(MReg::RAX, width);
+                            out.push_back(MInstr::make_unary(MOp::MOVSX,
+                                MOperand::make_reg(pr, 8), src));
+                        } else {
+                            out.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(pr, 8), reg(MReg::RAX)));
+                        }
+                    }
+
+                    if (inline_ok)
+                        out.push_back(MInstr::make_label_def(Ldone));
+                    if (dst_spilled)
+                        out.push_back(MInstr::make_unary(MOp::MOV,
+                            slot_mem(ra.slot_of(in.dst.vreg_id())), reg(scr0)));
+                    return;
+                }
+
                 if (op == MOp::ALLOCA) {
                     /* dst = host_ptr a `size` bytes reservados en el frame
                      * (debajo de los spills).  LEA dst, [rbp - off]. */
@@ -568,6 +788,34 @@ namespace jit {
                     if (dst_spilled)
                         out.push_back(MInstr::make_unary(MOp::MOV,
                             slot_mem(ra.slot_of(in.dst.vreg_id())), pdst));
+                    return;
+                }
+
+                if (op == MOp::ALLOCA_VM) {
+                    /* dst = vaddr a `size` bytes del VM stack del proceso:
+                     *   mov scr0, [rbx+SP]; sub scr0, aligned; mov [rbx+SP],scr0
+                     *   dst = scr0.
+                     * scr0 (R10) es scratch reservado; RBX trae el ProcessVM*.
+                     * El prologue ya salvo el VM-RSP original y el epilogue lo
+                     * restaura, asi que la resta es local al frame. */
+                    const uint32_t size =
+                        static_cast<uint32_t>(in.src1.value);
+                    const uint32_t aligned = (size + 15u) & ~15u;  // 16-align
+                    const MOperand sp_mem = MOperand::make_mem(
+                        MReg::RBX, VESTA_PROC_STACK_POINTER_OFFSET);
+                    out.push_back(MInstr::make_unary(MOp::MOV, reg(scr0), sp_mem));
+                    if (aligned > 0)
+                        out.push_back(MInstr::make_unary(MOp::SUB, reg(scr0),
+                            MOperand::make_imm32(static_cast<int32_t>(aligned))));
+                    out.push_back(MInstr::make_unary(MOp::MOV, sp_mem, reg(scr0)));
+                    const bool dst_spilled =
+                        in.dst.is_vreg() && ra.spilled(in.dst.vreg_id());
+                    if (dst_spilled)
+                        out.push_back(MInstr::make_unary(MOp::MOV,
+                            slot_mem(ra.slot_of(in.dst.vreg_id())), reg(scr0)));
+                    else
+                        out.push_back(MInstr::make_unary(MOp::MOV,
+                            resolve(in.dst), reg(scr0)));
                     return;
                 }
 
@@ -774,18 +1022,29 @@ namespace jit {
         /* Detectar si la funcion tiene CALLs (para reservar shadow space). */
         bool has_calls = false;
         uint32_t alloca_total = 0;  // commit 8: bytes de allocas en el frame
+        bool has_vm_alloca = false; // Fase 2: reserva en el VM stack del proceso
         for (const auto &b : vf.blocks) {
             for (const auto &in : b.instrs) {
                 if (in.op == MOp::CALL || in.op == MOp::CALL_ABS) has_calls = true;
+                /* LOAD_VM/STORE_VM: el page-miss emite un CALL a vrt_vm_*; aunque
+                 * el hit no llama, debe reservarse el frame + shadow space Win64
+                 * (no frameless). */
+                if (in.op == MOp::LOAD_VM || in.op == MOp::STORE_VM) has_calls = true;
+                /* TAILCALL: su expansion hace emit_epilogue (necesita el frame
+                 * montado: lea rsp,[rbp-...] + pops) -> forzar frame (no
+                 * frameless), igual que un call normal. */
+                if (in.op == MOp::TAILCALL) has_calls = true;
                 if (in.op == MOp::ALLOCA) {
                     const uint32_t sz = static_cast<uint32_t>(in.src1.value);
                     alloca_total += (sz + 7u) & ~7u;
                 }
+                if (in.op == MOp::ALLOCA_VM) has_vm_alloca = true;
             }
         }
-        Lowerer lw(ra, tri, abi, has_calls, alloca_total);
+        Lowerer lw(ra, tri, abi, has_calls, alloca_total, has_vm_alloca);
         lw.ivs = ivs;  // commit 6: para construir stackmaps en CALLs
         MFunction pf;
+        lw.pf = &pf;   // labels intra-expansion (LOAD_VM/STORE_VM page-cache)
         pf.name          = vf.name;
         pf.next_label_id  = vf.next_label_id;
         pf.label_offsets  = vf.label_offsets;

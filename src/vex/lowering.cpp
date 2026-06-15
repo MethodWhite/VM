@@ -4258,9 +4258,6 @@ namespace vex {
     // porque lower_try y try_lower_builtin_call los usan.
     static uint64_t intern_class_name(ir::IrModule &mod, const std::string &name);
 
-    static void emit_findclass_inline(std::ostringstream &asm_,
-                                      uint64_t            name_idx,
-                                      uint32_t            name_len);
 
     /// usado por lower_class_methods para emitir el CALLVIRT a
     /// destructores de fields destructibles del contenedor.
@@ -11753,9 +11750,6 @@ namespace vex {
     // forName/getClass 
     static uint64_t intern_class_name(ir::IrModule &mod, const std::string &name);
 
-    static void emit_findclass_inline(std::ostringstream &asm_,
-                                      uint64_t            name_idx,
-                                      uint32_t            name_len);
 
     bool Lowering::try_lower_builtin_call(ast::CallExpr *e, ir::IrValueId &out_value) {
         // Solo manejamos identifier-callees (validado en lower_call).
@@ -17642,118 +17636,11 @@ namespace vex {
         return mod.intern_static_data(std::move(bytes));
     }
 
-    /**
-     * @brief Estado del cluster de stores (base + ultimo offset).  Permite
-     *        que las llamadas consecutivas a @c emit_store_qword_vm con el
-     *        mismo base salten el `mov r5, base; addu r5, offset` y emitan
-     *        solo `addu r5, delta` -- el caller mantiene el StoreCluster
-     *        durante toda la secuencia de campos.
-     */
-    struct StoreCluster {
-        std::string base;
-        uint32_t    offset = 0;
-        bool        init   = false;
-    };
-
-    /**
-     * @brief Determina si @p val_expr puede emitirse directamente como segundo
-     *        operando de `mov [r5], <val>` (SIB o INMED), evitando el
-     *        intermediario via r6.  Acepta:
-     *        - registros generales `rN` o `rNN` (con sufijos opcionales).
-     *        - anotaciones `@Absolute(...)`, `@Relative(...)`, `@Method(...)`.
-     *        - literales numericos decimales/hex/bin/octal (positivos).
-     */
-    static bool is_inline_store_value(const std::string &val_expr) {
-        if (val_expr.empty()) return false;
-        // anotaciones siempre validas
-        if (val_expr[0] == '@') return true;
-        // registros: 'r' seguido de digitos (rN o rNN, opcional sufijo b/w/d/q)
-        if (val_expr[0] == 'r' && val_expr.size() >= 2) {
-            size_t i = 1;
-            while (i < val_expr.size() && val_expr[i] >= '0' && val_expr[i] <= '9') ++i;
-            if (i == 1) return false; // no digitos -> no es registro general
-            // resto: vacio, o un solo char de sufijo (b/w/d/q)
-            if (i == val_expr.size()) return true;
-            if (i + 1 == val_expr.size()) {
-                char c = val_expr[i];
-                if (c == 'b' || c == 'w' || c == 'd' || c == 'q') return true;
-            }
-            return false; // identificadores que empiezan con r pero no son regs
-        }
-        // literales numericos: empieza con digito o '-'/'+' o '0x'/'0b'/'0o'
-        char c0 = val_expr[0];
-        if ((c0 >= '0' && c0 <= '9') || c0 == '-' || c0 == '+') return true;
-        return false;
-    }
-
-    /**
-     * @brief Emite el ASM que escribe un qword en una direccion de memoria
-     *        VM @c base+offset usando @c mov [reg], reg64.  Las structs
-     *        DefXxxParams viven en stack (memoria VM), por lo que NO se
-     *        usa @c writecur (que escribe en memoria HOST a traves de un
-     *        cursor) sino el MOV con direccionamiento SIB simple.
-     *
-     * @param state  Opcional: si != nullptr, el helper aprovecha que r5 ya
-     *               apunta a base+last_offset y emite solo `addu r5, delta`.
-     *               Llamadas con state=nullptr emiten siempre `mov r5, base;
-     *               addu r5, offset` (modo conservador para callers que
-     *               comparten r5 con otro codigo).
-     */
-    static void emit_store_qword_vm(std::ostringstream &asm_,
-                                    const std::string & base_reg,
-                                    uint32_t            offset,
-                                    const std::string & val_expr,
-                                    StoreCluster *      state = nullptr) {
-        if (state != nullptr && state->init && state->base == base_reg) {
-            int32_t delta = static_cast<int32_t>(offset)
-                          - static_cast<int32_t>(state->offset);
-            if (delta > 0)      asm_ << "addu r5, "  <<  delta << "\n";
-            else if (delta < 0) asm_ << "subu r5, "  << -delta << "\n";
-            // delta == 0: r5 ya apunta al offset correcto.
-        } else {
-            asm_ << "mov r5, " << base_reg << "\n";
-            if (offset > 0) asm_ << "addu r5, " << offset << "\n";
-        }
-        // Direct memory store: si val_expr es un registro general (rN), una
-        // anotacion @Absolute/@Relative o un literal numerico, podemos saltar
-        // el intermediario `mov r6, val; mov [r5], r6` y emitir `mov [r5], val`
-        // directamente (SIB para regs, INMED para literales/anotaciones).  Ahorra
-        // 1 instr completa (~4-11 bytes) por cada store del cluster.
-        if (is_inline_store_value(val_expr)) {
-            asm_ << "mov [r5], " << val_expr << "\n";
-        } else {
-            asm_ << "mov r6, " << val_expr << "\n";
-            asm_ << "mov [r5], r6\n";
-        }
-        if (state != nullptr) {
-            state->base   = base_reg;
-            state->offset = offset;
-            state->init   = true;
-        }
-    }
 
     /**
      * @brief Emite el ASM que construye una FindClassParams (16 bytes) en
      *        stack y deja en @c r12 el ClassInfo* localizado.
      */
-    static void emit_findclass_inline(std::ostringstream &asm_,
-                                      uint64_t            name_idx,
-                                      uint32_t            name_len) {
-        asm_ << "subsp rsp, 16\n";
-        asm_ << "mov r12, rsp\n";
-        StoreCluster sc;
-        // [+0] name_addr = @Absolute("code.s_<idx>")
-        emit_store_qword_vm(asm_, "r12", 0,
-                            "@Absolute(\"code.s_" + std::to_string(name_idx) + "\")",
-                            &sc);
-        // [+8] name_len|0
-        emit_store_qword_vm(asm_, "r12", 8, std::to_string(name_len), &sc);
-        // findclass
-        asm_ << "findclass r12, r12\n";
-        asm_ << "addsp rsp, 16\n";
-    }
-
-
     void Lowering::generate_new_helpers(ir::IrModule &out) {
         // Para cada clase declarada en el modulo, generamos una funcion
         // __new_<Class>(arg1, ..., argN) -> handle (GcHandle).  El cuerpo
@@ -17848,6 +17735,114 @@ namespace vex {
 
             const ir::IrBlockId entry = fn.new_block("entry");
 
+            // raw_asm-elim Fase 1 (__new_X a IR): la variante LOCAL del helper
+            // se construye con IR ops estructurados en vez de RAW_ASM textual,
+            // para que el path vreg y el optimizer lo compilen sin el
+            // mini-parser de raw_asm.  Patron equivalente al RAW_ASM del
+            // bloque `else` de abajo:
+            //   v_slot = STR_LIT_ADDR(cache_idx)   (@Absolute("code.s_N"))
+            //   v_cls  = LOAD(v_slot)              (ClassInfo* cacheado, vm_mem)
+            //   v_h    = NEWOBJ(v_cls)             (GcHandle, r0)
+            //   v_this = GC_DEREF_HOST(v_h)        (host_ptr al ObjectHeader)
+            //   --- si hay ctor efectivo: ---
+            //   CALLVIRT(this=v_this, args=params, vtable_idx=ctor)
+            //   v_ret  = GC_DEREF_HOST(v_h)        (RE-deref: el GC del ctor
+            //                                       puede haber movido el obj)
+            //   RET v_ret
+            //   --- sin ctor: RET v_this (campos ya a 0 por gc_heap.alloc) ---
+            // raw_asm-elim: la variante SHARED (__new_<X>_shared) tambien se
+            // emite estructurada usando IrOp::NEWOBJS (newobjs -> SharedHeap)
+            // en lugar de NEWOBJ.  Asi NINGUN __new_<X> queda en RAW_ASM.
+            const bool emit_structured = true;
+            if (emit_structured) {
+                // v_slot = direccion del slot ClassInfo* cacheado (static_data).
+                const ir::IrValueId v_slot = fn.new_value(ir::IrType::PTR);
+                {
+                    ir::IrInstr sa{};
+                    sa.op          = ir::IrOp::STR_LIT_ADDR;
+                    sa.type        = ir::IrType::PTR;
+                    sa.dst         = v_slot;
+                    sa.imm         = cache_idx;
+                    sa.source_line = cd->loc.line;
+                    fn.append(entry, std::move(sa));
+                }
+                // v_cls = LOAD(v_slot): ClassInfo* leido del slot (vm_mem).
+                const ir::IrValueId v_cls = fn.new_value(ir::IrType::I64);
+                {
+                    ir::IrInstr ld{};
+                    ld.op          = ir::IrOp::LOAD;
+                    ld.type        = ir::IrType::I64;
+                    ld.dst         = v_cls;
+                    ld.operands    = {v_slot};
+                    ld.source_line = cd->loc.line;
+                    fn.append(entry, std::move(ld));
+                }
+                // v_h = NEWOBJ/NEWOBJS(v_cls): aloca el objeto -> GcHandle.  La
+                // variante shared usa NEWOBJS (SharedHeap); el handle lleva el
+                // bit 31 y GC_DEREF_HOST de abajo lo resuelve por el path shared.
+                const ir::IrValueId v_h = fn.new_value(ir::IrType::I64);
+                {
+                    ir::IrInstr no{};
+                    no.op          = is_shared_variant ? ir::IrOp::NEWOBJS
+                                                       : ir::IrOp::NEWOBJ;
+                    no.type        = ir::IrType::I64;
+                    no.dst         = v_h;
+                    no.operands    = {v_cls};
+                    no.source_line = cd->loc.line;
+                    fn.append(entry, std::move(no));
+                }
+                // v_this = GC_DEREF_HOST(v_h): host_ptr al ObjectHeader.
+                const ir::IrValueId v_this = fn.new_value(ir::IrType::PTR);
+                fn.values[v_this].is_host_ptr  = true;
+                fn.values[v_this].is_gc_object = true;
+                {
+                    ir::IrInstr ra{};
+                    ra.op          = ir::IrOp::GC_DEREF_HOST;
+                    ra.type        = ir::IrType::PTR;
+                    ra.dst         = v_this;
+                    ra.operands    = {v_h};
+                    ra.source_line = cd->loc.line;
+                    fn.append(entry, std::move(ra));
+                }
+
+                if (effective_ctor) {
+                    // CALLVIRT(this=v_this, args=params del helper).  El ctor
+                    // es void; argc = nargs + 1 (this + args).
+                    //
+                    // CLAVE: v_this (host_ptr GC) vive a traves del call (se usa
+                    // en el RET de abajo).  El mecanismo de preservacion de GC
+                    // roots lo convierte a handle ANTES del call y lo refresca a
+                    // host_ptr DESPUES (save_live_regs gchandle/push/pop/gcderef
+                    // en el interp; spill + stackmap del commit 6 en el vreg) --
+                    // exactamente lo que el RAW_ASM legacy hacia a mano.  Por
+                    // eso NO re-derefamos ni marcamos el handle: marcar v_h
+                    // (que YA es handle) como GC hacia que el interp le aplicara
+                    // gchandle (host_ptr->handle) sobre un handle -> basura.
+                    ir::IrInstr cv{};
+                    cv.op          = ir::IrOp::CALLVIRT;
+                    cv.type        = ir::IrType::VOID;
+                    cv.dst         = ir::IR_NO_VALUE;
+                    cv.operands.reserve(nargs + 1);
+                    cv.operands.push_back(v_this);
+                    for (size_t i = 0; i < nargs; ++i) {
+                        cv.operands.push_back(fn.params[i]);
+                    }
+                    cv.imm         = static_cast<uint64_t>(ctor_vtable_idx);
+                    cv.source_line = cd->loc.line;
+                    fn.append(entry, std::move(cv));
+                }
+
+                // RET v_this (host_ptr al objeto; preservado/refrescado a
+                // traves del callvirt si habia ctor).
+                {
+                    ir::IrInstr ret{};
+                    ret.op          = ir::IrOp::RET;
+                    ret.type        = ir::IrType::PTR;
+                    ret.operands    = {v_this};
+                    ret.source_line = cd->loc.line;
+                    fn.append(entry, std::move(ret));
+                }
+            } else {
             // Construir RAW_ASM body.
             std::ostringstream asm_;
 
@@ -17945,6 +17940,7 @@ namespace vex {
             ret.type        = ir::IrType::VOID;
             ret.source_line = cd->loc.line;
             fn.append(entry, std::move(ret));
+            } // fin else (path RAW_ASM legacy: ctor / nargs>0 / shared)
 
             propagate_is_gc_object_through_phis(fn);
 
@@ -17989,7 +17985,128 @@ namespace vex {
         fn.ret_type               = ir::IrType::VOID;
         const ir::IrBlockId entry = fn.new_block("entry");
 
-        std::ostringstream asm_;
+        // raw_asm-elim Fase 2c: __module_init se construye con IR ESTRUCTURADO
+        // (en vez de un unico bloque RAW_ASM monolitico), para que el path vreg
+        // del JIT lo compile sin el mini-parser de raw_asm y para que el futuro
+        // AOT no vea bytecode opaco.  Patron equivalente al RAW_ASM legacy:
+        //   - Un buffer de params FRESCO (ALLOCA 40 bytes = max de los structs
+        //     24/32/40) por operacion.  El buffer NO se promueve a host (sus
+        //     usos como operando de DEF*/FIND* son escape para
+        //     promote_local_allocas) -> queda como vaddr valido que los ops de
+        //     meta-OOP leen via params_vaddr.
+        //   - STORE a vm_mem (el buffer es vaddr) arma cada struct; el DEF/FIND
+        //     correspondiente lo consume inmediatamente.  Los ops meta-OOP son
+        //     side-effecting + barreras de DSE/scheduler -> el optimizer no
+        //     reordena ni elimina los STORE que arman el struct.
+        //   - CADA clase y CADA advice se emiten en su PROPIO basic block
+        //     (encadenados por BR).  Razon: el regalloc del .vel (interp) es
+        //     fragil con un unico bloque enorme de cientos de temporales (una
+        //     instruccion de mas voltea el spill a codigo incorrecto -> findclass
+        //     lee params de una direccion basura).  Con un bloque por clase/
+        //     advice los valores son LOCALES al bloque (buffers frescos, v_cls
+        //     recargado del cache slot, valores AOP intra-advice) -> el liveness
+        //     se resetea en cada frontera -> presion acotada -> regalloc correcto.
+        //     Sin PHIs ni valores cross-block.
+        const int ln = 0;  // ops sinteticas (sin linea fuente propia)
+        ir::IrBlockId cur = entry;  // bloque actual (avanza con new_seg)
+
+        // Crea un nuevo segmento (basic block) y encadena con BR desde el actual.
+        auto new_seg = [&](const std::string &name) {
+            const ir::IrBlockId nb = fn.new_block(name);
+            ir::IrInstr br{};
+            br.op = ir::IrOp::BR; br.type = ir::IrType::VOID;
+            br.target_block = nb; br.source_line = ln;
+            fn.append(cur, std::move(br));
+            cur = nb;
+        };
+
+        // --- helpers locales para emitir IR sobre fn/cur ---
+        auto emit_const64 = [&](uint64_t k) -> ir::IrValueId {
+            const ir::IrValueId v = fn.new_value(ir::IrType::I64);
+            ir::IrInstr c{};
+            c.op = ir::IrOp::CONST; c.type = ir::IrType::I64;
+            c.dst = v; c.imm = k; c.source_line = ln;
+            fn.append(cur, std::move(c));
+            return v;
+        };
+        auto emit_strlit = [&](uint64_t idx) -> ir::IrValueId {
+            // Direccion vaddr del slot static_data idx (@Absolute("code.s_N")).
+            const ir::IrValueId v = fn.new_value(ir::IrType::PTR);
+            ir::IrInstr s{};
+            s.op = ir::IrOp::STR_LIT_ADDR; s.type = ir::IrType::PTR;
+            s.dst = v; s.imm = idx; s.source_line = ln;
+            fn.append(cur, std::move(s));
+            return v;
+        };
+        auto emit_label_addr = [&](const std::string &label) -> ir::IrValueId {
+            // Direccion vaddr de un label de codigo (@Absolute("code.LABEL")).
+            const ir::IrValueId v = fn.new_value(ir::IrType::PTR);
+            ir::IrInstr s{};
+            s.op = ir::IrOp::LABEL_ADDR; s.type = ir::IrType::PTR;
+            s.dst = v; s.func_name = label; s.source_line = ln;
+            fn.append(cur, std::move(s));
+            return v;
+        };
+        // Buffer de params UNICO (40 bytes = max de los structs 24/32/40) en el
+        // VM stack, alocado UNA sola vez y reusado para todos los defclass/
+        // deffield/defmethod/findmethod/setmethdbg/findclass/addadvice.  Razones:
+        //   - Un ALLOCA por OP inflaria el VM stack (subsp por op sin addsp hasta
+        //     el `leave`); con muchas clases/metodos eso baja el VM-RSP cientos de
+        //     bytes y cambia el layout VM-stack/heap -> destapa bugs latentes de
+        //     scan/GC dependientes del layout (99/133/179 crasheaban en interp).
+        //     Un solo ALLOCA mantiene el VM stack casi plano (como el RAW_ASM).
+        //   - El multi-bloque (un block por clase/advice) + el SPILL cross-bloque
+        //     del .vel regalloc evitan el clobber del registro del buffer (el bug
+        //     del single-block era tenerlo en un registro vivo a traves de ~80
+        //     ops; spillado a un slot y recargado por uso, no se clobbea).
+        //   - La DSE-barrera de los ops meta-OOP preserva los STORE que arman el
+        //     struct aunque se reuse buf+0 entre defs.
+        ir::IrValueId shared_buf = ir::IR_NO_VALUE;
+        auto fresh_buf = [&]() -> ir::IrValueId {
+            if (shared_buf != ir::IR_NO_VALUE) return shared_buf;
+            const ir::IrValueId v = fn.new_value(ir::IrType::PTR);
+            ir::IrInstr al{};
+            al.op = ir::IrOp::ALLOCA; al.type = ir::IrType::I8;  // unidad 1 byte
+            al.dst = v; al.imm = 40; al.source_line = ln;
+            fn.append(cur, std::move(al));  // is_host_ptr=false -> VM stack
+            shared_buf = v;
+            return v;
+        };
+        // STORE v_val en buf + off (vm_mem; el buffer es vaddr).
+        auto store_at = [&](ir::IrValueId buf, uint64_t off, ir::IrValueId v_val) {
+            ir::IrValueId v_addr = buf;
+            if (off != 0) {
+                v_addr = fn.new_value(ir::IrType::PTR);
+                ir::IrInstr ad{};
+                ad.op = ir::IrOp::ADD; ad.type = ir::IrType::I64;
+                ad.dst = v_addr;
+                ad.operands = {buf, emit_const64(off)};
+                ad.source_line = ln;
+                fn.append(cur, std::move(ad));  // is_host_ptr=false (vaddr)
+            }
+            ir::IrInstr st{};
+            st.op = ir::IrOp::STORE; st.type = ir::IrType::I64;
+            st.operands = {v_val, v_addr}; st.source_line = ln;
+            fn.append(cur, std::move(st));
+        };
+        // FINDCLASS/DEFCLASS/FINDMETHOD: dst = op(buf).  ClassInfo*/MethodInfo*
+        // son host_ptr nativos (no GC) -> is_host_ptr=true, is_gc_object=false.
+        auto emit_find1 = [&](ir::IrOp op, ir::IrValueId buf) -> ir::IrValueId {
+            const ir::IrValueId v = fn.new_value(ir::IrType::PTR);
+            fn.values[v].is_host_ptr = true;
+            ir::IrInstr i{};
+            i.op = op; i.type = ir::IrType::PTR; i.dst = v;
+            i.operands = {buf}; i.source_line = ln;
+            fn.append(cur, std::move(i));
+            return v;
+        };
+        // DEFFIELD/DEFMETHOD: op(v_cls, buf) sin dst.
+        auto emit_def2 = [&](ir::IrOp op, ir::IrValueId v_cls, ir::IrValueId buf) {
+            ir::IrInstr i{};
+            i.op = op; i.type = ir::IrType::VOID;
+            i.operands = {v_cls, buf}; i.source_line = ln;
+            fn.append(cur, std::move(i));
+        };
 
         for (auto &decl: mod_.decls) {
             if (!decl || decl->kind != ast::NodeKind::ClassDecl) continue;
@@ -17998,342 +18115,224 @@ namespace vex {
             if (it == tc_.class_layouts().end()) continue;
             const ClassLayout &lay = it->second;
 
-            // 1) Construir DefClassParams (32 bytes) en stack y llamar defclass.
+            // Bloque propio para esta clase (presion de registros acotada).
+            new_seg("cls_" + cd->name);
+
             const uint64_t cname_idx = intern_class_name(out, cd->name);
             const uint32_t cname_len = static_cast<uint32_t>(cd->name.size());
 
-            asm_ << "// === defclass " << cd->name << " ===\n";
-
-            // Si hay superclase, hacer findclass del super primero para
-            // tener su ClassInfo*.  El bytecode de findclass requiere
-            // sus propios FindClassParams en stack.
-            std::string super_reg = "0"; // por defecto sin super
+            // 1) Si hay superclase: FindClassParams (16B) + findclass -> v_super.
+            ir::IrValueId v_super = ir::IR_NO_VALUE;
             if (!cd->super_name.empty()) {
                 const uint64_t sname_idx = intern_class_name(out, cd->super_name);
                 const uint32_t sname_len = static_cast<uint32_t>(cd->super_name.size());
-                emit_findclass_inline(asm_, sname_idx, sname_len);
-                // findclass deja el resultado en r12.  Movemos a r11 para
-                // preservar durante el defclass.
-                asm_ << "mov r11, r12\n";
-                super_reg = "r11";
+                const ir::IrValueId b = fresh_buf();
+                store_at(b, 0, emit_strlit(sname_idx));
+                store_at(b, 8, emit_const64(sname_len));
+                v_super = emit_find1(ir::IrOp::FINDCLASS, b);
             }
 
-            asm_ << "subsp rsp, 32\n";
-            asm_ << "mov r3, rsp\n";
+            // 2) DefClassParams (32B) + defclass -> v_cls.
+            const ir::IrValueId b_dc = fresh_buf();
+            store_at(b_dc, 0, emit_strlit(cname_idx));
+            // [+8] (flags<<32)|name_len con flags=CLASS_VIS_PUBLIC=1.
+            store_at(b_dc, 8, emit_const64((uint64_t(1) << 32) | uint64_t(cname_len)));
+            // [+16] super_class (ClassInfo* o 0).
+            store_at(b_dc, 16, (v_super != ir::IR_NO_VALUE) ? v_super : emit_const64(0));
+            // [+24] reserved = 0.
+            store_at(b_dc, 24, emit_const64(0));
+            const ir::IrValueId v_cls = emit_find1(ir::IrOp::DEFCLASS, b_dc);
+
+            // 2.5) Cachear el ClassInfo* en su slot static_data (lo lee
+            // __new_<Class> sin findclass).  STORE a vm_mem (slot = vaddr).
+            const uint64_t cache_idx = intern_class_cache_slot(out, cd->name);
             {
-                StoreCluster sc;
-                // [+0] name_addr
-                emit_store_qword_vm(asm_, "r3", 0,
-                                    "@Absolute(\"code.s_" + std::to_string(cname_idx) + "\")",
-                                    &sc);
-                // [+8] (flags<<32)|name_len = (1<<32)|len  con flags=CLASS_VIS_PUBLIC=1
-                uint64_t packed = (uint64_t(1) << 32) | uint64_t(cname_len);
-                emit_store_qword_vm(asm_, "r3", 8, std::to_string(packed), &sc);
-                // [+16] super_class: 0 si sin herencia, o el ClassInfo* del super.
-                emit_store_qword_vm(asm_, "r3", 16, super_reg, &sc);
-                // [+24] reserved = 0
-                emit_store_qword_vm(asm_, "r3", 24, "0", &sc);
+                const ir::IrValueId v_cache = emit_strlit(cache_idx);
+                ir::IrInstr st{};
+                st.op = ir::IrOp::STORE; st.type = ir::IrType::I64;
+                st.operands = {v_cls, v_cache}; st.source_line = ln;
+                fn.append(cur, std::move(st));
             }
 
-            asm_ << "defclass r1, r3\n";
-            asm_ << "addsp rsp, 32\n";
-            asm_ << "mov r12, r1\n"; // r12 = ClassInfo* persiste durante deffield/defmethod
-            // fix11 - cachear el ClassInfo* en su slot static_data
-            // para que __new_<Class> lo lea directamente sin findclass.
-            // El slot fue reservado en generate_new_helpers (intern_class_cache_slot).
-            {
-                const uint64_t cache_idx = intern_class_cache_slot(out, cd->name);
-                asm_ << "mov r5, @Absolute(\"code.s_" << cache_idx << "\")\n";
-                asm_ << "mov [r5], r1\n"; // cache[Class] = ClassInfo*
-            }
+            // Helper: recargar el ClassInfo* desde el cache slot (corto-vivo en
+            // cada def para no estresar el regalloc con un v_cls vivo a traves
+            // de muchos deffield/defmethod).
+            auto reload_cls = [&]() -> ir::IrValueId {
+                const ir::IrValueId v_a = emit_strlit(cache_idx);
+                const ir::IrValueId v = fn.new_value(ir::IrType::PTR);
+                fn.values[v].is_host_ptr = true;
+                ir::IrInstr ld{};
+                ld.op = ir::IrOp::LOAD; ld.type = ir::IrType::I64;
+                ld.dst = v; ld.operands = {v_a}; ld.source_line = ln;
+                fn.append(cur, std::move(ld));
+                return v;
+            };
 
-            // 2) Para cada field PROPIO: DefFieldParams + deffield.
-            // Los heredados ya los anyadio define_class en el loader al
-            // copiar la jerarquia del super; re-emitirlos aqui causaria
-            // duplicado y add_field devolveria error.
-            for (size_t fi = lay.inherited_field_count;
-                 fi < lay.fields.size(); ++fi) {
+            // 3) Fields PROPIOS (los heredados ya los copio define_class).
+            for (size_t fi = lay.inherited_field_count; fi < lay.fields.size(); ++fi) {
                 const auto &   f         = lay.fields[fi];
                 const uint64_t fname_idx = intern_class_name(out, f.name);
                 const uint32_t fname_len = static_cast<uint32_t>(f.name.size());
-                asm_ << "// deffield " << f.name << "\n";
-                asm_ << "subsp rsp, 32\n";
-                asm_ << "mov r3, rsp\n";
-                {
-                    StoreCluster sc;
-                    // [+0] name_addr
-                    emit_store_qword_vm(asm_, "r3", 0,
-                                        "@Absolute(\"code.s_" + std::to_string(fname_idx) + "\")",
-                                        &sc);
-                    // [+8] packed: (name_len) | (kind<<32) | (access<<40) | (is_static<<48).
-                    uint64_t packed = uint64_t(fname_len);
-                    packed |= (uint64_t(0)) << 32; // kind = FIELD_PRIMITIVE
-                    packed |= (uint64_t(0)) << 40; // access = FIELD_PUBLIC
-                    packed |= (uint64_t(0)) << 48; // is_static = false
-                    emit_store_qword_vm(asm_, "r3", 8, std::to_string(packed), &sc);
-                    // [+16] (size_bytes) | (_pad2<<32)
-                    emit_store_qword_vm(asm_, "r3", 16, "8", &sc); // 8 bytes por slot
-                    // [+24] type_class = 0 (primitive)
-                    emit_store_qword_vm(asm_, "r3", 24, "0", &sc);
-                }
-
-                asm_ << "deffield r12, r3\n";
-                asm_ << "addsp rsp, 32\n";
+                const ir::IrValueId b = fresh_buf();
+                store_at(b, 0, emit_strlit(fname_idx));
+                // [+8] name_len (kind/access/is_static = 0 para field de instancia).
+                store_at(b, 8, emit_const64(uint64_t(fname_len)));
+                store_at(b, 16, emit_const64(8));   // size_bytes = 8 (1 slot)
+                store_at(b, 24, emit_const64(0));   // type_class = 0 (primitive)
+                emit_def2(ir::IrOp::DEFFIELD, reload_cls(), b);
             }
 
-            // 2.5) Para cada static field PROPIO: DefFieldParams + deffield
-            // con is_static=1.  Solo se emite para los static fields nuevos
-            // (los heredados ya los anyadio define_class del loader al
-            // copiar el padre).  Layout identico al loop anterior pero con
-            // is_static=1 en byte +14 del packed.
+            // 3.5) Static fields PROPIOS (is_static=1 en bit +48 del packed).
             for (size_t si = lay.inherited_static_field_count;
                  si < lay.static_fields.size(); ++si) {
                 const auto &   f         = lay.static_fields[si];
                 const uint64_t fname_idx = intern_class_name(out, f.name);
                 const uint32_t fname_len = static_cast<uint32_t>(f.name.size());
-                asm_ << "// deffield static " << f.name << "\n";
-                asm_ << "subsp rsp, 32\n";
-                asm_ << "mov r3, rsp\n";
-                {
-                    StoreCluster sc;
-                    emit_store_qword_vm(asm_, "r3", 0,
-                                        "@Absolute(\"code.s_" + std::to_string(fname_idx) + "\")",
-                                        &sc);
-                    uint64_t packed = uint64_t(fname_len);
-                    packed |= (uint64_t(0)) << 32; // kind = FIELD_PRIMITIVE
-                    packed |= (uint64_t(0)) << 40; // access = FIELD_PUBLIC
-                    packed |= (uint64_t(1)) << 48; // is_static = TRUE
-                    emit_store_qword_vm(asm_, "r3", 8, std::to_string(packed), &sc);
-                    emit_store_qword_vm(asm_, "r3", 16, "8", &sc); // 8 bytes por slot
-                    emit_store_qword_vm(asm_, "r3", 24, "0", &sc); // type_class = 0
-                }
-                asm_ << "deffield r12, r3\n";
-                asm_ << "addsp rsp, 32\n";
+                const ir::IrValueId b = fresh_buf();
+                store_at(b, 0, emit_strlit(fname_idx));
+                store_at(b, 8, emit_const64(uint64_t(fname_len) | (uint64_t(1) << 48)));
+                store_at(b, 16, emit_const64(8));
+                store_at(b, 24, emit_const64(0));
+                emit_def2(ir::IrOp::DEFFIELD, reload_cls(), b);
             }
 
-            // 3) Para cada metodo PROPIO o sobreescrito: DefMethodParams +
-            // defmethod.  Los metodos heredados sin override se copian
-            // automaticamente por define_class al instalar la jerarquia
-            // (loader); re-emitirlos aqui no es necesario.  El criterio
-            // de "propio" es @c defining_class == cd->name.
-            //
-            // Las interfaces NO emiten defmethod: sus metodos son
-            // abstractos (sin code_vaddr).  defclass las registra para
-            // que la reflexion las encuentre, pero no aportan vtable.
-            if (cd->is_interface) {
-                asm_ << "// === fin interface " << cd->name << " (sin defmethod) ===\n";
-                continue;
-            }
+            // Las interfaces no emiten defmethod (metodos abstractos sin code).
+            if (cd->is_interface) continue;
+
+            // 4) Metodos PROPIOS o sobreescritos (defining_class == cd->name).
             for (const auto &m: lay.methods) {
-                if (!m.defining_class.empty()
-                    && m.defining_class != cd->name)
-                    continue; // heredado puro
-                std::string suffix      = m.is_constructor ? std::string("ctor") : m.name;
-                std::string owner_class = m.defining_class.empty()
-                                              ? cd->name
-                                              : m.defining_class;
-                std::string method_label = owner_class + "__" + suffix;
-                // Strings para name y descriptor.
+                if (!m.defining_class.empty() && m.defining_class != cd->name)
+                    continue;  // heredado puro
+                const std::string suffix      = m.is_constructor ? std::string("ctor") : m.name;
+                const std::string owner_class = m.defining_class.empty()
+                                                    ? cd->name : m.defining_class;
+                const std::string method_label = owner_class + "__" + suffix;
                 const uint64_t mname_idx = intern_class_name(out, m.name);
                 const uint32_t mname_len = static_cast<uint32_t>(m.name.size());
-                // Descriptor minimal: solo se usa para reflexion/AOP; aqui
-                // ponemos una cadena vacia (idx -1) o simplemente la firma
-                // no se valida al definir.  Usamos una cadena "" via idx 0
-                // si esta disponible.  Para simplificar, registramos "()".
                 const std::string desc_str = "()";
                 const uint64_t    desc_idx = intern_class_name(out, desc_str);
                 const uint32_t    desc_len = static_cast<uint32_t>(desc_str.size());
 
                 uint64_t mflags = 0;
-                if (m.is_constructor) mflags |= /*METHOD_FLAG_CONSTRUCTOR*/ (1ULL << 9);
-                else mflags |= /*METHOD_FLAG_VIRTUAL*/ (1ULL << 10);
+                if (m.is_constructor) mflags |= (1ULL << 9);   // METHOD_FLAG_CONSTRUCTOR
+                else                  mflags |= (1ULL << 10);  // METHOD_FLAG_VIRTUAL
 
-                asm_ << "// defmethod " << method_label << "\n";
-                asm_ << "subsp rsp, 40\n";
-                asm_ << "mov r3, rsp\n";
-                {
-                    StoreCluster sc;
-                    // [+0] name_addr
-                    emit_store_qword_vm(asm_, "r3", 0,
-                                        "@Absolute(\"code.s_" + std::to_string(mname_idx) + "\")",
-                                        &sc);
-                    // [+8] (descriptor_len<<32)|name_len
-                    uint64_t packed = uint64_t(mname_len)
-                            | (uint64_t(desc_len) << 32);
-                    emit_store_qword_vm(asm_, "r3", 8, std::to_string(packed), &sc);
-                    // [+16] descriptor_addr
-                    emit_store_qword_vm(asm_, "r3", 16,
-                                        "@Absolute(\"code.s_" + std::to_string(desc_idx) + "\")",
-                                        &sc);
-                    // [+24] code_vaddr = label del metodo
-                    emit_store_qword_vm(asm_, "r3", 24,
-                                        "@Absolute(\"code." + method_label + "\")",
-                                        &sc);
-                    // [+32] flags
-                    emit_store_qword_vm(asm_, "r3", 32, std::to_string(mflags), &sc);
-                }
+                // DefMethodParams (40B) + defmethod.
+                const ir::IrValueId b = fresh_buf();
+                store_at(b, 0, emit_strlit(mname_idx));
+                store_at(b, 8, emit_const64(uint64_t(mname_len) | (uint64_t(desc_len) << 32)));
+                store_at(b, 16, emit_strlit(desc_idx));
+                store_at(b, 24, emit_label_addr(method_label));   // code_vaddr
+                store_at(b, 32, emit_const64(mflags));
+                emit_def2(ir::IrOp::DEFMETHOD, reload_cls(), b);
 
-                asm_ << "defmethod r12, r3\n";
-                asm_ << "addsp rsp, 40\n";
-
-                // Registrar debug info (file + line) para el
-                // metodo recien definido.  defmethod retorna vtable_idx
-                // en R0, no el MethodInfo*.  Lo obtenemos via findmethod
-                // por nombre y emitimos setmethdbg con un params struct
-                // de 24 bytes en stack: { method_ptr, file_addr, file_len,
-                // start_line }.  Solo si tenemos source info valida.
+                // Debug info (file:line) si la hay: findmethod + setmethdbg.
                 if (!m.source_file.empty() && m.source_line > 0) {
                     const uint64_t fname_idx = intern_class_name(out, m.source_file);
                     const uint32_t fname_len = static_cast<uint32_t>(m.source_file.size());
 
-                    // 1. findmethod r5, r4 -> R0 = MethodInfo* del metodo
-                    //    recien definido.  r4 -> FindMethodParams { class, name_addr, name_len }.
-                    //    Usamos r4 como base porque emit_store_qword_vm
-                    //    clobrea r5 y r6 internamente.
-                    asm_ << "subsp rsp, 24\n";
-                    asm_ << "mov r4, rsp\n";
-                    {
-                        StoreCluster sc;
-                        emit_store_qword_vm(asm_, "r4", 0, "r12", &sc); // class_ptr
-                        emit_store_qword_vm(asm_, "r4", 8,
-                                            "@Absolute(\"code.s_" + std::to_string(mname_idx) + "\")",
-                                            &sc);
-                        // [+16] name_len (i32, padding superior libre).
-                        emit_store_qword_vm(asm_, "r4", 16, std::to_string(mname_len), &sc);
-                    }
-                    asm_ << "findmethod r5, r4\n";
-                    asm_ << "addsp rsp, 24\n";
-                    // Preservar method_ptr en r3 (no clobrado por
-                    // emit_store_qword_vm que usa r5/r6 internamente).
-                    asm_ << "mov r3, r5\n";
+                    // FindMethodParams (24B) + findmethod -> v_method.
+                    const ir::IrValueId bf = fresh_buf();
+                    store_at(bf, 0, reload_cls());
+                    store_at(bf, 8, emit_strlit(mname_idx));
+                    store_at(bf, 16, emit_const64(uint64_t(mname_len)));
+                    const ir::IrValueId v_method = emit_find1(ir::IrOp::FINDMETHOD, bf);
 
-                    // 2. SetMethDebugParams (24 bytes): { method_ptr,
-                    //    file_addr, file_len, start_line }.  Usamos r4
-                    //    como base para no clobrear r3 (method_ptr).
-                    asm_ << "subsp rsp, 24\n";
-                    asm_ << "mov r4, rsp\n";
-                    {
-                        StoreCluster sc;
-                        emit_store_qword_vm(asm_, "r4", 0, "r3", &sc); // method_ptr
-                        emit_store_qword_vm(asm_, "r4", 8,
-                                            "@Absolute(\"code.s_" + std::to_string(fname_idx) + "\")",
-                                            &sc);
-                        // [+16] file_len (i32) | [+20] start_line (i32).
-                        const uint64_t packed = uint64_t(fname_len)
-                                | (uint64_t(m.source_line) << 32);
-                        emit_store_qword_vm(asm_, "r4", 16, std::to_string(packed), &sc);
-                    }
-                    asm_ << "setmethdbg r3, r4\n";
-                    asm_ << "addsp rsp, 24\n";
+                    // SetMethDebugParams (24B) + setmethdbg.
+                    const ir::IrValueId bs = fresh_buf();
+                    store_at(bs, 0, v_method);
+                    store_at(bs, 8, emit_strlit(fname_idx));
+                    store_at(bs, 16, emit_const64(uint64_t(fname_len)
+                                                  | (uint64_t(m.source_line) << 32)));
+                    ir::IrInstr smd{};
+                    smd.op = ir::IrOp::SETMETHDBG; smd.type = ir::IrType::VOID;
+                    smd.operands = {v_method, bs}; smd.source_line = ln;
+                    fn.append(cur, std::move(smd));
                 }
             }
-            asm_ << "// === fin clase " << cd->name << " ===\n";
         }
 
         // -----------------------------------------------------------------
-        // 2do pase: AOP.  Tras definir todas las clases y metodos, recorremos
-        // los aspectos y emitimos findclass + findmethod + addadvice por
-        // cada @Before/@After/@Around encontrado.  Esto requiere que las
-        // clases target ya esten registradas (de ahi el segundo pase).
+        // 2do pase: AOP.  Tras registrar todas las clases/metodos, recorremos
+        // los aspectos y emitimos findclass + findmethod (x2) + addadvice por
+        // cada @Before/@After/@Around (cada advice en su propio bloque).
+        // Requiere que las clases target ya esten registradas (2do pase).
         // -----------------------------------------------------------------
         for (auto &decl: mod_.decls) {
             if (!decl || decl->kind != ast::NodeKind::ClassDecl) continue;
             auto *cd = static_cast<ast::ClassDecl *>(decl.get());
-            if (!cd->type_params.empty()) continue; // template, no se procesa
+            if (!cd->type_params.empty()) continue;  // template, no se procesa
             for (auto &m_uptr: cd->methods) {
                 auto *m = m_uptr.get();
                 if (!m || m->advice_kind == 0) continue;
 
-                // Pointcut: "ClassName.methodName" (formato exacto v0).
                 const std::string &target = m->advice_target;
-                size_t             dot    = target.find('.');
-                if (dot == std::string::npos || dot == 0
-                    || dot + 1 >= target.size()) {
+                const size_t        dot   = target.find('.');
+                if (dot == std::string::npos || dot == 0 || dot + 1 >= target.size()) {
                     error_at(m->loc,
                              "AOP: pointcut '" + target + "' no tiene formato 'Clase.metodo'");
                     continue;
                 }
                 const std::string tcls  = target.substr(0, dot);
                 const std::string tmeth = target.substr(dot + 1);
+                const uint8_t     rt_kind = static_cast<uint8_t>(m->advice_kind - 1);
 
-                // Convertir advice_kind del AST (1=BEFORE, 2=AFTER, 3=AROUND,
-                // 4=AFTER_RETURNING) al kind del runtime (resta 1).
-                const uint8_t rt_kind = static_cast<uint8_t>(m->advice_kind - 1);
+                // Bloque propio para este advice (presion acotada).
+                new_seg("aop_" + cd->name + "_" + m->name);
 
-                asm_ << "// === advice " << cd->name << "." << m->name
-                        << " " << (rt_kind == 0
-                                       ? "BEFORE"
-                                       : rt_kind == 1
-                                             ? "AFTER"
-                                             : "AROUND")
-                        << " " << target << " ===\n";
-
-                // 1) findclass de la clase target -> r10
+                // 1) findclass de la clase target -> v_tc.
                 const uint64_t tcls_idx = intern_class_name(out, tcls);
                 const uint32_t tcls_len = static_cast<uint32_t>(tcls.size());
-                emit_findclass_inline(asm_, tcls_idx, tcls_len);
-                asm_ << "mov r10, r12\n"; // r10 = ClassInfo* target
+                const ir::IrValueId b1 = fresh_buf();
+                store_at(b1, 0, emit_strlit(tcls_idx));
+                store_at(b1, 8, emit_const64(tcls_len));
+                const ir::IrValueId v_tc = emit_find1(ir::IrOp::FINDCLASS, b1);
 
-                // 2) findmethod del target -> r9
+                // 2) findmethod del target -> v_tm.
                 const uint64_t tmeth_idx = intern_class_name(out, tmeth);
                 const uint32_t tmeth_len = static_cast<uint32_t>(tmeth.size());
-                asm_ << "subsp rsp, 24\n";
-                asm_ << "mov r3, rsp\n";
-                {
-                    StoreCluster sc;
-                    emit_store_qword_vm(asm_, "r3", 0, "r10", &sc); // class_ptr
-                    emit_store_qword_vm(asm_, "r3", 8,
-                                        "@Absolute(\"code.s_" + std::to_string(tmeth_idx) + "\")",
-                                        &sc);
-                    emit_store_qword_vm(asm_, "r3", 16, std::to_string(tmeth_len), &sc);
-                }
-                asm_ << "findmethod r9, r3\n";
-                asm_ << "addsp rsp, 24\n";
+                const ir::IrValueId b2 = fresh_buf();
+                store_at(b2, 0, v_tc);
+                store_at(b2, 8, emit_strlit(tmeth_idx));
+                store_at(b2, 16, emit_const64(tmeth_len));
+                const ir::IrValueId v_tm = emit_find1(ir::IrOp::FINDMETHOD, b2);
 
-                // 3) findclass del aspect -> r8 (luego findmethod del advice)
+                // 3) findclass del aspecto -> v_ac.
                 const uint64_t acls_idx = intern_class_name(out, cd->name);
                 const uint32_t acls_len = static_cast<uint32_t>(cd->name.size());
-                emit_findclass_inline(asm_, acls_idx, acls_len);
-                asm_ << "mov r8, r12\n"; // r8 = ClassInfo* aspect
+                const ir::IrValueId b3 = fresh_buf();
+                store_at(b3, 0, emit_strlit(acls_idx));
+                store_at(b3, 8, emit_const64(acls_len));
+                const ir::IrValueId v_ac = emit_find1(ir::IrOp::FINDCLASS, b3);
 
-                // 4) findmethod del advice -> r7
+                // 4) findmethod del advice -> v_am.
                 const uint64_t adm_idx = intern_class_name(out, m->name);
                 const uint32_t adm_len = static_cast<uint32_t>(m->name.size());
-                asm_ << "subsp rsp, 24\n";
-                asm_ << "mov r3, rsp\n";
-                {
-                    StoreCluster sc;
-                    emit_store_qword_vm(asm_, "r3", 0, "r8", &sc);
-                    emit_store_qword_vm(asm_, "r3", 8,
-                                        "@Absolute(\"code.s_" + std::to_string(adm_idx) + "\")",
-                                        &sc);
-                    emit_store_qword_vm(asm_, "r3", 16, std::to_string(adm_len), &sc);
-                }
-                asm_ << "findmethod r7, r3\n";
-                asm_ << "addsp rsp, 24\n";
+                const ir::IrValueId b4 = fresh_buf();
+                store_at(b4, 0, v_ac);
+                store_at(b4, 8, emit_strlit(adm_idx));
+                store_at(b4, 16, emit_const64(adm_len));
+                const ir::IrValueId v_am = emit_find1(ir::IrOp::FINDMETHOD, b4);
 
-                // 5) addadvice r9 (target), r7 (advice), kind imm
-                asm_ << "addadvice r9, r7, " << static_cast<int>(rt_kind) << "\n";
+                // 5) addadvice(target, advice, kind).
+                ir::IrInstr aa{};
+                aa.op = ir::IrOp::ADDADVICE; aa.type = ir::IrType::VOID;
+                aa.operands = {v_tm, v_am}; aa.imm = rt_kind; aa.source_line = ln;
+                fn.append(cur, std::move(aa));
             }
         }
 
-        ir::IrInstr ra{};
-        ra.op          = ir::IrOp::RAW_ASM;
-        ra.type        = ir::IrType::VOID;
-        ra.dst         = ir::IR_NO_VALUE;
-        ra.func_name   = asm_.str();
-        ra.source_line = 0;
-        fn.append(entry, std::move(ra));
-
         // L2.2: inicializar runtime globals con su literal de init.
-        // Activamos el contexto del lowering (fn_=&fn, current_block_=entry)
-        // temporalmente para reutilizar emit_const/STRMAKE/STORE.
+        // Activamos el contexto del lowering (fn_=&fn, current_block_=cur)
+        // temporalmente para reutilizar emit_const/STRMAKE/STORE.  Usamos
+        // @c cur (el ultimo bloque encadenado), no @c entry, porque el
+        // generador parte __module_init en multiples bloques.
         if (has_runtime_globals) {
             ir::IrFunction *saved_fn      = fn_;
             ir::IrBlockId   saved_block   = current_block_;
             bool            saved_term    = block_terminated_;
             fn_               = &fn;
-            current_block_    = entry;
+            current_block_    = cur;
             block_terminated_ = false;
             for (auto &decl : mod_.decls) {
                 if (!decl || decl->kind != ast::NodeKind::GlobalVarDecl) continue;
@@ -18380,7 +18379,7 @@ namespace vex {
         ret.op          = ir::IrOp::RET;
         ret.type        = ir::IrType::VOID;
         ret.source_line = 0;
-        fn.append(entry, std::move(ret));
+        fn.append(cur, std::move(ret));  // ultimo bloque encadenado
 
         propagate_is_gc_object_through_phis(fn);
         out.add_function(std::move(fn));
@@ -19324,105 +19323,229 @@ namespace vex {
             // Marcar obj como host_ptr (instancia GC-derivada).
             fn_->values[obj].is_host_ptr = true;
 
-            // 1. Cargar ClassInfo* del objeto: load *(obj + 0).
-            const ir::IrValueId v_cls = fn_->new_value(ir::IrType::I64); {
-                ir::IrInstr ld{};
-                ld.op          = ir::IrOp::LOAD;
-                ld.type        = ir::IrType::I64;
-                ld.dst         = v_cls;
-                ld.operands    = {obj};
-                ld.source_line = e->loc.line;
-                fn_->append(current_block_, std::move(ld));
-            }
+            // Dispatch de interfaz via ITABLE (en vez de findmethod+callm):
+            // construimos un @c ItfCallParams (32 bytes) en stack con el
+            // nombre de la interfaz, el nombre del metodo, el indice del metodo
+            // (posicion en la declaracion de la interfaz = vtable_index) y el
+            // numero de metodos de la interfaz, y emitimos un solo CALLITF.
+            //   +0  iface_name_addr (8)
+            //   +8  iface_name_len (lo32) | method_index (hi32)
+            //   +16 method_name_addr (8)
+            //   +24 method_name_len (lo32) | count (hi32)
+            // El interp despacha via la itable lazy de la clase concreta
+            // (indice O(1) tras el warmup); el JIT inlinea el scan de itables.
+            const std::string &iface_name = bt.struct_name; // == lay.name
+            const std::string &method_name = mtd->name;
+            const uint64_t iface_idx  = intern_class_name(*out_mod_, iface_name);
+            const uint32_t iface_len  = static_cast<uint32_t>(iface_name.size());
+            const uint64_t method_idx_str = intern_class_name(*out_mod_, method_name);
+            const uint32_t method_len = static_cast<uint32_t>(method_name.size());
+            const uint32_t method_index = mtd->vtable_index;
+            const uint32_t mcount       = static_cast<uint32_t>(lay.methods.size());
 
-            // 2. Construir FindMethodParams (24 bytes) en stack.
-            const uint64_t name_idx = intern_class_name(*out_mod_, mtd->name);
-            const uint32_t name_len = static_cast<uint32_t>(mtd->name.size());
-
-            const ir::IrValueId v_buf = fn_->new_value(ir::IrType::PTR); {
-                ir::IrInstr al{};
-                al.op          = ir::IrOp::ALLOCA;
-                al.type        = ir::IrType::I8;
-                al.imm         = 24;
-                al.dst         = v_buf;
-                al.source_line = e->loc.line;
-                fn_->append(current_block_, std::move(al));
-            }
-            // [+0] class_ptr.
+            // Buffer de ItfCallParams (32 bytes) construido UNA VEZ en el entry
+            // block (block 0) de la funcion -- su contenido es 100%
+            // loop-invariante (nombres + indices constantes).  El @c callitf en
+            // el loop solo LEE el buffer.  Critico para correctness:
+            //   (1) un ALLOCA por dispatch creceria el VM stack en loops
+            //       calientes (pic_real 3M iter desbordaba el stack);
+            //   (2) construir el struct DENTRO del loop hacia que el LICM/
+            //       regalloc hoisteara un CONST a un reg de arg (r1) que el
+            //       marshalling del call clobbeaba -> v_buf corrupto en iter 2+.
+            // Construir en el entry (dominador de todo) evita ambos.  Cada call
+            // site tiene su propio buffer (params distintos); como el call site
+            // se baja UNA vez, son pocos buffers (1 por dispatch textual).
+            //
+            // Insertamos las instrucciones de construccion en block 0 ANTES de
+            // su terminador (o al final si aun no esta terminado).
+            std::vector<ir::IrInstr> setup;
+            const ir::IrValueId v_buf = fn_->new_value(ir::IrType::PTR);
             {
+                ir::IrInstr al{};
+                al.op = ir::IrOp::ALLOCA; al.type = ir::IrType::I8; al.imm = 32;
+                al.dst = v_buf; al.source_line = e->loc.line;
+                setup.push_back(std::move(al));
+            }
+            // Helper local: STORE i64 @c val a @c v_buf + @c off (instrs -> setup).
+            auto setup_store_at = [&](uint64_t off, ir::IrValueId val) {
+                ir::IrValueId base = v_buf;
+                if (off != 0) {
+                    const ir::IrValueId v_off = fn_->new_value(ir::IrType::I64);
+                    ir::IrInstr c{};
+                    c.op = ir::IrOp::CONST; c.type = ir::IrType::I64; c.imm = off;
+                    c.dst = v_off; c.source_line = e->loc.line;
+                    setup.push_back(std::move(c));
+                    base = fn_->new_value(ir::IrType::PTR);
+                    ir::IrInstr add{};
+                    add.op = ir::IrOp::ADD; add.type = ir::IrType::I64; add.dst = base;
+                    add.operands = {v_buf, v_off}; add.source_line = e->loc.line;
+                    setup.push_back(std::move(add));
+                }
                 ir::IrInstr st{};
-                st.op          = ir::IrOp::STORE;
-                st.type        = ir::IrType::I64;
-                st.dst         = ir::IR_NO_VALUE;
-                st.operands    = {v_cls, v_buf};
+                st.op = ir::IrOp::STORE; st.type = ir::IrType::I64;
+                st.dst = ir::IR_NO_VALUE; st.operands = {val, base};
                 st.source_line = e->loc.line;
-                fn_->append(current_block_, std::move(st));
-            }
-            // [+8] name_addr.
-            const ir::IrValueId v_eight = emit_const(ir::IrType::I64, 8, e->loc.line);
-            const ir::IrValueId v_buf8  = fn_->new_value(ir::IrType::PTR); {
-                ir::IrInstr add_8{};
-                add_8.op          = ir::IrOp::ADD;
-                add_8.type        = ir::IrType::I64;
-                add_8.dst         = v_buf8;
-                add_8.operands    = {v_buf, v_eight};
-                add_8.source_line = e->loc.line;
-                fn_->append(current_block_, std::move(add_8));
-            }
-            const ir::IrValueId v_name = fn_->new_value(ir::IrType::PTR); {
+                setup.push_back(std::move(st));
+            };
+            auto setup_const = [&](uint64_t k) -> ir::IrValueId {
+                const ir::IrValueId v = fn_->new_value(ir::IrType::I64);
+                ir::IrInstr c{};
+                c.op = ir::IrOp::CONST; c.type = ir::IrType::I64; c.imm = k;
+                c.dst = v; c.source_line = e->loc.line;
+                setup.push_back(std::move(c));
+                return v;
+            };
+            auto setup_str_lit = [&](uint64_t idx) -> ir::IrValueId {
+                const ir::IrValueId v = fn_->new_value(ir::IrType::PTR);
                 ir::IrInstr ns{};
-                ns.op          = ir::IrOp::STR_LIT_ADDR;
-                ns.type        = ir::IrType::PTR;
-                ns.dst         = v_name;
-                ns.imm         = name_idx;
-                ns.source_line = e->loc.line;
-                fn_->append(current_block_, std::move(ns));
-            } {
-                ir::IrInstr st{};
-                st.op          = ir::IrOp::STORE;
-                st.type        = ir::IrType::I64;
-                st.dst         = ir::IR_NO_VALUE;
-                st.operands    = {v_name, v_buf8};
-                st.source_line = e->loc.line;
-                fn_->append(current_block_, std::move(st));
+                ns.op = ir::IrOp::STR_LIT_ADDR; ns.type = ir::IrType::PTR;
+                ns.dst = v; ns.imm = idx; ns.source_line = e->loc.line;
+                setup.push_back(std::move(ns));
+                return v;
+            };
+            // [+0] iface_name_addr ; [+8] iface_len|method_index<<32 ;
+            // [+16] method_name_addr ; [+24] method_len|count<<32.
+            setup_store_at(0, setup_str_lit(iface_idx));
+            setup_store_at(8, setup_const(static_cast<uint64_t>(iface_len)
+                               | (static_cast<uint64_t>(method_index) << 32)));
+            setup_store_at(16, setup_str_lit(method_idx_str));
+            setup_store_at(24, setup_const(static_cast<uint64_t>(method_len)
+                               | (static_cast<uint64_t>(mcount) << 32)));
+            // ----------------------------------------------------------------
+            // (C2): preparar devirt especulativa estatica del CALLITF.
+            // Si la interfaz tiene pocos (<=K) implementors concretos NO-aspecto
+            // con el metodo inlineable, resolvemos el ClassInfo* de cada uno
+            // (findclass en el entry, loop-invariante) y registramos los
+            // candidatos; el pase ir_pass_spec_devirt reescribe el CALLITF en
+            // un guard-chain por tipo + fallback al dispatch via itable.
+            //  - Solo metodos que devuelven valor (dst != IR_NO_VALUE) y
+            //    no-SRET (v1).
+            //  - Conservador con AOP: si el modulo declara cualquier @Aspect,
+            //    NO especulamos (un advice podria targetear el metodo y el CALL
+            //    directo del fast path lo saltaria); el dispatch via itable
+            //    recorre la advice_chain correctamente.
+            // Resolucion v1 (2a): findclass directo en el entry, 1x/invocacion
+            // (despreciable para dispatch-en-loop).  2b lo cambiara a slot-cache
+            // eager en __module_init (1x total).
+            std::vector<ir::DevirtCandidate> spec_cands;
+            if (dst != ir::IR_NO_VALUE && !method_call_sret) {
+                bool module_has_aspect = false;
+                for (const auto &kv : tc_.class_layouts()) {
+                    if (kv.second.is_aspect) { module_has_aspect = true; break; }
+                }
+                if (!module_has_aspect) {
+                    constexpr size_t K_MAX = 4;
+                    // (cls_name, callee_ir_name) por implementor concreto.
+                    std::vector<std::pair<std::string, std::string>> impls;
+                    bool too_many = false;
+                    for (const auto &kv : tc_.class_layouts()) {
+                        const auto &cl = kv.second;
+                        if (cl.is_interface || cl.is_aspect) continue;
+                        bool implements = false;
+                        for (const auto &in : cl.interface_names)
+                            if (in == iface_name) { implements = true; break; }
+                        if (!implements) continue;
+                        // Localizar el metodo de la interfaz en la clase.
+                        const std::string *owner = nullptr;
+                        for (const auto &mm : cl.methods) {
+                            if (mm.name == method_name && !mm.is_constructor) {
+                                owner = mm.defining_class.empty()
+                                            ? &cl.name : &mm.defining_class;
+                                break;
+                            }
+                        }
+                        if (!owner) continue;  // no deberia pasar si implements
+                        impls.emplace_back(cl.name, *owner + "__" + method_name);
+                        if (impls.size() > K_MAX) { too_many = true; break; }
+                    }
+                    if (!too_many && !impls.empty() && impls.size() <= K_MAX) {
+                        const int ln = e->loc.line;
+                        // Resolver cada ClassInfo* via findclass construido en el
+                        // vector `setup` (que se splice en block 0, el entry).
+                        auto setup_findclass = [&](const std::string &cls_name)
+                                                   -> ir::IrValueId {
+                            const uint64_t nidx = intern_class_name(*out_mod_, cls_name);
+                            const uint32_t nlen = static_cast<uint32_t>(cls_name.size());
+                            const ir::IrValueId vp = fn_->new_value(ir::IrType::PTR);
+                            { ir::IrInstr al{}; al.op = ir::IrOp::ALLOCA;
+                              al.type = ir::IrType::I8; al.dst = vp; al.imm = 16;
+                              al.source_line = ln; setup.push_back(std::move(al)); }
+                            const ir::IrValueId vna = fn_->new_value(ir::IrType::PTR);
+                            { ir::IrInstr la{}; la.op = ir::IrOp::LABEL_ADDR;
+                              la.type = ir::IrType::PTR; la.dst = vna;
+                              la.func_name = "s_" + std::to_string(nidx);
+                              la.source_line = ln; setup.push_back(std::move(la)); }
+                            { ir::IrInstr st{}; st.op = ir::IrOp::STORE;
+                              st.type = ir::IrType::I64; st.operands = {vna, vp};
+                              st.source_line = ln; setup.push_back(std::move(st)); }
+                            const ir::IrValueId vlen = setup_const(static_cast<uint64_t>(nlen));
+                            const ir::IrValueId voff = setup_const(8);
+                            const ir::IrValueId vp8  = fn_->new_value(ir::IrType::PTR);
+                            { ir::IrInstr add{}; add.op = ir::IrOp::ADD;
+                              add.type = ir::IrType::I64; add.dst = vp8;
+                              add.operands = {vp, voff}; add.source_line = ln;
+                              setup.push_back(std::move(add)); }
+                            { ir::IrInstr st{}; st.op = ir::IrOp::STORE;
+                              st.type = ir::IrType::I64; st.operands = {vlen, vp8};
+                              st.source_line = ln; setup.push_back(std::move(st)); }
+                            const ir::IrValueId vc = fn_->new_value(ir::IrType::PTR);
+                            fn_->values[vc].is_host_ptr = true;
+                            { ir::IrInstr fc{}; fc.op = ir::IrOp::FINDCLASS;
+                              fc.type = ir::IrType::PTR; fc.dst = vc; fc.operands = {vp};
+                              fc.is_call_site = true; fc.source_line = ln;
+                              setup.push_back(std::move(fc)); }
+                            return vc;
+                        };
+                        for (const auto &pr : impls) {
+                            const ir::IrValueId v_cls = setup_findclass(pr.first);
+                            spec_cands.push_back(ir::DevirtCandidate{ v_cls, pr.second });
+                        }
+                    }
+                }
             }
-            // [+16] name_len.
-            const ir::IrValueId v_sixteen = emit_const(ir::IrType::I64, 16, e->loc.line);
-            const ir::IrValueId v_buf16   = fn_->new_value(ir::IrType::PTR); {
-                ir::IrInstr add_16{};
-                add_16.op          = ir::IrOp::ADD;
-                add_16.type        = ir::IrType::I64;
-                add_16.dst         = v_buf16;
-                add_16.operands    = {v_buf, v_sixteen};
-                add_16.source_line = e->loc.line;
-                fn_->append(current_block_, std::move(add_16));
+
+            // Splice de las instrucciones de construccion en block 0 antes de
+            // su terminador (op de control de flujo final).  Si block 0 no esta
+            // terminado (dispatch en el propio entry), se anexan al final.
+            {
+                auto &e0 = fn_->blocks[0].instrs;
+                size_t pos = e0.size();
+                if (pos > 0) {
+                    const ir::IrOp last = e0.back().op;
+                    if (last == ir::IrOp::BR || last == ir::IrOp::BR_COND
+                        || last == ir::IrOp::RET || last == ir::IrOp::UNREACHABLE
+                        || last == ir::IrOp::TAILCALL || last == ir::IrOp::RETHROW
+                        || last == ir::IrOp::THROW) {
+                        pos = e0.size() - 1;
+                    }
+                }
+                e0.insert(e0.begin() + pos,
+                          std::make_move_iterator(setup.begin()),
+                          std::make_move_iterator(setup.end()));
             }
-            const ir::IrValueId v_len = emit_const(ir::IrType::I64,
-                                                   static_cast<uint64_t>(name_len),
-                                                   e->loc.line); {
-                ir::IrInstr st{};
-                st.op          = ir::IrOp::STORE;
-                st.type        = ir::IrType::I64;
-                st.dst         = ir::IR_NO_VALUE;
-                st.operands    = {v_len, v_buf16};
-                st.source_line = e->loc.line;
-                fn_->append(current_block_, std::move(st));
-            }
-            // 3. findmethod via IR op: dst = MethodInfo*.
-            const ir::IrValueId v_method = emit_findmethod(v_buf, e->loc.line);
-            // 4. CALLM: operands[0]=obj, operands[1]=method, [2..]=args.
-            ir::IrInstr cm{};
-            cm.op   = ir::IrOp::CALLM;
-            cm.type = ret_ir;
-            cm.dst  = dst;
-            cm.operands.push_back(obj);
-            cm.operands.push_back(v_method);
-            // SRET: retbuf entre method y args.
+
+            // CALLITF: operands[0]=obj, [1]=params_ptr, [2..]=args (retbuf SRET
+            // como [2] si aplica).  func_name = "iface\x1fmethod", imm packed.
+            ir::IrInstr ci{};
+            ci.op   = ir::IrOp::CALLITF;
+            ci.type = ret_ir;
+            ci.dst  = dst;
+            ci.func_name = iface_name;
+            ci.func_name.push_back('\x1f');
+            ci.func_name += method_name;
+            ci.imm  = (static_cast<uint64_t>(mcount) << 32)
+                    | static_cast<uint64_t>(method_index);
+            ci.operands.push_back(obj);
+            ci.operands.push_back(v_buf);
             if (method_call_sret)
-                cm.operands.push_back(v_method_call_retbuf);
-            for (auto av: arg_vals) cm.operands.push_back(av);
-            cm.source_line = e->loc.line;
-            fn_->append(current_block_, std::move(cm));
+                ci.operands.push_back(v_method_call_retbuf);
+            for (auto av: arg_vals) ci.operands.push_back(av);
+            ci.source_line = e->loc.line;
+            fn_->append(current_block_, std::move(ci));
+            // registrar el site especulativo (keyed por el dst del
+            // CALLITF).  El pase ir_pass_spec_devirt lo consume @O2.
+            if (!spec_cands.empty())
+                fn_->spec_devirt_sites[dst] = std::move(spec_cands);
             return visible_dst;
         }
 

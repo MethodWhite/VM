@@ -43,7 +43,8 @@ namespace jit {
     uint8_t *vreg_compile(const ir::IrFunction &fn, CodeCache &cc,
                           const CallResolver &resolve_call = {},
                           const VregEntries &ent = {},
-                          const CallResolver &resolve_native = {});
+                          const CallResolver &resolve_native = {},
+                          const CallResolver &resolve_symbol = {});
 
     /**
      * @brief Compila @p fn por el path vreg con un OSR-entry para el loop cuyo
@@ -60,6 +61,8 @@ namespace jit {
      * @param resolve_call   Resolver de CALLs a user-fns (igual que el C1).
      * @param ent            Entradas runtime del selector vreg.
      * @param resolve_native Resolver de CALLN nativas.
+     * @param resolve_symbol Resolver de simbolos del linker (STR_LIT_ADDR /
+     *                       LABEL_ADDR); igual que el C1.
      * @param header_block   MBlock del loop header a reanudar (== IR block id).
      * @param osr_entry_out  [out] direccion absoluta del OSR-entry (o nullptr).
      * @param required_captures  Red de seguridad: VIDs que el C1 capturo.  Si
@@ -75,6 +78,7 @@ namespace jit {
                               const CallResolver &resolve_call,
                               const VregEntries &ent,
                               const CallResolver &resolve_native,
+                              const CallResolver &resolve_symbol,
                               uint32_t header_block,
                               uint8_t **osr_entry_out,
                               const std::vector<uint32_t> *required_captures = nullptr);

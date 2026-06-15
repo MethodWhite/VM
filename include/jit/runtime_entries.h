@@ -99,6 +99,9 @@ namespace jit {
         /* ----- CALLM (interfaces, reflexion) ----- */
         uint64_t   (*callm)           (vrt_proc *, uint8_t *, void *)        = nullptr;
 
+        /* ----- CALLITF (dispatch de interfaz via itable) ----- */
+        uint64_t   (*callitf)         (vrt_proc *, uint8_t *, uint64_t, uint64_t) = nullptr;
+
         /* ----- CALLCLOSURE (closures) ----- */
         uint64_t   (*callclosure)     (vrt_proc *, uint64_t, uint64_t)       = nullptr;
 

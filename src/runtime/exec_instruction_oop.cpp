@@ -30,6 +30,8 @@
 #include <cstdio>
 #include "gc/raw_allocator.h"
 #include "loader/oop_types.h"
+#include "loader/loader.h"
+#include "loader/class_registry.h"
 
 /* hook JIT en CALLVIRT fast path. */
 #include "jit/interp_jit_bridge.h"
@@ -745,6 +747,180 @@ namespace runtime {
         size_t n_b = 0, n_a = 0;
         for (loader::AdviceEntry *e = method->advice_chain;
              e != nullptr; e = e->next) {
+            if      (e->kind == loader::ADVICE_BEFORE && n_b < 16) befores[n_b++] = e->advice_method;
+            else if (e->kind == loader::ADVICE_AFTER  && n_a < 16) afters [n_a++] = e->advice_method;
+        }
+        if (n_b == 0 && n_a == 0) {
+            push_step(method, ret_addr);
+            vm->registers.rip.qword(method->code_vaddr);
+            vm->decoded_ptr->flags_info.did_jump = true;
+            return;
+        }
+        loader::MethodInfo *seq[33];
+        size_t n_seq = 0;
+        for (size_t i = 0; i < n_b; ++i) seq[n_seq++] = befores[i];
+        seq[n_seq++] = method;
+        for (size_t i = 0; i < n_a; ++i) seq[n_seq++] = afters[i];
+        push_step(seq[n_seq - 1], ret_addr);
+        for (size_t i = n_seq - 1; i > 0; --i) {
+            push_step(seq[i - 1], seq[i]->code_vaddr);
+        }
+        vm->registers.rip.qword(seq[0]->code_vaddr);
+        vm->decoded_ptr->flags_info.did_jump = true;
+    }
+
+    // =========================================================================
+    //  0xAE CALLITF r_obj, r_params - dispatch de interfaz via itable
+    // =========================================================================
+
+    /**
+     * @brief Layout del @c ItfCallParams (32 bytes en vm_mem) que construye el
+     *        frontend para CALLITF.
+     *
+     *   +0  [8] iface_name_addr  -- VM addr del nombre de la interfaz
+     *   +8  [4] iface_name_len   -- bytes del nombre de la interfaz
+     *   +12 [4] method_index     -- posicion del metodo en la decl. de la interfaz
+     *   +16 [8] method_name_addr -- VM addr del nombre del metodo (solo cold fill)
+     *   +24 [4] method_name_len  -- bytes del nombre del metodo
+     *   +28 [4] count            -- nº de metodos de la interfaz (dimensiona itable)
+     */
+    struct ItfCallParamsLayout {
+        uint64_t iface_name_addr;
+        uint32_t iface_name_len;
+        uint32_t method_index;
+        uint64_t method_name_addr;
+        uint32_t method_name_len;
+        uint32_t count;
+    };
+    static_assert(sizeof(ItfCallParamsLayout) == 32, "ItfCallParams ABI");
+
+    /**
+     * @brief Cache thread_local interfaz_name_addr -> ClassInfo* resuelto.
+     *
+     * El @c iface_name_addr es estable por call site (es @c @Absolute de un
+     * literal interned), asi que cachear por esa direccion evita el
+     * @c find_class (lectura de vm_mem + hash) en cada dispatch.  8 entradas
+     * round-robin, sin locks (thread_local).  Mismo patron que el cache de
+     * @c vrt_findmethod (CALLM 1a fase).
+     */
+    struct ItfIfaceCacheEntry { uint64_t name_addr; loader::ClassInfo *iface; };
+    static thread_local ItfIfaceCacheEntry g_itf_iface_cache[8] = {};
+    static thread_local uint32_t           g_itf_iface_cache_rr = 0;
+
+    void exec_instr_callitf(ProcessVM *vm, const DecodedInstr &instr) {
+        const uint8_t r_obj    = instr.data_instruction.reg_data.reg1;
+        const uint8_t r_params = instr.data_instruction.reg_data.reg2;
+
+        const uint64_t obj_ptr = vm->registers.regs[r_obj].qword();
+        if (__builtin_expect(obj_ptr == 0, 0)) {
+            runtime::throw_fatal(vm, runtime::FATAL_NULL_POINTER,
+                "CALLITF: deref de objeto null");
+            return;
+        }
+
+        // Leer el ItfCallParams (32 bytes) desde vm_mem.
+        ItfCallParamsLayout p;
+        vm->vm_mem.read_bytes(vm->registers.regs[r_params].qword(), &p, sizeof(p));
+
+        // Sprint D.6: type observation (mismo punto que CALLM/CALLVIRT).
+        auto *hdr = reinterpret_cast<loader::ObjectHeader *>(obj_ptr);
+        if (__builtin_expect(
+                runtime::profile::g_profile.active.load(std::memory_order_relaxed),
+                0)) {
+            runtime::profile::profile_callvirt(vm->registers.rip.raw(), hdr->class_ptr);
+        }
+        loader::ClassInfo *cls = hdr->class_ptr;
+        if (__builtin_expect(cls == nullptr, 0)) {
+            runtime::throw_fatal(vm, runtime::FATAL_NULL_POINTER,
+                "CALLITF: objeto sin class_ptr");
+            return;
+        }
+
+        // Resolver la interfaz (cache thread_local por name_addr; cold ->
+        // find_class leyendo el nombre de vm_mem).
+        loader::ClassInfo *iface = nullptr;
+        for (auto &e : g_itf_iface_cache) {
+            if (e.name_addr == p.iface_name_addr && e.iface != nullptr) {
+                iface = e.iface;
+                break;
+            }
+        }
+        loader::ClassRegistry &registry =
+            vm->scheduler.vm_reference.loader_public.class_registry();
+        if (__builtin_expect(iface == nullptr, 0)) {
+            std::string iname(p.iface_name_len, '\0');
+            if (p.iface_name_len > 0) {
+                vm->vm_mem.read_bytes(p.iface_name_addr, &iname[0], p.iface_name_len);
+            }
+            iface = registry.find_class(iname);
+            if (iface != nullptr) {
+                auto &slot   = g_itf_iface_cache[g_itf_iface_cache_rr & 7];
+                slot.name_addr = p.iface_name_addr;
+                slot.iface     = iface;
+                ++g_itf_iface_cache_rr;
+            }
+        }
+        if (__builtin_expect(iface == nullptr, 0)) {
+            runtime::throw_fatal(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                "CALLITF: interfaz no encontrada en el registry");
+            return;
+        }
+
+        // Resolver el metodo concreto via la itable.  Warm path: la entry ya
+        // existe y el slot esta resuelto -> indice puro, sin leer el nombre del
+        // metodo.  Cold path: rellenar por nombre (lee method_name de vm_mem).
+        loader::MethodInfo *method = nullptr;
+        loader::ItableEntry *entry = registry.get_or_build_itable(cls, iface, p.count);
+        if (entry != nullptr && p.method_index < entry->count && entry->methods) {
+            method = entry->methods[p.method_index];
+        }
+        if (__builtin_expect(method == nullptr, 0)) {
+            // Cold: leer el nombre del metodo y resolver+cachear.
+            std::string mname(p.method_name_len, '\0');
+            if (p.method_name_len > 0) {
+                vm->vm_mem.read_bytes(p.method_name_addr, &mname[0], p.method_name_len);
+            }
+            method = registry.resolve_itable_method(cls, iface, p.count,
+                                                    p.method_index,
+                                                    mname.data(), mname.size());
+        }
+        if (__builtin_expect(method == nullptr || method->code_vaddr == 0, 0)) {
+            runtime::throw_fatal(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                "CALLITF: metodo de interfaz sin implementacion");
+            return;
+        }
+
+        const uint64_t ret_addr = vm->registers.rip.raw()
+                                + static_cast<uint64_t>(instr.flags_info.size_instr);
+
+        // Dispatch identico a CALLM (push_step + advice_chain).
+        auto push_step = [&](loader::MethodInfo *m, uint64_t ret_to) {
+            const uint64_t cur_rsp = vm->registers.stack_pointer.qword();
+            auto *frame       = vm->frame_pool.acquire();
+            frame->prev       = vm->frame_stack;
+            frame->method     = m;
+            frame->return_pc  = ret_to;
+            frame->frame_base = cur_rsp;
+            frame->proceed_target = nullptr;
+            frame->around_chain      = nullptr;
+            frame->around_chain_len  = 0;
+            frame->around_chain_owns = 0;
+            vm->frame_stack   = frame;
+            vm->registers.stack_pointer.qword(cur_rsp - 8);
+        };
+
+        if (method->advice_chain == nullptr) {
+            push_step(method, ret_addr);
+            vm->registers.rip.qword(method->code_vaddr);
+            vm->decoded_ptr->flags_info.did_jump = true;
+            return;
+        }
+
+        // Slow path con advices (igual que CALLM).
+        loader::MethodInfo *befores[16];
+        loader::MethodInfo *afters [16];
+        size_t n_b = 0, n_a = 0;
+        for (loader::AdviceEntry *e = method->advice_chain; e != nullptr; e = e->next) {
             if      (e->kind == loader::ADVICE_BEFORE && n_b < 16) befores[n_b++] = e->advice_method;
             else if (e->kind == loader::ADVICE_AFTER  && n_a < 16) afters [n_a++] = e->advice_method;
         }

@@ -441,7 +441,41 @@ namespace jit {
          * del runtime en el encoder. */
         LOAD_PROC   = 80,
 
-        COUNT       = 81
+        /* Pseudo (cobertura vreg vm_mem, 2026-06-09): acceso a memoria del VM
+         * (vaddr, is_host_ptr=false).  La memoria del VM NO es contigua (TLB
+         * 3-niveles + arenas dispersas) -> no hay traduccion base+offset.  El
+         * rewrite los expande POST-regalloc al patron page-cache INLINE del
+         * selector (cmp contra la pagina cacheada + load/store directo en hit;
+         * CALL a vrt_vm_read/write_u<w> en miss).  Marcados call-position (el
+         * miss clobbea caller-saved).  La direccion de la funcion de fallback
+         * se hornea en imm64_pool y su indice viaja en un operando libre del
+         * MInstr (src2 para LOAD_VM, dst para STORE_VM). */
+        LOAD_VM     = 82,   ///< dst = vm_mem[addr] (page-cache inline + fallback).
+                            ///< dst = dst_vreg, src1 = addr_vreg,
+                            ///< src2 = imm64_idx(&vm_read_u<w>);
+                            ///< flags = (width<<1)|signed.
+        STORE_VM    = 83,   ///< vm_mem[addr] = val (page-cache inline + fallback).
+                            ///< src1 = addr_vreg, src2 = val_vreg,
+                            ///< dst = imm64_idx(&vm_write_u<w>); flags = width.
+        ALLOCA_VM   = 84,   ///< Fase 2: dst = vaddr a `size` bytes reservados en
+                            ///< el VM stack del proceso (proc->stack_pointer).
+                            ///< dst = dst_vreg, src1 = imm32(size).  El
+                            ///< prologue salva el VM-RSP y el epilogue lo
+                            ///< restaura (regalloc_rewrite).  El dst es un
+                            ///< vaddr (is_host_ptr=false) -> sus LOAD/STORE
+                            ///< van por LOAD_VM/STORE_VM (page-cache).
+
+        /* Pseudo TCO (2026-06-10): tail-call con REUSO de frame.  El rewrite
+         * lo expande POST-regalloc a: mov A0,rbx (proc -> arg0, sobrevive el
+         * teardown por ser caller-saved) + emit_epilogue (desmonta el frame
+         * actual; rsp queda apuntando a la return address del caller) + jmp al
+         * target (code+0 del callee).  El prologue del callee monta un frame
+         * fresco; su RET retorna al caller original -> profundidad de pila O(1)
+         * (igual que el bytecode tailcall 0x24).  src1 = LABEL(bloque 0) para
+         * self-tail-call; src1 = imm64_idx(addr) para tail-call cross-fn. */
+        TAILCALL    = 85,
+
+        COUNT       = 86
     };
 
     /* ===================================================================== */
@@ -515,6 +549,23 @@ namespace jit {
             return i;
         }
 
+        /** @brief TAILCALL self: reuso de frame, salto rel32 a code+0 (label
+         *  del bloque 0).  El rewrite emite epilogue + jmp label. */
+        static MInstr make_tailcall_label(uint32_t label_id) noexcept {
+            MInstr i; i.op = MOp::TAILCALL;
+            i.src1 = MOperand::make_label(label_id);
+            return i;
+        }
+
+        /** @brief TAILCALL cross-fn: reuso de frame, salto a una direccion
+         *  absoluta (en @c imm64_pool[@p imm64_idx]).  El rewrite emite
+         *  epilogue + mov scratch,addr + jmp scratch. */
+        static MInstr make_tailcall_abs(uint32_t imm64_idx) noexcept {
+            MInstr i; i.op = MOp::TAILCALL;
+            i.src1 = MOperand::make_imm64_idx(imm64_idx);
+            return i;
+        }
+
         /**
          * @brief Pseudo LOAD_PROC: carga @c ProcessVM* en @p dst (RBX).
          * @param dst            Registro destino (RBX por convencion).
@@ -548,9 +599,36 @@ namespace jit {
             i.flags = width;
             return i;
         }
+        /** @brief LOAD_VM: @p dst = vm_mem[@p addr] (memoria del VM, vaddr).
+         *  @p width = 1/2/4/8; @p sgn = sign-extend.  @p fn_idx = indice en
+         *  @c imm64_pool de la direccion de @c vrt_vm_read_u<width> (usada en
+         *  el fallback page-miss).  El rewrite lo expande al page-cache inline. */
+        static MInstr make_load_vm(MOperand dst, MOperand addr, uint8_t width,
+                                   bool sgn, uint32_t fn_idx) noexcept {
+            MInstr i; i.op = MOp::LOAD_VM; i.dst = dst; i.src1 = addr;
+            i.src2 = MOperand::make_imm64_idx(fn_idx);
+            i.flags = static_cast<uint16_t>((width << 1) | (sgn ? 1u : 0u));
+            return i;
+        }
+        /** @brief STORE_VM: vm_mem[@p addr] = @p val (memoria del VM, vaddr).
+         *  @p width = 1/2/4/8.  @p fn_idx = indice en @c imm64_pool de la
+         *  direccion de @c vrt_vm_write_u<width> (usada en el fallback). */
+        static MInstr make_store_vm(MOperand addr, MOperand val, uint8_t width,
+                                    uint32_t fn_idx) noexcept {
+            MInstr i; i.op = MOp::STORE_VM; i.src1 = addr; i.src2 = val;
+            i.dst = MOperand::make_imm64_idx(fn_idx);
+            i.flags = width;
+            return i;
+        }
         /** @brief ALLOCA: @p dst = host_ptr a @p size bytes del frame JIT. */
         static MInstr make_alloca(MOperand dst, uint32_t size) noexcept {
             MInstr i; i.op = MOp::ALLOCA; i.dst = dst;
+            i.src1 = MOperand::make_imm32(static_cast<int32_t>(size));
+            return i;
+        }
+        /** @brief ALLOCA_VM: @p dst = vaddr a @p size bytes del VM stack. */
+        static MInstr make_alloca_vm(MOperand dst, uint32_t size) noexcept {
+            MInstr i; i.op = MOp::ALLOCA_VM; i.dst = dst;
             i.src1 = MOperand::make_imm32(static_cast<int32_t>(size));
             return i;
         }

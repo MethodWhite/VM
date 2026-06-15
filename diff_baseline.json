@@ -1,0 +1,449 @@
+{
+  "vm": "cmake-build-release\\vm.exe",
+  "elapsed_s": 233.35753726959229,
+  "summary": {
+    "OK": 213,
+    "DIVERGE": 2,
+    "CRASH": 5,
+    "TIMEOUT": 0,
+    "NOCOMPILA": 10,
+    "NORUN": 0,
+    "NODET": 2,
+    "SKIP": 1
+  },
+  "categories": {
+    "OK": [
+      "00_aritmetica",
+      "01_factorial",
+      "02_hola_mundo",
+      "03_contador",
+      "04_escribe_fichero",
+      "05_struct_punto",
+      "06_struct_multi",
+      "07_punteros",
+      "08_punteros_loop",
+      "09_punteros_arith",
+      "100_reflection_full",
+      "101_raii_casos_limite",
+      "102_closure_env_gc",
+      "103_async_args_typed",
+      "104_hot_loop_bench",
+      "105_decjnz_bench",
+      "105_unique_with_vesta",
+      "105b_decjnz_simple",
+      "106_virtualalloc_unique",
+      "107_unique_lifo_move_chain",
+      "108_shared_use_count",
+      "109_unique_comprehensive",
+      "10_heap_malloc",
+      "110_unique_return_from_fn",
+      "112_borrow_mut_ok",
+      "117_borrow_param_elision",
+      "118_borrow_nll",
+      "11_arrays_nativos",
+      "120_borrow_reborrow_mut",
+      "121_borrow_shared_reborrow_of_mut",
+      "122_borrow_reborrow_chain",
+      "123_borrow_helper_mutation",
+      "124_borrow_aggregator",
+      "125_borrow_nll_realistic",
+      "126_borrow_reborrow_helper",
+      "127_borrow_state_machine",
+      "128_borrow_factory_chain",
+      "12_clases_basico",
+      "131_borrow_combined_real",
+      "132_comptime_introspect",
+      "133_comptime_introspect2",
+      "134_comptime_introspect3",
+      "135_introspect_runtime",
+      "136_ternary_comptime_const",
+      "138_metaprog_completa",
+      "139_comptime_imperativo",
+      "13_clases_modificadores",
+      "140_metaprog_avanzada",
+      "141_metaprog_nested",
+      "142_type_first_class",
+      "143_type_composable",
+      "144_method_enum_introspect",
+      "145_auto_inference",
+      "146_wait_inside_synchronized",
+      "147_macros_comptime_compile",
+      "148_macros_emit_splice",
+      "149_macros_hygenic_gensym",
+      "14_clases_visibilidad",
+      "150_macros_pattern_template",
+      "151_sugar_aliases_block",
+      "152_macros_inject_at_macro",
+      "153_macros_compose_recurse_global",
+      "154_macros_zero_runtime_overhead",
+      "155_concat_loop_optimized",
+      "156_macros_pure_memoization",
+      "157_concat_multichunk",
+      "158_macros_lowered_to_ir",
+      "159_macro_expr_capture",
+      "15_herencia_basica",
+      "162_macro_comptime_data",
+      "163_try_operator",
+      "164_enum_f64_payload",
+      "165_unique_dtor",
+      "166_z_shared_memory",
+      "167_z_gc_sweep",
+      "168_newtypes",
+      "169_newtype_advanced",
+      "16_aop_basico",
+      "170_local_to_calln_native",
+      "171_callback_qsort",
+      "172_string_array_natural",
+      "173_wndproc_win32",
+      "173b_wndproc_visible",
+      "174_async_chains_complex",
+      "175_generics_deep_nesting",
+      "176_adt_complex_payloads",
+      "177_callback_many_args",
+      "178_escape_scalar_repl",
+      "179_spec_devirt_inherit",
+      "17_ecs_basico",
+      "18_reflexion_basica",
+      "19_tco_basico",
+      "20_reflexion_field",
+      "21_interfaces_basico",
+      "22_iface_polimorfismo",
+      "23_aop_around",
+      "24_try_catch",
+      "25_try_multi_finally",
+      "26_foreach",
+      "27_generics_box",
+      "28_generics_avanzado",
+      "29_optional",
+      "30_unwrap_null",
+      "31_nonnull_bangbang",
+      "32_bangbang_decl",
+      "33_optional_result_builtin",
+      "34_optional_result_avanzado",
+      "35_synchronized_basico",
+      "35b_sync_tiny",
+      "36_synchronized_exception",
+      "36b_sync_throw_simple",
+      "37_synchronized_return",
+      "38_spawn_basico",
+      "39_spawn_pingpong",
+      "39b_spawn_recv_only",
+      "40_future_basico",
+      "41_async_basico",
+      "42_propiedades_basico",
+      "43_paralelismo_real",
+      "44_paralelismo_heavy",
+      "45_spawn_placement",
+      "46_spawn_here_observable",
+      "47_rspawn_basico",
+      "48_loadmodule_plugin",
+      "50_lambda_simple",
+      "50b_lambda_no_capture",
+      "51_lambda_captura",
+      "52_lambda_hof",
+      "53_enum_simple",
+      "54_enum_payload",
+      "56_linkedlist_hof",
+      "57_linkedlist_option",
+      "58_quicksort",
+      "60_stack_iface",
+      "61_rpn_calc",
+      "62_compose_curry",
+      "63_topfn_as_fnvalue",
+      "64_curry_returning_closures",
+      "65_io_format",
+      "66_io_colors",
+      "67_fatal_isolation",
+      "68_panic_capture",
+      "69_string_basico",
+      "70_string_ops_native",
+      "71_bit_fields",
+      "72_typedef_cstyle",
+      "73_init_lists",
+      "74_bf_init",
+      "75_string_methods",
+      "76_string_exhaustive",
+      "77_float_arith",
+      "78_f32_full",
+      "79_compound_assign",
+      "80_triple_quoted",
+      "81_math_builtins",
+      "82_host_ptr_addr_taken",
+      "83_host_ptr_indirect",
+      "84_static_fields",
+      "85_extern_winapi",
+      "86_ffi_runtime",
+      "87_collections_hashmap",
+      "88_collections_queue_deque_tree",
+      "89_string_array_ops",
+      "90_match_repro",
+      "91_str_split",
+      "92_collections_primitive",
+      "93_dispose_explicit",
+      "94_escape_detection",
+      "95_destructor_raii",
+      "95_unique_ptr_basico",
+      "96_destructor_escape_rules",
+      "96_unique_move",
+      "97_gc_writebarrier",
+      "97_shared_basico",
+      "98_arraylist_string_natural",
+      "99_dtor_recursive_fields",
+      "beep_bepp",
+      "bug3",
+      "bug3_class",
+      "bug4",
+      "check_chain",
+      "check_multi",
+      "check_return_unique",
+      "check_with_return",
+      "test_av_catch",
+      "test_av_mixed",
+      "test_fmt_spec",
+      "test_print_formats",
+      "alloc",
+      "array_sum",
+      "bitops",
+      "callvirt",
+      "callvirt_hot",
+      "cmp_fusion",
+      "fib_recursive",
+      "fp_jit",
+      "hash_lookup",
+      "int_mixed",
+      "intops_jit",
+      "jit_method",
+      "mem_class",
+      "mem_malloc_free",
+      "mem_struct",
+      "nested_loops",
+      "obj_accum",
+      "pic_real",
+      "polymorphic",
+      "quicksort",
+      "rotops_jit",
+      "string_hot",
+      "string_workout",
+      "struct_field",
+      "tight_loop"
+    ],
+    "DIVERGE": [
+      "branch_unpredict",
+      "state_machine"
+    ],
+    "CRASH": [
+      "111_borrow_shared_ok",
+      "119_borrow_reborrow",
+      "55_linkedlist_basico",
+      "59_arraylist",
+      "memcpy_loop"
+    ],
+    "TIMEOUT": [],
+    "NOCOMPILA": [
+      "113_borrow_err_mut_shared",
+      "114_borrow_err_double_mut",
+      "115_borrow_err_mut_during_shared",
+      "116_borrow_err_move_while_borrowed",
+      "129_borrow_err_helper_double_mut",
+      "130_borrow_err_return_local",
+      "137_static_assert_fail",
+      "146b_wait_outside_synchronized",
+      "161_macro_ffi_compile_time",
+      "96b_destructor_illegal_escape"
+    ],
+    "NORUN": [],
+    "NODET": [
+      "160_macro_walk_pchase",
+      "bug3_struct"
+    ],
+    "SKIP": [
+      "49_loadmodule_caller"
+    ]
+  },
+  "detail": [
+    {
+      "name": "111_borrow_shared_ok",
+      "interp": [
+        "ok",
+        "2a"
+      ],
+      "jit-vreg": [
+        "ok",
+        "2a"
+      ],
+      "jit-slots": [
+        "crash",
+        null
+      ],
+      "cat": "CRASH"
+    },
+    {
+      "name": "113_borrow_err_mut_shared",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "114_borrow_err_double_mut",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "115_borrow_err_mut_during_shared",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "116_borrow_err_move_while_borrowed",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "119_borrow_reborrow",
+      "interp": [
+        "ok",
+        "2a"
+      ],
+      "jit-vreg": [
+        "ok",
+        "2a"
+      ],
+      "jit-slots": [
+        "crash",
+        null
+      ],
+      "cat": "CRASH"
+    },
+    {
+      "name": "129_borrow_err_helper_double_mut",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "130_borrow_err_return_local",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "137_static_assert_fail",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "146b_wait_outside_synchronized",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "160_macro_walk_pchase",
+      "interp": [
+        "crash",
+        null
+      ],
+      "jit-vreg": [
+        "ok",
+        "2a"
+      ],
+      "jit-slots": [
+        "ok",
+        "2a"
+      ],
+      "cat": "NODET"
+    },
+    {
+      "name": "161_macro_ffi_compile_time",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "55_linkedlist_basico",
+      "interp": [
+        "ok",
+        "6"
+      ],
+      "jit-vreg": [
+        "ok",
+        "6"
+      ],
+      "jit-slots": [
+        "crash",
+        null
+      ],
+      "cat": "CRASH"
+    },
+    {
+      "name": "59_arraylist",
+      "interp": [
+        "ok",
+        "2a"
+      ],
+      "jit-vreg": [
+        "ok",
+        "2a"
+      ],
+      "jit-slots": [
+        "crash",
+        null
+      ],
+      "cat": "CRASH"
+    },
+    {
+      "name": "96b_destructor_illegal_escape",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "bug3_struct",
+      "interp": [
+        "ok",
+        "fffffb8"
+      ],
+      "jit-vreg": [
+        "ok",
+        "fffffe8"
+      ],
+      "jit-slots": [
+        "ok",
+        "fffffe8"
+      ],
+      "cat": "NODET"
+    },
+    {
+      "name": "branch_unpredict",
+      "interp": [
+        "ok",
+        "b8"
+      ],
+      "jit-vreg": [
+        "ok",
+        "b8"
+      ],
+      "jit-slots": [
+        "ok",
+        "68"
+      ],
+      "cat": "DIVERGE"
+    },
+    {
+      "name": "memcpy_loop",
+      "interp": [
+        "ok",
+        "d2"
+      ],
+      "jit-vreg": [
+        "ok",
+        "d2"
+      ],
+      "jit-slots": [
+        "crash",
+        null
+      ],
+      "cat": "CRASH"
+    },
+    {
+      "name": "state_machine",
+      "interp": [
+        "ok",
+        "b7d4"
+      ],
+      "jit-vreg": [
+        "ok",
+        "b7d4"
+      ],
+      "jit-slots": [
+        "ok",
+        "7"
+      ],
+      "cat": "DIVERGE"
+    }
+  ]
+}

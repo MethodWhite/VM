@@ -77,8 +77,17 @@ namespace jit {
             /* LOAD: dst = [addr].  STORE: [addr] = val (commit 7). */
             case MOp::LOAD:  r.dst = R::DEF; r.src1 = R::USE; break;
             case MOp::STORE: r.src1 = R::USE; r.src2 = R::USE; break;
+            /* LOAD_VM/STORE_VM (vm_mem, 2026-06-09): igual rol que LOAD/STORE.
+             * Los operandos imm64_idx (src2 en LOAD_VM, dst en STORE_VM) no son
+             * vregs -> el interval builder los ignora via is_vreg(). */
+            case MOp::LOAD_VM:  r.dst = R::DEF; r.src1 = R::USE; break;
+            case MOp::STORE_VM: r.src1 = R::USE; r.src2 = R::USE; break;
             /* ALLOCA: dst = host_ptr al frame (src1 = size imm, no es vreg). */
             case MOp::ALLOCA: r.dst = R::DEF; break;
+            /* ALLOCA_VM: dst = vaddr al VM stack (src1 = size imm).  Solo
+             * mueve proc->stack_pointer (mov/sub/mov), NO hace CALL -> NO es
+             * call-position. */
+            case MOp::ALLOCA_VM: r.dst = R::DEF; break;
 
             /* FP scalar (XMM).  En v1 los XMM son fisicos hardcodeados (no
              * vregs), pero clasificamos por correccion para la fase FP. */
@@ -271,9 +280,12 @@ namespace jit {
             uint32_t gi = first_gi[b];
             for (const MInstr &in : mf.blocks[b].instrs) {
                 /* DIVMOD_V clobbea RAX/RDX (idiv) -> tratarlo como call-position
-                 * para que los vregs vivos a traves vayan a callee-saved. */
+                 * para que los vregs vivos a traves vayan a callee-saved.
+                 * LOAD_VM/STORE_VM: su page-miss hace CALL a vrt_vm_read/write
+                 * -> clobbea caller-saved -> tambien call-position. */
                 if (in.op == MOp::CALL || in.op == MOp::CALL_ABS
-                 || in.op == MOp::DIVMOD_V)
+                 || in.op == MOp::DIVMOD_V
+                 || in.op == MOp::LOAD_VM || in.op == MOp::STORE_VM)
                     out.call_positions.push_back(2u * gi);
                 ++gi;
             }

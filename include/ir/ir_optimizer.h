@@ -387,6 +387,41 @@ bool ir_pass_speculative_devirt(IrFunction &fn,
                                 const std::vector<SpecDevirtSite> &sites);
 
 /**
+ * @brief Devirtualizacion especulativa ESTATICA via guard-chain (TAREA 2, C2).
+ *
+ * A diferencia de @c ir_pass_speculative_devirt (runtime, guiado por IC, un
+ * solo candidato con @c class_ptr CONST), este pase es COMPILE-TIME y maneja
+ * varios candidatos (<=K) tomados del closed-world del modulo: para un dispatch
+ * de interfaz/virtual con pocos implementors inlineables, reescribe el call en
+ * una CADENA de guardas por tipo + fallback al dispatch original:
+ *
+ *     cls = load[obj]                          ; class_ptr (offset 0)
+ *     if (cls == cls_value_1) r1 = call C1__m(obj, args...)   ; fast 1
+ *     elif (cls == cls_value_2) r2 = call C2__m(obj, args...) ; fast 2
+ *     ... (hasta K) ...
+ *     else                    rN = <CALLITF/CALLVIRT/CALLM original>  ; fallback
+ *     r = phi(r1, r2, ..., rN)
+ *
+ * Como el @c ClassInfo* de cada candidato NO es constante en compile-time (se
+ * crea en @c __module_init), el @c cls_value de cada candidato es un SSA value
+ * que el LOWERING resuelve en el entry (slot-cache lazy via @c findclass) y
+ * registra en @c fn.spec_devirt_sites (keyed por el @c dst del call).  Este
+ * pase SOLO hace la cirugia CFG con esos datos ya en el IR; el
+ * @c ir_pass_inline posterior inlinea los @c CALL directos del fast path.
+ *
+ * CORRECTO POR CONSTRUCCION: si el tipo del objeto no coincide con ningun
+ * candidato (incl. tipos de @c loadmodule), cae al dispatch original ->
+ * mismo resultado.  No necesita deopt.
+ *
+ * v1: solo call sites con @c dst != IR_NO_VALUE (metodos que devuelven valor,
+ * no-SRET).  Beneficia tanto al interp como al JIT (ambos bajan este IR).
+ *
+ * @param fn Funcion a transformar (lee @c fn.spec_devirt_sites).
+ * @return true si transformo al menos un site.
+ */
+bool ir_pass_spec_devirt(IrFunction &fn);
+
+/**
  * @brief Pase de propagacion de copias.
  *
  * Para cada %b = mov.T %a, sustituye todos los usos de %b por %a y

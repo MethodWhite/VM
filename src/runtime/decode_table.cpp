@@ -3194,11 +3194,11 @@ namespace runtime {
             exec_instr_sharedstat, decode_instr_two_op_reg
         },
 
-        /* 0xAE */{
-            //
-            "", Assembly::Bytecode::AddressingMode::COUNT,
-            Assembly::Bytecode::InstrSizeMode::FIXED_1,
-            nullptr, nullptr
+        /* 0xAE  callitf r_obj, r_params: dispatch de interfaz via itable */
+        {
+            "callitf", Assembly::Bytecode::AddressingMode::REG,
+            Assembly::Bytecode::InstrSizeMode::FIXED_4,
+            exec_instr_callitf, decode_instr_two_op_reg
         },
 
         /* 0xAF */{

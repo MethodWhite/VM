@@ -1,0 +1,29 @@
+import VestaCore.ModuleSystem;
+
+module VestaCore.FileSystem;
+
+type FileHandle = {
+    id: string,
+    mode: string
+};
+
+interface IFileSystem {
+    read(path: string): string;
+    write(path: string, content: string): void;
+    delete(path: string): void;
+    exists(path: string): bool;
+    open(path: string, mode: string): FileHandle;
+    close(handle: FileHandle): void;
+}
+
+export function createFileSystem(): IFileSystem {
+    // Abstract filesystem primitive
+    return {
+        read: (path) => { return "content of " + path; },
+        write: (path, content) => { print("Writing to " + path); },
+        delete: (path) => { print("Deleting " + path); },
+        exists: (path) => { return true; },
+        open: (path, mode) => { return { id: path, mode: mode }; },
+        close: (handle) => { print("Closing handle " + handle.id); }
+    };
+}

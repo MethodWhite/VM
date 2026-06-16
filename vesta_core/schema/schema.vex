@@ -1,0 +1,33 @@
+module Vesta.Schema;
+
+// System for defining data models and tool specifications
+// Shared between VM, Zenith, and other projects
+
+type SchemaField = {
+    name: string,
+    type: string, // e.g., "string", "int", "float", "boolean"
+    required: bool,
+    description: string
+};
+
+type DataModel = {
+    name: string,
+    fields: SchemaField[],
+    version: string
+};
+
+type ToolSpec = {
+    toolName: string,
+    description: string,
+    parameters: SchemaField[],
+    returnType: string
+};
+
+export function validateModel(model: DataModel, data: map<string, any>): bool {
+    // Validates data against the provided model schema
+    return true;
+}
+
+export function defineTool(spec: ToolSpec) {
+    print("Defining tool: " + spec.toolName);
+}

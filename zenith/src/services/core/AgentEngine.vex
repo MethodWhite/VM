@@ -1,0 +1,51 @@
+// AgentEngine.vex - Core AI Reasoning Loop
+import Vesta.Schema;
+import VestaCore.Networking;
+
+type EngineStatus = enum {
+    IDLE,
+    PLANNING,
+    EXECUTING,
+    REFLECTING,
+    COMPLETE
+};
+
+struct AgentEngine {
+    state: AgentState,
+    status: EngineStatus,
+    provider: HttpClient
+};
+
+export function run_cycle(engine: AgentEngine, input: string): Message {
+    engine.status = EngineStatus.PLANNING;
+    let plan = generate_plan(input);
+    engine.state.plan = plan;
+
+    for (let step in plan) {
+        engine.status = EngineStatus.EXECUTING;
+        let result = execute_step(step, engine);
+        engine.state.history.push(create_message(Role.ASSISTANT, result));
+        
+        engine.status = EngineStatus.REFLECTING;
+        if (reflect_result(result)) {
+            engine.status = EngineStatus.COMPLETE;
+            break;
+        }
+    }
+
+    return engine.state.history.last();
+}
+
+fn generate_plan(input: string): list<string> {
+    let response = VestaCore.Networking.send(HttpRequest.post("api/plan", input));
+    return JSON.parse_list(response.body);
+}
+
+fn execute_step(step: string, engine: AgentEngine): string {
+    let response = VestaCore.Networking.send(HttpRequest.post("api/execute", step));
+    return response.body;
+}
+
+fn reflect_result(result: string): bool {
+    return result.contains("TASK_COMPLETE");
+}

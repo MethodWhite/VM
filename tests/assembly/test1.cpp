@@ -35,7 +35,7 @@ int main() {
     }
 
     const char* assembly = "mov eax, 0x1234\nadd eax, 0x1";
-    err = ks_asm(ks, assembly, 0, &encode, &size, &count);
+    err = static_cast<ks_err>(ks_asm(ks, assembly, 0, &encode, &size, &count));
     if (err != KS_ERR_OK) {
         std::cerr << "Keystone assembly error: " << ks_strerror(err) << "\n";
         return -1;

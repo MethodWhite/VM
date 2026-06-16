@@ -1,0 +1,38 @@
+// Vesta.Schema - Native Data Models for Zenith
+module Vesta.Schema;
+
+type Role = enum {
+    USER,
+    ASSISTANT,
+    SYSTEM,
+    TOOL
+};
+
+type Message = struct {
+    role: Role,
+    content: string,
+    timestamp: int64,
+    metadata: map<string, string>
+};
+
+type ToolSpec = struct {
+    name: string,
+    description: string,
+    parameters: string
+};
+
+type AgentState = struct {
+    current_step: int,
+    history: list<Message>,
+    plan: list<string>,
+    context_window: int
+};
+
+export function create_message(role: Role, content: string): Message {
+    return {
+        role: role,
+        content: content,
+        timestamp: Native.now(),
+        metadata: {}
+    };
+}

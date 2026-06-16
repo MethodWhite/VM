@@ -1,0 +1,23 @@
+// Orchestrator.vex - Agent Role Management
+import Vesta.Schema;
+
+type AgentRole = enum {
+    COORDINATOR,
+    RESEARCHER,
+    CODER,
+    REVIEWER
+};
+
+struct Orchestrator {
+    active_agents: map<AgentRole, AgentEngine>,
+    current_lead: AgentRole
+};
+
+export function delegate_task(orch: Orchestrator, task: string, role: AgentRole): Message {
+    let agent = orch.active_agents[role];
+    return run_cycle(agent, task);
+}
+
+export function switch_lead(orch: Orchestrator, new_role: AgentRole): void {
+    orch.current_lead = new_role;
+}

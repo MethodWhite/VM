@@ -1,0 +1,22 @@
+module VestaCore.ModuleSystem;
+
+// Standardized module definition for Vex ecosystem
+// All libraries must export a 'manifest' and implement 'init'
+
+type ModuleManifest = {
+    name: string,
+    version: string,
+    dependencies: string[],
+    description: string
+};
+
+interface IModule {
+    manifest: ModuleManifest,
+    init(): void,
+    shutdown(): void
+}
+
+export function registerModule(mod: IModule) {
+    // Implementation for module registration in Vex VM
+    print("Registering module: " + mod.manifest.name);
+}

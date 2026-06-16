@@ -1856,8 +1856,8 @@ namespace Assembly::Bytecode::Linker {
         }
         result->output.reserve(4096); // evita realocaciones
         { LinkerPhaseTimer __t("resolve_symbols");        resolve_symbols(); }
-        { LinkerPhaseTimer __t("apply_relocations");      apply_relocations(); }
         { LinkerPhaseTimer __t("optimize_modules");       optimize_modules(); }
+        { LinkerPhaseTimer __t("apply_relocations");      apply_relocations(); }
         { LinkerPhaseTimer __t("merge_address_spaces");   merge_address_spaces(); }
         { LinkerPhaseTimer __t("merge_sections");         merge_sections(); }
 

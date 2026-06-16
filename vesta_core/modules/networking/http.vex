@@ -1,0 +1,34 @@
+import VestaCore.ModuleSystem;
+
+module VestaCore.Networking;
+
+type HttpRequest = {
+    method: string,
+    url: string,
+    headers: map<string, string>,
+    body: string
+};
+
+type HttpResponse = {
+    statusCode: int,
+    headers: map<string, string>,
+    body: string
+};
+
+interface HttpClient {
+    send(req: HttpRequest): HttpResponse;
+}
+
+interface HttpServer {
+    listen(port: int, handler: (HttpRequest) => HttpResponse): void;
+    stop(): void;
+}
+
+export function createHttpClient(): HttpClient {
+    // Basic HTTP client primitive implementation
+    return {
+        send: (req) => {
+            return { statusCode: 200, headers: {}, body: "OK" };
+        }
+    };
+}

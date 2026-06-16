@@ -19492,7 +19492,7 @@ namespace vex {
                             fn_->values[vc].is_host_ptr = true;
                             { ir::IrInstr fc{}; fc.op = ir::IrOp::FINDCLASS;
                               fc.type = ir::IrType::PTR; fc.dst = vc; fc.operands = {vp};
-                              fc.is_call_site = true; fc.source_line = ln;
+                              fc.set_is_call_site(true); fc.source_line = ln;
                               setup.push_back(std::move(fc)); }
                             return vc;
                         };

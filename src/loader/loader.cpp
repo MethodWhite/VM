@@ -705,27 +705,34 @@ namespace loader {
 
         // copiamos cada seccion del ejecutable a la memoria virtual
         // de la VM
+        uint64_t first_sec_vm = 0, first_sec_file = 0;
+        bool has_first_sec = false;
         for (auto *sec: exe->sections) {
+            if (!sec) continue;
             uint64_t vm_addr = sec->memory.address_init;
             uint64_t offset  = sec->file_offset;
-
-            // no se debe usar raw_bytecode_file ya que no contiene simbolos
-            // resueltos; usar exe->bytecode que contiene los mismos datos
-            // pero con las instrucciones parcheadas.
-            //
-            // sec->file_offset YA es absoluto al inicio del archivo (lo
-            // computa parser_table_sections como
-            // space->file_offset + delta_va, y space->file_offset =
-            // address_spaces[i].offset_bytecode que el linker patchea con
-            // base_bytecode_offset absoluto).  Por tanto NO sumar
-            // exe->offset_real_bytecode (tambien absoluto), o se produce
-            // double-counting + lectura OOB del vector exe->bytecode.
-            // Bug introducido en a0e3098; logica correcta original en
-            // commit dff2bc7 (`bytecode.data() + offset`).
+            if (!has_first_sec) {
+                first_sec_vm = vm_addr;
+                first_sec_file = offset;
+                has_first_sec = true;
+            }
             if (offset >= exe->bytecode.size()) continue;
             const uint8_t *src    = exe->bytecode.data() + offset;
-            const size_t   avail  = exe->bytecode.size() - offset;
-            proccess->vm_mem.vm_to_host_memcpy(vm_addr, src, avail);
+            const size_t   sec_sz = (sec->size_real > 0)
+                ? sec->size_real : (exe->bytecode.size() - offset);
+            proccess->vm_mem.vm_to_host_memcpy(vm_addr, src, sec_sz);
+        }
+        // Aplicar relocalizaciones (VELB v3: linker NO parchea el bytecode,
+        // las deja en tabla separada para que el loader las aplique).
+        for (const auto &reloc : exe->velb_relocations) {
+            if (reloc.type != static_cast<uint8_t>(RelocTypeVELB::ABSOLUTE64))
+                continue;
+            /* bytecode_offset es relativo a offset_real_bytecode del .velb */
+            const uint64_t file_off = exe->offset_real_bytecode + reloc.bytecode_offset;
+            if (!has_first_sec || file_off < first_sec_file) continue;
+            const uint64_t vm_off = first_sec_vm + (file_off - first_sec_file);
+            const uint64_t val = reloc.target_value;
+            proccess->vm_mem.write_u64(vm_off, val);
         }
         // poner ejecutable a la pila de ejecutuables
         executables.push_back(std::move(exe));

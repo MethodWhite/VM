@@ -332,6 +332,7 @@ namespace jit {
         uint8_t *c2_code = vreg_compile_osr(
             loop_body, cache_, resolve_user_fn, ent,
             std::function<uint64_t(const std::string &)>{},
+            std::function<uint64_t(const std::string &)>{},
             0,  /* header_block: el primer bloque es el loop header extraido */
             &osr_entry,
             &req.captured_vids);

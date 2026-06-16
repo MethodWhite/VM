@@ -648,6 +648,7 @@ namespace vex {
          * @brief Busca @p name desde el scope interno hacia el global.
          * @return Puntero al Symbol o nullptr si no existe.
          */
+    public:
         const Symbol *lookup(const std::string &name) const;
 
         /**

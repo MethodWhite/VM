@@ -709,7 +709,7 @@ namespace jit {
                         if (size == 0 || size > 65536) {  // sanity (frame chico)
                             vreg_dbg(fn.name.c_str(), "alloca-size"); return false;
                         }
-                        if (!in.host_alloca) {
+                        if (!in.host_alloca()) {
                             O.push_back(MInstr::make_alloca_vm(vr(in.dst),
                                 static_cast<uint32_t>(size)));
                             break;

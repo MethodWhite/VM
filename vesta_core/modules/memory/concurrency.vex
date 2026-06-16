@@ -1,0 +1,23 @@
+import VestaCore.ModuleSystem;
+
+module VestaCore.Memory;
+
+type Mutex = {
+    locked: bool
+};
+
+interface IMemoryManager {
+    allocate(size: int): void*,
+    free(ptr: void*): void,
+    lock(mutex: Mutex): void,
+    unlock(mutex: Mutex): void
+}
+
+export function createMemoryManager(): IMemoryManager {
+    return {
+        allocate: (size) => { return null; },
+        free: (ptr) => { },
+        lock: (mutex) => { mutex.locked = true; },
+        unlock: (mutex) => { mutex.locked = false; }
+    };
+}

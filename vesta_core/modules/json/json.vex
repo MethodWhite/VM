@@ -1,0 +1,30 @@
+import VestaCore.ModuleSystem;
+
+module VestaCore.JSON;
+
+type JsonValue = 
+    | { type: "string", value: string }
+    | { type: "number", value: float }
+    | { type: "boolean", value: bool }
+    | { type: "null", value: null }
+    | { type: "array", value: JsonValue[] }
+    | { type: "object", value: map<string, JsonValue> };
+
+interface IJsonParser {
+    parse(input: string): JsonValue;
+}
+
+interface IJsonSerializer {
+    serialize(value: JsonValue): string;
+}
+
+export function createJsonHandler(): { parse: (string) => JsonValue, serialize: (JsonValue) => string } {
+    return {
+        parse: (input) => {
+            return Native.call("json_parse", input);
+        },
+        serialize: (value) => {
+            return Native.call("json_serialize", value);
+        }
+    };
+}

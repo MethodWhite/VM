@@ -3641,10 +3641,16 @@ namespace jit {
                                 /* jne skip_e */
                                 mf.blocks.back().instrs.push_back(
                                     MInstr::make_jcc(MCond::NE, skip_e_label));
-                                /* mov rax, [r10 + code_off] */
+                                /* mov rax, [r10 + code_off]; jit_code */
                                 mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
                                     MOperand::make_reg(MReg::RAX),
                                     MOperand::make_mem(MReg::R10, code_off)));
+                                /* test rax, rax; jz ic_miss (jit_code null) */
+                                mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::TEST,
+                                    MOperand::make_reg(MReg::RAX),
+                                    MOperand::make_reg(MReg::RAX)));
+                                mf.blocks.back().instrs.push_back(
+                                    MInstr::make_jcc(MCond::E, ic_miss_label));
                                 /* jmp hit_call */
                                 mf.blocks.back().instrs.push_back(MInstr::make_jmp(hit_call_label));
                                 /* skip_e: */

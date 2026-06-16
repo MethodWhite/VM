@@ -957,11 +957,16 @@ namespace jit {
                     /* Fase 2: class registry de 1 arg (proc, params_vaddr).
                      * Mismo marshalling que gc_handle/newobj.  FINDCLASS/
                      * FINDMETHOD/FINDFIELD/DEFCLASS dejan el resultado en dst. */
-                    case ir::IrOp::FINDCLASS:
-                    case ir::IrOp::FINDMETHOD:
-                    case ir::IrOp::FINDFIELD:
-                    case ir::IrOp::DEFCLASS:
-                    /* Cluster strings de 1 arg (proc, handle):
+                     case ir::IrOp::FINDCLASS:
+                     case ir::IrOp::FINDMETHOD:
+                     case ir::IrOp::FINDFIELD:
+                     /* DEFCLASS cae a slot selector (el vreg genera codigo
+                      * incorrecto para runtime calls de clase). */
+                     case ir::IrOp::DEFCLASS: {
+                         vreg_dbg(fn.name.c_str(), "defclass-unsupported");
+                         return false;
+                     }
+                     /* Cluster strings de 1 arg (proc, handle):
                      *   STRLEN(handle)      -> i64 code-points
                      *   STRGETBYTES(handle) -> i64 byte_len
                      *   STRRAW(handle)      -> host_ptr a data[] (is_host_ptr;
@@ -1234,33 +1239,11 @@ namespace jit {
                      * dispatch CALLVIRT inline).  El CALL_ABS reusa R10 para la
                      * direccion, pero R10/R11 ya estan muertos en el call (sus
                      * valores se copiaron a los arg-regs). */
-                    case ir::IrOp::DEFFIELD:
-                    case ir::IrOp::DEFMETHOD: {
-                        flush_pending();
-                        const uint64_t addr = (in.op == ir::IrOp::DEFFIELD)
-                                                  ? ent.deffield : ent.defmethod;
-                        if (!vm || addr == 0) {
-                            vreg_dbg(fn.name.c_str(), "deffield/defmethod"); return false;
-                        }
-                        if (in.operands.size() != 2) return false;
-#if defined(_WIN32)
-                        const MReg da0 = MReg::RCX, da1 = MReg::RDX, da2 = MReg::R8;
-#else
-                        const MReg da0 = MReg::RDI, da1 = MReg::RSI, da2 = MReg::RDX;
-#endif
-                        O.push_back(MInstr::make_unary(MOp::MOV,
-                            MOperand::make_reg(MReg::R10, 8), vr(in.operands[0]))); // cls
-                        O.push_back(MInstr::make_unary(MOp::MOV,
-                            MOperand::make_reg(MReg::R11, 8), vr(in.operands[1]))); // params
-                        O.push_back(MInstr::make_unary(MOp::MOV,
-                            MOperand::make_reg(da1, 8), MOperand::make_reg(MReg::R10, 8)));
-                        O.push_back(MInstr::make_unary(MOp::MOV,
-                            MOperand::make_reg(da2, 8), MOperand::make_reg(MReg::R11, 8)));
-                        O.push_back(MInstr::make_unary(MOp::MOV,
-                            MOperand::make_reg(da0, 8), MOperand::make_reg(MReg::RBX, 8)));
-                        O.push_back(MInstr::make_call_abs(out.intern_imm64(addr)));
-                        break;
-                    }
+                      case ir::IrOp::DEFFIELD:
+                      case ir::IrOp::DEFMETHOD: {
+                          vreg_dbg(fn.name.c_str(), "deffield/defmethod-unsupported");
+                          return false;
+                     }
 
                     case ir::IrOp::ADDADVICE: {
                         flush_pending();
@@ -1292,27 +1275,12 @@ namespace jit {
                         break;
                     }
 
-                    case ir::IrOp::SETMETHDBG: {
-                        flush_pending();
-                        if (!vm || ent.setmethdbg == 0) {
-                            vreg_dbg(fn.name.c_str(), "setmethdbg"); return false;
-                        }
-                        if (in.operands.size() != 2) return false;
-#if defined(_WIN32)
-                        const MReg sd0 = MReg::RCX, sd1 = MReg::RDX;
-#else
-                        const MReg sd0 = MReg::RDI, sd1 = MReg::RSI;
-#endif
-                        // operands[1]=params (operands[0]=method ignorado).
-                        O.push_back(MInstr::make_unary(MOp::MOV,
-                            MOperand::make_reg(sd1, 8), vr(in.operands[1])));
-                        O.push_back(MInstr::make_unary(MOp::MOV,
-                            MOperand::make_reg(sd0, 8), MOperand::make_reg(MReg::RBX, 8)));
-                        O.push_back(MInstr::make_call_abs(out.intern_imm64(ent.setmethdbg)));
-                        break;
-                    }
+                     case ir::IrOp::SETMETHDBG: {
+                         vreg_dbg(fn.name.c_str(), "setmethdbg-unsupported");
+                         return false;
+                     }
 
-                    /* RAW_FREE(ptr) -> void.  free(ptr) del runtime.
+                     /* RAW_FREE(ptr) -> void.  free(ptr) del runtime.
                      *  - ptr de ALLOCA host-stack  -> NO-OP (lo libera el
                      *    epilogue; vrt_raw_free sobre un host-stack ptr crashea).
                      *    Es el caso mas inline posible (cero runtime).

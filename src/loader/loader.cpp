@@ -759,6 +759,13 @@ namespace loader {
         if (jit::g_jit_threshold != UINT32_MAX && !executables.empty()
          && !sandbox_active) {
             auto &last_exe = executables.back();
+            /* VELB v3 sin seccion IR: desactivar JIT (no hay IR para compilar).
+             * main y cualquier callvm se ejecutan en el interprete. */
+            if (last_exe->header.offset_ir_section == 0
+             || last_exe->header.size_ir_section == 0) {
+                jit::set_jit_threshold(UINT32_MAX);
+                goto done_jit_check;
+            }
             /* AOP fix 2026-05-16: si el programa tiene CUALQUIER metodo con
              * advice_chain != null (i.e. usa @Before/@After/@Around), no
              * eager-compile main.  El JIT-eated main hace CALLVIRT inline
@@ -931,7 +938,7 @@ namespace loader {
             }
         }
 
-        //vm->vm_mem[0x10] = 1;
+        done_jit_check:;
         return proccess;
     }
 

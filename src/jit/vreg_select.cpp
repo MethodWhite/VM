@@ -1374,11 +1374,47 @@ namespace jit {
                             }
                             addr = resolve_call(in.func_name);
                             if (addr == 0) {
-                                vreg_dbg(fn.name.c_str(), "call-unresolved");
-                                return false;
+                                /* Fallback: compilar como CALL a vrt_call_bc_function
+                                 * (trampoline JIT->interp).  El bytecode de la callee
+                                 * se ejecuta en el mini-interprete sincronico.
+                                 * Buscar el bytecode entry en symbol_table. */
+                                bool is_bc_tramp = false;
+                                uint64_t bc_va = 0;
+                                if (resolve_symbol && ent.call_bc_function != 0) {
+                                    const std::string sym = "code." + in.func_name;
+                                    bc_va = resolve_symbol(sym);
+                                    if (bc_va != 0) {
+                                        addr = ent.call_bc_function;
+                                        is_bc_tramp = true;
+                                        vreg_dbg(fn.name.c_str(), "call-bc-trampoline");
+                                    }
+                                }
+                                if (!is_bc_tramp) {
+                                    vreg_dbg(fn.name.c_str(), "call-unresolved");
+                                    return false;
+                                }
+                                /* Para bc-trampoline: args ya en proc->regs[1..N],
+                                 * emitir R15 = nargs + RSI = bc_va + CALL. */
+                                /* 1a. R15 = nargs */
+                                O.push_back(MInstr::make_unary(MOp::MOV,
+                                    vm_reg_mem(static_cast<int>(15)),
+                                    MOperand::make_imm32(
+                                        static_cast<int32_t>(in.operands.size()))));
+                                /* 1b. RSI = bc_entry_va (segundo arg de vrt_call_bc_function) */
+#if defined(_WIN32)
+                                const MReg bc_arg1 = MReg::RDX;
+#else
+                                const MReg bc_arg1 = MReg::RSI;
+#endif
+                                O.push_back(MInstr::make_unary(MOp::MOV,
+                                    MOperand::make_reg(bc_arg1, 8),
+                                    MOperand::make_imm64_idx(out.intern_imm64(bc_va))));
                             }
                         }
-                        /* 1. Stores de args a proc->registers.regs[i+1]. */
+                        /* 1. Stores de args a proc->registers.regs[i+1].
+                         *    Para bc-trampoline los args VM ya van a
+                         *    proc->registers, y vrt_call_bc_function los lee
+                         *    de ahi.  Para CALL normal los escribe el JIT. */
                         for (size_t i = 0; i < in.operands.size(); ++i)
                             O.push_back(MInstr::make_unary(MOp::MOV,
                                 vm_reg_mem(static_cast<int>(i) + 1),
@@ -1398,7 +1434,7 @@ namespace jit {
                             O.push_back(MInstr::make_call_label(blbl[0]));
                         else
                             O.push_back(MInstr::make_call_abs(out.intern_imm64(addr)));
-                        /* 4. Resultado desde regs[0]. */
+                        /* 4. Resultado desde regs[0] o RAX. */
                         if (in.dst != ir::IR_NO_VALUE)
                             O.push_back(MInstr::make_unary(MOp::MOV, vr(in.dst),
                                 vm_reg_mem(0)));

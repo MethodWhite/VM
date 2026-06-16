@@ -1427,11 +1427,15 @@ namespace Assembly::Bytecode::Linker {
     void Linker::optimize_modules() {
         if (!options.optimize_bytecode)
             return;
+        return; // <<< DESHABILITADO: corrompe bytecode (mueve 0x10→0x00)
 
         for (auto &mod: modules) {
             size_t before = mod.bytecode.size();
             auto &bc = mod.bytecode;
-
+            if (bc.size() > 0x0B) {
+                fprintf(stderr, "OPT-BEFORE: bc[0x0B]=0x%02x bc[0x0D]=0x%02x\n", bc[0x0B], bc[0x0D]);
+            }
+            
             // 1. Eliminacion de NOPs redundantes (opcode 0x90).
             //    Barrido simple: elimina bytes 0x90 consecutivos.
             bc.erase(std::remove(bc.begin(), bc.end(), static_cast<uint8_t>(0x90)),
@@ -1497,6 +1501,9 @@ namespace Assembly::Bytecode::Linker {
             }
 
             size_t after = bc.size();
+            if (bc.size() > 0x0B) {
+                fprintf(stderr, "OPT-AFTER: bc[0x0B]=0x%02x\n", bc[0x0B]);
+            }
             report.optimizations_applied += (before - after);
         }
     }

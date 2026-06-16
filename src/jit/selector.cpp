@@ -3519,9 +3519,43 @@ namespace jit {
                      * (necesita un trampoline jit_to_interp completo, Phase D.3-E).
                      */
                     case IrOp::CALLVIRT: {
-                        /* CALLVIRT deshabilitado en JIT temporalmente */
-                        warn_unsupported(ins.op, ins.source_line, "CALLVIRT JIT deshab");
-                        unsupported = true;
+                        /* Call vrt_callvirt runtime directamente (sin inline dispatch) */
+                        if (opts_.runtime == nullptr || opts_.runtime->callvirt == nullptr) {
+                            warn_unsupported(ins.op, ins.source_line, "runtime->callvirt null");
+                            unsupported = true; break;
+                        }
+                        {
+                            const uint32_t _vtbl_idx = static_cast<uint32_t>(ins.imm);
+                            load_op_rematerializable(mf, ir_fn, ins.operands[0], SCRATCH_A);
+#if defined(_WIN32)
+                            const MReg _a0 = MReg::RCX, _a1 = MReg::RDX, _a2 = MReg::R8;
+#else
+                            const MReg _a0 = MReg::RDI, _a1 = MReg::RSI, _a2 = MReg::RDX;
+#endif
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(_a0), MOperand::make_reg(MReg::RBX)));
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(_a1), MOperand::make_reg(SCRATCH_A)));
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(_a2),
+                                MOperand::make_imm32(static_cast<int32_t>(_vtbl_idx))));
+                            uint64_t _fn = reinterpret_cast<uint64_t>(opts_.runtime->callvirt);
+                            uint32_t _idx = mf.intern_imm64(_fn);
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(MReg::RAX), MOperand::make_imm64_idx(_idx)));
+                            {
+                                MInstr _c; _c.op = MOp::CALL;
+                                _c.src1 = MOperand::make_reg(MReg::RAX);
+                                emit_stackmap_for_safepoint(_c);
+                                mf.blocks.back().instrs.push_back(_c);
+                            }
+                            if (ins.dst != ir::IR_NO_VALUE) {
+                                mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                    MOperand::make_reg(SCRATCH_A),
+                                    MOperand::make_mem(MReg::RBX, VESTA_PROC_REGISTERS_OFFSET)));
+                                store_op(mf, ins.dst, SCRATCH_A);
+                            }
+                        }
                         break;
                     }
 
@@ -3671,9 +3705,42 @@ namespace jit {
                      * inline del scan de itables (F3b) eliminara este CALL en el hot
                      * path. */
                     case IrOp::CALLITF: {
-                        /* CALLITF deshabilitado en JIT temporalmente */
-                        warn_unsupported(ins.op, ins.source_line, "CALLITF JIT deshab");
-                        unsupported = true;
+                        /* Call vrt_callitf runtime directamente (sin inline itable scan) */
+                        if (opts_.runtime == nullptr || opts_.runtime->callitf == nullptr) {
+                            warn_unsupported(ins.op, ins.source_line, "runtime->callitf null");
+                            unsupported = true; break;
+                        }
+                        {
+                            load_op_rematerializable(mf, ir_fn, ins.operands[0], MReg::R10); /* obj */
+                            load_op_rematerializable(mf, ir_fn, ins.operands[1], MReg::R11); /* params */
+#if defined(_WIN32)
+                            const MReg _a0 = MReg::RCX, _a1 = MReg::RDX, _a2 = MReg::R8;
+#else
+                            const MReg _a0 = MReg::RDI, _a1 = MReg::RSI, _a2 = MReg::RDX;
+#endif
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(_a1), MOperand::make_reg(MReg::R10)));
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(_a2), MOperand::make_reg(MReg::R11)));
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(_a0), MOperand::make_reg(MReg::RBX)));
+                            uint64_t _fn = reinterpret_cast<uint64_t>(opts_.runtime->callitf);
+                            uint32_t _idx = mf.intern_imm64(_fn);
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(MReg::RAX), MOperand::make_imm64_idx(_idx)));
+                            {
+                                MInstr _c; _c.op = MOp::CALL;
+                                _c.src1 = MOperand::make_reg(MReg::RAX);
+                                emit_stackmap_for_safepoint(_c);
+                                mf.blocks.back().instrs.push_back(_c);
+                            }
+                            if (ins.dst != ir::IR_NO_VALUE) {
+                                mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                    MOperand::make_reg(SCRATCH_A),
+                                    MOperand::make_mem(MReg::RBX, VESTA_PROC_REGISTERS_OFFSET)));
+                                store_op(mf, ins.dst, SCRATCH_A);
+                            }
+                        }
                         break;
                     }
 

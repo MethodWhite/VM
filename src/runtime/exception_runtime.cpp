@@ -637,6 +637,10 @@ namespace runtime {
         (void)ctx;
         ProcessVM *proc = t_executing_proc;
         if (proc == nullptr || !proc->av_recovery_active) {
+            std::fprintf(stderr, "[AV] SIG=%d proc=%p recovery=%d addr=0x%lx -- JIT crash\n",
+                sig, (void*)proc, proc ? (int)proc->av_recovery_active : -1,
+                (unsigned long)(info ? (uint64_t)(uintptr_t)info->si_addr : 0));
+            std::fflush(stderr);
             std::signal(sig, SIG_DFL);
             std::raise(sig);
             return;

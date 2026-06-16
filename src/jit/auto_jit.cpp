@@ -551,8 +551,8 @@ namespace jit {
          * entradas x 16 bytes = 64 bytes, cache-line aligned, zero-init.
          * @c get_ic_slot reusa el slot del call site (clave != 0) o aloca uno
          * fresco (clave 0). */
-        mc_opts.reserve_ic_slot = [](uint64_t key) -> uint64_t {
-            return get_ic_slot(key);
+        mc_opts.reserve_ic_slot = [](uint64_t) -> uint64_t {
+            return 0;  // <<< IC slots deshabilitados: crash en PIC inline
         };
         /* C2 tier-up (opt-in): instrumentar el prologo con el contador
          * on-entry cuando C2 esta activo.  El Selector solo lo emite si la

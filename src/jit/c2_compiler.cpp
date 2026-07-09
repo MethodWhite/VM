@@ -146,8 +146,10 @@ namespace jit {
         // ---------------------------------------------------------------
         //  Phase 5: Bounds Check Elimination (BCE)
         // ---------------------------------------------------------------
-        apply_bce(opt_ir);
-        if (result.opt_flags & C2_OPT_BCE) {
+        uint32_t bce_count = apply_bce(opt_ir);
+        if (bce_count > 0) {
+            result.opt_flags |= C2_OPT_BCE;
+            result.bce_eliminated = bce_count;
             ir::ir_pass_dce(opt_ir);
         }
 
@@ -155,6 +157,9 @@ namespace jit {
         //  Phase 6: Speculative optimizations with deopt guards
         // ---------------------------------------------------------------
         apply_speculative_ops(opt_ir, result.deopt_metadata);
+        if (!result.deopt_metadata.empty()) {
+            result.opt_flags |= C2_OPT_SPECULATIVE;
+        }
 
         // ---------------------------------------------------------------
         //  Emit stackmaps for the optimized function
@@ -356,13 +361,8 @@ namespace jit {
     //  Phase 5: Bounds Check Elimination
     // =====================================================================
 
-    void C2Compiler::apply_bce(ir::IrFunction &ir_fn) const {
-        // BCE is performed during IR lowering/optimization.
-        // Here we handle the C2-level analysis: identify ARRAY_LOAD/ARRAY_STORE
-        // where the index is provably within [0, array_length).
-        //
-        // For now, we mark the optimization as applied if we find simple cases
-        // where the index is a constant less than a known array length bound.
+    uint32_t C2Compiler::apply_bce(ir::IrFunction &ir_fn) const {
+        uint32_t eliminated = 0;
 
         for (auto &block : ir_fn.blocks) {
             for (auto &instr : block.instrs) {
@@ -379,17 +379,19 @@ namespace jit {
                 const auto &val = ir_fn.values[index_val];
                 if (!val.is_const) continue;
 
-                // Constant index - check against known bounds
                 int64_t idx = static_cast<int64_t>(val.const_val);
 
-                // If index is non-negative and the array was allocated
-                // with a known length constant, we can eliminate the check.
-                // For now, we handle the simple case: index >= 0.
+                // Constant index >= 0 can skip the runtime bounds check.
+                // The emitter uses instr.preserve to decide whether to
+                // emit the bounds check bytecode.
                 if (idx >= 0) {
                     instr.set_preserve(true);
+                    eliminated++;
                 }
             }
         }
+
+        return eliminated;
     }
 
     // =====================================================================

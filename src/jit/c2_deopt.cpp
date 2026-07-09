@@ -269,7 +269,7 @@ namespace c2_deopt {
     //  Emit deopt handler trampolines for a compilation
     // =====================================================================
 
-    static void emit_deopt_handlers(
+    void emit_deopt_handlers(
         const ir::IrFunction &ir_fn,
         const std::vector<C2DeoptMetadata> &meta_list,
         CodeCache &cache,

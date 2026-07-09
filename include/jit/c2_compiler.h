@@ -161,7 +161,7 @@ namespace jit {
                           const std::vector<C2DevirtSite> &sites) const;
 
         /// Phase 5: Bounds Check Elimination.
-        void apply_bce(ir::IrFunction &ir_fn) const;
+        uint32_t apply_bce(ir::IrFunction &ir_fn) const;
 
         /// Phase 6: Speculative optimizations with deopt guards.
         void apply_speculative_ops(

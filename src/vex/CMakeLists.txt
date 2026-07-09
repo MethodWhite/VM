@@ -24,6 +24,7 @@ add_library(vex_lib STATIC
     lowering.cpp
     lowering_builtin.cpp
     lowering_expr.cpp
+    lowering_stmt.cpp
     borrow_checker.cpp
     compiler.cpp
     compiler_project.cpp

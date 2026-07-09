@@ -217,6 +217,13 @@ namespace runtime {
      * @param instr byte2 = (r_dst<<4) | r_params.
      */
     void exec_instr_defclass(ProcessVM *vm, const DecodedInstr &instr) {
+        // Phase M.sandbox: check CLASSREG capability
+        if (!vm->scheduler.vm_reference.loader_public.check_cap_at_pc(
+                vm->registers.rip.raw(), ::loader::Caps::CLASSREG)) {
+            runtime::throw_fatal(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                "defclass denegado por sandbox: falta la capability 'classreg'");
+            return;
+        }
         // Convencion del assembler: el primer operando textual va a reg1
         // (nibble bajo de byte2) y el segundo a reg2 (nibble alto).  Por
         // eso `defclass r_dst, r_params` -> r_dst = reg1, r_params = reg2.
@@ -550,6 +557,13 @@ namespace runtime {
     }
 
     void exec_instr_dlopen(ProcessVM *vm, const DecodedInstr &instr) {
+        // Phase M.sandbox: check FFI_OPEN capability
+        if (!vm->scheduler.vm_reference.loader_public.check_cap_at_pc(
+                vm->registers.rip.raw(), ::loader::Caps::FFI_OPEN)) {
+            runtime::throw_fatal(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                "dlopen denegado por sandbox: falta la capability 'ffi:open'");
+            return;
+        }
         const uint8_t r_dst       = instr.data_instruction.mem_data.reg_base;
         const uint8_t r_path_addr = instr.data_instruction.mem_data.reg_index;
         const uint8_t r_path_len  = instr.data_instruction.mem_data.reg_final;

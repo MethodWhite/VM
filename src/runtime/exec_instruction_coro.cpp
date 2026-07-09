@@ -103,6 +103,13 @@ namespace runtime {
      * @param instr reg1 = registro GP que contiene la direccion de inicio del proceso.
      */
     void exec_instr_spawn(ProcessVM *vm, const DecodedInstr &instr) {
+        // Phase M.sandbox: check SPAWN capability
+        if (!vm->scheduler.vm_reference.loader_public.check_cap_at_pc(
+                vm->registers.rip.raw(), ::loader::Caps::SPAWN)) {
+            runtime::throw_fatal(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+                "spawn denegado por sandbox: falta la capability 'spawn'");
+            return;
+        }
         const uint8_t  reg_idx  = instr.data_instruction.reg_data.reg1; // registro con fn_addr
         const uint64_t fn_addr  = vm->registers.regs[reg_idx].qword();  // direccion de inicio
 

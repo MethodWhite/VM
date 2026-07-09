@@ -37,6 +37,7 @@
 #include "distrib/dist_runtime.h"
 #include "distrib/mailbox.h"
 #include "loader/loader.h"   // Loader::load_module_dynamic
+#include "runtime/exception_runtime.h"  // throw_fatal, FATAL_ILLEGAL_INSTRUCTION
 #include "debug/debugger.h"  // Debugger::on_message hook (tracing)
 #include <fstream>           // leer archivo .velb del filesystem
 #include <iterator>          // istreambuf_iterator
@@ -99,6 +100,13 @@ void exec_instr_rspawn(ProcessVM *vm, const DecodedInstr &instr) {
  *              reg2 = registro con longitud en bytes del path.
  */
 void exec_instr_loadmod(ProcessVM *vm, const DecodedInstr &instr) {
+    // Phase M.sandbox: check LOADMOD capability
+    if (!vm->scheduler.vm_reference.loader_public.check_cap_at_pc(
+            vm->registers.rip.raw(), ::loader::Caps::LOADMOD)) {
+        runtime::throw_fatal(vm, runtime::FATAL_ILLEGAL_INSTRUCTION,
+            "loadmod denegado por sandbox: falta la capability 'loadmod'");
+        return;
+    }
     const uint8_t  r_path_addr = instr.data_instruction.reg_data.reg1;
     const uint8_t  r_path_len  = instr.data_instruction.reg_data.reg2;
     const uint64_t path_addr   = vm->registers.regs[r_path_addr].qword();

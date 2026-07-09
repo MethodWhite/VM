@@ -324,42 +324,16 @@ namespace port {
     }
 
     void WasmBackend::emit_code_section() {
-        if (func_type_indices_.empty()) return;
+        if (func_bodies_.empty()) return;
         begin_section(WASM_SEC_CODE);
 
-        // We've been accumulating bytecode per function in current_body_
-        // but since the emit model gives us one function at a time,
-        // we need to finalize each function separately.
-        // For now, we emit a placeholder count and the actual bodies
-        // are stored and emitted here.
+        write_leb128_u(func_bodies_.size());
 
-        size_t func_count = func_type_indices_.size();
-        write_leb128_u(func_count);
-
-        // In this model, each function body is a separate entry.
-        // Since we process functions one at a time through emit_fn_open/close,
-        // the bytecode is accumulated in current_body_ and needs to be flushed.
-        // However, due to how the transpiler calls emit_fn_signature before
-        // each function, we batch all function bodies here.
-
-        // For correctness, each function's body is written as a code entry.
-        // We track function bodies in a list.
-        // For this implementation, we assume at least one function.
-        for (size_t i = 0; i < func_count; ++i) {
-            // For the first version, we write a minimal valid function body
-            // that does nothing but return.
-            // In the future, this will contain the accumulated bytecode.
-            std::vector<uint8_t> body_bytes;
-            body_bytes.reserve(64);
-
-            // Locals declaration: count of local declarations
-            // Format: count (LEB128), then (count_type, val_type) pairs
-            // Count locals grouped by type
+        for (const auto &body : func_bodies_) {
             std::vector<uint8_t> local_decls;
             uint32_t i32_count = 0, i64_count = 0, f32_count = 0, f64_count = 0;
 
-            // We need to count locals from our tracked per-function data
-            for (auto lt : current_body_.local_types) {
+            for (auto lt : body.local_types) {
                 switch (lt) {
                     case WASM_I32: i32_count++; break;
                     case WASM_I64: i64_count++; break;
@@ -368,7 +342,6 @@ namespace port {
                 }
             }
 
-            // Write grouped local declarations
             auto emit_local_group = [&](uint32_t count, WasmValType type) {
                 if (count == 0) return;
                 uint8_t buf[16];
@@ -387,11 +360,9 @@ namespace port {
             emit_local_group(f32_count, WASM_F32);
             emit_local_group(f64_count, WASM_F64);
 
-            // Build full body: local declarations + bytecode + end
             std::vector<uint8_t> full_body;
-            full_body.reserve(4 + local_decls.size() + current_body_.bytecode.size() + 1);
+            full_body.reserve(4 + local_decls.size() + body.bytecode.size() + 1);
 
-            // Number of local declaration groups
             uint32_t num_groups = (i32_count > 0) + (i64_count > 0) + (f32_count > 0) + (f64_count > 0);
             uint8_t num_groups_buf[16];
             size_t ng_pos = 0;
@@ -403,7 +374,7 @@ namespace port {
             full_body.insert(full_body.end(), num_groups_buf, num_groups_buf + ng_pos);
 
             full_body.insert(full_body.end(), local_decls.begin(), local_decls.end());
-            full_body.insert(full_body.end(), current_body_.bytecode.begin(), current_body_.bytecode.end());
+            full_body.insert(full_body.end(), body.bytecode.begin(), body.bytecode.end());
             full_body.push_back(WASM_OP_END);
 
             write_leb128_u(full_body.size());
@@ -455,6 +426,7 @@ namespace port {
         func_types_.clear();
         func_type_indices_.clear();
         func_names_.clear();
+        func_bodies_.clear();
         current_body_ = FuncBody();
         current_body_.is_open = false;
         has_open_function_ = false;
@@ -562,6 +534,9 @@ namespace port {
         if (has_open_function_) {
             current_body_.is_open = false;
             has_open_function_ = false;
+            func_bodies_.push_back(std::move(current_body_));
+            current_body_ = FuncBody();
+            current_body_.local_count = 0;
         }
         current_fn_ = nullptr;
     }

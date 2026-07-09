@@ -303,6 +303,7 @@ namespace port {
             bool is_open;
         };
         FuncBody current_body_;
+        std::vector<FuncBody> func_bodies_;
         bool has_open_function_;
 
         std::unordered_map<ir::IrValueId, uint32_t> local_map_;

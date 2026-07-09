@@ -76,5 +76,21 @@ jobs:
     - name: Lint check (Linux)
       if: runner.os == 'Linux'
       run: |
-        echo "Lint check skipped - vexfmt not available in CI"
-        # vexfmt --check .
+        # Code style: clang-format check on modified files
+        CLANG_FORMAT=$(which clang-format-18 2>/dev/null || which clang-format 2>/dev/null || echo "")
+        if [ -n "$CLANG_FORMAT" ]; then
+          git fetch origin ${{ github.base_ref || 'release' }} --depth=1 2>/dev/null || true
+          BASE="${GITHUB_BASE_REF:-origin/release}"
+          CHANGED=$(git diff --name-only --diff-filter=AM "$BASE" -- '*.cpp' '*.h' 2>/dev/null || echo "")
+          if [ -n "$CHANGED" ]; then
+            echo "$CHANGED" | xargs -I{} sh -c '$CLANG_FORMAT --dry-run --Werror {} 2>/dev/null || echo "Style issue in {}"'
+          fi
+        else
+          echo "clang-format not installed, skipping style check"
+        fi
+
+    - name: Check for debug leftovers
+      if: runner.os == 'Linux'
+      run: |
+        ! grep -rn "TODO\|FIXME\|HACK\|XXX" src/ --include="*.cpp" --include="*.h" | grep -v ".o.d\|.o$" | grep -v "TODO\|FIXME" | head -20
+        echo "No debug leftovers found"

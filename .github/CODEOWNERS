@@ -1,0 +1,33 @@
+# Code Owners para VestaVM
+# Cada linea: patrón @usuario/equipo
+# Los cambios en estos archivos requieren approval del owner
+
+# Core VM
+/src/runtime/     @desmonHak @MethodWhite
+/src/jit/         @desmonHak
+/src/gc/          @desmonHak
+
+# Lenguaje Vex
+/src/vex/         @desmonHak
+/src/parser/      @desmonHak
+/src/lexer/       @desmonHak
+
+# Compilador / Optimizador
+/src/ir/          @desmonHak
+/src/optimizer/   @desmonHak
+
+# Tooling
+/src/cli/         @desmonHak
+/src/lsp/         @desmonHak
+/src/install/     @desmonHak
+
+# Ports (C, WASM)
+/src/port/        @desmonHak
+
+# Build
+/CMakeLists.txt   @desmonHak @MethodWhite
+/.github/         @MethodWhite
+
+# Documentacion
+/doc/             @desmonHak
+README.md         @MethodWhite

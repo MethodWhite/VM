@@ -1,0 +1,35 @@
+# Configuracion del Stale Bot para VestaVM
+# Marca issues/PRs inactivos y los cierra tras un periodo
+
+daysUntilStale: 60
+daysUntilClose: 14
+
+staleLabel: "stale"
+
+exemptLabels:
+  - "security"
+  - "bug"
+  - "priority:critical"
+  - "enhancement"
+  - "discussion"
+  - "help wanted"
+
+staleIssueMessage: >
+  Este issue lleva 60 días sin actividad. Se marcará como `stale` y se cerrará
+  en 14 días si no hay más actividad. Si sigue siendo relevante, por favor
+  actualizalo o comenta para mantenerlo abierto.
+
+stalePRMessage: >
+  Este PR lleva 60 días sin actividad. Se marcará como `stale` y se cerrará
+  en 14 días si no hay más actividad. Si sigues trabajando en él, comenta
+  para mantenerlo abierto.
+
+closeIssueMessage: >
+  Este issue se ha cerrado automáticamente por inactividad. Si el problema
+  persiste, por favor abre un nuevo issue con información actualizada.
+
+closePRMessage: >
+  Este PR se ha cerrado automáticamente por inactividad. Si quieres
+  retomarlo, puedes abrir un nuevo PR con los cambios actualizados.
+
+only: issues

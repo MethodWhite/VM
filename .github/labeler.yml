@@ -1,0 +1,43 @@
+# Auto-labeler: asigna labels segun archivos modificados
+
+"runtime":
+  - src/runtime/**/*
+
+"jit":
+  - src/jit/**/*
+
+"gc":
+  - src/gc/**/*
+
+"vex-language":
+  - src/vex/**/*
+  - src/lexer/**/*
+  - src/parser/**/*
+
+"ir-optimizer":
+  - src/ir/**/*
+  - src/optimizer/**/*
+
+"loader":
+  - src/loader/**/*
+
+"tooling":
+  - src/cli/**/*
+  - src/lsp/**/*
+
+"ports":
+  - src/port/**/*
+
+"build":
+  - CMakeLists.txt
+  - cmake/**/*
+
+"ci":
+  - .github/**/*
+
+"documentation":
+  - doc/**/*
+  - *.md
+
+"tests":
+  - tests/**/*

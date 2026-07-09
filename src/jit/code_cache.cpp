@@ -263,8 +263,8 @@ namespace jit {
      *
      * Llamado por el JIT tras escribir todos los bytes maquina y
      * resolver las relocations.  Hace dos cosas:
-     *   1. Transicion de permisos (no-op en modo RWX; lo prepara para
-     *      Phase E cuando vayamos a W^X).
+     *   1. Transicion de permisos RW -> RX via transition_to_executable()
+     *      (W^X hardening: las paginas nunca son RWX simultaneamente).
      *   2. Flush de la icache para que el CPU descarte cualquier copia
      *      cacheada de los bytes anteriores en ese rango.  Esencial en
      *      ARM/AArch64; no-op en x86-64 (modelo de memoria coherente

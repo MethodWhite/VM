@@ -23,6 +23,7 @@ add_library(vex_lib STATIC
     lombok.cpp
     lowering.cpp
     lowering_builtin.cpp
+    lowering_expr.cpp
     borrow_checker.cpp
     compiler.cpp
     compiler_project.cpp

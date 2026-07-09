@@ -57,10 +57,11 @@
 #include "ffi/native_ffi.h"
 #include "linker/velb_linker_bytecode.h"
 #include "loader/class_registry.h"
-#include "runtime/runtime.h"
 
 namespace runtime {
     class ManageVM;
+    class VM;
+    class ProcessVM;
 }
 
 #define LOADER_THROW(kind, msg) throw loader::LoaderError(kind, msg)

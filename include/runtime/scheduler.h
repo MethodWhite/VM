@@ -29,7 +29,6 @@
 #include <mutex>
 #include <condition_variable>
 
-#include "runtime/runtime.h"
 #include "runtime/proceso_runtime.h"
 #include "vm_state_event.h"
 #include "profiler/timer.h"

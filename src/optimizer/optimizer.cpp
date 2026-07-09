@@ -6,6 +6,7 @@
  */
 
 #include "optimizer/optimizer.h"
+#include "emmit/emmit_decl.h"
 #include <cstring>
 
 namespace Assembly::Bytecode::Optimizer {
@@ -46,95 +47,169 @@ namespace Assembly::Bytecode::Optimizer {
         code.resize(write);
     }
 
+    /**
+     * @brief Longitud en bytes de una instruccion en @p pos.
+     * Soporta opcodes primarios y extendidos (prefijo 0x00).
+     */
+    static size_t instr_len_full(const std::vector<uint8_t> &code, size_t pos) {
+        if (pos >= code.size()) return 1;
+        uint8_t b0 = code[pos];
+
+        // Opcode extendido (0x00 prefix)
+        if (b0 == 0x00 && pos + 1 < code.size()) {
+            uint8_t b1 = code[pos + 1];
+            // MIXED_SIZE immediates (3 + imm)
+            if (b1 == 0x06 || b1 == 0x09 || b1 == 0x0C || b1 == 0x0F ||
+                b1 == 0x12 || b1 == 0x41) return 4; // default imm8: 3+1
+            // FIXED_11
+            if (b1 == 0x15 || b1 == 0x5A || b1 == 0x5B || b1 == 0xFA) return 11;
+            // FIXED_8
+            if (b1 == 0x2D || b1 == 0x60 || b1 == 0x61 || b1 == 0x68 ||
+                b1 == 0x69 || b1 == 0x6A) return 8;
+            // FIXED_6
+            if (b1 == 0xC3) return 6;
+            // Default FIXED_4 (mayoria de extendidos)
+            return 4;
+        }
+
+        // Opcodes primarios
+        if (b0 == 0x10 || b0 == 0x11 || b0 == 0x28) return 10; // callvm, jmp, enter
+        if (b0 == 0x14) return 4;  // xchg
+        if (b0 == 0x29) return 1;  // leave
+        if (b0 == 0xC3) return 1;  // ret
+        if (b0 == 0xE9) return 3;  // jmp short
+        if (b0 == 0x90) return 1;  // nop
+        if ((b0 >= 0x12 && b0 <= 0x13) || (b0 >= 0x15 && b0 <= 0x16)) return 2; // push, pop, jmpr, callvmr
+        if ((b0 >= 0x50 && b0 <= 0x5F)) return 2; // push/pop short
+        if ((b0 >= 0xB0 && b0 <= 0xBF)) return 2; // mov reg, imm8
+        if (b0 == 0x04) return 2; // inc/dec
+        if ((b0 >= 0x01 && b0 <= 0x03)) return 2; // vminfo etc
+        return 1; // default
+    }
+
+    /**
+     * @brief Analiza una instruccion en @p pos para DCE.
+     * Determina si tiene efectos secundarios, que registro escribe y lee.
+     */
+    static void analyze_instr(const std::vector<uint8_t> &code, size_t pos, size_t len,
+                               bool &has_side_effect, uint8_t &dst, uint8_t &src, bool &reads_src) {
+        has_side_effect = true;
+        dst = 0xFF; src = 0xFF; reads_src = false;
+        if (pos >= code.size() || len < 1) return;
+
+        uint8_t b0 = code[pos];
+
+        if (b0 == 0x00 && pos + 1 < code.size()) {
+            uint8_t b1 = code[pos + 1];
+            // ALU reg,reg / mov reg,reg: pure
+            if ((b1 >= 0x05 && b1 <= 0x14) || (b1 >= 0x17 && b1 <= 0x1D) || b1 == 0x40) {
+                has_side_effect = false;
+                if (len >= 4) {
+                    uint8_t regs = code[pos + 3];
+                    dst = (regs >> 4) & 0xF;
+                    src = regs & 0xF;
+                    reads_src = true;
+                }
+                return;
+            }
+            // ALU imm: pure, dst in ctrl byte
+            if (b1 == 0x06 || b1 == 0x09 || b1 == 0x0C || b1 == 0x0F ||
+                b1 == 0x12 || b1 == 0x41) {
+                has_side_effect = false;
+                if (len >= 3) dst = code[pos + 2] & 0xF;
+                return;
+            }
+            // MOV imm (inmed_mov): pure
+            if (b1 == 0x15) {
+                has_side_effect = false;
+                if (len >= 3) dst = code[pos + 2] & 0xF;
+                return;
+            }
+            // Float ops: pure
+            if ((b1 >= 0xF0 && b1 <= 0xF9)) {
+                has_side_effect = false;
+                if (len >= 4) {
+                    uint8_t regs = code[pos + 3];
+                    dst = (regs >> 4) & 0xF;
+                    src = regs & 0xF;
+                    reads_src = true;
+                }
+                return;
+            }
+            // Float load/store/mowi: memory side effect
+            if (b1 == 0xFA || b1 == 0xFB || b1 == 0xFC) return;
+            // SIB memory access: side effect
+            if (b1 == 0x07 || b1 == 0x0A || b1 == 0x0D || b1 == 0x10 ||
+                b1 == 0x13 || b1 == 0x16 || b1 == 0x1E || b1 == 0x1F ||
+                b1 == 0x42) return;
+            // Default: assume side effects
+            return;
+        }
+
+        // Primary opcodes
+        if (b0 == 0x90) { has_side_effect = false; return; } // NOP
+        if ((b0 >= 0xB0 && b0 <= 0xBF) && len >= 2) {
+            has_side_effect = false;
+            dst = b0 & 0xF;
+            return;
+        }
+        if (b0 == 0x04 && len >= 2) {
+            has_side_effect = false;
+            dst = code[pos + 1] & 0xF;
+            return;
+        }
+        // Everything else has side effects
+    }
+
     static void pass_dead_code(std::vector<uint8_t> &code) {
         if (code.size() < 2) return;
 
-        auto instr_len = [&](size_t pos) -> size_t {
-            if (pos >= code.size()) return 1;
-            uint8_t op = code[pos];
-            uint8_t group = op >> 4;
-            if (op == 0x90) return 1;
-            if (group == 0x1) return 2;
-            if (op >= 0x50 && op <= 0x5F) return 2;
-            if (op >= 0x58 && op <= 0x67) return 2;
-            if (op == 0xE9) return 3;
-            if (op >= 0xB0 && op <= 0xBF) return 2;
-            return 1;
-        };
-
         int16_t last_def[16];
         bool last_def_used[16];
-        for (int r = 0; r < 16; r++) {
-            last_def[r] = -1;
-            last_def_used[r] = false;
-        }
+        for (int r = 0; r < 16; r++) { last_def[r] = -1; last_def_used[r] = false; }
 
         std::vector<bool> dead(code.size(), false);
 
         size_t i = 0;
         while (i < code.size()) {
-            size_t len = instr_len(i);
+            size_t len = instr_len_full(code, i);
             if (i + len > code.size()) break;
 
-            uint8_t op = code[i];
-            uint8_t group = op >> 4;
-            bool has_side_effect = true;
-            uint8_t dst = 0xFF;
-            uint8_t src = 0xFF;
-            bool reads_src = false;
+            bool has_side_effect, reads_src;
+            uint8_t dst, src;
+            analyze_instr(code, i, len, has_side_effect, dst, src, reads_src);
 
-            if (op == 0x90) {
-                has_side_effect = false;
-                dead[i] = true;
-            } else if (group == 0x1 && len >= 2) {
-                has_side_effect = false;
-                dst = (code[i+1] >> 4) & 0xF;
-                src = code[i+1] & 0xF;
-                reads_src = true;
-            } else if (op >= 0xB0 && op <= 0xBF && len >= 2) {
-                has_side_effect = false;
-                dst = op & 0xF;
-            }
-
-            if (reads_src && src < 16 && last_def[src] >= 0) {
+            if (reads_src && src < 16 && last_def[src] >= 0)
                 last_def_used[src] = true;
-            }
 
             if (has_side_effect) {
-                for (int r = 0; r < 16; r++) {
+                for (int r = 0; r < 16; r++)
                     if (last_def[r] >= 0) last_def_used[r] = true;
-                }
             }
 
             if (dst < 16) {
                 if (last_def[dst] >= 0 && !last_def_used[dst]) {
-                    size_t prev_len = instr_len(last_def[dst]);
-                    for (size_t j = 0; j < prev_len; j++) {
+                    size_t plen = instr_len_full(code, last_def[dst]);
+                    for (size_t j = 0; j < plen; j++)
                         dead[last_def[dst] + j] = true;
-                    }
                 }
                 last_def[dst] = (int16_t)i;
                 last_def_used[dst] = false;
             }
-
             i += len;
         }
 
         for (int r = 0; r < 16; r++) {
             if (last_def[r] >= 0 && !last_def_used[r]) {
-                size_t prev_len = instr_len(last_def[r]);
-                for (size_t j = 0; j < prev_len; j++) {
+                size_t plen = instr_len_full(code, last_def[r]);
+                for (size_t j = 0; j < plen; j++)
                     dead[last_def[r] + j] = true;
-                }
             }
         }
 
         size_t write = 0;
-        for (size_t read = 0; read < code.size(); read++) {
-            if (!dead[read]) {
-                code[write++] = code[read];
-            }
-        }
+        for (size_t read = 0; read < code.size(); read++)
+            if (!dead[read]) code[write++] = code[read];
         code.resize(write);
     }
 

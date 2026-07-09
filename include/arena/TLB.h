@@ -159,16 +159,10 @@ namespace tlb {
         TLBEntry() : level(DATA), payload({}) {}
 
         /**
-         * @brief Libera la tabla hija si este nodo es un nodo intermedio.
-         *
-         * El destructor solo actua cuando is_table == true para evitar
-         * liberar memoria union que no fue asignada como tabla.
+         * @brief Destructor declarado (definido tras TLBTable para evitar
+         * delete sobre tipo incompleto).
          */
-        ~TLBEntry() {
-            if (is_table && payload.table) {
-                delete payload.table; // liberar la tabla hija de forma recursiva
-            }
-        }
+        ~TLBEntry();
     } TLBEntry;
 
     /**
@@ -184,6 +178,13 @@ namespace tlb {
         /** @brief Crea la tabla con una entrada vacia inicial. */
         TLBTable() : entry(1) {}
     } TLBTable;
+
+    // Destructor de TLBEntry (definido aqui tras TLBTable completo)
+    inline TLBEntry::~TLBEntry() {
+        if (is_table && payload.table) {
+            delete payload.table;
+        }
+    }
 
     /**
      * @brief Nodo del arbol TLB lazy con propiedad unica sobre hijos.

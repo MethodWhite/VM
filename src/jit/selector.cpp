@@ -3502,26 +3502,53 @@ namespace jit {
                         break;
                     }
 
-                    /* --------- CALLVIRT (dispatch dinamico v1 via runtime) --------- */
+                    /* --------- CALLVIRT (dispatch dinamico via runtime) --------- */
                     /*
-                     * Despachamos a un runtime entry @c vrt_callvirt que hace
-                     * el vtable lookup + dispatch:
-                     *   1. Colocar args en proc->registers.regs[1..N+1]
-                     *      (VM_ABI convention).  r1 = obj, r2..r_{N+1} = args.
-                     *   2. CALL vrt_callvirt(proc, obj_payload, vtbl_idx)
-                     *      con Native ABI args (rdi/rcx=proc, rsi/rdx=obj,
-                     *      rdx/r8=vtbl_idx).
-                     *   3. Resultado en RAX -> dst slot.
-                     *
-                     * Si la callee aun no tiene jit_code, vrt_callvirt intenta
-                     * compilarla on-the-fly.  Si falla, lanza FatalError
-                     * capturable.  Sin fallback automatico a interp en v1
-                     * (necesita un trampoline jit_to_interp completo, Phase D.3-E).
+                     * Despachamos a vrt_callvirt(proc, obj_payload, vtbl_idx).
+                     * Usamos R10/R11 como scratch temporal (NUNCA asignables a
+                     * vregs) para evitar que load_op_rematerializable corrompa
+                     * los arg-regs nativos.  Mismo patron que CALLM.
                      */
                                         case IrOp::CALLVIRT: {
-                        /* CALLVIRT unsupported en slot selector (register allocator bug) */
-                        warn_unsupported(ins.op, ins.source_line, "CALLVIRT unsupported");
-                        unsupported = true;
+                        if (opts_.runtime == nullptr || opts_.runtime->callvirt == nullptr) {
+                            warn_unsupported(ins.op, ins.source_line, "runtime->callvirt null");
+                            unsupported = true; break;
+                        }
+                        {
+                            const uint32_t vtbl_idx = static_cast<uint32_t>(ins.imm);
+                            /* obj a R10 (scratch, no-colisionable) */
+                            load_op_rematerializable(mf, ir_fn, ins.operands[0], MReg::R10);
+#if defined(_WIN32)
+                            const MReg ca0 = MReg::RCX, ca1 = MReg::RDX, ca2 = MReg::R8;
+#else
+                            const MReg ca0 = MReg::RDI, ca1 = MReg::RSI, ca2 = MReg::RDX;
+#endif
+                            /* a0=proc, a1=obj(R10), a2=vtbl_idx */
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(ca0), MOperand::make_reg(MReg::RBX)));
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(ca1), MOperand::make_reg(MReg::R10)));
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(ca2),
+                                MOperand::make_imm32(static_cast<int32_t>(vtbl_idx))));
+                            const uint64_t fn_addr = reinterpret_cast<uint64_t>(opts_.runtime->callvirt);
+                            const uint32_t fn_idx = mf.intern_imm64(fn_addr);
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(MReg::RAX), MOperand::make_imm64_idx(fn_idx)));
+                            {
+                                MInstr ic; ic.op = MOp::CALL;
+                                ic.src1 = MOperand::make_reg(MReg::RAX);
+                                emit_stackmap_for_safepoint(ic);
+                                mf.blocks.back().instrs.push_back(ic);
+                            }
+                            /* Resultado en proc->registers.regs[0] */
+                            if (ins.dst != ir::IR_NO_VALUE) {
+                                mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                    MOperand::make_reg(SCRATCH_A),
+                                    MOperand::make_mem(MReg::RBX, VESTA_PROC_REGISTERS_OFFSET)));
+                                store_op(mf, ins.dst, SCRATCH_A);
+                            }
+                        }
                         break;
                     }
 
@@ -3662,15 +3689,48 @@ case IrOp::CALLM: {
 
                     /* --------- CALLITF (dispatch de interfaz via itable) --------- */
                     /* Layout IR: operands[0]=obj, operands[1]=params_ptr (ItfCallParams
-                     * en vm_mem), operands[2..]=args.  F3a: stage args + CALL al
-                     * runtime entry vrt_callitf(proc, obj, params_addr) que resuelve
-                     * la itable + despacha (enter_jit del metodo, o mini-interp).  El
-                     * inline del scan de itables (F3b) eliminara este CALL en el hot
-                     * path. */
+                     * en vm_mem), operands[2..]=args.  CALL a vrt_callitf(proc, obj,
+                     * params_addr) que resuelve itable + despacha.  Misma precaucion
+                     * de R10/R11 que CALLVIRT. */
                                         case IrOp::CALLITF: {
-                        /* CALLITF unsupported en slot selector (itable scan bug) */
-                        warn_unsupported(ins.op, ins.source_line, "CALLITF unsupported");
-                        unsupported = true;
+                        if (opts_.runtime == nullptr || opts_.runtime->callitf == nullptr) {
+                            warn_unsupported(ins.op, ins.source_line, "runtime->callitf null");
+                            unsupported = true; break;
+                        }
+                        {
+                            /* obj a R10, params_ptr a R11 (scratch, no-colisionable) */
+                            load_op_rematerializable(mf, ir_fn, ins.operands[0], MReg::R10);
+                            load_op_rematerializable(mf, ir_fn, ins.operands[1], MReg::R11);
+#if defined(_WIN32)
+                            const MReg ia0 = MReg::RCX, ia1 = MReg::RDX, ia2 = MReg::R8;
+#else
+                            const MReg ia0 = MReg::RDI, ia1 = MReg::RSI, ia2 = MReg::RDX;
+#endif
+                            /* a0=proc, a1=obj(R10), a2=params(R11) */
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(ia1), MOperand::make_reg(MReg::R10)));
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(ia2), MOperand::make_reg(MReg::R11)));
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(ia0), MOperand::make_reg(MReg::RBX)));
+                            const uint64_t fn_addr = reinterpret_cast<uint64_t>(opts_.runtime->callitf);
+                            const uint32_t fn_idx = mf.intern_imm64(fn_addr);
+                            mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                MOperand::make_reg(MReg::RAX), MOperand::make_imm64_idx(fn_idx)));
+                            {
+                                MInstr ic; ic.op = MOp::CALL;
+                                ic.src1 = MOperand::make_reg(MReg::RAX);
+                                emit_stackmap_for_safepoint(ic);
+                                mf.blocks.back().instrs.push_back(ic);
+                            }
+                            /* Resultado en proc->registers.regs[0] */
+                            if (ins.dst != ir::IR_NO_VALUE) {
+                                mf.blocks.back().instrs.push_back(MInstr::make_unary(MOp::MOV,
+                                    MOperand::make_reg(SCRATCH_A),
+                                    MOperand::make_mem(MReg::RBX, VESTA_PROC_REGISTERS_OFFSET)));
+                                store_op(mf, ins.dst, SCRATCH_A);
+                            }
+                        }
                         break;
                     }
 
@@ -6026,8 +6086,8 @@ case IrOp::CALLCLOSURE: {
                                  * vrt_gc_handle_for_ptr(proc, host_ptr) -> handle. */
                                 if (opcode == "gchandle" && args.size() == 2
                                  && opts_.runtime->gc_handle_for_ptr
-                                 && (args[0].size() > 0 && args[0][0] == '{'
-                                  || args[1].size() > 0 && args[1][0] == '{')) {
+                                 && ((args[0].size() > 0 && args[0][0] == '{')
+                                  || (args[1].size() > 0 && args[1][0] == '{'))) {
                                     if (!resolve_arg_to_reg(args[1], ABI_ARG1)) {
                                         all_ok = false; break;
                                     }

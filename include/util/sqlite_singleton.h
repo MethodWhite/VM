@@ -203,7 +203,7 @@ namespace Sqlite {
          *   std::string err;
          *   auto rows = SqliteSingleton::query_json_rows_map(
          *       "SELECT id, val FROM kv2;", &err);
-         *   if (!err.empty()) { /* manejar error *\/ }
+         *   if (!err.empty()) { manejar error }
          *   for (const auto &row : rows) {
          *       std::string id  = row.at("id");
          *       std::string val = row.at("val");

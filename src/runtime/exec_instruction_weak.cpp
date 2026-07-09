@@ -24,6 +24,7 @@
  */
 
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/proceso_runtime.h"
 #include "gc/gc_heap.h"
 
@@ -100,5 +101,32 @@ namespace runtime {
 
         vm->gc_heap.free_weak(idx); // liberar la entrada de la tabla
     }
+
+
+class WeakHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "weak"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = dispatch_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    WeakHandler() {
+        dispatch_[48] = exec_instr_weakref;
+        dispatch_[50] = exec_instr_deref_weak;
+        dispatch_[52] = exec_instr_free_weak;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn dispatch_[256] = {};
+};
+
+WeakHandler g_weak_handler_instance;
+
+InstructionHandler * g_weak_handler = reinterpret_cast<InstructionHandler *>(&g_weak_handler_instance);
+
 
 } // namespace runtime

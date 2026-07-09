@@ -16,6 +16,7 @@
  * Implementa las instrucciones ALLOC, FREE, REALLOC, NEWOBJ, DROP, GCRUN,
  * GCWB, GCCONFIG, GCALLOC, GCDEREF y las operaciones de cursor (READCUR, WRITECUR).
  */#include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/proceso_runtime.h"
 #include "runtime/host_alloca_tracker.h"
 #include "gc/gc_heap.h"
@@ -742,5 +743,62 @@ namespace runtime {
         }
         vm->registers.regs[rdst].qword(result);
     }
+
+
+class GcHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "gc"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = instr.flags_info.is_not_extended
+            ? primary_[instr.flags_info.opcode_index]
+            : extended_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    GcHandler() {
+        extended_[86] = exec_instr_gchandle;
+        extended_[87] = exec_instr_getpid;
+        extended_[114] = exec_instr_mvtake;
+        extended_[126] = exec_instr_htrack;
+        extended_[160] = exec_instr_newobj;
+        extended_[161] = exec_instr_gcrun;
+        extended_[162] = exec_instr_gcconfig;
+        extended_[163] = exec_instr_gc_drop;
+        extended_[164] = exec_instr_gcwb;
+        extended_[165] = exec_instr_gcalloc;
+        extended_[166] = exec_instr_newobjs;
+        extended_[167] = exec_instr_gcpromote;
+        extended_[168] = exec_instr_gcdemote;
+        extended_[169] = exec_instr_atomicld;
+        extended_[170] = exec_instr_atomicst;
+        extended_[171] = exec_instr_atomiccas;
+        extended_[172] = exec_instr_atomicadd;
+        extended_[173] = exec_instr_sharedstat;
+        extended_[176] = exec_instr_raw_alloc;
+        extended_[177] = exec_instr_raw_free;
+        extended_[178] = exec_instr_raw_realloc;
+        extended_[192] = exec_instr_readcur;
+        extended_[193] = exec_instr_writecur;
+        extended_[194] = exec_instr_gcderef;
+        extended_[195] = exec_instr_addcur;
+        extended_[196] = exec_instr_vmcopy;
+        extended_[197] = exec_instr_vcopyh;
+        extended_[198] = exec_instr_getproc;
+        extended_[199] = exec_instr_getvm;
+        extended_[200] = exec_instr_getmgr;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn primary_[256] = {};
+    ExecFn extended_[256] = {};
+};
+
+GcHandler g_gc_handler_instance;
+
+InstructionHandler * g_gc_handler = reinterpret_cast<InstructionHandler *>(&g_gc_handler_instance);
+
 
 } // namespace runtime

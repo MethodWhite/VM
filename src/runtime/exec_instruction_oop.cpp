@@ -23,6 +23,7 @@
  */
 
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/proceso_runtime.h"
 #include "runtime/exception_runtime.h"
 #include "runtime/host_alloca_tracker.h"
@@ -1509,5 +1510,63 @@ namespace runtime {
             vm->registers.regs[instr.data_instruction.reg_data.reg1].qword());
         vm->registers.regs[R00].qword(attr_val(f, instr.data_instruction.reg_data.reg2));
     }
+
+
+class OopHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "oop"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = instr.flags_info.is_not_extended
+            ? primary_[instr.flags_info.opcode_index]
+            : extended_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    OopHandler() {
+        extended_[174] = exec_instr_callitf;
+        extended_[208] = exec_instr_newobjraw;
+        extended_[209] = exec_instr_callvirt;
+        extended_[210] = exec_instr_callsuper;
+        extended_[211] = exec_instr_throw;
+        extended_[212] = exec_instr_rethrow;
+        extended_[213] = exec_instr_getclass;
+        extended_[214] = exec_instr_instanceof;
+        extended_[215] = exec_instr_checkcast;
+        extended_[216] = exec_instr_getfield;
+        extended_[217] = exec_instr_getmethod;
+        extended_[218] = exec_instr_fieldcount;
+        extended_[219] = exec_instr_methodcount;
+        extended_[220] = exec_instr_classname;
+        extended_[221] = exec_instr_classdoc;
+        extended_[222] = exec_instr_classattrcount;
+        extended_[223] = exec_instr_classattrkey;
+        extended_[224] = exec_instr_classattrval;
+        extended_[225] = exec_instr_methodname;
+        extended_[226] = exec_instr_methoddoc;
+        extended_[227] = exec_instr_methoddesc;
+        extended_[228] = exec_instr_methodattrcount;
+        extended_[229] = exec_instr_methodattrkey;
+        extended_[230] = exec_instr_methodattrval;
+        extended_[231] = exec_instr_fieldname;
+        extended_[232] = exec_instr_fielddoc;
+        extended_[233] = exec_instr_fieldattrcount;
+        extended_[234] = exec_instr_fieldattrkey;
+        extended_[235] = exec_instr_fieldattrval;
+        extended_[253] = exec_instr_callm;
+        extended_[254] = exec_instr_proceed;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn primary_[256] = {};
+    ExecFn extended_[256] = {};
+};
+
+OopHandler g_oop_handler_instance;
+
+InstructionHandler * g_oop_handler = reinterpret_cast<InstructionHandler *>(&g_oop_handler_instance);
+
 
 } // namespace runtime

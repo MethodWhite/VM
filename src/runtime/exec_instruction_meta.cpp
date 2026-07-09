@@ -49,6 +49,7 @@
  */
 
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/proceso_runtime.h"
 #include "runtime/exception_runtime.h"
 #include "runtime/native_invoke.h"
@@ -670,5 +671,42 @@ namespace runtime {
         uint8_t *payload = vm->gc_heap.deref(h);
         vm->registers.regs[r_dst].qword(reinterpret_cast<uint64_t>(payload));
     }
+
+
+class MetaHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "meta"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = dispatch_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    MetaHandler() {
+        dispatch_[96] = exec_instr_getstatic;
+        dispatch_[97] = exec_instr_setstatic;
+        dispatch_[98] = exec_instr_dlopen;
+        dispatch_[99] = exec_instr_dlsym;
+        dispatch_[100] = exec_instr_callni;
+        dispatch_[101] = exec_instr_gcallocp;
+        dispatch_[201] = exec_instr_defclass;
+        dispatch_[202] = exec_instr_deffield;
+        dispatch_[203] = exec_instr_defmethod;
+        dispatch_[204] = exec_instr_findclass;
+        dispatch_[205] = exec_instr_findmethod;
+        dispatch_[206] = exec_instr_addadvice;
+        dispatch_[207] = exec_instr_findfield;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn dispatch_[256] = {};
+};
+
+MetaHandler g_meta_handler_instance;
+
+InstructionHandler * g_meta_handler = reinterpret_cast<InstructionHandler *>(&g_meta_handler_instance);
+
 
 } // namespace runtime

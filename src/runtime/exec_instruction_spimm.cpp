@@ -29,6 +29,7 @@
  */
 
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/proceso_runtime.h"
 
 namespace runtime {
@@ -101,5 +102,31 @@ namespace runtime {
             write_rbp(vm, read_rbp(vm) + delta);
         }
     }
+
+
+class SpimmHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "spimm"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = dispatch_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    SpimmHandler() {
+        dispatch_[46] = exec_instr_subsp;
+        dispatch_[47] = exec_instr_addsp;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn dispatch_[256] = {};
+};
+
+SpimmHandler g_spimm_handler_instance;
+
+InstructionHandler * g_spimm_handler = reinterpret_cast<InstructionHandler *>(&g_spimm_handler_instance);
+
 
 } // namespace runtime

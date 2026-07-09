@@ -30,6 +30,7 @@
  */
 
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/proceso_runtime.h"
 #include "runtime/scheduler.h"
 #include "runtime/runtime.h"
@@ -382,5 +383,35 @@ void exec_instr_memsync(ProcessVM *vm, const DecodedInstr &instr) {
     // la instruccion no produce un valor de retorno directo;
     // el future_handle dentro de MemsyncParams se resuelve de forma asincrona
 }
+
+
+class DistribHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "distrib"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = dispatch_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    DistribHandler() {
+        dispatch_[59] = exec_instr_rspawn;
+        dispatch_[60] = exec_instr_msgsend;
+        dispatch_[61] = exec_instr_msgrecv;
+        dispatch_[62] = exec_instr_memsync;
+        dispatch_[89] = exec_instr_loadmod;
+        dispatch_[109] = exec_instr_unloadmod;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn dispatch_[256] = {};
+};
+
+DistribHandler g_distrib_handler_instance;
+
+InstructionHandler * g_distrib_handler = reinterpret_cast<InstructionHandler *>(&g_distrib_handler_instance);
+
 
 } // namespace runtime

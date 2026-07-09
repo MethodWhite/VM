@@ -34,6 +34,7 @@
  */
 
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/proceso_runtime.h"
 #include "loader/loader.h"
 #include "loader/oop_types.h"
@@ -82,5 +83,30 @@ namespace runtime {
         vm->registers.regs[r_dst].qword(
             reinterpret_cast<uint64_t>(specialized)); // r_dst = ClassInfo* especializado
     }
+
+
+class GenericHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "generic"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = dispatch_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    GenericHandler() {
+        dispatch_[58] = exec_instr_specialize;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn dispatch_[256] = {};
+};
+
+GenericHandler g_generic_handler_instance;
+
+InstructionHandler * g_generic_handler = reinterpret_cast<InstructionHandler *>(&g_generic_handler_instance);
+
 
 } // namespace runtime

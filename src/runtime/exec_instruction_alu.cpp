@@ -26,6 +26,7 @@
  *  - @c exec_instr_syscall / @c exec_instr_int                             : llamadas al sistema
  */
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/exception_runtime.h"
 #include "runtime/profile.h"   // Sprint D.6 (2026-06-03): PGO counters
 #include <cstdio>
@@ -1684,5 +1685,78 @@ void exec_instr_loadz(ProcessVM *vm, const DecodedInstr &instr) {
     }
     vm->registers.regs[r_dst].qword(val); // qword() escribe 64 bits = zero-extend implicito
 }
+
+
+class AluHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "alu"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = instr.flags_info.is_not_extended
+            ? primary_[instr.flags_info.opcode_index]
+            : extended_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    AluHandler() {
+        primary_[4] = exec_instr_inc_dec_reg;        extended_[5] = exec_instr_add_reg;
+        extended_[6] = exec_instr_add_imm;
+        extended_[7] = exec_instr_add_sib;
+        extended_[8] = exec_instr_sub_reg;
+        extended_[9] = exec_instr_sub_imm;
+        extended_[10] = exec_instr_sub_sib;
+        extended_[11] = exec_instr_mul_reg;
+        extended_[12] = exec_instr_mul_imm;
+        extended_[13] = exec_instr_mul_sib;
+        extended_[14] = exec_instr_div_reg;
+        extended_[15] = exec_instr_div_imm;
+        extended_[16] = exec_instr_div_sib;
+        extended_[17] = exec_instr_cmp_reg;
+        extended_[18] = exec_instr_cmp_imm;
+        extended_[19] = exec_instr_cmp_sib;
+        extended_[20] = exec_instr_mov_reg;
+        extended_[22] = exec_instr_mov_sib;
+        extended_[23] = exec_instr_and_reg;
+        extended_[24] = exec_instr_or_reg;
+        extended_[25] = exec_instr_xor_reg;
+        extended_[26] = exec_instr_not_reg;
+        extended_[27] = exec_instr_shl_reg;
+        extended_[28] = exec_instr_shr_reg;
+        extended_[29] = exec_instr_sar_reg;
+        extended_[30] = exec_instr_movc_mem;
+        extended_[31] = exec_instr_movc_reg;
+        extended_[64] = exec_instr_mod_reg;
+        extended_[65] = exec_instr_mod_imm;
+        extended_[66] = exec_instr_mod_sib;
+        extended_[67] = exec_instr_setcc;
+        extended_[104] = exec_instr_cmpjmp;
+        extended_[105] = exec_instr_cmpjmpu;
+        extended_[106] = exec_instr_decjnz;
+        extended_[112] = exec_instr_fastpush;
+        extended_[113] = exec_instr_fastpop;
+        extended_[115] = exec_instr_alu3;
+        extended_[116] = exec_instr_alu3;
+        extended_[117] = exec_instr_alu3;
+        extended_[118] = exec_instr_alu3;
+        extended_[119] = exec_instr_alu3;
+        extended_[120] = exec_instr_alu3;
+        extended_[121] = exec_instr_alu3;
+        extended_[122] = exec_instr_alu3;
+        extended_[123] = exec_instr_alu3;
+        extended_[124] = exec_instr_loadz;
+        extended_[125] = exec_instr_loadz;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn primary_[256] = {};
+    ExecFn extended_[256] = {};
+};
+
+AluHandler g_alu_handler_instance;
+
+InstructionHandler * g_alu_handler = reinterpret_cast<InstructionHandler *>(&g_alu_handler_instance);
+
 
 } // namespace runtime

@@ -33,6 +33,7 @@
  */
 
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/proceso_runtime.h"
 #include "runtime/scheduler.h"
 #include "runtime/runtime.h"
@@ -275,5 +276,34 @@ namespace runtime {
         vm->scheduler.on_event(EVT_HALT);
         vm->decoded_ptr->flags_info.blocking = true;
     }
+
+
+class AsyncHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "async"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = dispatch_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    AsyncHandler() {
+        dispatch_[41] = exec_instr_future;
+        dispatch_[42] = exec_instr_await;
+        dispatch_[43] = exec_instr_fulfill;
+        dispatch_[44] = exec_instr_reject;
+        dispatch_[103] = exec_instr_fulfillhlt;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn dispatch_[256] = {};
+};
+
+AsyncHandler g_async_handler_instance;
+
+InstructionHandler * g_async_handler = reinterpret_cast<InstructionHandler *>(&g_async_handler_instance);
+
 
 } // namespace runtime

@@ -176,9 +176,14 @@ list(FILTER VM_SOURCES EXCLUDE REGEX "/src/vex/")
 # Port transpiler IR -> codigo (C, futuro Java/JS) vive en vex_lib (ver
 # src/vex/CMakeLists.txt).  Excluir para evitar definicion duplicada.
 list(FILTER VM_SOURCES EXCLUDE REGEX "/src/port/")
+# instruction_handlers.cpp depende de g_float_handler (definido en
+# exec_instruction_float.cpp) que NO esta en vmcore/vesta_rt.  Se agrega
+# explicitamente solo al target vm.
+list(FILTER VM_SOURCES EXCLUDE REGEX "/src/runtime/instruction_handlers\\.cpp$")
 # main.cpp se agrega explicitamente (GLOB_RECURSE con "main.cpp" encontraria
 # tambien preprocessor/src/main.cpp y causaria definicion multiple de main)
-list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
+list(APPEND VM_SOURCES ${CMAKE_SOURCE_DIR}/main.cpp)
+list(APPEND VM_SOURCES ${CMAKE_SOURCE_DIR}/src/runtime/instruction_handlers.cpp)
 list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_closure.cpp)
 list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_spimm.cpp)
 list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/exec_instruction_pattern.cpp)

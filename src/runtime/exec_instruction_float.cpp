@@ -58,6 +58,7 @@
 
 #include "runtime/exec_instruction.h"
 #include "runtime/proceso_runtime.h"
+#include "runtime/instruction_handler.h"
 
 namespace runtime {
 
@@ -1291,5 +1292,56 @@ void exec_instr_bitz2g(ProcessVM *vm, const DecodedInstr &instr) {
     __builtin_memcpy(&bits, vm->registers.zmm[zmm_src].data, 8);
     vm->registers.regs[gp_dst].qword(bits);
 }
+
+// =========================================================================
+// FloatHandler: implementacion del InstructionHandler para la familia
+// de punto flotante.  Despacha por opcode_index (tabla extendida 0x00).
+// =========================================================================
+
+class FloatHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "float"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = dispatch_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    FloatHandler() {
+        dispatch_[0x5C] = exec_instr_fextend;
+        dispatch_[0x5D] = exec_instr_fnarrow;
+        dispatch_[0x80] = exec_instr_fmin;
+        dispatch_[0x81] = exec_instr_fmax;
+        dispatch_[0x82] = exec_instr_ffloor;
+        dispatch_[0x83] = exec_instr_fceil;
+        dispatch_[0x84] = exec_instr_fround;
+        dispatch_[0x85] = exec_instr_ftrunc;
+        dispatch_[0x86] = exec_instr_bitg2z;
+        dispatch_[0x87] = exec_instr_bitz2g;
+        dispatch_[0xF0] = exec_instr_fmov;
+        dispatch_[0xF1] = exec_instr_fadd;
+        dispatch_[0xF2] = exec_instr_fsub;
+        dispatch_[0xF3] = exec_instr_fmul;
+        dispatch_[0xF4] = exec_instr_fdiv;
+        dispatch_[0xF5] = exec_instr_fcmp;
+        dispatch_[0xF6] = exec_instr_fsqrt;
+        dispatch_[0xF7] = exec_instr_fabs;
+        dispatch_[0xF8] = exec_instr_fneg;
+        dispatch_[0xF9] = exec_instr_fcvt;
+        dispatch_[0xFA] = exec_instr_fmovi;
+        dispatch_[0xFB] = exec_instr_fload;
+        dispatch_[0xFC] = exec_instr_fstore;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn dispatch_[256] = {};
+};
+
+FloatHandler g_float_handler_instance;
+
+InstructionHandler * g_float_handler = reinterpret_cast<InstructionHandler *>(&g_float_handler_instance);
+
 
 } // namespace runtime

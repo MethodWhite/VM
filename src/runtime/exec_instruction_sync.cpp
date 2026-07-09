@@ -40,6 +40,7 @@
  */
 
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/proceso_runtime.h"
 #include "runtime/scheduler.h"
 #include "runtime/runtime.h"
@@ -270,5 +271,34 @@ namespace runtime {
             wake_pid_with_notify(vm, pid); // set condvar_notified + wake
         }
     }
+
+
+class SyncHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "sync"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = dispatch_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    SyncHandler() {
+        dispatch_[53] = exec_instr_monenter;
+        dispatch_[54] = exec_instr_monexit;
+        dispatch_[55] = exec_instr_monwait;
+        dispatch_[56] = exec_instr_monnoti;
+        dispatch_[57] = exec_instr_monnota;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn dispatch_[256] = {};
+};
+
+SyncHandler g_sync_handler_instance;
+
+InstructionHandler * g_sync_handler = reinterpret_cast<InstructionHandler *>(&g_sync_handler_instance);
+
 
 } // namespace runtime

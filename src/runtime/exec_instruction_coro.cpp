@@ -27,6 +27,7 @@
  *     memoria VM: [0..7]=PC, [8..15]=SP, [16..23]=BP, [24..151]=R0..R15.
  */
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/proceso_runtime.h"
 #include "loader/loader.h"  // Loader::copy_executables_to en spawn
 #include "runtime/scheduler.h"
@@ -372,5 +373,35 @@ namespace runtime {
         // no lo incremente automaticamente al final del ciclo EXECUTE
         const_cast<DecodedInstr &>(instr).flags_info.did_jump = true;
     }
+
+
+class CoroHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "coro"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = dispatch_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    CoroHandler() {
+        dispatch_[88] = exec_instr_spawn_on;
+        dispatch_[102] = exec_instr_spawnargs;
+        dispatch_[236] = exec_instr_yield;
+        dispatch_[237] = exec_instr_resume;
+        dispatch_[238] = exec_instr_spawn;
+        dispatch_[239] = exec_instr_swapctx;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn dispatch_[256] = {};
+};
+
+CoroHandler g_coro_handler_instance;
+
+InstructionHandler * g_coro_handler = reinterpret_cast<InstructionHandler *>(&g_coro_handler_instance);
+
 
 } // namespace runtime

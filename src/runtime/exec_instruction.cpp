@@ -18,6 +18,7 @@
  * de flujo (JMP, JCC, JREL, CALL, RET, ENTER, LEAVE), llamadas nativas
  * (CALLN, CALLVM), syscall, interrupcion (INT) y OOP (CALLVIRT, etc.).
  */#include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/decode_instruction.h"
 #include "runtime/exception_runtime.h"
 #include "runtime/native_invoke.h"
@@ -670,5 +671,52 @@ namespace runtime {
             // destino = PC + size_instr + desplazamiento (relativo a la instruccion siguiente)
             write_rip(vm, vm->registers.rip.raw() + instr.flags_info.size_instr + static_cast<uint64_t>(disp));
     }
+
+// =========================================================================
+// CoreHandler: instrucciones base (hlt, push, pop, xchg, jmp, callvm,
+// ret, enter, leave, jmpr, callvmr, jrel, calln, inmed_mov)
+// =========================================================================
+
+class CoreHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "core"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = instr.flags_info.is_not_extended
+            ? primary_[instr.flags_info.opcode_index]
+            : extended_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    CoreHandler() {
+        // Primarios
+        primary_[0x10] = exec_instr_callvm;
+        primary_[0x11] = exec_instr_jmp;
+        primary_[0x12] = exec_instr_push;
+        primary_[0x13] = exec_instr_pop;
+        primary_[0x14] = exec_instr_xchg;
+        primary_[0x15] = exec_instr_jmpr;
+        primary_[0x16] = exec_instr_callvmr;
+        primary_[0x28] = exec_instr_enter;
+        primary_[0x29] = exec_instr_leave;
+        primary_[0xC3] = exec_instr_ret;
+        // Extendidos
+        extended_[0x03] = exec_instr_hlt;
+        extended_[0x15] = exec_instr_inmed_mov;
+        extended_[0x2D] = exec_instr_jrel;
+        extended_[0x55] = exec_instr_calln;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn primary_[256] = {};
+    ExecFn extended_[256] = {};
+};
+
+CoreHandler g_core_handler_instance;
+
+InstructionHandler * g_core_handler = reinterpret_cast<InstructionHandler *>(&g_core_handler_instance);
+
 
 } // namespace runtime

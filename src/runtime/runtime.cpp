@@ -23,6 +23,7 @@
 #include "runtime/manager_runtime.h"
 #include "runtime/exception_runtime.h"
 #include "distrib/dist_runtime.h"
+#include "runtime/instruction_handlers.h"
 #include <chrono>  // std::chrono::milliseconds para wait_for del shared_gc_cv
 
 namespace runtime {
@@ -48,6 +49,9 @@ namespace runtime {
         mgr_vm(mgr_vm_),
         num_schedulers(num_schedulers) {
         id = id_vm; // asignar el ID de la instancia
+
+        // inicializar los instruction handlers antes del primer decode/execute
+        runtime::init_instruction_handlers();
 
         schedulers.reserve(num_schedulers); // reservar capacidad para evitar realocaciones
 

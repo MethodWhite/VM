@@ -27,6 +27,7 @@
  *   TRYLEAVE FIXED_2:     [0x00][0x45]
  */
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 
 namespace runtime {
 
@@ -112,5 +113,31 @@ namespace runtime {
         top->prev = vm->exc_free_list;
         vm->exc_free_list = top;
     }
+
+
+class ExcHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "exc"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = dispatch_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    ExcHandler() {
+        dispatch_[68] = exec_instr_tryenter;
+        dispatch_[69] = exec_instr_tryleave;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn dispatch_[256] = {};
+};
+
+ExcHandler g_exc_handler_instance;
+
+InstructionHandler * g_exc_handler = reinterpret_cast<InstructionHandler *>(&g_exc_handler_instance);
+
 
 } // namespace runtime

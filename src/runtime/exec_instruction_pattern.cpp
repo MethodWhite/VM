@@ -30,6 +30,7 @@
  */
 
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/proceso_runtime.h"
 #include "loader/oop_types.h"
 
@@ -110,5 +111,31 @@ namespace runtime {
         }
         // ninguna entrada coincidio: caer al siguiente opcode (no saltar)
     }
+
+
+class PatternHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "pattern"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = dispatch_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    PatternHandler() {
+        dispatch_[39] = exec_instr_jumptable;
+        dispatch_[40] = exec_instr_typeswitch;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn dispatch_[256] = {};
+};
+
+PatternHandler g_pattern_handler_instance;
+
+InstructionHandler * g_pattern_handler = reinterpret_cast<InstructionHandler *>(&g_pattern_handler_instance);
+
 
 } // namespace runtime

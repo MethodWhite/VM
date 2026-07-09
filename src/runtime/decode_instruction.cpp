@@ -21,6 +21,7 @@
 #include "runtime/decode_table.h"
 #include "runtime/dispatch_table.h"
 #include "runtime/runtime.h"
+#include "runtime/instruction_handler.h"
 #include <cstdio>   // debug temporal
 
 // Activar con -DDEBUG_DECODE_PRINT para volcar cada instruccion descodificada
@@ -1116,13 +1117,22 @@ namespace runtime {
 
         const uint64_t t1 = measuring ? now_ns() : 0; // marca de tiempo inicial
 
-        // ejecutar la instruccion descodificada; si exec es null, tratar como HLT (instruccion invalida)
-        if (!process->decoded_ptr->metadata->exec) {
-            process->scheduler.on_event(EVT_HALT); // opcode sin implementacion: detener el proceso
+        // ejecutar la instruccion descodificada.
+        // Prioridad 1: handler virtual (nuevo sistema, desacoplado por familia).
+        // Prioridad 2: exec directo (legacy, migracion gradual).
+        // Si ambos son nullptr, tratar como HLT (instruccion invalida).
+        auto *h = process->decoded_ptr->metadata->handler;
+        auto  e = process->decoded_ptr->metadata->exec;
+        if (!h && !e) {
+            process->scheduler.on_event(EVT_HALT);
             vm_hook(process, DebugStage::ExecuteEnd);
             return EVT_HALT;
         }
-        process->decoded_ptr->metadata->exec(process, *process->decoded_ptr);
+        if (h) {
+            h->execute(process, *process->decoded_ptr);
+        } else {
+            e(process, *process->decoded_ptr);
+        }
 
         /**
          * Si la instruccion requiere esperar E/S u otro recurso, no avanzar el PC:

@@ -59,6 +59,7 @@
  */
 
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/proceso_runtime.h"
 #include "runtime/runtime.h"           // para acceder a vm->scheduler.vm_reference.script_args
 #include "runtime/scheduler.h"
@@ -1612,5 +1613,52 @@ int64_t strcmp_public(ProcessVM *vm,
     if (la == lb) return 0;
     return (la < lb) ? -1 : 1;
 }
+
+
+class StringHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "string"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = instr.flags_info.is_not_extended
+            ? primary_[instr.flags_info.opcode_index]
+            : extended_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    StringHandler() {
+        extended_[70] = exec_instr_strmake;
+        extended_[94] = exec_instr_strmake_h;
+        extended_[71] = exec_instr_strlen;
+        extended_[72] = exec_instr_strcat;
+        extended_[73] = exec_instr_strcmp;
+        extended_[74] = exec_instr_strconv;
+        extended_[75] = exec_instr_strraw;
+        extended_[76] = exec_instr_strslice;
+        extended_[77] = exec_instr_strflat;
+        extended_[78] = exec_instr_strhash;
+        extended_[79] = exec_instr_strintern;
+        extended_[80] = exec_instr_strgetenc;
+        extended_[81] = exec_instr_strgetbytes;
+        extended_[82] = exec_instr_strgetkind;
+        extended_[83] = exec_instr_strreserve;
+        extended_[84] = exec_instr_strfinalize;
+        extended_[107] = exec_instr_getargc;
+        extended_[108] = exec_instr_getarg;
+        extended_[110] = exec_instr_getmethat;
+        extended_[111] = exec_instr_getfldat;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn primary_[256] = {};
+    ExecFn extended_[256] = {};
+};
+
+StringHandler g_string_handler_instance;
+
+InstructionHandler * g_string_handler = reinterpret_cast<InstructionHandler *>(&g_string_handler_instance);
+
 
 } // namespace runtime

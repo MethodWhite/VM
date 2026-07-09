@@ -32,6 +32,7 @@
  */
 
 #include "runtime/exec_instruction.h"
+#include "runtime/instruction_handler.h"
 #include "runtime/proceso_runtime.h"
 #include "runtime/exception_runtime.h"
 #include "runtime/host_alloca_tracker.h"
@@ -403,5 +404,36 @@ namespace runtime {
 
         vm->registers.regs[r_dst].qword(val); // desenvolver el valor
     }
+
+
+class ClosureHandler : public InstructionHandler {
+public:
+    const char* name() const override { return "closure"; }
+
+    vm_event execute(ProcessVM *vm, const DecodedInstr &instr) override {
+        auto fn = dispatch_[instr.flags_info.opcode_index];
+        if (fn) fn(vm, instr);
+        return EVT_EXEC_DONE;
+    }
+
+    ClosureHandler() {
+        dispatch_[32] = exec_instr_mkclosure;
+        dispatch_[33] = exec_instr_callclosure;
+        dispatch_[34] = exec_instr_mkrawclosure;
+        dispatch_[35] = exec_instr_callrawclosure;
+        dispatch_[36] = exec_instr_tailcall;
+        dispatch_[37] = exec_instr_isnull;
+        dispatch_[38] = exec_instr_unwrap;
+    }
+
+private:
+    using ExecFn = void (*)(ProcessVM *, const DecodedInstr &);
+    ExecFn dispatch_[256] = {};
+};
+
+ClosureHandler g_closure_handler_instance;
+
+InstructionHandler * g_closure_handler = reinterpret_cast<InstructionHandler *>(&g_closure_handler_instance);
+
 
 } // namespace runtime

@@ -91,16 +91,17 @@ namespace runtime {
 
     struct DecodedInstr; ///< Declaracion adelantada de la instruccion descodificada
     class  ProcessVM;    ///< Declaracion adelantada del proceso virtual
+    class  InstructionHandler; ///< Declaracion adelantada del handler de familia
 
     /**
      * @brief Metadatos de una instruccion del bytecode VestaVM.
      *
      * Cada entrada de decode_table_primary y decode_table_extended es un
-     * InstrFormat.  El par (exec, decode) forma el contrato de la instruccion:
+     * InstrFormat.  El par (handler, decode) forma el contrato de la instruccion:
      *   - decode() extrae los operandos del flujo de bytes y los almacena en DecodedInstr.
-     *   - exec()   aplica la semantica de la instruccion sobre el estado del proceso.
+     *   - handler->execute() aplica la semantica de la instruccion sobre el estado del proceso.
      *
-     * Las entradas con mode == AddressingMode::COUNT o exec/decode == nullptr son
+     * Las entradas con mode == AddressingMode::COUNT o handler/decode == nullptr son
      * ranuras no implementadas o reservadas; el descodificador abortara si las
      * encuentra (solo en modo VM_DEBUG_CHECKS).
      */
@@ -134,14 +135,8 @@ namespace runtime {
         /**
          * @brief Puntero a la funcion que implementa la semantica de la instruccion.
          *
-         * Se invoca durante la fase EXECUTE del pipeline.  Es responsable de
-         * modificar registros, memoria, banderas u otros componentes de la VM.
-         * No debe avanzar el PC; si la instruccion realiza un salto debe marcar
-         * decoded_ptr->flags_info.did_jump = true para que execute_instruction()
-         * no avance el PC automaticamente.
-         *
-         * @param vm    Proceso virtual sobre el que se ejecuta la instruccion.
-         * @param instr Instruccion descodificada con todos sus operandos.
+         * Metodo legacy: se invoca directamente.  Reemplazado gradualmente por
+         * el campo @c handler para permitir desacoplamiento por familia.
          */
         void (*exec)(ProcessVM *, const DecodedInstr &) = nullptr;
 
@@ -156,6 +151,18 @@ namespace runtime {
          * @param instr Estructura de instruccion que se rellena con los operandos.
          */
         void (*decode)(ProcessVM *, DecodedInstr &) = nullptr;
+
+        /**
+         * @brief Handler virtual que implementa la semantica de la instruccion.
+         *
+         * Se invoca durante la fase EXECUTE del pipeline via handler->execute().
+         * Reemplaza gradualmente el puntero a funcion directo (exec) para
+         * permitir que cada familia de instrucciones viva en su propia TU.
+         *
+         * Mientras exec y handler coexisten, execute_instruction() prioriza
+         * handler; si handler es nullptr, cae en exec.
+         */
+        class InstructionHandler *handler = nullptr;
     } InstrFormat;
 
 

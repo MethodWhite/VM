@@ -2992,6 +2992,12 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             std::string r_idx = ctx.load_src(ins.operands[1], 1);
             std::string rd    = ctx.dst_of(ins.dst);
             uint64_t stride   = ir_type_size(ins.type);
+            std::string oob_lbl = ctx.unique_lbl("oob");
+            // Bounds check: cmpu r_idx, [r_arr] (length in first 8 bytes)
+            ctx.out << "    load r13, [" << r_arr << "]\n";
+            ctx.out << "    cmpu " << r_idx << ", r13\n";
+            ctx.out << "    jmp.jae " << EmitCtx::abs_lbl(oob_lbl) << "\n";
+            // Actual array access
             ctx.out << "    mov r13, " << r_idx << "\n";
             if (stride > 1)
                 ctx.out << "    mulu r13, " << stride << "\n";
@@ -2999,6 +3005,9 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             ctx.out << "    addu r13, " << r_arr << "\n";
             ctx.out << "    mov " << rd << ", [r13]\n";
             ctx.store_spilled(ins.dst);
+            // Out-of-bounds handler: halt the process safely
+            ctx.out << oob_lbl << ":\n";
+            ctx.out << "    hlt\n";
             break;
         }
 
@@ -3009,6 +3018,12 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             std::string r_idx = ctx.load_src(ins.operands[1], 1);
             std::string r_val = ctx.load_src(ins.operands[2], 0);
             uint64_t stride   = ir_type_size(ins.type);
+            std::string oob_lbl = ctx.unique_lbl("oob");
+            // Bounds check: cmpu r_idx, [r_arr] (length in first 8 bytes)
+            ctx.out << "    load r13, [" << r_arr << "]\n";
+            ctx.out << "    cmpu " << r_idx << ", r13\n";
+            ctx.out << "    jmp.jae " << EmitCtx::abs_lbl(oob_lbl) << "\n";
+            // Actual array store
             ctx.out << "    mov r13, " << r_idx << "\n";
             if (stride > 1)
                 ctx.out << "    mulu r13, " << stride << "\n";
@@ -3018,6 +3033,9 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             // write barrier si el tipo de elemento es HANDLE
             if (ins.type == IrType::HANDLE)
                 ctx.out << "    gcwb " << r_arr << "\n";
+            // Out-of-bounds handler: halt the process safely
+            ctx.out << oob_lbl << ":\n";
+            ctx.out << "    hlt\n";
             break;
         }
 

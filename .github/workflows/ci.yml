@@ -23,7 +23,6 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: recursive
-      continue-on-error: true
 
     - name: Install dependencies (Linux)
       if: runner.os == 'Linux'
@@ -92,5 +91,10 @@ jobs:
     - name: Check for debug leftovers
       if: runner.os == 'Linux'
       run: |
-        ! grep -rn "TODO\|FIXME\|HACK\|XXX" src/ --include="*.cpp" --include="*.h" | grep -v ".o.d\|.o$" | grep -v "TODO\|FIXME" | head -20
-        echo "No debug leftovers found"
+        FOUND=$(grep -rn "FIXME\|HACK\|XXX" src/ --include="*.cpp" --include="*.h" 2>/dev/null | grep -v ".o.d\|.o$" | head -20 || true)
+        if [ -n "$FOUND" ]; then
+          echo "⚠️ Debug leftovers found:"
+          echo "$FOUND"
+        else
+          echo "No debug leftovers found"
+        fi

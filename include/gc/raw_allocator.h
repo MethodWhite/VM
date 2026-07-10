@@ -305,10 +305,13 @@ namespace gc {
         // esa clase esta vacio (grow).  Ver vreg_select.cpp::RAW_ALLOC.
         // ---------------------------------------------------------------------
         static size_t jit_slab_free_list_offset() noexcept {
-            return offsetof(RawAllocator, slab_free_list_);
+            // RawAllocator no es standard-layout (acceso mixto public/private).
+            // Usamos __builtin_offsetof (GCC/Clang) que funciona incluso en
+            // tipos no standard-layout, a diferencia de offsetof (C++17 UB).
+            return __builtin_offsetof(RawAllocator, slab_free_list_);
         }
         static size_t jit_total_bytes_offset() noexcept {
-            return offsetof(RawAllocator, total_bytes_);
+            return __builtin_offsetof(RawAllocator, total_bytes_);
         }
         static constexpr size_t jit_slab_classes() noexcept { return SLAB_CLASSES; }
         static constexpr size_t jit_slab_size(size_t i) noexcept {

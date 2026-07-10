@@ -20,6 +20,9 @@ add_library(vex_lib STATIC
     ast.cpp
     parser.cpp
     type_checker.cpp
+    type_checker_decl.cpp
+    type_checker_stmt.cpp
+    type_checker_expr.cpp
     lombok.cpp
     lowering.cpp
     lowering_builtin.cpp

@@ -1427,83 +1427,96 @@ namespace Assembly::Bytecode::Linker {
     void Linker::optimize_modules() {
         if (!options.optimize_bytecode)
             return;
-        return; // <<< DESHABILITADO: corrompe bytecode (mueve 0x10→0x00)
 
         for (auto &mod: modules) {
             size_t before = mod.bytecode.size();
             auto &bc = mod.bytecode;
-            if (bc.size() > 0x0B) {
-                fprintf(stderr, "OPT-BEFORE: bc[0x0B]=0x%02x bc[0x0D]=0x%02x\n", bc[0x0B], bc[0x0D]);
-            }
+            // Construir mapa de desplazamiento relocation-aware:
+            // Para cada posicion en el bytecode original, calculamos cuantos
+            // bytes se eliminaron antes de esa posicion, para ajustar los
+            // offsets de las relocalizaciones.
             
-            // 1. Eliminacion de NOPs redundantes (opcode 0x90).
-            //    Barrido simple: elimina bytes 0x90 consecutivos.
-            bc.erase(std::remove(bc.begin(), bc.end(), static_cast<uint8_t>(0x90)),
-                     bc.end());
+            // Fase 1: marcar los bytes que seran eliminados en un bitmap
+            std::vector<bool> keep(bc.size(), true);
+            size_t eliminated = 0;
 
-            // 2. Peephole: eliminar pares MOV R,R redundantes.
-            //    Formato tipico: 0xB0+reg src, 0xB0+reg dst cuando son iguales.
-            //    Patron: 0xB0 <reg> 0xB0 <mismo_reg>
-            if (bc.size() >= 4) {
-                std::vector<uint8_t> cleaned;
-                cleaned.reserve(bc.size());
-                for (size_t i = 0; i < bc.size(); ) {
-                    if (i + 3 < bc.size() &&
-                        bc[i] == 0xB0 && bc[i+2] == 0xB0 && bc[i+1] == bc[i+3]) {
-                        // MOV R,R -> eliminar ambas
-                        i += 4;
-                        continue;
-                    }
-                    cleaned.push_back(bc[i]);
-                    ++i;
+            // 1a. Eliminar NOPs (0x90).
+            for (size_t i = 0; i < bc.size(); ++i) {
+                if (bc[i] == 0x90) {
+                    keep[i] = false;
+                    ++eliminated;
                 }
-                bc.swap(cleaned);
             }
 
-            // 3. Peephole: fusionar PUSH/POP triviales.
-            //    Patron: PUSH R; POP R -> eliminar ambos (stack no cambia).
-            //    Opcodes: 0x50+R PUSH, 0x58+R POP
-            if (bc.size() >= 2) {
-                std::vector<uint8_t> cleaned;
-                cleaned.reserve(bc.size());
-                for (size_t i = 0; i < bc.size(); ) {
-                    if (i + 1 < bc.size() &&
-                        (bc[i] >= 0x50 && bc[i] <= 0x57) &&
-                        (bc[i+1] >= 0x58 && bc[i+1] <= 0x5F) &&
-                        (bc[i] - 0x50) == (bc[i+1] - 0x58)) {
-                        i += 2;
-                        continue;
-                    }
-                    cleaned.push_back(bc[i]);
+            // 1b. Eliminar pares MOV R,R (0xB0 <reg> 0xB0 <mismo_reg>).
+            for (size_t i = 0; i + 3 < bc.size(); ) {
+                if (keep[i] && keep[i+1] && keep[i+2] && keep[i+3] &&
+                    bc[i] == 0xB0 && bc[i+2] == 0xB0 && bc[i+1] == bc[i+3]) {
+                    keep[i] = keep[i+1] = keep[i+2] = keep[i+3] = false;
+                    eliminated += 4;
+                    i += 4;
+                } else {
                     ++i;
                 }
-                bc.swap(cleaned);
             }
 
-            // 4. Eliminar secuencias NOP multi-byte (0x0F 0x1F 0x00...)
-            //    Usado por alineacion de compiladores x86.
+            // 1c. Eliminar PUSH R / POP R del mismo registro.
+            for (size_t i = 0; i + 1 < bc.size(); ) {
+                if (keep[i] && keep[i+1] &&
+                    (bc[i] >= 0x50 && bc[i] <= 0x57) &&
+                    (bc[i+1] >= 0x58 && bc[i+1] <= 0x5F) &&
+                    (bc[i] - 0x50) == (bc[i+1] - 0x58)) {
+                    keep[i] = keep[i+1] = false;
+                    eliminated += 2;
+                    i += 2;
+                } else {
+                    ++i;
+                }
+            }
+
+            // 1d. Eliminar NOP multi-byte (0x0F 0x1F 0x00).
             for (size_t i = 0; i + 2 < bc.size(); ) {
-                if (bc[i] == 0x0F && bc[i+1] == 0x1F && bc[i+2] == 0x00) {
-                    bc.erase(bc.begin() + static_cast<long>(i),
-                             bc.begin() + static_cast<long>(i) + 3);
-                    continue;
+                if (keep[i] && keep[i+1] && keep[i+2] &&
+                    bc[i] == 0x0F && bc[i+1] == 0x1F && bc[i+2] == 0x00) {
+                    keep[i] = keep[i+1] = keep[i+2] = false;
+                    eliminated += 3;
+                    i += 3;
+                } else {
+                    ++i;
                 }
-                ++i;
             }
 
-            // 5. Llamar al optimizador externo si esta disponible
-            //    (BytecodeOptimizer declarado en optimizer/optimizer.h).
-            //    Como es un stub que aun no implementa transformaciones,
-            //    lo invocamos para mantener compatibilidad futura.
-            {
-                Assembly::Bytecode::Optimizer::BytecodeOptimizer ext_opt;
-                ext_opt.optimize(bc);
+            // Si no hay nada que eliminar, saltar la reescritura.
+            if (eliminated == 0)
+                continue;
+
+            // Fase 2: construir arreglo de desplazamiento acumulado.
+            // shift[i] = cuantos bytes se eliminaron desde [0, i)
+            std::vector<size_t> shift(bc.size() + 1, 0);
+            size_t acc = 0;
+            for (size_t i = 0; i < bc.size(); ++i) {
+                shift[i] = acc;
+                if (!keep[i])
+                    ++acc;
+            }
+            shift[bc.size()] = acc;
+
+            // Fase 3: reescribir bytecode manteniendo solo los keep.
+            std::vector<uint8_t> new_bc;
+            new_bc.reserve(bc.size() - eliminated);
+            for (size_t i = 0; i < bc.size(); ++i) {
+                if (keep[i])
+                    new_bc.push_back(bc[i]);
+            }
+            bc.swap(new_bc);
+
+            // Fase 4: actualizar offsets de relocalizaciones.
+            for (auto &rel : mod.relocations) {
+                if (rel.offset < shift.size())
+                    rel.offset -= shift[rel.offset];
             }
 
             size_t after = bc.size();
-            if (bc.size() > 0x0B) {
-                fprintf(stderr, "OPT-AFTER: bc[0x0B]=0x%02x\n", bc[0x0B]);
-            }
             report.optimizations_applied += (before - after);
         }
     }

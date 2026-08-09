@@ -1,4 +1,5 @@
 #include "vex/asm_parser.h"
+#include "vex/asm/asm_effects.h" // ASA: inferencia de clobbers + efectos
 #include "vex/lowering.h"
 #include "vex/type_checker.h"
 #include "ir/ssa_ir.h"
@@ -245,6 +246,31 @@ ir::IrValueId lower_vex_asm_expression(
         }
         if (!has_memory) {
             parsed.clobbers.push_back({"memory"});
+        }
+    }
+
+    // ASA: inferir clobbers automaticamente del cuerpo NASM.  Registros
+    // ligados por register() (inputs/outputs) se excluyen del set.  La
+    // inferencia cubre los que el usuario no declaro (implicit writes,
+    // memoria, flags, calls) sin depender de Keystone/Capstone.
+    {
+        std::vector<std::string> bound_canon;
+        for (auto &c : parsed.clobbers) {
+            std::string canon = vex::asm_canonical_reg(c.name);
+            if (!canon.empty()) bound_canon.push_back(canon);
+        }
+        auto infer = vex::asm_infer_clobbers(parsed.assembly_text, bound_canon);
+        for (auto &r : infer.clobber_regs) {
+            bool dup = false;
+            for (auto &ec : parsed.clobbers)
+                if (ec.name == r) { dup = true; break; }
+            if (!dup) parsed.clobbers.push_back({r});
+        }
+        if (infer.clobber_memory) {
+            bool has_memory = false;
+            for (auto &c : parsed.clobbers)
+                if (c.name == "memory") { has_memory = true; break; }
+            if (!has_memory) parsed.clobbers.push_back({"memory"});
         }
     }
 

@@ -53,6 +53,9 @@ add_library(vex_lib STATIC
     ${CMAKE_SOURCE_DIR}/src/port/transpiler_base.cpp
     ${CMAKE_SOURCE_DIR}/src/port/c/c_backend.cpp
     ${CMAKE_SOURCE_DIR}/src/port/wasm/wasm_backend.cpp
+    # Inline asm (ASA): analisis de efectos + inferencia de clobbers.
+    asm/asm_effects.cpp
+    asm/asm_analyze.cpp
 )
 
 # La libreria expone sus headers desde include/vex/; PUBLIC para que los

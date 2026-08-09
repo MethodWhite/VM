@@ -67,8 +67,12 @@ módulo.  No se arrastra código muerto de la otra rama.
   simbolo destino.  El .o se linka con g++ contra vmcore/vex_lib/vpp_lib.
   **Verificado**: FULL ejecuta return 42, if=7, fib(10)=55, factorial=120,
   loop=10, gcd=6.
-- **Pendiente**: runtime FULL/EMBED para I/O/GC/strings (los vrt_* que el
-  runtime linkado aporta), multi-ISA, DWARF.
+- **Pendiente**: runtime FULL/EMBED para I/O/GC/strings.  El AOT linka
+  libvmcore pero los plugins de E/S (vesta_io.so, etc.) se cargan
+  dinamicamente y el AOT no los resuelve: STR_LIT_ADDR (string literals)
+  y calln (FFI) fallan en el AOT.  Requiere embeber los plugins o portar
+  el runtime de E/S de Desmon (subsistema aparte).
+- **Pendiente**: multi-ISA, DWARF.
 - Ver `src/aot/README.md` limitaciones.
 
 ### vectorize (P1, 30 commits)

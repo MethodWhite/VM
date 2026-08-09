@@ -324,10 +324,16 @@ namespace aot {
         bool unsupported = false;
         jit::MFunction mfn = selector.select(ir_fn, &unsupported);
         if (unsupported) {
+            /* Diagnostico: decir CUAL op no soporto el selector.  El
+             * selector ya emite el warning via g_jit_warn_unsupported
+             * si VESTA_JIT_WARN esta activo; aqui se suma el nombre de
+             * la funcion para el driver AOT. */
+            if (std::getenv("VESTA_JIT_WARN"))
+                std::fprintf(stderr, "[aot] funcion '%s': op no soportada "
+                                     "por el selector (NATIVE_ABI)\n",
+                             ir_fn.name.c_str());
             return false;
         }
-
-        // 4. Emitir codigo nativo via x86 encoder
         jit::X86Encoder encoder;
         size_t before = code.size();
         size_t emitted = encoder.encode(mfn, code);

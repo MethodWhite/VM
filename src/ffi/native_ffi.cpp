@@ -29,6 +29,10 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #endif
+#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#endif
 #include <vector>
 
 namespace ffi {
@@ -81,7 +85,17 @@ namespace ffi {
 #else
     static std::string vm_exe_dir(void) {
         char buf[4096];
-        ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        ssize_t n = -1;
+#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        size_t len = sizeof(buf) - 1;
+        int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
+        if (sysctl(mib, 4, buf, &len, nullptr, 0) == 0) {
+            n = static_cast<ssize_t>(len);
+            buf[len] = '\0';
+        }
+#else
+        n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+#endif
         if (n <= 0) return std::string();
         buf[n] = 0;
         std::string p(buf);

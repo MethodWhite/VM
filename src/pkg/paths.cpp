@@ -15,6 +15,10 @@
 #else
 #  include <unistd.h>
 #  include <limits.h>
+#  if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#    include <sys/sysctl.h>
+#    include <sys/types.h>
+#  endif
 #endif
 
 namespace fs = std::filesystem;
@@ -73,7 +77,17 @@ namespace pkg::paths {
         return install.string();
 #else
         char buf[PATH_MAX];
-        ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        ssize_t n = -1;
+#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        size_t len = sizeof(buf) - 1;
+        int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
+        if (sysctl(mib, 4, buf, &len, nullptr, 0) == 0) {
+            n = static_cast<ssize_t>(len);
+            buf[len] = '\0';
+        }
+#else
+        n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+#endif
         if (n <= 0) return std::string();
         buf[n] = '\0';
         fs::path exe(buf);

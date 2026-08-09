@@ -40,6 +40,11 @@
 #include <unistd.h>
 #endif
 
+#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#endif
+
 namespace fs {
     /// Alias al namespace de la libreria estandar para evitar colisiones de nombre.
     namespace fs = std::filesystem;
@@ -460,9 +465,21 @@ namespace fs {
         uint32_t size = sizeof(buffer);
         _NSGetExecutablePath(buffer, &size);
         return std::string(buffer);
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        /* BSD no tiene procfs montado por defecto: la ruta del ejecutable
+         * se pregunta al kernel con sysctl(KERN_PROC_PATHNAME). */
+        char buffer[4096];
+        size_t len = sizeof(buffer) - 1;
+        int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
+        if (sysctl(mib, 4, buffer, &len, nullptr, 0) == 0) {
+            buffer[len] = '\0';
+            return std::string(buffer);
+        }
+        return std::string();
 #else
         char buffer[4096];
         ssize_t len = readlink("/proc/self/exe", buffer, sizeof(buffer)-1);
+        if (len < 0) return std::string();
         buffer[len] = '\0';
         return std::string(buffer);
 #endif

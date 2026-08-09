@@ -25,6 +25,12 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <pwd.h>
+#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#  include <sys/sysctl.h>
+#endif
+#if defined(__APPLE__)
+#  include <mach-o/dyld.h>
+#endif
 
 #include <filesystem>
 #include <iostream>
@@ -49,12 +55,30 @@ namespace install {
         return pw ? std::filesystem::path(pw->pw_dir) : std::filesystem::path("/tmp");
     }
 
-    /// Localiza el binario actual a traves de /proc/self/exe.
+    /// Localiza el binario actual.  En Linux via /proc/self/exe; en BSD
+    /// via sysctl(KERN_PROC_PATHNAME); en macOS via _NSGetExecutablePath.
     static std::filesystem::path module_path() {
+#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        char buf[4096];
+        size_t len = sizeof(buf) - 1;
+        int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
+        if (sysctl(mib, 4, buf, &len, nullptr, 0) == 0) {
+            buf[len] = '\0';
+            return std::filesystem::path(buf);
+        }
+        return std::filesystem::current_path();
+#elif defined(__APPLE__)
+        char buf[4096];
+        uint32_t sz = sizeof(buf);
+        if (_NSGetExecutablePath(buf, &sz) == 0)
+            return std::filesystem::path(buf);
+        return std::filesystem::current_path();
+#else
         std::error_code ec;
         auto p = std::filesystem::read_symlink("/proc/self/exe", ec);
         if (ec) return std::filesystem::current_path();
         return p;
+#endif
     }
 
     /// Run shell command, devuelve exit code. Output a stderr para visibilidad.

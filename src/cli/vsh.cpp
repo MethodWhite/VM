@@ -55,6 +55,9 @@
 #include <cstring>
 #include <map>
 #include <sys/types.h>
+#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#  include <sys/sysctl.h>
+#endif
 #if !defined(_WIN32)
 #  include <sys/wait.h>
 #  include <dlfcn.h>
@@ -2524,6 +2527,13 @@ namespace vsh {
         char buf[4096];
         uint32_t sz = sizeof(buf);
         if (_NSGetExecutablePath(buf, &sz) != 0) return {};
+        return std::string(buf);
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        char buf[4096];
+        size_t len = sizeof(buf) - 1;
+        int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
+        if (sysctl(mib, 4, buf, &len, nullptr, 0) != 0) return {};
+        buf[len] = '\0';
         return std::string(buf);
 #else
         char buf[4096];

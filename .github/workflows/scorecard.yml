@@ -1,0 +1,47 @@
+name: OpenSSF Scorecard
+
+on:
+  # Semanal: para que el repositorio se puntúe con regularidad
+  schedule:
+    - cron: '0 0 * * 0'
+  # A demanda: workflow_dispatch permite disparar manualmente
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      # Necesario para leer el código y escribir los resultados
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      # Cargar los resultados como Code Scanning Alerts en la pestaña Security
+      - name: Upload SARIF
+        uses: actions/upload-artifact@v4
+        with:
+          name: SARIF results
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif

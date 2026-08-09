@@ -1025,4 +1025,4 @@ Si tienes una caracteristica especifica en mente, busca el doc dedicado en
 [doc/VMdoc/Vex/](./VMdoc/Vex/). Cada uno tiene ejemplos completos y
 referencia tecnica.
 
-Si vas a contribuir codigo, ver  [doc/CONTRIBUTING.md](./CONTRIBUTING.md).
+Si vas a contribuir codigo, ver  [CONTRIBUTING.md](../CONTRIBUTING.md).

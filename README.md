@@ -9,7 +9,10 @@
 [![Estado](https://img.shields.io/badge/estado-Phase%20A%20Complete-brightgreen.svg)](./doc/ROADMAP.md)
 [![Tests](https://img.shields.io/badge/tests-213%2F213%20PASS-brightgreen.svg)](./tests/vex/)
 [![JIT](https://img.shields.io/badge/JIT-C1%20geomean%2016×%20%2F%20peak%20155×-orange.svg)](./doc/BENCHMARKS.md)
-[![Plataformas](https://img.shields.io/badge/plataformas-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#inicio-r%C3%A1pido)
+[![Plataformas](https://img.shields.io/badge/plataformas-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20BSD-lightgrey.svg)](#inicio-r%C3%A1pido)
+[![SemVer](https://img.shields.io/badge/semver-2.0.0-blue.svg)](./VERSIONING.md)
+[![CII Best Practices](https://img.shields.io/badge/CII%20Best%20Practices-Pending-yellow.svg)](https://bestpractices.coreinfrastructure.org/)
+[![OpenSSF Scorecard](https://img.shields.io/badge/OpenSSF%20Scorecard-en%20curso-yellow.svg)](./SECDEVOPS.md)
 
 [**Inicio rápido**](./doc/QUICKSTART.md) · [**El lenguaje Vex**](./doc/LANGUAGE.md) · [**Arquitectura**](./doc/ARCHITECTURE.md) · [**Benchmarks**](./doc/BENCHMARKS.md) · [**Roadmap**](./doc/ROADMAP.md)
 
@@ -506,7 +509,15 @@ distribución y herramientas se diseñan juntos. Comparativa de features clave:
 ### Proyecto
 
 - [LICENSE](./LICENSE.md) — licencia VMProject
-- [CONTRIBUTING](./doc/CONTRIBUTING.md) — cómo contribuir
+- [GOVERNANCE](./GOVERNANCE.md) — gobernanza, roles y proceso de decisión
+- [CONTRIBUTING](./CONTRIBUTING.md) — cómo contribuir (DCO, convenciones)
+- [MAINTAINERS](./MAINTAINERS.md) — mantenedores y áreas
+- [SUPPORT](./SUPPORT.md) — canales de soporte
+- [VERSIONING](./VERSIONING.md) — política SemVer
+- [RELEASE_PROCESS](./RELEASE_PROCESS.md) — ciclo de release
+- [SECURITY](./SECURITY.md) — política de seguridad (disclosure coordinada)
+- [SECDEVOPS](./SECDEVOPS.md) — seguridad en el pipeline y hardening
+- [ADRs](./docs/decisions/) — registro de decisiones de arquitectura
 - [DEPENDENCIES](./doc/DEPENDENCIES.md) — librerías necesarias
 - [github_work](./doc/github_work.md) — GitFlow del proyecto
 
@@ -620,7 +631,9 @@ donde lenguaje, runtime, distribución y herramientas se diseñan juntos:
 - **Repositorio principal**: [github.com/desmonHak/VM](https://github.com/desmonHak/VM)
 - **Documentación Obsidian-friendly**: [github.com/desmonHak/VMdoc](https://github.com/desmonHak/VMdoc)
 - **Issues y feature requests**: [GitHub Issues](https://github.com/desmonHak/VM/issues)
-- **Cómo contribuir**: [doc/CONTRIBUTING.md](./doc/CONTRIBUTING.md)
+- **Cómo contribuir**: [CONTRIBUTING.md](./CONTRIBUTING.md)
+- **Soporte**: [SUPPORT.md](./SUPPORT.md)
+- **Reportar una vulnerabilidad**: [SECURITY.md](./SECURITY.md) (privado)
 
 ---
 

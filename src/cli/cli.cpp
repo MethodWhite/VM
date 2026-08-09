@@ -772,21 +772,8 @@ namespace cli {
         for (auto &p : imp_paths) pp.options().import_paths.push_back(p);
         for (auto &d : defines)   pp.options().predefines.push_back(d);
 
-        // macros de plataforma
-#ifdef _WIN32
-        pp.options().predefines.push_back("__VPP_WINDOWS__");
-#elif defined(__linux__)
-        pp.options().predefines.push_back("__VPP_LINUX__");
-#elif defined(__APPLE__)
-        pp.options().predefines.push_back("__VPP_MACOS__");
-#endif
-#if defined(__x86_64__) || defined(_M_X64)
-        pp.options().predefines.push_back("__VPP_X86_64__");
-#elif defined(__i386__) || defined(_M_IX86)
-        pp.options().predefines.push_back("__VPP_X86_32__");
-#elif defined(__aarch64__) || defined(_M_ARM64)
-        pp.options().predefines.push_back("__VPP_AARCH64__");
-#endif
+        // macros de plataforma (SO + arquitectura)
+        pp.push_platform_predefines();
 
         // --- ejecutar el preprocesador ---
         std::string result = pp.process(source, src_file);

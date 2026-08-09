@@ -568,20 +568,7 @@ int main(int argc, char *argv[]) {
         pp.options().import_paths.push_back(exe_dir + "/preprocessor/include_lib");
         pp.options().import_paths.push_back(exe_dir + "/include_lib");
         pp.options().import_paths.push_back(source_dir);
-#ifdef _WIN32
-        pp.options().predefines.push_back("__VPP_WINDOWS__");
-#elif defined(__linux__)
-        pp.options().predefines.push_back("__VPP_LINUX__");
-#elif defined(__APPLE__)
-        pp.options().predefines.push_back("__VPP_MACOS__");
-#endif
-#if defined(__x86_64__) || defined(_M_X64)
-        pp.options().predefines.push_back("__VPP_X86_64__");
-#elif defined(__i386__) || defined(_M_IX86)
-        pp.options().predefines.push_back("__VPP_X86_32__");
-#elif defined(__aarch64__) || defined(_M_ARM64)
-        pp.options().predefines.push_back("__VPP_AARCH64__");
-#endif
+        pp.push_platform_predefines();
 
         std::string processed = pp.process(source, src_path);
 
@@ -1103,13 +1090,7 @@ int main(int argc, char *argv[]) {
             pp.options().import_paths.push_back(exe_dir + "/preprocessor/include_lib");
             pp.options().import_paths.push_back(exe_dir + "/include_lib");
             pp.options().import_paths.push_back(source_dir);
-#ifdef _WIN32
-            pp.options().predefines.push_back("__VPP_WINDOWS__");
-#elif defined(__linux__)
-            pp.options().predefines.push_back("__VPP_LINUX__");
-#elif defined(__APPLE__)
-            pp.options().predefines.push_back("__VPP_MACOS__");
-#endif
+            pp.push_platform_predefines();
             std::string processed = pp.process(vex_source, vex_path);
             if (pp.diagnostics().has_errors()) {
                 for (const auto &d : pp.diagnostics().diagnostics()) {

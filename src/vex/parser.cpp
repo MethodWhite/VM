@@ -220,8 +220,16 @@ namespace vex {
             return val == "macos" || val == "posix";
 #elif defined(__linux__)
             return val == "linux" || val == "posix";
+#elif defined(__FreeBSD__)
+            return val == "freebsd" || val == "bsd" || val == "posix";
+#elif defined(__OpenBSD__)
+            return val == "openbsd" || val == "bsd" || val == "posix";
+#elif defined(__NetBSD__)
+            return val == "netbsd" || val == "bsd" || val == "posix";
+#elif defined(__DragonFly__)
+            return val == "dragonfly" || val == "bsd" || val == "posix";
 #else
-            return false;
+            return val == "posix";
 #endif
         }
         if (key == "arch") {

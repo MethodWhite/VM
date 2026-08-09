@@ -36,7 +36,9 @@ namespace jit {
                           const CallResolver &resolve_call,
                           const VregEntries &ent,
                           const CallResolver &resolve_native,
-                          const CallResolver &resolve_symbol) {
+                          const CallResolver &resolve_symbol,
+                          std::vector<LineMapEntry> *out_line_map,
+                          size_t *out_code_size) {
         /* 1. Seleccionar MachineIR de vregs (VM_ABI).  Si la funcion usa un
          *    op fuera del subset soportado, abortar -> fallback. */
         MFunction mf;
@@ -80,7 +82,7 @@ namespace jit {
         /* 3. Encode a bytes. */
         X86Encoder enc;
         std::vector<uint8_t> bytes;
-        if (enc.encode(pf, bytes) == 0 || bytes.empty()) return nullptr;
+        if (enc.encode(pf, bytes, out_line_map) == 0 || bytes.empty()) return nullptr;
 
         /* 4. Alojar en el code cache + commit (flush icache). */
         uint8_t *code = cc.alloc(bytes.size(), 16);
@@ -101,6 +103,8 @@ namespace jit {
         JitRegistry::instance().register_function(
             code, code + bytes.size(), pf.stackmaps,
             static_cast<uint32_t>(8u * ra.num_spill_slots), "vreg");
+
+        if (out_code_size) *out_code_size = bytes.size();
 
         return code;
     }

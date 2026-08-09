@@ -61,7 +61,8 @@ namespace jit {
     /* encode (pasada principal + resolve)                                    */
     /* ===================================================================== */
 
-    size_t X86Encoder::encode(MFunction &fn, std::vector<uint8_t> &out) {
+    size_t X86Encoder::encode(MFunction &fn, std::vector<uint8_t> &out,
+                              std::vector<LineMapEntry> *out_line_map) {
         instr_count_ = 0;
         const size_t base = out.size();
 
@@ -69,6 +70,12 @@ namespace jit {
         size_t total_instrs = 0;
         for (const auto &b : fn.blocks) total_instrs += b.instrs.size();
         out.reserve(out.size() + total_instrs * 6);
+
+        /* Diagnostico: linea del fuente vigente al emitir cada instr.  El
+         * selector/vreg deja la linea en MInstr::source_pc (0 = sin linea).
+         * Solo se anade una entrada cuando la linea CAMBIA. */
+        uint32_t cur_line = 0;
+        if (out_line_map) out_line_map->clear();
 
         for (auto &block : fn.blocks) {
             block.byte_offset = static_cast<uint32_t>(out.size() - base);
@@ -80,12 +87,17 @@ namespace jit {
             }
             for (const auto &mi : block.instrs) {
                 ++instr_count_;
+                const uint32_t off_before = static_cast<uint32_t>(out.size() - base);
                 if (!emit_instr(fn, mi, out)) {
                     /* fail-fast: opcode no soportado.  El INT3 hace que la
                      * ejecucion crasheee con SIGTRAP en lugar de seguir
                      * con basura. */
                     put8(out, 0xCC);
                     return 0;
+                }
+                if (out_line_map && mi.source_pc != 0 && mi.source_pc != cur_line) {
+                    cur_line = mi.source_pc;
+                    out_line_map->push_back(LineMapEntry{off_before, cur_line});
                 }
             }
         }

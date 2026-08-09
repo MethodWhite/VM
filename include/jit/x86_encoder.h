@@ -81,6 +81,10 @@ namespace jit {
 
         /**
          * @brief Codifica @p fn en bytes y los anyade a @p out.
+         * @param out_line_map Si no es nullptr, se rellena con la correlacion
+         *        offset-nativo -> linea de fuente (compresa: solo donde la
+         *        linea cambia, en orden).  Requiere que las MInstr lleven la
+         *        linea en @c MInstr::source_pc.
          * @return numero total de bytes emitidos para esta funcion, o 0
          *         si encontro un opcode no soportado (en cuyo caso
          *         @p out queda parcialmente escrito hasta el punto del
@@ -89,7 +93,8 @@ namespace jit {
          * Tras emit, hace @c resolve_fixups() para patchear todas las
          * branches rel32 con offsets correctos.
          */
-        size_t encode(MFunction &fn, std::vector<uint8_t> &out);
+        size_t encode(MFunction &fn, std::vector<uint8_t> &out,
+                      std::vector<LineMapEntry> *out_line_map = nullptr);
 
         /** @brief Numero de instrucciones emitidas en la ultima llamada a encode(). */
         size_t instr_count() const noexcept { return instr_count_; }

@@ -313,6 +313,12 @@ namespace jit {
                 MCond cc;
                 if (in.op == ir::IrOp::PHI) continue;  // resuelto via copias
 
+                /* Diagnostico: marcar las MInstr emitidas por esta IR con la
+                 * linea del fuente (el encoder construye el line_map).  Se
+                 * anota DESPUES del cuerpo del switch para cubrir todos los
+                 * push, incluidos los de lambdas anidadas (phi/param). */
+                const size_t emit_before = O.size();
+
                 if (cmp_cond(in.op, cc)) {
                     flush_pending();
                     if (in.operands.size() != 2) return false;
@@ -1889,6 +1895,11 @@ namespace jit {
                         vreg_dbg(fn.name.c_str(), ir::ir_op_name(in.op));
                         return false;  // op fuera del subset -> fallback
                 }
+
+                /* Anotar la linea del fuente en las MInstr emitidas por esta
+                 * IR instr (diagnostico JIT: encoder -> line_map). */
+                for (size_t i = emit_before; i < O.size(); ++i)
+                    O[i].source_pc = in.source_line;
             }
             flush_pending();  // por si el bloque termina sin terminador explicito
             out.blocks.push_back(std::move(mb));

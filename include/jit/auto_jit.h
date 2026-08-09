@@ -39,6 +39,9 @@ namespace ir      { struct IrFunction; }
 
 namespace jit {
 
+    struct LineMapEntry; ///< correlacion codigo-nativo <-> linea (machine_ir.h)
+
+
     /**
      * @brief Threshold global de invocaciones para auto-JIT.
      *        Default: UINT32_MAX (JIT desactivado).
@@ -246,6 +249,46 @@ namespace jit {
      *        Util para tests; en produccion no se usa.
      */
     void clear_jit_code_at_pc_map() noexcept;
+
+    /**
+     * @brief Registra una region de codigo JIT nativo junto con la
+     *        correlacion offset-nativo -> linea de fuente de la funcion.
+     *
+     * Usado para el diagnostico: cuando el codigo compilado falla, la
+     * direccion NATIVA del fallo (que el handler de senales entrega) se
+     * traduce a linea del fuente.  El line_map se guarda comprimido (solo
+     * donde la linea cambia), ver @c LineMapEntry.
+     *
+     * @param fn        Inicio del codigo nativo.
+     * @param code_size Tamano en bytes.
+     * @param line_map  Correlacion offset->linea, o vacio si no disponible.
+     */
+    void register_jit_region(void *fn, size_t code_size,
+                             const std::vector<LineMapEntry> *line_map = nullptr,
+                             const char *name = nullptr) noexcept;
+
+    /**
+     * @brief En que linea del fuente estaba el codigo NATIVO que fallo.
+     *
+     * @param native_pc Direccion del fallo (PC nativo).
+     * @param[out] out_line Linea del fuente (1-based).
+     * @return true si se pudo determinar.
+     */
+    bool lookup_line_by_native_pc(uint64_t native_pc, uint32_t &out_line) noexcept;
+
+    /**
+     * @brief Nombre de la funcion cuyo codigo nativo contiene @p native_pc.
+     *
+     * @param native_pc Direccion del fallo.
+     * @return Nombre de la funcion, o cadena vacia si no se determino.
+     */
+    std::string lookup_function_by_native_pc(uint64_t native_pc);
+
+    /** @brief Limpia el registro de regiones JIT (tests). */
+    void clear_jit_regions() noexcept;
+
+    /** @brief Imprime todas las regiones JIT registradas (depuracion). */
+    void dump_jit_regions() noexcept;
 
     /**
      * @brief Sprint D.5-callvm-trigger: dispara la compilacion JIT de la

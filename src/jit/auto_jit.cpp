@@ -1040,12 +1040,18 @@ namespace jit {
          * forzamos el path del Selector (slots + regalloc rewrite) que SI lo
          * implementa. */
         if (g_jit_use_vregs && !callback_entry) {
+            std::vector<LineMapEntry> vcode_lines;
+            size_t vcode_size = 0;
             uint8_t *vcode = vreg_compile(ir_fn, *g_code_cache, resolver,
                                           make_vreg_entries(), resolve_native_fn,
-                                          sym_resolver);
+                                          sym_resolver, &vcode_lines, &vcode_size);
             if (vcode != nullptr) {
                 if (!ir_fn.name.empty())
                     g_eager_cache[ir_fn.name] = reinterpret_cast<uint64_t>(vcode);
+                /* Diagnostico: correlacion offset-nativo -> linea de fuente
+                 * para que un crash en codigo compilado diga donde ocurrio. */
+                register_jit_region(vcode, vcode_size, &vcode_lines,
+                                    ir_fn.name.c_str());
                 /* NOTA: el registro pc->jit lo hace el caller
                  * (maybe_compile_callvm_target) desde el CompileResult; no lo
                  * duplicamos aqui para no registrar compiles degenerados. */
@@ -1338,6 +1344,85 @@ namespace jit {
         g_pc_to_jit_code.clear();
         /* NO reseteamos g_pc_jit_active: el flag es sticky a proposito
          * (ver comentario arriba).  Tests pueden setearlo manualmente. */
+    }
+
+    /* ===================================================================== */
+    /* Diagnostico JIT: regiones nativas -> linea de fuente                   */
+    /* ===================================================================== */
+
+    namespace {
+        struct NativeRegion {
+            uint64_t start = 0;          ///< Inicio del codigo nativo.
+            uint64_t size  = 0;          ///< Tamano en bytes.
+            std::string name;            ///< Nombre de la funcion.
+            std::vector<LineMapEntry> lines; ///< offset->linea (comprimido).
+        };
+        std::mutex                   g_regions_mtx;
+        std::vector<NativeRegion>    g_native_regions;
+    }
+
+    void register_jit_region(void *fn, size_t code_size,
+                             const std::vector<LineMapEntry> *line_map,
+                             const char *name) noexcept {
+        if (!fn || code_size == 0) return;
+        std::lock_guard<std::mutex> lk(g_regions_mtx);
+        NativeRegion r;
+        r.start = reinterpret_cast<uint64_t>(fn);
+        r.size  = code_size;
+        if (name) r.name = name;
+        if (line_map) r.lines = *line_map;
+        g_native_regions.push_back(std::move(r));
+        if (const char *dbg = std::getenv("VESTA_JIT_REGIONS")) {
+            if (dbg[0] && dbg[0] != '0') {
+                std::fprintf(stderr, "[jit-region] 0x%llx +%zu fn='%s' lines=%zu\n",
+                    (unsigned long long)r.start, r.size, r.name.c_str(), r.lines.size());
+            }
+        }
+    }
+
+    bool lookup_line_by_native_pc(uint64_t native_pc, uint32_t &out_line) noexcept {
+        std::lock_guard<std::mutex> lk(g_regions_mtx);
+        for (const auto &r : g_native_regions) {
+            if (native_pc < r.start || native_pc >= r.start + r.size) continue;
+            if (r.lines.empty()) return false;
+            const uint64_t off = native_pc - r.start;
+            /* LineMapEntry ordenado por offset: ultima entrada con
+             * offset <= off. */
+            uint32_t line = 0;
+            for (const auto &e : r.lines) {
+                if (e.offset <= off) line = e.line;
+                else break;
+            }
+            if (line != 0) { out_line = line; return true; }
+            return false;
+        }
+        return false;
+    }
+
+    std::string lookup_function_by_native_pc(uint64_t native_pc) {
+        std::lock_guard<std::mutex> lk(g_regions_mtx);
+        for (const auto &r : g_native_regions) {
+            if (native_pc >= r.start && native_pc < r.start + r.size) {
+                return r.name;
+            }
+        }
+        return std::string();
+    }
+
+    void clear_jit_regions() noexcept {
+        std::lock_guard<std::mutex> lk(g_regions_mtx);
+        g_native_regions.clear();
+    }
+
+    void dump_jit_regions() noexcept {
+        std::lock_guard<std::mutex> lk(g_regions_mtx);
+        std::fprintf(stderr, "[jit-regions] total=%zu\n", g_native_regions.size());
+        for (const auto &r : g_native_regions) {
+            std::fprintf(stderr, "  0x%llx +%llu fn='%s' lines=%zu\n",
+                (unsigned long long)r.start, (unsigned long long)r.size,
+                r.name.c_str(), r.lines.size());
+        }
+        std::fflush(stderr);
     }
 
     /* ===================================================================== */

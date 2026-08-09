@@ -10,6 +10,7 @@
 #include "loader/loader.h"
 #include "loader/class_registry.h"
 #include "debug/debugger.h"
+#include "jit/auto_jit.h" // diagnostico: linea/funcion de un crash JIT
 
 #include <atomic>
 #include <csetjmp>
@@ -677,6 +678,31 @@ namespace runtime {
             std::fprintf(stderr, "[AV] SIG=%d proc=%p recovery=%d addr=0x%lx -- JIT crash\n",
                 sig, (void*)proc, proc ? (int)proc->av_recovery_active : -1,
                 (unsigned long)(info ? (uint64_t)(uintptr_t)info->si_addr : 0));
+            /* Diagnostico: si el fallo fue en codigo JIT compilado, decir la
+             * funcion y la linea del fuente.  El PC nativo lo entrega el
+             * ucontext (no el PC de la VM, que no se sincroniza al compilar). */
+            if (ctx != nullptr) {
+#if defined(__x86_64__)
+                const uint64_t native_pc =
+                    reinterpret_cast<const ucontext_t *>(ctx)->uc_mcontext.gregs[REG_RIP];
+#elif defined(__aarch64__)
+                const uint64_t native_pc =
+                    reinterpret_cast<const ucontext_t *>(ctx)->uc_mcontext.pc;
+#else
+                const uint64_t native_pc = 0;
+#endif
+                if (native_pc != 0) {
+                    uint32_t line = 0;
+                    const bool has_line = jit::lookup_line_by_native_pc(native_pc, line);
+                    const std::string fn = jit::lookup_function_by_native_pc(native_pc);
+                    if (has_line || !fn.empty()) {
+                        std::fprintf(stderr, "[AV]  nativo: 0x%llx  funcion: %s  linea: %u\n",
+                            (unsigned long long)native_pc,
+                            fn.empty() ? "?" : fn.c_str(), line);
+                        std::fflush(stderr);
+                    }
+                }
+            }
             std::fflush(stderr);
             std::signal(sig, SIG_DFL);
             std::raise(sig);

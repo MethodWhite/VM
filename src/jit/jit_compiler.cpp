@@ -48,6 +48,7 @@
 #include "jit/jit_registry.h"
 #include "jit/machine_ir.h"
 #include "jit/x86_encoder.h"
+#include "jit/auto_jit.h" // diagnostico: registro de regiones nativas
 
 #include <cstring>
 #include <utility>
@@ -196,6 +197,12 @@ namespace jit {
             std::move(mf.stackmaps),
             mf.stack_frame_size,
             ir_fn.name.c_str());
+
+        /* Diagnostico: registrar la region nativa -> funcion para que un
+         * crash en codigo compilado diga en que funcion ocurrio.  El
+         * line_map del encoder se pasa solo si el selector lo lleno. */
+        jit::register_jit_region(code, bytes.size(), nullptr,
+                                 ir_fn.name.c_str());
 
         return result;
     }

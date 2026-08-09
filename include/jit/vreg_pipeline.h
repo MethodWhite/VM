@@ -44,7 +44,9 @@ namespace jit {
                           const CallResolver &resolve_call = {},
                           const VregEntries &ent = {},
                           const CallResolver &resolve_native = {},
-                          const CallResolver &resolve_symbol = {});
+                          const CallResolver &resolve_symbol = {},
+                          std::vector<LineMapEntry> *out_line_map = nullptr,
+                          size_t *out_code_size = nullptr);
 
     /**
      * @brief Compila @p fn por el path vreg con un OSR-entry para el loop cuyo

@@ -885,4 +885,25 @@ namespace jit {
 
 } // namespace jit
 
+// ---------------------------------------------------------------------------
+// Correlacion codigo-nativo <-> fuente (diagnostico JIT)
+// ---------------------------------------------------------------------------
+
+namespace jit {
+
+    /**
+     * @brief Entrada del mapa de lineas de una funcion compilada a nativo.
+     *
+     * Relaciona un desplazamiento dentro del codigo nativo con la linea del
+     * fuente Vex que lo origino.  Se guarda COMPRIMIDO: solo donde la linea
+     * CAMBIA (unas decenas de entradas por funcion en vez de una por
+     * instruccion), en orden creciente de offset.
+     */
+    struct LineMapEntry {
+        uint32_t offset = 0; ///< Desplazamiento dentro del codigo nativo.
+        uint32_t line   = 0; ///< Linea del fuente (1-based).
+    };
+
+} // namespace jit
+
 #endif // VESTA_JIT_MACHINE_IR_H

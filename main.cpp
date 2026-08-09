@@ -36,6 +36,8 @@
 #include "cli/runtime_api_commands.h"
 #include "util/assembler_multiprocess.h"
 #include "vex/compiler.h"
+#include "aot/aot_compiler.h"      // compilador AOT (Vex -> ejecutable nativo)
+#include "ir/ssa_ir_serialize.h"   // IrModule -> bytes / bytes -> IrModule
 #include "vex/comptime_vm.h"   /* Phase MC.4 probe del ComptimeRuntime */
 #include "vex/project_cache.h" /* Phase M5.B project-level cache */
 #include "vex/velb_signature.h" /* Phase M.L28: firmas digitales */
@@ -290,6 +292,10 @@ int main(int argc, char *argv[]) {
             // sandbox.h para tabla completa de caps + sintaxis.
             ("vex-caps",          "Phase M.sandbox: restringe caps del modulo principal. Sintaxis: 'fs:read,net,ffi:call=kernel32.dll;user32.dll'. Vacio = ALL granted (default). 'none' = sandbox total.",
                 cxxopts::value<std::string>()->default_value(""))
+            ("aot",               "Compilar archivo .vex a ejecutable nativo ELF (AOT). Uso: --aot <archivo.vex> -o salida [--aot-tier full|embed|bare]",
+                cxxopts::value<std::string>())
+            ("aot-tier",          "Tier del AOT: full|embed|bare (default full)",
+                cxxopts::value<std::string>()->default_value("full"))
             // Diagramas para debug y traceo del pipeline Vex.  Tres formatos
             // seleccionables via --diagram-format:
             //   mermaid (default): escribe .mmd con bloque ```mermaid```;
@@ -1009,6 +1015,85 @@ int main(int argc, char *argv[]) {
             /*keep_labels=*/(result.count("keep-labels") > 0),
             /*ir_section_bytes=*/nullptr,
             /*emit_map=*/(result.count("emit-map") > 0));
+    }
+
+    // ---------------------------------------------------------------------
+    // Compilador AOT: .vex -> ejecutable nativo ELF (sin runtime VM).
+    //   vm --aot programa.vex -o programa [--aot-tier full|embed|bare]
+    //
+    // Pipeline:
+    //   .vex -> Vex frontend (compile_vex_source) -> ir_section_bytes
+    //        -> parse_ir_section (IrModule) -> aot::AotCompiler -> ELF
+    // ---------------------------------------------------------------------
+    if (result.count("aot")) {
+        const std::string &vex_path = result["aot"].as<std::string>();
+        const std::string out_path  = result.count("o")
+            ? result["o"].as<std::string>()
+            : (vex_path + ".elf");
+        const std::string tier_str = result["aot-tier"].as<std::string>();
+
+        std::ifstream ifs(vex_path);
+        if (!ifs.is_open()) {
+            std::cerr << "[aot] No se puede abrir: " << vex_path << "\n";
+            return EXIT_FAILURE;
+        }
+        std::string vex_source((std::istreambuf_iterator<char>(ifs)),
+                                std::istreambuf_iterator<char>());
+
+        // Compilar .vex -> IR (reusa el frontend; no hace falta el .velb).
+        vex::CompileOptions copts;
+        copts.opt_level  = 2;
+        vex::CompileResult cr = vex::compile_vex_source(vex_source, vex_path, copts);
+        if (!cr.ok) {
+            for (const auto &d : cr.diagnostics.all())
+                std::cerr << d.loc.file << ":" << d.loc.line << ": "
+                          << d.message << "\n";
+            std::cerr << "[aot] Error de compilacion de " << vex_path << "\n";
+            return EXIT_FAILURE;
+        }
+        if (cr.ir_section_bytes.empty()) {
+            std::cerr << "[aot] No se produjo IR para " << vex_path
+                      << " (sin funciones?)" << "\n";
+            return EXIT_FAILURE;
+        }
+
+        // Reconstruir el IrModule desde la seccion IR serializada.
+        std::vector<ir::IrFunction> functions;
+        if (!ir::parse_ir_section(cr.ir_section_bytes, 0,
+                                  cr.ir_section_bytes.size(), functions)) {
+            std::cerr << "[aot] No se pudo deserializar el IR de " << vex_path << "\n";
+            return EXIT_FAILURE;
+        }
+        ir::IrModule mod;
+        mod.functions = std::move(functions);
+
+        // Configurar el compilador AOT.
+        aot::AotOptions aopts;
+        aopts.output_format = aot::OutputFormat::ELF;
+        if      (tier_str == "bare")  aopts.tier = aot::Tier::BARE;
+        else if (tier_str == "embed") aopts.tier = aot::Tier::EMBED;
+        else                          aopts.tier = aot::Tier::FULL;
+        aot::AotCompiler compiler;
+        compiler.set_options(aopts);
+
+        aot::AotResult ar = compiler.compile(mod);
+        if (!ar.ok) {
+            std::cerr << "[aot] Error de compilacion AOT: " << ar.error << "\n";
+            return EXIT_FAILURE;
+        }
+
+        std::ofstream ofs(out_path, std::ios::binary);
+        if (!ofs) {
+            std::cerr << "[aot] No se puede escribir: " << out_path << "\n";
+            return EXIT_FAILURE;
+        }
+        ofs.write(reinterpret_cast<const char *>(ar.executable.data()),
+                  static_cast<std::streamsize>(ar.executable.size()));
+        ofs.close();
+        std::cerr << "[aot] " << out_path << ": " << ar.executable.size()
+                  << " bytes (code=" << ar.code_size
+                  << ", data=" << ar.data_size << ", tier=" << tier_str << ")\n";
+        return EXIT_SUCCESS;
     }
 
     // Compilar un archivo .vex (lenguaje Vex) a .velb.

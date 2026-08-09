@@ -57,6 +57,8 @@
 
 #include <functional>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace jit {
 
@@ -296,6 +298,17 @@ namespace jit {
          * principal de emision.
          */
         HostPrepass analyze_host_values(const ir::IrFunction &ir_fn);
+
+        /**
+         * @brief ALLOCAs hoistables a bloques entry (LICM).  Evita stack
+         *        overflow en loops: cada iter no libera bytes antes de la
+         *        back-edge.  Extraido del setup de select().
+         */
+        struct HoistInfo {
+            std::unordered_map<ir::IrValueId, uint64_t> hoisted_allocas;
+            std::vector<std::pair<ir::IrValueId, uint64_t>> hoisted_order;
+        };
+        HoistInfo compute_alloca_hoist(const ir::IrFunction &ir_fn);
 
         SelectorOptions opts_;
         /// Indice en imm64_pool de la direccion del safepoint handler.

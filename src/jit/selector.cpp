@@ -207,31 +207,14 @@ namespace jit {
          *   - !host_in_jit (VM-addr de ALLOCA/param): inline page cache
          *     hit + fallback vrt_vm_read/write per-size.  */
 
-        /* LICM para ALLOCA: las ALLOCAs en bloques no-entry causan
-         * stack overflow si estan dentro de loops (cada iter consume
-         * bytes sin liberarlos antes de la back-edge).  Solucion:
-         * hoist a entry.  Cada slot stack se reusa entre iteraciones.
-         *
-         * Construimos un mapa: VID de ALLOCA -> bytes a reservar.  En
-         * el prologue del MBlock entry emitimos los `sub rsp, N` para
-         * todas las ALLOCAs hoisted Y guardamos el `mov dst_slot, rsp`
-         * (ajustado al offset acumulado).  En el switch de IrOp::ALLOCA
-         * dentro del loop body, si el VID esta en el mapa, NO emitimos
-         * nada (ya esta hoisted). */
-        std::unordered_map<ir::IrValueId, uint64_t> hoisted_allocas;
-        std::vector<std::pair<ir::IrValueId, uint64_t>> hoisted_order;
-        for (size_t bi_chk = 1; bi_chk < ir_fn.blocks.size(); ++bi_chk) {
-            for (const auto &ins_chk : ir_fn.blocks[bi_chk].instrs) {
-                if (ins_chk.op == ir::IrOp::ALLOCA
-                 && ins_chk.dst != ir::IR_NO_VALUE) {
-                    const uint64_t bytes = ins_chk.imm;
-                    if (bytes == 0 || bytes >= INT32_MAX) continue;
-                    const uint64_t aligned = (bytes + 15ULL) & ~15ULL;
-                    hoisted_allocas[ins_chk.dst] = aligned;
-                    hoisted_order.emplace_back(ins_chk.dst, aligned);
-                }
-            }
-        }
+        /* LICM para ALLOCA: extraido a compute_alloca_hoist().  Devuelve
+         * el mapa VID de ALLOCA -> bytes a reservar y el orden de hoist.
+         * En el prologue del MBlock entry se emiten los `sub rsp, N` y en
+         * el switch de IrOp::ALLOCA del loop body, si el VID esta en el
+         * mapa, NO se emite nada (ya esta hoisted). */
+        HoistInfo hi = compute_alloca_hoist(ir_fn);
+        std::unordered_map<ir::IrValueId, uint64_t> &hoisted_allocas = hi.hoisted_allocas;
+        std::vector<std::pair<ir::IrValueId, uint64_t>> &hoisted_order = hi.hoisted_order;
 
         const JitRegalloc regalloc = compute_jit_regalloc(ir_fn);
 
@@ -7849,6 +7832,31 @@ case IrOp::CALLCLOSURE: {
         }
 
         return hp;
+    }
+
+    /* ===================================================================== */
+    /* Pre-pase: LICM de ALLOCAs a entry (extraido del metodo select)         */
+    /* ===================================================================== */
+
+    Selector::HoistInfo Selector::compute_alloca_hoist(const ir::IrFunction &ir_fn) {
+        HoistInfo hi;
+        /* Las ALLOCAs en bloques no-entry causan stack overflow si estan
+         * dentro de loops (cada iter consume bytes sin liberarlos antes de
+         * la back-edge).  Se hoistean a entry: cada slot se reusa entre
+         * iteraciones. */
+        for (size_t bi_chk = 1; bi_chk < ir_fn.blocks.size(); ++bi_chk) {
+            for (const auto &ins_chk : ir_fn.blocks[bi_chk].instrs) {
+                if (ins_chk.op == ir::IrOp::ALLOCA
+                 && ins_chk.dst != ir::IR_NO_VALUE) {
+                    const uint64_t bytes = ins_chk.imm;
+                    if (bytes == 0 || bytes >= INT32_MAX) continue;
+                    const uint64_t aligned = (bytes + 15ULL) & ~15ULL;
+                    hi.hoisted_allocas[ins_chk.dst] = aligned;
+                    hi.hoisted_order.emplace_back(ins_chk.dst, aligned);
+                }
+            }
+        }
+        return hi;
     }
 
 } // namespace jit

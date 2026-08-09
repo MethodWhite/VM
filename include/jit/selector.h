@@ -310,6 +310,13 @@ namespace jit {
         };
         HoistInfo compute_alloca_hoist(const ir::IrFunction &ir_fn);
 
+        /**
+         * @brief Cuenta usos por VID (operands + phi_args + func_ptr).
+         *        Habilitador de la fusion CMP+BR_COND: solo segura cuando
+         *        el resultado del CMP_* tiene exactamente un uso.
+         */
+        std::vector<uint32_t> compute_use_counts(const ir::IrFunction &ir_fn);
+
         SelectorOptions opts_;
         /// Indice en imm64_pool de la direccion del safepoint handler.
         /// Computado al inicio de @c select() si VM_ABI y handler != 0.

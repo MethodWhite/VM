@@ -218,27 +218,10 @@ namespace jit {
 
         const JitRegalloc regalloc = compute_jit_regalloc(ir_fn);
 
-        /* Sprint CCC: contar usos por VID para habilitar fusion CMP+BR_COND.
-         * El selector emite `xor rax,rax; cmp; setcc; store` para CMP_* y
-         * luego `load; test; jcc` para BR_COND -- 8 instr.  Con fusion:
-         * `cmp; jcc<cond>` -- 2 instr.  Solo seguro cuando el resultado del
-         * CMP_* tiene EXACTAMENTE un uso (el BR_COND).  use_count cubre
-         * todos los operands + phi_args. */
-        std::vector<uint32_t> use_count(ir_fn.values.size(), 0);
-        for (const auto &blk : ir_fn.blocks) {
-            for (const auto &ins : blk.instrs) {
-                for (ir::IrValueId v : ins.operands) {
-                    if (v != ir::IR_NO_VALUE && v < use_count.size()) use_count[v]++;
-                }
-                for (const auto &pa : ins.phi_args) {
-                    if (pa.value != ir::IR_NO_VALUE && pa.value < use_count.size())
-                        use_count[pa.value]++;
-                }
-                if (ins.func_ptr != ir::IR_NO_VALUE && ins.func_ptr < use_count.size())
-                    use_count[ins.func_ptr]++;
-            }
-        }
-
+        /* Sprint CCC: contar usos por VID (extraido a compute_use_counts)
+         * para habilitar fusion CMP+BR_COND.  Solo seguro cuando el
+         * resultado del CMP_* tiene EXACTAMENTE un uso (el BR_COND). */
+        std::vector<uint32_t> use_count = compute_use_counts(ir_fn);
         /* Set para deduplicar warnings de IR ops no soportadas dentro de
          * la misma funcion: la misma op repetida en multiples lineas o
          * el mismo (op, linea) en multiples puntos solo se reporta una vez.
@@ -7857,6 +7840,28 @@ case IrOp::CALLCLOSURE: {
             }
         }
         return hi;
+    }
+
+    /* ===================================================================== */
+    /* Pre-pase: conteo de usos por VID (fusion CMP+BR_COND)                 */
+    /* ===================================================================== */
+
+    std::vector<uint32_t> Selector::compute_use_counts(const ir::IrFunction &ir_fn) {
+        std::vector<uint32_t> use_count(ir_fn.values.size(), 0);
+        for (const auto &blk : ir_fn.blocks) {
+            for (const auto &ins : blk.instrs) {
+                for (ir::IrValueId v : ins.operands) {
+                    if (v != ir::IR_NO_VALUE && v < use_count.size()) use_count[v]++;
+                }
+                for (const auto &pa : ins.phi_args) {
+                    if (pa.value != ir::IR_NO_VALUE && pa.value < use_count.size())
+                        use_count[pa.value]++;
+                }
+                if (ins.func_ptr != ir::IR_NO_VALUE && ins.func_ptr < use_count.size())
+                    use_count[ins.func_ptr]++;
+            }
+        }
+        return use_count;
     }
 
 } // namespace jit

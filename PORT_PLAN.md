@@ -61,16 +61,14 @@ módulo.  No se arrastra código muerto de la otra rama.
   - **Verificado**: `return 42` -> 42; `if` -> 7; `fib(10)` -> 55;
     `factorial(5)` -> 120; `while` loop (0..4) -> 10.  El AOT BARE ya
     compila programas con control de flujo, llamadas y recursion.
-- **Tier FULL/EMBED (en curso)**: el emitter de objeto ELF genera un .o
-  valido y el driver linka con g++ contra vmcore/vex_lib.  Con
-  -nostartfiles -Ttext=0x400000 las funciones quedan en 0x400000 y las
-  vaddr de los CALLs coinciden, pero hay un bug de alineacion de los
-  simbolos _start/stub en el emitter (el stub real no coincide con el
-  offset que el simbolo apunta) -> SIGILL.  `return 42` (sin CALLs
-  internos) funciona en FULL.
-- **Pendiente**: pipeline de relocaciones PC32 + alineacion de simbolos
-  del emitter (nucleo del port AOT de Desmon con linker propio), runtime
-  FULL/EMBED para I/O/GC/strings, multi-ISA, DWARF.
+- **Tier FULL/EMBED (2026-08-09)**: relocaciones R_X86_64_64 para los
+  CALLs entre funciones.  El selector marca los imm64 de user-calls, el
+  encoder registra sus posiciones, y el AOT genera relocaciones al
+  simbolo destino.  El .o se linka con g++ contra vmcore/vex_lib/vpp_lib.
+  **Verificado**: FULL ejecuta return 42, if=7, fib(10)=55, factorial=120,
+  loop=10, gcd=6.
+- **Pendiente**: runtime FULL/EMBED para I/O/GC/strings (los vrt_* que el
+  runtime linkado aporta), multi-ISA, DWARF.
 - Ver `src/aot/README.md` limitaciones.
 
 ### vectorize (P1, 30 commits)

@@ -372,6 +372,33 @@ namespace aot {
             uint64_t start_offset = text_code.size();
             emit_startup_stub(text_code);
 
+            /* Resolver la relocacion interna del stub: en el ejecutable
+             * directo (BARE) el _start hace `call main` con un placeholder
+             * de 4 bytes (offset rel32).  Sin resolverlo, el call apunta a
+             * si mismo y el exit code de main se pierde.  El offset relativo
+             * es: dst - (PC_after_call) = main_off - (start_off + 5).
+             * El call main es la primera instruccion del stub (offset 0). */
+            if (options_.tier == Tier::BARE && !opt_mod.functions.empty()) {
+                auto it_main = fn_offsets.find("main");
+                if (it_main == fn_offsets.end() && !opt_mod.functions.empty()) {
+                    /* Si no hay `main` literal, usar la primera funcion. */
+                    it_main = fn_offsets.begin();
+                }
+                if (it_main != fn_offsets.end()) {
+                    const uint64_t call_pc = start_offset + 5; // tras E8 + 4
+                    const int64_t  disp =
+                        static_cast<int64_t>(it_main->second) -
+                        static_cast<int64_t>(call_pc);
+                    const size_t disp_off = start_offset + 1;
+                    if (disp_off + 4 <= text_code.size()) {
+                        text_code[disp_off + 0] = static_cast<uint8_t>(disp & 0xFF);
+                        text_code[disp_off + 1] = static_cast<uint8_t>((disp >> 8) & 0xFF);
+                        text_code[disp_off + 2] = static_cast<uint8_t>((disp >> 16) & 0xFF);
+                        text_code[disp_off + 3] = static_cast<uint8_t>((disp >> 24) & 0xFF);
+                    }
+                }
+            }
+
             // 4. Construir secciones para el emisor ELF
             std::vector<SectionInfo> sections;
 

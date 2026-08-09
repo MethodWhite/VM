@@ -54,10 +54,15 @@ módulo.  No se arrastra código muerto de la otra rama.
     parse_ir_section (IrModule) -> aot::AotCompiler -> ELF.
   - Fix de relocacion interna `_start -> main` en ejecutables BARE
     (el call main apuntaba a si mismo -> exit 0).
-  - Verificado: `return 42` genera ELF que ejecuta y devuelve 42.
-- **Pendiente**: llamadas/recursión (fib(10) falla: el AOT rudimentario
-  no emite CALL correctamente), runtime FULL/EMBED, GC AOT, multi-ISA,
-  debug info DWARF.  Ver `src/aot/README.md` limitaciones.
+  - Resolver de CALLs a funciones user (resolve_user_fn): las llamadas
+    entre funciones se resuelven por direccion absoluta (0x400000+offset).
+  - Self-recursion: el callee en compilacion devuelve 0x400000+offset
+    actual (current_fn_name_).
+  - **Verificado**: `return 42` -> 42; `if` -> 7; `fib(10)` -> 55;
+    `factorial(5)` -> 120; `while` loop (0..4) -> 10.  El AOT BARE ya
+    compila programas con control de flujo, llamadas y recursion.
+- **Pendiente**: runtime FULL/EMBED (io/GC), AOT para strings/FFI,
+  multi-ISA, debug info DWARF.  Ver `src/aot/README.md` limitaciones.
 
 ### vectorize (P1, 30 commits)
 - Desmon: `src/vx/vectorize.cpp` (2359 LOC) — pase del Lowering que

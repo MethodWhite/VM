@@ -307,7 +307,8 @@ namespace aot {
     bool AotCompiler::compile_function(const ir::IrFunction &ir_fn,
                                        std::vector<uint8_t> &code,
                                        std::unordered_map<std::string, uint64_t> &sym_offsets,
-                                       const std::function<uint64_t(const std::string &)> &resolve_user_fn) {
+                                       const std::function<uint64_t(const std::string &)> &resolve_user_fn,
+                                       std::vector<std::pair<size_t, uint64_t>> *out_user_call_sites) {
         // 1. Calcular liveness
         ir::LivenessResult liveness;
         try {
@@ -346,6 +347,22 @@ namespace aot {
         size_t emitted = encoder.encode(mfn, code);
         if (emitted == 0) {
             return false;
+        }
+
+        /* AOT relocaciones: recoger las posiciones (dentro del texto de
+         * esta fn) de los imm64 de user-calls y su valor.  El valor es
+         * 0x400000+offset del callee; el AOT lo mapea al nombre para
+         * generar la relocacion R_X86_64_64 al simbolo. */
+        if (out_user_call_sites) {
+            for (size_t pos : mfn.user_call_byte_offsets) {
+                /* pos es absoluta al buffer `code` (incluye fns previas). */
+                if (pos + 8 <= code.size()) {
+                    uint64_t v64 = 0;
+                    for (int i = 0; i < 8; ++i)
+                        v64 |= static_cast<uint64_t>(code[pos + i]) << (8 * i);
+                    out_user_call_sites->emplace_back(pos, v64);
+                }
+            }
         }
 
         // Registrar offset de la funcion
@@ -399,12 +416,19 @@ namespace aot {
                 return 0;
             };
 
+            /* AOT relocaciones: (posicion absoluta en text_code, valor imm64)
+             * de cada CALL a funcion user.  El valor es 0x400000+offset del
+             * callee; se mapea al nombre via fn_offsets y se genera una
+             * relocacion R_X86_64_64 al simbolo. */
+            std::vector<std::pair<size_t, uint64_t>> user_call_sites;
+
             auto compile_one = [&](const ir::IrFunction &fn) -> bool {
                 if (fn.is_native) return true; // saltar stubs nativos
                 uint64_t offset_before = text_code.size();
                 current_fn_name_ = fn.name;
                 cur_fn_offset    = offset_before;
-                if (!compile_function(fn, text_code, fn_offsets, aot_resolver)) {
+                if (!compile_function(fn, text_code, fn_offsets, aot_resolver,
+                                      &user_call_sites)) {
                     current_fn_name_.clear();
                     result.error = "Fallo al compilar funcion: " + fn.name;
                     return false;
@@ -574,6 +598,38 @@ namespace aot {
             // Relocaciones: por ahora placeholder para _start -> main
             // En un sistema real, el linker (ld) resuelve estas.
             // Para el ejecutable directo, emitimos relocaciones internas.
+
+            /* AOT: mapa vaddr (0x400000+offset) -> nombre de funcion, y
+             * relocaciones R_X86_64_64 para los CALLs user.  El imm64 del
+             * user-call queda reemplazado por el valor del simbolo destino
+             * (el linker lo reubica a la posicion final). */
+            {
+                std::unordered_map<uint64_t, std::string> vaddr_to_name;
+                for (const auto &kv : fn_offsets)
+                    vaddr_to_name[AOT_TEXT_BASE + kv.second] = kv.first;
+
+                /* Los simbolos de funciones van primero.  El symtab del .o
+                 * empieza con STN_UNDEF (indice 0), asi el indice final de
+                 * un simbolo en el vector `symbols` (0-based) es +1. */
+                std::unordered_map<std::string, uint32_t> name_to_symidx;
+                for (uint32_t si = 0; si < symbols.size(); ++si) {
+                    if (symbols[si].shndx == text_shndx && !symbols[si].name.empty())
+                        name_to_symidx[symbols[si].name] = si + 1; // +STN_UNDEF
+                }
+
+                for (const auto &[pos, vaddr] : user_call_sites) {
+                    auto it = vaddr_to_name.find(vaddr);
+                    if (it == vaddr_to_name.end()) continue;
+                    auto sit = name_to_symidx.find(it->second);
+                    if (sit == name_to_symidx.end()) continue;
+                    RelocInfo rel;
+                    rel.offset    = pos;         // offset en .text (archivo)
+                    rel.type      = 1;           // R_X86_64_64 (absoluta)
+                    rel.sym_index = sit->second; // indice del simbolo destino
+                    rel.addend    = 0;
+                    relocations.push_back(rel);
+                }
+            }
 
             // 7. Crear emisor ELF y generar archivo objeto
             ElfEmitter emitter;

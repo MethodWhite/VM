@@ -1126,7 +1126,8 @@ int main(int argc, char *argv[]) {
                 return EXIT_FAILURE;
             }
             std::cerr << "[aot] " << out_path << ": linkado contra " << rt_lib << "\n";
-            std::filesystem::remove(obj_path);
+            if (!std::getenv("VESTA_AOT_KEEP_OBJ"))
+                std::filesystem::remove(obj_path);
         } else {
             std::ofstream ofs(out_path, std::ios::binary);
             if (!ofs) {

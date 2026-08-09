@@ -2255,6 +2255,18 @@ namespace jit {
 
                         /* mov rax, fn_addr (via imm64 pool) */
                         const uint32_t fn_pool_idx = mf.intern_imm64(fn_addr);
+                        /* AOT: marcar el imm64 de este user-call para que
+                         * el encoder registre su posicion y el AOT genere
+                         * una relocacion al simbolo del callee (el linker
+                         * reubica el .text, asi las vaddr absolutas que
+                         * quedarian fijas apuntarian mal). */
+                        if (is_user_call) {
+                            bool already = false;
+                            for (uint32_t v : mf.user_call_imm64_indices)
+                                if (v == fn_pool_idx) { already = true; break; }
+                            if (!already)
+                                mf.user_call_imm64_indices.push_back(fn_pool_idx);
+                        }
                         mf.blocks.back().instrs.push_back(
                             MInstr::make_unary(MOp::MOV,
                                 MOperand::make_reg(MReg::RAX),

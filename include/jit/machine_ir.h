@@ -811,6 +811,16 @@ namespace jit {
         /// el encoder.
         std::vector<size_t>        self_ref_byte_offsets;
 
+        /// AOT (relocaciones PC32): indices del imm64_pool que referencian
+        /// una funcion user (CALL a otra funcion del mismo .o).  El encoder
+        /// registra la posicion de cada uno en @c user_call_byte_offsets.
+        /// El AOT los convierte en relocaciones al simbolo de la funcion
+        /// destino (los imm64 son 0x400000+offset, que el linker no reubica).
+        std::vector<uint32_t>      user_call_imm64_indices;
+        /// Posiciones (byte offsets) de los imm64 de user-calls.  Poblado
+        /// por el encoder cuando el imm64 matchea user_call_imm64_indices.
+        std::vector<size_t>        user_call_byte_offsets;
+
         /// Phase D.7 (regalloc por vregs): numero de registros virtuales
         /// reservados en esta funcion.  Los ids son densos 0..vreg_count-1.
         /// Solo se usa en el path VREG (flag @c VESTA_JIT_VREGS); el path de

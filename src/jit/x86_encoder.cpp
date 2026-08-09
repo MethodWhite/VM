@@ -695,6 +695,14 @@ namespace jit {
                     break;
                 }
             }
+            /* AOT: registrar la posicion de los imm64 de user-calls para
+             * que el AOT genere relocaciones al simbolo del callee. */
+            for (uint32_t uc_idx : fn.user_call_imm64_indices) {
+                if (uc_idx == idx) {
+                    fn.user_call_byte_offsets.push_back(imm64_pos);
+                    break;
+                }
+            }
             return;
         }
 

@@ -168,7 +168,8 @@ namespace aot {
         bool compile_function(const ir::IrFunction &fn,
                               std::vector<uint8_t> &code,
                               std::unordered_map<std::string, uint64_t> &sym_offsets,
-                              const std::function<uint64_t(const std::string &)> &resolve_user_fn = {});
+                              const std::function<uint64_t(const std::string &)> &resolve_user_fn = {},
+                              std::vector<std::pair<size_t, uint64_t>> *out_user_call_sites = nullptr);
 
         /**
          * @brief Genera el prologo de inicializacion segun el tier.

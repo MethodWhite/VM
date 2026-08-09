@@ -1,7 +1,7 @@
 /*
- * VestaVM - src/install/platform_linux.cpp
+ * VestaVM - src/install/platform_posix.cpp
  *
- * Backend Linux del instalador.
+ * Backend POSIX del instalador (Linux, BSD, macOS).
  *
  *   Per-user (sin sudo):
  *     ~/.local/lib/vesta/         -> binario, recursos
@@ -15,9 +15,10 @@
  *     /usr/local/bin/vesta
  *     /usr/share/applications, /usr/share/mime/packages, /usr/share/icons
  *
- * El registro de la asociacion lo hacen los gestores XDG; nosotros
+ * El registro de la asociacion lo hacen los gestores XDG (freedesktop);
  * generamos los ficheros y llamamos a `update-mime-database` y
- * `update-desktop-database` al final.
+ * `update-desktop-database` al final SOLO si esos comandos existen (en
+ * FreeBSD/OpenBSD/NetBSD y macOS no estan instalados por defecto).
  */
 
 #if !defined(_WIN32)
@@ -86,6 +87,20 @@ namespace install {
         return std::system(cmd.c_str());
     }
 
+    /// True si @p cmd esta en el PATH.  En BSD/macOS los comandos XDG de
+    /// freedesktop no estan instalados por defecto; hay que degradar.
+    static bool command_available(const std::string& cmd) {
+        std::string probe = "command -v " + cmd + " >/dev/null 2>&1";
+        return std::system(probe.c_str()) == 0;
+    }
+
+    /// Ejecuta @p cmd solo si el binario existe; si no, no-op silencioso.
+    static void run_cmd_if_available(const std::string& cmd_bin,
+                                     const std::string& args) {
+        if (command_available(cmd_bin))
+            run_cmd(cmd_bin + " " + args);
+    }
+
     static bool copy_dir_recursive(const std::filesystem::path& src,
                                     const std::filesystem::path& dst,
                                     Manifest& mf, bool overwrite)
@@ -115,10 +130,10 @@ namespace install {
     }
 
     // ====================================================================
-    // PlatformLinux
+    // PlatformPosix
     // ====================================================================
 
-    class PlatformLinux : public Platform {
+    class PlatformPosix : public Platform {
     public:
         bool is_elevated() const override { return geteuid() == 0; }
         std::string elevation_hint() const override {
@@ -270,24 +285,22 @@ namespace install {
                 mf.desktop_files.push_back({ desk_path });
 
                 // [3] Asignar como handler default del MIME (per-user)
-                if (geteuid() != 0) {
+                if (geteuid() != 0 && command_available("xdg-mime")) {
                     std::string cmd = "xdg-mime default vesta-" + ext_clean +
                                       ".desktop " + mime + " 2>/dev/null";
                     run_cmd(cmd);
                 }
             }
 
-            // Refrescar bases de datos XDG
+            // Refrescar bases de datos XDG (solo si el comando existe).
             std::string upd_mime = (geteuid() == 0)
-                ? "update-mime-database /usr/share/mime 2>/dev/null"
-                : "update-mime-database " + (home_dir() / ".local/share/mime").string() +
-                  " 2>/dev/null";
+                ? "/usr/share/mime"
+                : (home_dir() / ".local/share/mime").string();
             std::string upd_desk = (geteuid() == 0)
-                ? "update-desktop-database /usr/share/applications 2>/dev/null"
-                : "update-desktop-database " + (home_dir() / ".local/share/applications").string() +
-                  " 2>/dev/null";
-            run_cmd(upd_mime);
-            run_cmd(upd_desk);
+                ? "/usr/share/applications"
+                : (home_dir() / ".local/share/applications").string();
+            run_cmd_if_available("update-mime-database", upd_mime + " 2>/dev/null");
+            run_cmd_if_available("update-desktop-database", upd_desk + " 2>/dev/null");
             return true;
         }
 
@@ -377,11 +390,11 @@ namespace install {
             std::error_code ec;
             for (auto& d : mf.desktop_files) std::filesystem::remove(d.path, ec);
             for (auto& m : mf.mime_files)    std::filesystem::remove(m.path, ec);
-            // Refrescar bases
-            run_cmd("update-mime-database " +
-                    (home_dir() / ".local/share/mime").string() + " 2>/dev/null");
-            run_cmd("update-desktop-database " +
-                    (home_dir() / ".local/share/applications").string() + " 2>/dev/null");
+            // Refrescar bases (solo si el comando existe).
+            run_cmd_if_available("update-mime-database",
+                (home_dir() / ".local/share/mime").string() + " 2>/dev/null");
+            run_cmd_if_available("update-desktop-database",
+                (home_dir() / ".local/share/applications").string() + " 2>/dev/null");
             return true;
         }
 
@@ -436,7 +449,7 @@ namespace install {
     };
 
     Platform& current_platform() {
-        static PlatformLinux inst;
+        static PlatformPosix inst;
         return inst;
     }
 

@@ -328,7 +328,8 @@ if(WIN32)
     target_sources(vesta_install PRIVATE src/install/platform_win.cpp)
     target_link_libraries(vesta_install PRIVATE Shell32 Advapi32 Ole32 User32 Shlwapi)
 else()
-    target_sources(vesta_install PRIVATE src/install/platform_linux.cpp)
+    # POSIX: Linux, BSD, macOS (degrade los comandos XDG si no existen).
+    target_sources(vesta_install PRIVATE src/install/platform_posix.cpp)
 endif()
 
 target_include_directories(vesta_install PUBLIC include)

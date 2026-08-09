@@ -11,6 +11,7 @@
 #include "loader/class_registry.h"
 #include "debug/debugger.h"
 
+#include <atomic>
 #include <csetjmp>
 #include <csignal>
 #include <cstdarg>
@@ -387,6 +388,39 @@ namespace runtime {
     // throw_fatal: ruta dual (capturable / fatal-original).
     // ---------------------------------------------------------------------
 
+    /// Que fallo acabo con el proceso.  0 = ninguno.  Lo lee quien decide con
+    /// que codigo sale el programa; ponerlo aqui evita que cada sitio que
+    /// arranca una VM tenga que ir a buscarlo por su cuenta.
+    static std::atomic<uint32_t> g_last_fatal_kind{0};
+
+    int last_fatal_exit_code() {
+        switch (g_last_fatal_kind.load(std::memory_order_relaxed)) {
+        case 0: return 0;
+        /* SIGFPE: operacion aritmetica invalida. */
+        case FATAL_DIVISION_BY_ZERO: return 128 + 8;
+        /* SIGSEGV: la memoria no era suya.  El desbordamiento de pila entra
+         * aqui porque es exactamente eso: pasarse del final. */
+        case FATAL_NULL_POINTER:
+        case FATAL_SEGMENTATION_FAULT:
+        case FATAL_STACK_OVERFLOW:
+        case FATAL_STACK_UNDERFLOW:
+        case FATAL_NATIVE_CRASH: return 128 + 11;
+        /* SIGILL: el codigo no era ejecutable. */
+        case FATAL_ILLEGAL_INSTRUCTION: return 128 + 4;
+        /* SIGABRT: el programa se rindio -- panic, memoria agotada, una
+         * excepcion nativa que nadie recogio. */
+        case FATAL_USER_ABORT:
+        case FATAL_OUT_OF_MEMORY:
+        case FATAL_NATIVE_EXCEPTION: return 128 + 6;
+        /* Lo que no encaja en ninguna senal sale con el fallo generico. */
+        default: return 1;
+        }
+    }
+
+    static void record_fatal_kind(uint32_t kind) noexcept {
+        g_last_fatal_kind.store(kind, std::memory_order_relaxed);
+    }
+
     void throw_fatal(ProcessVM *vm, uint32_t kind, const char *message) {
         if (!vm) return;
 
@@ -406,6 +440,7 @@ namespace runtime {
         // el caso comun (programas sin try/catch envolvente).  Cero
         // overhead anadido: 1 lectura + 1 branch.
         if (vm->exc_frame_stack == nullptr) {
+            record_fatal_kind(kind);
             vm->err_thread = fatal_to_thread_err(kind);
             vm->scheduler.on_event(EVT_ERROR);
             return;
@@ -415,6 +450,7 @@ namespace runtime {
         // (init_exception_classes no se llamo), no podemos lanzar como
         // excepcion -- caemos al camino antiguo.
         if (g_fatal_error_class == nullptr) {
+            record_fatal_kind(kind);
             vm->err_thread = fatal_to_thread_err(kind);
             vm->scheduler.on_event(EVT_ERROR);
             return;
@@ -424,6 +460,7 @@ namespace runtime {
         ensure_fatal_buffers(vm);
         if (!vm->fatal_slot) {
             // OOM en el slot mismo: ruta antigua.
+            record_fatal_kind(kind);
             vm->err_thread = fatal_to_thread_err(kind);
             vm->scheduler.on_event(EVT_ERROR);
             return;

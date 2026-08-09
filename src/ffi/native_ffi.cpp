@@ -115,6 +115,23 @@ namespace ffi {
                 candidates.push_back(dir + "/" + name);
             }
         }
+#ifndef _WIN32
+        /* dlopen() a diferencia de LoadLibraryA() no anade la extension
+         * por si solo: un nombre sin extension ("vesta_io") no se resuelve
+         * a "vesta_io.so" (Linux/BSD) ni a "vesta_io.dylib" (macOS).  El
+         * nombre del import llega habitualmente sin extension, asi que
+         * probamos tambien con ella antes de rendirnos. */
+        if (name.find(".so") == std::string::npos &&
+            name.find(".dylib") == std::string::npos) {
+            candidates.push_back(name + ".so");
+            std::string dir = vm_exe_dir();
+            if (!dir.empty()) candidates.push_back(dir + "/" + name + ".so");
+#if defined(__APPLE__)
+            candidates.push_back(name + ".dylib");
+            if (!dir.empty()) candidates.push_back(dir + "/" + name + ".dylib");
+#endif
+        }
+#endif
         std::string last_err;
 
         for (const auto &cand : candidates) {

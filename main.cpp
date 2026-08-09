@@ -30,6 +30,7 @@
 #include "ir/ir_emitter.h"
 #include "jit/auto_jit.h"
 #include "runtime/profile.h"          // Sprint D.6 (2026-06-03)
+#include "runtime/exception_runtime.h" // codigo de salida tras un fallo
 #include "pkg/cli.h"
 #include "runtime/proceso_runtime.h"
 #include "cli/runtime_api_commands.h"
@@ -2408,6 +2409,12 @@ int main(int argc, char *argv[]) {
             std::cerr << "Error al ejecutar " << velb_path << ": " << e.what() << "\n";
             return EXIT_FAILURE;
         }
+        /* Si el programa murio por un fallo que nadie capturo, el proceso sale
+         * con el codigo que le corresponde y no con cero.  Salir con cero tras
+         * reventar es mentirle a quien lo llamo -- y quien lo llama suele ser un
+         * guion o una integracion continua que se lo cree. */
+        if (const int fatal_rc = runtime::last_fatal_exit_code())
+            return fatal_rc;
         return EXIT_SUCCESS;
     }
 

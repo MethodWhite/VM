@@ -88,6 +88,21 @@ namespace runtime {
     extern loader::ClassInfo *g_fatal_error_class;
 
     /**
+     * @brief Codigo con el que debe salir el proceso tras un fallo sin capturar.
+     *
+     * Se usan los codigos de siempre y no unos propios: un fallo que en C mata
+     * al proceso con SIGFPE sale con lo mismo aqui.  La convencion es la de
+     * cualquier interprete de ordenes -- 128 mas el numero de senal -- asi que
+     * una division entre cero sale 136 y un acceso invalido 139, y quien tenga
+     * guiones o integracion continua mirando esos numeros no tiene que
+     * aprenderse otros.  Cabe en los 8 bits que deja un codigo de salida, que
+     * es la otra razon.
+     *
+     * @return El codigo, o 0 si no hubo ningun fallo.
+     */
+    int last_fatal_exit_code();
+
+    /**
      * @brief Registra la clase @c FatalError en el ClassRegistry del
      *        loader publico si aun no existe.  Idempotente.
      *

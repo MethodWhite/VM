@@ -1403,7 +1403,7 @@ ir::IrValueId emit_field_addr(ir::IrFunction *fn, ir::IrBlockId block,
     ir::IrValueId emit_field_addr(ir::IrFunction *fn,
                                          ir::IrBlockId   block,
                                          ir::IrValueId   base,
-                                         uint32_t        offset,
+                                         uint64_t        offset,
                                          uint32_t        line) {
         if (offset == 0) {
             // El frontend marca el resultado como host_ptr para que LOAD/

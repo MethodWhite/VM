@@ -14,6 +14,7 @@
  * division por constante (Hacker's Delight).
  */
 
+#include "jit/selector_helpers.h"
 #include "jit/selector.h"
 
 #include "jit/auto_jit.h"
@@ -131,27 +132,11 @@ namespace jit {
         return trim_str(s.substr(1, s.size() - 2));
     }
 
-    /* Regs scratch: usamos solo caller-saved que ningun ABI preserva
-     * para evitar push/pop adicionales en el prologue/epilogue. */
-    constexpr MReg SCRATCH_A = MReg::RAX;
-    constexpr MReg SCRATCH_B = MReg::RCX;
-    constexpr MReg SCRATCH_C = MReg::RDX;
+    /* ----- Regs scratch y convencion ----- */
 
-    /* Calling convention nativa per-platform.  JIT_PROC_REG es donde
-     * el prologue VM_ABI deposita el ProcessVM* (callee-saved RBX,
-     * vive durante toda la funcion).  NATIVE_ARG[0..2] son los
-     * primeros 3 args segun ABI (SysV: rdi/rsi/rdx; Win64:
-     * rcx/rdx/r8). */
-    constexpr MReg JIT_PROC_REG = MReg::RBX;
-#if defined(_WIN32)
-    constexpr MReg NATIVE_ARG0 = MReg::RCX;
-    constexpr MReg NATIVE_ARG1 = MReg::RDX;
-    constexpr MReg NATIVE_ARG2 = MReg::R8;
-#else
-    constexpr MReg NATIVE_ARG0 = MReg::RDI;
-    constexpr MReg NATIVE_ARG1 = MReg::RSI;
-    constexpr MReg NATIVE_ARG2 = MReg::RDX;
-#endif
+    // SCRATCH_A/B/C, JIT_PROC_REG, NATIVE_ARG0/1/2 defined in selector_helpers.h
+
+    /* Calling convention nativa per-platform. */
 
     /** @brief Offset del slot stack de un SSA value (RBP - offset). */
     int32_t slot_offset(ir::IrValueId vid) noexcept {

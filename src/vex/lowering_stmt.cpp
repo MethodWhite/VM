@@ -32,8 +32,8 @@ namespace {
 }
 
 // Forward decl of helpers defined in lowering.cpp used by stmt lowering
-static void collect_assigned_vars(const ast::Node *n,
-                                   std::set<std::string> &out);
+void collect_assigned_vars(const ast::Node *n,
+                           std::set<std::string> &out);
 
 static void scan_assign(ast::Stmt *s, std::set<std::string> &out);
 static void scan_read_expr(ast::Expr *e, std::set<std::string> &out);
@@ -2656,18 +2656,17 @@ static void scan_read_expr(ast::Expr *e, std::set<std::string> &out);
             "stdlib/native/runtime/vex_trace", "leave");
     }
 
-    // Forward decls de helpers definidos mas abajo en el TU.  Necesarias
-    // porque lower_try y try_lower_builtin_call los usan.
-    static uint64_t intern_class_name(ir::IrModule &mod, const std::string &name);
+    // Forward declarations of helpers defined in lowering_*.cpp files.
+    uint64_t intern_class_name(ir::IrModule &mod, const std::string &name);
 
 
     /// usado por lower_class_methods para emitir el CALLVIRT a
     /// destructores de fields destructibles del contenedor.
-    static ir::IrValueId emit_field_addr(ir::IrFunction *fn,
-                                         ir::IrBlockId   block,
-                                         ir::IrValueId   base,
-                                         uint32_t        offset,
-                                         uint32_t        line);
+    ir::IrValueId emit_field_addr(ir::IrFunction *fn,
+                                  ir::IrBlockId   block,
+                                  ir::IrValueId   base,
+                                  uint32_t        offset,
+                                  uint32_t        line);
 
     // ---------------------------------------------------------------------
     // try / catch / throw.

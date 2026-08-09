@@ -31,6 +31,7 @@
  * etiquetas estables.
  */
 
+#include "jit/selector_helpers.h"
 #include "jit/selector.h"
 
 #include "jit/auto_jit.h"

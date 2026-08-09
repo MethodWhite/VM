@@ -163,9 +163,15 @@ list(APPEND ALL_PROJECT_SOURCES ${CMAKE_SOURCE_DIR}/src/runtime/exec_instruction
 # Buscar todos los archivos .cpp dentro de tests/ y subcarpetas
 file(GLOB_RECURSE TEST_FILES RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} *.cpp)
 
+include(CTest)
+
 foreach (TEST_FILE ${TEST_FILES})
     # Crear un prefijo seguro basado en la ruta relativa
     get_filename_component(TEST_DIR ${TEST_FILE} DIRECTORY)
+    get_filename_component(TEST_NAME ${TEST_FILE} NAME_WE)
     string(REPLACE "/" "_" REL_DIR_SAFE ${TEST_DIR})
     add_single_test("test_${REL_DIR_SAFE}" ${TEST_FILE} "${ALL_PROJECT_SOURCES}")
+    add_test(NAME "test_${REL_DIR_SAFE}_${TEST_NAME}"
+             COMMAND "test_${REL_DIR_SAFE}_${TEST_NAME}"
+             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 endforeach ()

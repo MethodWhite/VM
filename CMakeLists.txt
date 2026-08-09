@@ -533,6 +533,7 @@ target_compile_options(vesta_rt PRIVATE
 )
 
 # Anadir subdirectorio de tests
+enable_testing()
 add_subdirectory(tests)
 
 # ---------------------------------------------------------------------------

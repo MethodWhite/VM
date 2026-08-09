@@ -59,6 +59,7 @@ add_library(vex_lib STATIC
 # consumidores (vm, tests) los hereden automaticamente al linkear.
 target_include_directories(vex_lib PUBLIC
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/libs/SourceCode/keystone/include
 )
 
 # C++17 minimo (consistente con el resto del proyecto).

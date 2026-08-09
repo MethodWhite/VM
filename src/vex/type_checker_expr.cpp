@@ -5016,4 +5016,3 @@ namespace vex {
     }
 
 } // namespace vex
-} // namespace vex

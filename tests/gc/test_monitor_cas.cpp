@@ -246,11 +246,11 @@ static void test_layout() {
           "offsetof(monitor_word) == 16");
 
     // Verificar helpers monitor_make / monitor_owner / monitor_depth
-    uint64_t w = loader::monitor_make(0x12345678u, 0x9ABCDEF0u);
+    uint64_t w = loader::monitor_make(0x12345678u, 0x9ABCu);
     CHECK(loader::monitor_owner(w) == 0x12345678u,
           "monitor_owner extrae bits 0-31");
-    CHECK(loader::monitor_depth(w) == 0x9ABCDEF0u,
-          "monitor_depth extrae bits 32-63");
+    CHECK(loader::monitor_depth(w) == 0x9ABCu,
+          "monitor_depth extrae bits 48-63 (16-bit depth)");
 
     // Round-trip: empacar, desempacar, comparar
     uint64_t w2 = loader::monitor_make(loader::monitor_owner(w),

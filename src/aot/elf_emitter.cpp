@@ -222,11 +222,13 @@ namespace aot {
             sym_name_offs.push_back(add_string(sym.name, strtab_));
         }
 
-        // Escribir datos de seccion
-        for (size_t i = 1; i < entries.size(); ++i) {
+        // Escribir datos de seccion (solo las secciones reales, no las
+        // sinteticas .symtab/.strtab/etc. que se escriben despues).
+        for (size_t i = 1; i <= sections_.size(); ++i) {
             entries[i].shdr.sh_offset = buf.size();
             if (entries[i].shdr.sh_type != SHT_NOBITS) {
-                buf.insert(buf.end(), sections_[i - 1].data.begin(), sections_[i - 1].data.end());
+                buf.insert(buf.end(), sections_[i - 1].data.begin(),
+                           sections_[i - 1].data.end());
             }
         }
 
@@ -403,7 +405,10 @@ namespace aot {
 
         // Construir ELF header al inicio
         std::vector<uint8_t> header;
-        write_ehdr(header, shoff, sec_count, shstrndx);
+        /* e_shoff se calculo sobre el buffer SIN el header.  Al insertar el
+         * header (sizeof(Elf64_Ehdr) bytes) al inicio, todos los offsets del
+         * archivo se desplazan hacia delante: corregir e_shoff por +ehsize. */
+        write_ehdr(header, shoff + sizeof(Elf64_Ehdr), sec_count, shstrndx);
         buf.insert(buf.begin(), header.begin(), header.end());
 
         return buf;

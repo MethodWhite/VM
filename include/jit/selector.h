@@ -329,6 +329,28 @@ namespace jit {
         };
         FrameLayout compute_frame_layout(size_t num_values);
 
+        /**
+         * @brief Layout de la work-area del callback ABI nativo (VM_ABI).
+         *        Extraido del setup de select().
+         */
+        struct CallbackLayout {
+            bool       cb_entry       = false;
+            bool       cb_use_call    = false;
+            bool       cb_save_all    = false;
+            uint32_t   cb_argc        = 0;
+            uint32_t   cb_n_reg_args  = 0;
+            uint32_t   cb_save_bytes  = 0;
+            uint32_t   cb_spill_bytes = 0;
+            uint32_t   cb_work_bytes  = 0;
+            int32_t    cb_work_base   = 0;
+            /// offset slot save del VM reg r (0..15) desde RBP
+            std::function<int32_t(uint32_t)> cb_save_off;
+            /// offset slot spill del reg-arg nativo i desde RBP
+            std::function<int32_t(uint32_t)> cb_spill_off;
+        };
+        CallbackLayout compute_callback_layout(const ir::IrFunction &ir_fn,
+                                               uint32_t slot_bytes);
+
         SelectorOptions opts_;
         /// Indice en imm64_pool de la direccion del safepoint handler.
         /// Computado al inicio de @c select() si VM_ABI y handler != 0.

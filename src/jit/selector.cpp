@@ -284,53 +284,19 @@ namespace jit {
         const uint32_t VM_STACK_SLOTS_BYTES = fl.vm_stack_slots_bytes;
 
         /* ===== callback-ABI: analisis del prologo/epilogo nativo ===== */
-        const bool cb_entry = opts_.callback_entry
-                           && opts_.mode == SelectorMode::VM_ABI;
-        /* argc del callback = numero de params (cap 12 = calling convention VM). */
-        const uint32_t cb_argc = cb_entry
-            ? static_cast<uint32_t>(ir_fn.params.size() > 12 ? 12 : ir_fn.params.size())
-            : 0u;
-        /* TLS-direct disponible? (-1 = usar el call fallback). */
-        const bool cb_use_call = cb_entry && (opts_.callback_tls_gs_disp == -1);
-        /* Numero de args que viajan en registros segun el ABI nativo. */
-#if defined(_WIN32)
-        const uint32_t CB_N_REG_ARGS = 4;
-#else
-        const uint32_t CB_N_REG_ARGS = 6;
-#endif
-        const uint32_t cb_n_reg_args = cb_entry
-            ? (cb_argc < CB_N_REG_ARGS ? cb_argc : CB_N_REG_ARGS) : 0u;
-        /* save-set: cuerpo hoja-puro -> no salvar nada; cualquier op no
-         * hoja-segura -> salvar el banco completo R0..R15 (modo "safe",
-         * equivalente al thunk previo). */
-        bool cb_save_all = false;
-        if (cb_entry) {
-            for (const auto &blk : ir_fn.blocks) {
-                for (const auto &ins : blk.instrs) {
-                    if (!cb_is_leaf_safe_op(ins.op)) { cb_save_all = true; break; }
-                }
-                if (cb_save_all) break;
-            }
-        }
-        /* Work area del callback, debajo de los VM-STACK slots:
-         *   - save area de proc->regs[0..15] (128 B) si cb_save_all.
-         *   - spill area de los reg-args (si cb_use_call). */
-        const uint32_t cb_save_bytes  = (cb_entry && cb_save_all) ? 128u : 0u;
-        const uint32_t cb_spill_bytes = (cb_entry && cb_use_call)
-            ? ((cb_n_reg_args * 8u + 15u) & ~15u) : 0u;
-        uint32_t cb_work_bytes = cb_save_bytes + cb_spill_bytes;
-        if (cb_work_bytes & 15) cb_work_bytes = (cb_work_bytes + 15) & ~15u;
-        /* Base de la work area (offset positivo desde RBP, se niega al usar). */
-        const int32_t cb_work_base = static_cast<int32_t>(slot_bytes + 16);
-        /* Offset del slot de save del VM reg r (0..15) desde RBP. */
-        auto cb_save_off = [&](uint32_t r) -> int32_t {
-            return -(cb_work_base + 8 + static_cast<int32_t>(r) * 8);
-        };
-        /* Offset del slot de spill del reg-arg nativo i desde RBP. */
-        auto cb_spill_off = [&](uint32_t i) -> int32_t {
-            return -(cb_work_base + static_cast<int32_t>(cb_save_bytes)
-                     + 8 + static_cast<int32_t>(i) * 8);
-        };
+        /* Extraido a compute_callback_layout(). */
+        CallbackLayout cbl = compute_callback_layout(ir_fn, slot_bytes);
+        const bool     cb_entry       = cbl.cb_entry;
+        const uint32_t cb_argc        = cbl.cb_argc;
+        const bool     cb_use_call    = cbl.cb_use_call;
+        const uint32_t cb_n_reg_args  = cbl.cb_n_reg_args;
+        const bool     cb_save_all    = cbl.cb_save_all;
+        const uint32_t cb_save_bytes  = cbl.cb_save_bytes;
+        const uint32_t cb_spill_bytes = cbl.cb_spill_bytes;
+        const uint32_t cb_work_bytes  = cbl.cb_work_bytes;
+        const int32_t  cb_work_base   = cbl.cb_work_base;
+        auto cb_save_off  = cbl.cb_save_off;
+        auto cb_spill_off = cbl.cb_spill_off;
 
         /* Padding fijo para alinear rsp + shadow space (solo Win64). */
         constexpr uint32_t ALIGN_PAD = 8;
@@ -7872,6 +7838,62 @@ case IrOp::CALLCLOSURE: {
         fl.vm_rsp_save_off  = -static_cast<int32_t>(fl.slot_bytes + 8);
         fl.hoisted_base_off = -static_cast<int32_t>(fl.slot_bytes + 16);
         return fl;
+    }
+
+    /* ===================================================================== */
+    /* Pre-pase: layout del callback ABI (extraido del metodo select)         */
+    /* ===================================================================== */
+
+    Selector::CallbackLayout Selector::compute_callback_layout(
+            const ir::IrFunction &ir_fn, uint32_t slot_bytes) {
+        CallbackLayout cb;
+        cb.cb_entry = opts_.callback_entry
+                   && opts_.mode == SelectorMode::VM_ABI;
+        /* argc del callback = numero de params (cap 12 = conv. VM). */
+        cb.cb_argc = cb.cb_entry
+            ? static_cast<uint32_t>(ir_fn.params.size() > 12 ? 12 : ir_fn.params.size())
+            : 0u;
+        /* TLS-direct disponible? (-1 = usar el call fallback). */
+        cb.cb_use_call = cb.cb_entry && (opts_.callback_tls_gs_disp == -1);
+        /* Numero de args que viajan en registros segun el ABI nativo. */
+#if defined(_WIN32)
+        const uint32_t CB_N_REG_ARGS = 4;
+#else
+        const uint32_t CB_N_REG_ARGS = 6;
+#endif
+        cb.cb_n_reg_args = cb.cb_entry
+            ? (cb.cb_argc < CB_N_REG_ARGS ? cb.cb_argc : CB_N_REG_ARGS) : 0u;
+        /* save-set: cuerpo hoja-puro -> no salvar nada; cualquier op no
+         * hoja-segura -> salvar el banco completo R0..R15 (modo "safe"). */
+        cb.cb_save_all = false;
+        if (cb.cb_entry) {
+            for (const auto &blk : ir_fn.blocks) {
+                for (const auto &ins : blk.instrs) {
+                    if (!cb_is_leaf_safe_op(ins.op)) { cb.cb_save_all = true; break; }
+                }
+                if (cb.cb_save_all) break;
+            }
+        }
+        /* Work area del callback, debajo de los VM-STACK slots:
+         *   - save area de proc->regs[0..15] (128 B) si cb_save_all.
+         *   - spill area de los reg-args (si cb_use_call). */
+        cb.cb_save_bytes  = (cb.cb_entry && cb.cb_save_all) ? 128u : 0u;
+        cb.cb_spill_bytes = (cb.cb_entry && cb.cb_use_call)
+            ? ((cb.cb_n_reg_args * 8u + 15u) & ~15u) : 0u;
+        cb.cb_work_bytes = cb.cb_save_bytes + cb.cb_spill_bytes;
+        if (cb.cb_work_bytes & 15) cb.cb_work_bytes = (cb.cb_work_bytes + 15) & ~15u;
+        /* Base de la work area (offset positivo desde RBP, se niega al usar). */
+        cb.cb_work_base = static_cast<int32_t>(slot_bytes + 16);
+        /* Offset del slot de save del VM reg r (0..15) desde RBP. */
+        cb.cb_save_off = [cb](uint32_t r) -> int32_t {
+            return -(cb.cb_work_base + 8 + static_cast<int32_t>(r) * 8);
+        };
+        /* Offset del slot de spill del reg-arg nativo i desde RBP. */
+        cb.cb_spill_off = [cb](uint32_t i) -> int32_t {
+            return -(cb.cb_work_base + static_cast<int32_t>(cb.cb_save_bytes)
+                     + 8 + static_cast<int32_t>(i) * 8);
+        };
+        return cb;
     }
 
 } // namespace jit

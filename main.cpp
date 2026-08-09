@@ -1082,14 +1082,50 @@ int main(int argc, char *argv[]) {
             return EXIT_FAILURE;
         }
 
-        std::ofstream ofs(out_path, std::ios::binary);
-        if (!ofs) {
-            std::cerr << "[aot] No se puede escribir: " << out_path << "\n";
-            return EXIT_FAILURE;
+        // Tier FULL/EMBED: el AOT genera un objeto ELF (.o) con simbolos
+        // runtime externos (vrt_*) que hay que resolver contra libvesta_rt.
+        // Se linka con `ld` (o el CC) contra la libreria del runtime.
+        const bool need_link = (aopts.tier != aot::Tier::BARE);
+        std::vector<uint8_t> final_bytes;
+        if (need_link) {
+            std::string obj_path = out_path + ".o";
+            {
+                std::ofstream ofs(obj_path, std::ios::binary);
+                if (!ofs) {
+                    std::cerr << "[aot] No se puede escribir: " << obj_path << "\n";
+                    return EXIT_FAILURE;
+                }
+                ofs.write(reinterpret_cast<const char *>(ar.object_data.data()),
+                          static_cast<std::streamsize>(ar.object_data.size()));
+            }
+            /* Localizar libvesta_rt: junto al ejecutable vm (build/). */
+            std::string rt_lib =
+                std::filesystem::path(fs::get_executable_path())
+                    .parent_path().string() + "/libvesta_rt.a";
+            if (!std::filesystem::exists(rt_lib)) {
+                rt_lib = "libvesta_rt.a";
+            }
+            const std::string link_cmd =
+                std::string("ld -o ") + out_path + " " + obj_path + " " +
+                rt_lib + " -lc -lpthread 2>&1";
+            const int lrc = std::system(link_cmd.c_str());
+            if (lrc != 0) {
+                std::cerr << "[aot] Link fallo (ld).  Tier "
+                          << tier_str << " requiere libvesta_rt.\n";
+                return EXIT_FAILURE;
+            }
+            std::cerr << "[aot] " << out_path << ": linkado contra " << rt_lib << "\n";
+            std::filesystem::remove(obj_path);
+        } else {
+            std::ofstream ofs(out_path, std::ios::binary);
+            if (!ofs) {
+                std::cerr << "[aot] No se puede escribir: " << out_path << "\n";
+                return EXIT_FAILURE;
+            }
+            ofs.write(reinterpret_cast<const char *>(ar.executable.data()),
+                      static_cast<std::streamsize>(ar.executable.size()));
+            ofs.close();
         }
-        ofs.write(reinterpret_cast<const char *>(ar.executable.data()),
-                  static_cast<std::streamsize>(ar.executable.size()));
-        ofs.close();
         std::cerr << "[aot] " << out_path << ": " << ar.executable.size()
                   << " bytes (code=" << ar.code_size
                   << ", data=" << ar.data_size << ", tier=" << tier_str << ")\n";

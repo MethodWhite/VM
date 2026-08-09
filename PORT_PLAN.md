@@ -84,14 +84,20 @@ módulo.  No se arrastra código muerto de la otra rama.
   `include/vex/lowering.h`), añadir VEC ops al `ssa_ir.h` local y su
   emisión en `ir_emitter.cpp`/`x86_encoder.cpp`.
 
-### ASA (P2, 37 commits)
+### ASA / inline asm (P2, 37 commits)
 - Local: `src/vex/asm_parser.cpp` + `asm_lowering.cpp` (RAW_ASM opaco).
 - Desmon: `src/vx/asm/*` (20 archivos, ~189KB) — `asm_effects.h` (tabla
   plana por-instrucción), `asm_analyze.h` (efectos por bloque),
   `asm_lift*` (lifting a IR tipado), CFG, atómicos, SIMD.
-- Port en fases:
-  1. `asm_effects` + `asm_analyze` (análisis, sin IR nuevo) — autónomo.
-  2. `asm_lift` (requiere IR ops `ASM_MICRO`, `ATOMIC_*`, `VEC_*`).
+- **Hecho (2026-08-09)**:
+  - `asm_effects` (tabla mnemonic->efectos x86/arm64, inferencia de
+    clobbers, canonicalizacion de registros, normalizacion de numeros).
+  - `asm_analyze` (modelo de efectos por bloque).
+  - Integrado en `asm_lowering.cpp`: el lowering deduce los clobbers del
+    cuerpo NASM automaticamente.
+  - Test: `tests/vex/test_asm_effects.cpp` (11 checks).
+- **Pendiente**: `asm_lift*` (lifting a IR tipado: ASM_MICRO, flags-as-SSA,
+  CFG) — requiere IR ops nuevas + emision en el runtime.
 
 ## Criterio de "hecho" por módulo
 

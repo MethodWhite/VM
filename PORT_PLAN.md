@@ -48,8 +48,16 @@ módulo.  No se arrastra código muerto de la otra rama.
   flag `--debug-info`).  Se compila pero nadie lo invoca.
 - Desmon: AOT multi-ISA con `src/toolchain/`, `src/aot/` (14+ archivos),
   linker propio, ELF/PE, GC AOT, debug info.
-- Port: empezar por el **driver** (`--aot`) que invoque el emitter local,
-  luego ampliar ISA y GC.  Ver `src/aot/README.md`.
+- **Hecho (2026-08-09)**:
+  - Driver `vm --aot prog.vex -o prog [--aot-tier full|embed|bare]`
+    (main.cpp): .vex -> compile_vex_source -> ir_section_bytes ->
+    parse_ir_section (IrModule) -> aot::AotCompiler -> ELF.
+  - Fix de relocacion interna `_start -> main` en ejecutables BARE
+    (el call main apuntaba a si mismo -> exit 0).
+  - Verificado: `return 42` genera ELF que ejecuta y devuelve 42.
+- **Pendiente**: llamadas/recursión (fib(10) falla: el AOT rudimentario
+  no emite CALL correctamente), runtime FULL/EMBED, GC AOT, multi-ISA,
+  debug info DWARF.  Ver `src/aot/README.md` limitaciones.
 
 ### vectorize (P1, 30 commits)
 - Desmon: `src/vx/vectorize.cpp` (2359 LOC) — pase del Lowering que

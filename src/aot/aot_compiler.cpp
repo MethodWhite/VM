@@ -57,11 +57,15 @@ namespace aot {
          * @brief Convierte un Tier AOT en un modo de selector.
          */
         jit::SelectorMode selector_mode_for_tier(Tier t) {
+            /* Todas las funciones se compilan con NATIVE_ABI: asi main es
+             * llamable por el crt (que no pasa ProcessVM*).  La diferencia
+             * entre tiers es el runtime linkado (FULL/EMBED: GC/io via
+             * vrt_*; BARE: freestanding). */
             switch (t) {
                 case Tier::BARE:  return jit::SelectorMode::NATIVE_ABI;
-                case Tier::EMBED: return jit::SelectorMode::VM_ABI;
+                case Tier::EMBED: return jit::SelectorMode::NATIVE_ABI;
                 case Tier::FULL:
-                default:          return jit::SelectorMode::VM_ABI;
+                default:          return jit::SelectorMode::NATIVE_ABI;
             }
         }
 

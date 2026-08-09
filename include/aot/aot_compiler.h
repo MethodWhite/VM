@@ -43,6 +43,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <functional>
 
 namespace aot {
 
@@ -153,6 +154,9 @@ namespace aot {
 
     private:
         AotOptions options_;
+        /// Nombre de la funcion en compilacion (para resolver self-recursion
+        /// en CALLs a si misma, cuyo offset aun no esta en sym_offsets).
+        std::string current_fn_name_;
 
         /**
          * @brief Compila una funcion individual a codigo maquina.
@@ -163,7 +167,8 @@ namespace aot {
          */
         bool compile_function(const ir::IrFunction &fn,
                               std::vector<uint8_t> &code,
-                              std::unordered_map<std::string, uint64_t> &sym_offsets);
+                              std::unordered_map<std::string, uint64_t> &sym_offsets,
+                              const std::function<uint64_t(const std::string &)> &resolve_user_fn = {});
 
         /**
          * @brief Genera el prologo de inicializacion segun el tier.

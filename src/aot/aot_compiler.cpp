@@ -38,6 +38,7 @@
 #include "jit/x86_encoder.h"
 #include "jit/runtime_entries.h"
 #include "jit/machine_ir.h"
+#include "jit/auto_jit.h" // g_jit_warn_unsupported (diagnostico AOT)
 
 #include <cstring>
 #include <cstdio>
@@ -301,7 +302,8 @@ namespace aot {
 
     bool AotCompiler::compile_function(const ir::IrFunction &ir_fn,
                                        std::vector<uint8_t> &code,
-                                       std::unordered_map<std::string, uint64_t> &sym_offsets) {
+                                       std::unordered_map<std::string, uint64_t> &sym_offsets,
+                                       const std::function<uint64_t(const std::string &)> &resolve_user_fn) {
         // 1. Calcular liveness
         ir::LivenessResult liveness;
         try {
@@ -319,19 +321,20 @@ namespace aot {
         // 3. Seleccionar instrucciones (IrFunction -> MFunction)
         jit::SelectorOptions sel_opts;
         sel_opts.mode = selector_mode_for_tier(options_.tier);
+        sel_opts.resolve_user_fn = resolve_user_fn;
+
+        /* Diagnostico: si VESTA_JIT_WARN esta activo, que el selector
+         * emita el detalle de la op no soportada DURANTE la seleccion. */
+        if (std::getenv("VESTA_JIT_WARN"))
+            jit::g_jit_warn_unsupported = true;
 
         jit::Selector selector(sel_opts);
         bool unsupported = false;
         jit::MFunction mfn = selector.select(ir_fn, &unsupported);
         if (unsupported) {
-            /* Diagnostico: decir CUAL op no soporto el selector.  El
-             * selector ya emite el warning via g_jit_warn_unsupported
-             * si VESTA_JIT_WARN esta activo; aqui se suma el nombre de
-             * la funcion para el driver AOT. */
-            if (std::getenv("VESTA_JIT_WARN"))
-                std::fprintf(stderr, "[aot] funcion '%s': op no soportada "
-                                     "por el selector (NATIVE_ABI)\n",
-                             ir_fn.name.c_str());
+            std::fprintf(stderr, "[aot] funcion '%s': op no soportada "
+                                 "por el selector (NATIVE_ABI)\n",
+                         ir_fn.name.c_str());
             return false;
         }
         jit::X86Encoder encoder;
@@ -359,19 +362,61 @@ namespace aot {
             ir::IrModule opt_mod = mod;
             ir::ir_optimize(opt_mod, options_.opt_level);
 
-            // 2. Compilar cada funcion
+            // 2. Compilar cada funcion.
+            //    main se compila AL FINAL: asi el resolver de CALLs ya
+            //    conoce los offsets de las callees (compiladas antes).
             std::vector<uint8_t> text_code;
             std::unordered_map<std::string, uint64_t> fn_offsets;
 
-            for (const auto &fn : opt_mod.functions) {
-                if (fn.is_native) continue; // saltar stubs nativos
+            /* Resolver de CALLs a funciones user: devuelve el offset del
+             * callee dentro del texto.  Solo es valido para callees ya
+             * compiladas (por eso main va al final). */
+            /* Resolver de CALLs a funciones user: devuelve la direccion
+             * ABSOLUTA del callee (0x400000 + offset en el texto).  El
+             * texto se mapea en 0x400000 en el ejecutable final; el
+             * selector emite call rax con esta direccion.  0 = no
+             * resuelto (sentinel del selector).
+             *
+             * Self-recursion: cuando el callee es la funcion en compilacion
+             * (todavia no registrada en fn_offsets), se devuelve la direccion
+             * basada en el offset ACTUAL del texto (donde empieza esta fn). */
+            const uint64_t AOT_TEXT_BASE = 0x400000u;
+            uint64_t cur_fn_offset = 0; // offset del texto de la fn en curso
+            auto aot_resolver = [&](const std::string &name) -> uint64_t {
+                auto it = fn_offsets.find(name);
+                if (it != fn_offsets.end())
+                    return AOT_TEXT_BASE + it->second;
+                /* Self-ref: la fn se esta compilando; su offset es el actual. */
+                if (name == current_fn_name_)
+                    return AOT_TEXT_BASE + cur_fn_offset;
+                if (std::getenv("VESTA_JIT_WARN"))
+                    std::fprintf(stderr, "[aot-resolver] '%s' NO compilada (offsets=%zu)\n",
+                                 name.c_str(), fn_offsets.size());
+                return 0;
+            };
 
+            auto compile_one = [&](const ir::IrFunction &fn) -> bool {
+                if (fn.is_native) return true; // saltar stubs nativos
                 uint64_t offset_before = text_code.size();
-                if (!compile_function(fn, text_code, fn_offsets)) {
+                current_fn_name_ = fn.name;
+                cur_fn_offset    = offset_before;
+                if (!compile_function(fn, text_code, fn_offsets, aot_resolver)) {
+                    current_fn_name_.clear();
                     result.error = "Fallo al compilar funcion: " + fn.name;
-                    return result;
+                    return false;
                 }
                 fn_offsets[fn.name] = offset_before;
+                current_fn_name_.clear();
+                return true;
+            };
+
+            for (const auto &fn : opt_mod.functions) {
+                if (fn.name == "main") continue;
+                if (!compile_one(fn)) return result;
+            }
+            for (const auto &fn : opt_mod.functions) {
+                if (fn.name != "main") continue;
+                if (!compile_one(fn)) return result;
             }
 
             // 3. Emitir startup stub

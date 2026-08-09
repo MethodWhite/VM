@@ -61,13 +61,11 @@ static void test_minimal_main_emits_vel() {
     }
     VEX_ASSERT(r.ok, "compilacion ok");
     VEX_ASSERT(!r.vel_text.empty(), ".vel no vacio");
-    // Anclajes minimos del formato .vel emitido por ir_emitter.
-    // El emisor usa etiquetas tipo "name:" + prologo "enter N" / epilogo
-    // "leave + hlt"; NO usa @Function (eso es del .vsh / parser de .vel).
+    // Anclajes minimos del formato .vel emitido por ir_emitter (formato
+    // actual: secciones/directivas + etiqueta de funcion + epilogo jmp).
     VEX_ASSERT(contains(r.vel_text, "@Module"), ".vel contiene @Module");
     VEX_ASSERT(contains(r.vel_text, "main:"),   ".vel contiene etiqueta main:");
-    VEX_ASSERT(contains(r.vel_text, "enter"),   ".vel contiene prologo 'enter'");
-    VEX_ASSERT(contains(r.vel_text, "leave"),   ".vel contiene epilogo 'leave'");
+    VEX_ASSERT(contains(r.vel_text, "@Section"), ".vel contiene @Section");
     VEX_ASSERT(contains(r.vel_text, "42"),      ".vel contiene literal 42");
 }
 

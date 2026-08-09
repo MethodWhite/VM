@@ -317,8 +317,7 @@ static void test_emit_add() {
     check(r.ok, "emit add: ok=true");
     check(!r.vel_text.empty(), "emit add: texto no vacio");
     check(contains(r.vel_text, "add:"), "emit add: etiqueta 'add' presente");
-    check(contains(r.vel_text, "enter"), "emit add: prologo enter presente");
-    check(contains(r.vel_text, "leave"), "emit add: epilogo leave presente");
+    check(contains(r.vel_text, "@Section"), "emit add: directiva @Section presente");
     check(contains(r.vel_text, "ret"),   "emit add: ret presente");
     // La instruccion adds (suma signada) debe estar
     check(contains(r.vel_text, "adds"), "emit add: instruccion adds presente");
@@ -878,13 +877,14 @@ entry:
     opts.opt_level = OptLevel::O0;
     EmitResult er = ir_emit_module(mod, opts);
     check(er.ok, "array ops emit ok");
-    // ARRAY_LOAD y ARRAY_STORE emiten movc con SIB (stride, offset=8)
-    check(contains(er.vel_text, "movc"), "array ops emit: usa movc para acceso");
+    // ARRAY_LOAD y ARRAY_STORE emiten bounds-check (cmpu/jmp.jae) + acceso
+    check(contains(er.vel_text, "cmpu"), "array ops emit: bounds-check cmpu");
+    check(contains(er.vel_text, "jmp.jae"), "array ops emit: saltar si OOB");
     // ARRAY_STORE con handle debe emitir gcwb
     check(contains(er.vel_text, "gcwb"), "array_store.handle emit: gcwb write barrier");
-    // array_len usa movc con offset 0
-    check(contains(er.vel_text, ", 0]") || contains(er.vel_text, ", 0, 0]"),
-          "array_len emit: movc offset 0");
+    // array_len usa load del campo length en offset 0
+    check(contains(er.vel_text, "load") && contains(er.vel_text, "[r"),
+          "array_len emit: load del length");
 }
 
 // =========================================================================

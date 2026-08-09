@@ -337,6 +337,7 @@ namespace gc {
         struct AllocRecord {
             void  *host_ptr; ///< puntero real del bloque (== clave del mapa)
             size_t size;     ///< tamano solicitado en bytes
+            bool   from_slab = false; ///< true si el bloque viene del slab (no liberar individual)
         };
 
         // ---------------------------------------------------------------------

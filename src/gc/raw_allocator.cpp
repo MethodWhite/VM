@@ -103,6 +103,13 @@ namespace gc {
             // Zero-init del payload (consistente con alloc tradicional).
             std::memset(node, 0, SLAB_SIZES[class_idx]);
             const uint64_t payload_ptr = reinterpret_cast<uint64_t>(node);
+            // Registro en allocations_ para que block_count()/free()/free_all()
+            // y las stats sean consistentes con el bloque vivo (el slab no
+            // debe escapar de la contabilidad del allocator).  El map insert
+            // es el coste que el slab evita en free() (que usa binary search);
+            // aqui solo se paga en alloc(), y solo para los que pidan block_count.
+            const uint64_t key = payload_ptr;
+            allocations_[key] = { node, SLAB_SIZES[class_idx], true };
             // Sprint mem-perf: NO map insert.  El class_idx se localiza
             // en @c free via binary search sobre @c slab_chunks_sorted_.
             // Stats.
@@ -189,7 +196,15 @@ namespace gc {
             if (it != slab_chunks_sorted_.begin()) {
                 --it;
                 if (ptr >= it->base && ptr < it->end) {
+                    /* Double-free guard: el bloque del slab solo es valido
+                     * si sigue registrado en allocations_.  Si ya fue
+                     * liberado (erase en el primer free), no lo empujamos
+                     * de nuevo al free list (seria un double-free real). */
                     const uint8_t class_idx = it->class_idx;
+                    auto al_it = allocations_.find(ptr);
+                    if (al_it == allocations_.end() || !al_it->second.from_slab) {
+                        return false;
+                    }
                     // Push al free list: el slot mismo guarda el next ptr.
                     SlabFreeNode *node = reinterpret_cast<SlabFreeNode *>(ptr);
                     node->next = slab_free_list_[class_idx];
@@ -199,6 +214,9 @@ namespace gc {
                     stats_.free_count++;
                     stats_.freed_bytes += slab_size;
                     total_bytes_ -= slab_size;
+                    // Des-registrar de allocations_ (registrado en alloc) para
+                    // que block_count()/free_all() no lo traten como vivo.
+                    allocations_.erase(al_it);
                     return true;
                 }
             }
@@ -324,10 +342,13 @@ namespace gc {
     void RawAllocator::free_all() {
         // Iterar la tabla completa.  Como vamos a @c clear() al final, no
         // hace falta @c erase incremental durante el bucle (mas rapido).
+        // Los bloques del slab NO se liberan individualmente: viven en
+        // chunks (mmap grandes) que slab_free_all() libera al final.
         for (auto &[key, rec] : allocations_) {
             stats_.free_count++;
             stats_.freed_bytes += rec.size;
-            vm::free_memory(rec.host_ptr, rec.size);
+            if (!rec.from_slab)
+                vm::free_memory(rec.host_ptr, rec.size);
         }
         // Clear despues del free: liberar memoria primero, despues
         // descartar la tabla de tracking.  Si pasara al reves dejariamos

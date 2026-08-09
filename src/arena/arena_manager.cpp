@@ -68,12 +68,14 @@ namespace vm {
     /**
      * @brief Inicializa el gestor de arenas con todos los contadores a cero.
      *
-     * El mapa de arenas comienza vacio y next_id se pone a 0 para que el
-     * primer bloque creado reciba el identificador 0.
+     * El mapa de arenas comienza vacio y next_id se pone a 1 para que el
+     * primer bloque creado reciba el identificador 1: el ID 0 esta
+     * RESERVADO como valor de error (ver create_arena), asi una arena
+     * valida jamas puede tener ID 0.
      */
     ArenaManager::ArenaManager()
         : total_allocated_bytes_(0), // ninguna arena reservada todavia
-          next_id(0),                // primer ID disponible es 0
+          next_id(1),                // el ID 0 es el valor de error
           arenas()                   // mapa de arenas vacio
     {
     }

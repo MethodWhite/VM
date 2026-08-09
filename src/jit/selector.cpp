@@ -190,194 +190,14 @@ namespace jit {
          * Resultado: vector<bool> host_in_jit indexado por VID.  Se
          * consulta en LOAD/STORE para elegir entre native mov (host)
          * y fallback vm_read/write (VM-addr). */
-        std::vector<uint8_t> host_in_jit(ir_fn.values.size(), 0u);
-
-        /* Sprint mem-loop-fix (2026-06-02): identificar VIDs que vienen
-         * de un ALLOCA con `host_alloca && host_alloca_explicit_free`.
-         * En el JIT, esos ALLOCAs emiten `sub rsp, N` (host stack), asi
-         * que el RAW_FREE asociado (preservado por el promote pass para
-         * que el INTERP no acumule htrack) debe ser SKIPPED en el JIT.
-         * Llamar `vrt_raw_free` sobre un ptr de host stack es crash
-         * garantizado.  El set se llena en el pre-pase y se consulta
-         * en el case IrOp::RAW_FREE. */
-        std::vector<uint8_t> skip_raw_free_vid(ir_fn.values.size(), 0u);
-
-        /* Sprint mem-loop-fix-v2 (2026-06-02): tamano del ALLOCA por VID
-         * para emitir `add rsp, aligned(N)` en el RAW_FREE matching,
-         * manteniendo el host stack balanceado per-iteracion en loops. */
-        std::vector<uint64_t> alloca_size_by_vid(ir_fn.values.size(), 0ull);
-
-        /* Seed inicial.  Tres categorias:
-         *   1. Valores con IR is_host_ptr=true: marcados por el frontend
-         *      (malloc/new/fields GC).  Son host_ptr en TODO modelo.
-         *   2. ALLOCA dsts + GC_ALLOC/etc: en JIT el ALLOCA emite
-         *      sub rsp host, asi que el dst es host_ptr aunque el IR
-         *      lo marque is_host_ptr=false (convencion interp).
-         *   3. Params PTR: asumimos JIT->JIT convention (caller paso
-         *      host_ptr). Trampoline JIT->interp con arg host_ptr
-         *      aborta el caller, asi que el modelo es coherente:
-         *      cuando una funcion JIT-compila, TODOS sus callees
-         *      alcanzables tambien estan en JIT (eager-compile
-         *      cascade); o el caller cae a interp si algun callee
-         *      no es JIT-able.
-         *
-         * El unico caso problematico es interp->JIT dispatch (dispatch
-         * hook con `enter_jit`): si interp pasa una VM-addr a un JIT
-         * callee que espera host_ptr, el inline cache miss + fallback
-         * vm_read trata el host_ptr como VM-addr -> garbage.  En la
-         * practica casi no ocurre con eager-compile cascade activo. */
-        for (size_t vid = 0; vid < ir_fn.values.size(); ++vid) {
-            if (ir_fn.values[vid].is_host_ptr) host_in_jit[vid] = 1u;
-        }
-        /* NO seedeamos params PTR como host_in_jit: el caller puede ser
-         * interp (que pasa VM-addrs) o JIT (que pasa host_ptrs).  Sin
-         * tag runtime no podemos decidir.  Asumimos VM-addr conservativo;
-         * el LOAD/STORE de esos params triggerea el bypass abajo y la
-         * funcion cae a interp.  Sprint Phase D.jit-mem-model VM-STACK
-         * dedicado lo resolveria cambiando ALLOCA del JIT a VM-stack
-         * (uniforme con interp), eliminando el mixing por completo. */
-        for (const auto &blk : ir_fn.blocks) {
-            for (const auto &ins : blk.instrs) {
-                if (ins.dst == ir::IR_NO_VALUE
-                 || ins.dst >= host_in_jit.size()) continue;
-                switch (ins.op) {
-                    /* ALLOCA con host_alloca=true (AUTO-PROMOTE): el JIT
-                     * lo emite en host stack, asi el dst es genuino
-                     * host_ptr.  Seedear como host_in_jit hace que LOAD/
-                     * STORE sobre derivados use native mov directo (sin
-                     * inline cache). */
-                    case ir::IrOp::ALLOCA:
-                        if (ins.host_alloca()) {
-                            host_in_jit[ins.dst] = 1u;
-                            /* Sprint mem-loop-fix-v2: AMBOS casos
-                             * (con/sin explicit_free) emiten `sub rsp, N`
-                             * en host stack.  La diferencia es que el
-                             * explicit_free TAMBIEN debe emitir `add rsp, N`
-                             * en el RAW_FREE matching para no acumular
-                             * stack en loops.  Marcamos skip_raw_free_vid
-                             * + guardamos size para el RAW_FREE. */
-                            if (ins.host_alloca_explicit_free()
-                             && ins.dst < skip_raw_free_vid.size()) {
-                                skip_raw_free_vid[ins.dst] = 1u;
-                                alloca_size_by_vid[ins.dst] = ins.imm;
-                            }
-                        }
-                        break;
-                    case ir::IrOp::GC_ALLOC:
-                    case ir::IrOp::GC_ALLOCP:
-                    case ir::IrOp::GC_DEREF_HOST:
-                    case ir::IrOp::NEWOBJ:
-                    case ir::IrOp::RAW_ALLOC:
-                        host_in_jit[ins.dst] = 1u;
-                        break;
-                    /* STR_LIT_ADDR produce un VM-addr (offset al slot de
-                     * static_data en proc->vm_mem), NO un host_ptr.  Si lo
-                     * seedeamos como host_in_jit, el LOAD/STORE subsiguiente
-                     * emitiria un native mov directo y page-fault.  Dejar
-                     * SIN marca: el LOAD/STORE caera al inline cache +
-                     * fallback vrt_vm_read/write que SI maneja VM-addrs. */
-                    case ir::IrOp::STR_LIT_ADDR:
-                        /* host_in_jit[ins.dst] permanece 0. */
-                        break;
-                    default: break;
-                }
-            }
-        }
-
-        /* Propagacion forward fixed-point.  Cota de 8 iter (en practica
-         * 2-3 son suficientes; cualquier programa razonable converge). */
-        for (int iter = 0; iter < 8; ++iter) {
-            bool changed = false;
-            for (const auto &blk : ir_fn.blocks) {
-                for (const auto &ins : blk.instrs) {
-                    if (ins.dst == ir::IR_NO_VALUE
-                     || ins.dst >= host_in_jit.size()) continue;
-                    if (host_in_jit[ins.dst]) continue;
-
-                    auto any_op_host = [&]() {
-                        for (ir::IrValueId v : ins.operands) {
-                            if (v != ir::IR_NO_VALUE && v < host_in_jit.size()
-                             && host_in_jit[v]) return true;
-                        }
-                        return false;
-                    };
-
-                    /* Sprint mem-loop-fix: propaga skip_raw_free_vid
-                     * cuando un operand viene de un ALLOCA con
-                     * host_alloca_explicit_free.  Cualquier deriv
-                     * (BITCAST/ADD/etc) hereda el flag para que el
-                     * RAW_FREE sobre el deriv tambien se skipee. */
-                    auto any_op_skip_free = [&]() {
-                        for (ir::IrValueId v : ins.operands) {
-                            if (v != ir::IR_NO_VALUE
-                             && v < skip_raw_free_vid.size()
-                             && skip_raw_free_vid[v]) return true;
-                        }
-                        return false;
-                    };
-
-                    /* Sprint mem-loop-fix-v2: hereda size del operand
-                     * para que el RAW_FREE sobre el deriv sepa cuanto
-                     * add rsp emitir. */
-                    auto inherit_alloca_size = [&]() -> uint64_t {
-                        for (ir::IrValueId v : ins.operands) {
-                            if (v != ir::IR_NO_VALUE
-                             && v < alloca_size_by_vid.size()
-                             && alloca_size_by_vid[v] != 0) {
-                                return alloca_size_by_vid[v];
-                            }
-                        }
-                        return 0;
-                    };
-
-                    switch (ins.op) {
-                        case ir::IrOp::ADD:
-                        case ir::IrOp::SUB:
-                        case ir::IrOp::BITCAST:
-                        case ir::IrOp::MOV:
-                        case ir::IrOp::CAST:
-                        case ir::IrOp::ZEXT:
-                        case ir::IrOp::SEXT:
-                        case ir::IrOp::TRUNC:
-                            if (any_op_host()) {
-                                host_in_jit[ins.dst] = 1u;
-                                changed = true;
-                            }
-                            if (ins.dst < skip_raw_free_vid.size()
-                             && !skip_raw_free_vid[ins.dst]
-                             && any_op_skip_free()) {
-                                skip_raw_free_vid[ins.dst] = 1u;
-                                if (ins.dst < alloca_size_by_vid.size()
-                                 && alloca_size_by_vid[ins.dst] == 0) {
-                                    alloca_size_by_vid[ins.dst] =
-                                        inherit_alloca_size();
-                                }
-                                changed = true;
-                            }
-                            break;
-                        case ir::IrOp::PHI: {
-                            if (ins.phi_args.empty()) break;
-                            bool all_host = true;
-                            for (const auto &pa : ins.phi_args) {
-                                if (pa.value == ir::IR_NO_VALUE
-                                 || pa.value >= host_in_jit.size()
-                                 || !host_in_jit[pa.value]) {
-                                    all_host = false;
-                                    break;
-                                }
-                            }
-                            if (all_host) {
-                                host_in_jit[ins.dst] = 1u;
-                                changed = true;
-                            }
-                            break;
-                        }
-                        default: break;
-                    }
-                }
-            }
-            if (!changed) break;
-        }
+        /* Pre-pase de analisis host (extraido a analyze_host_values):
+         * identifica VIDs host (malloc/new/ALLOCA/GC) y propaga
+         * skip_raw_free / alloca_size por VID.  Extraido para acotar
+         * el metodo select(). */
+        HostPrepass hp = analyze_host_values(ir_fn);
+        std::vector<uint8_t> &host_in_jit        = hp.host_in_jit;
+        std::vector<uint8_t> &skip_raw_free_vid  = hp.skip_raw_free_vid;
+        std::vector<uint64_t> &alloca_size_by_vid = hp.alloca_size_by_vid;
 
         /* Phase D.jit-mem-model VM-STACK: el bypass que abortaba JIT
          * para LOAD/STORE !host_in_jit ya NO es necesario.  El modelo
@@ -7887,6 +7707,148 @@ case IrOp::CALLCLOSURE: {
 
         if (out_unsupported) *out_unsupported = unsupported;
         return mf;
+    }
+
+    /* ===================================================================== */
+    /* Pre-pase: analisis de valores host (extraido del metodo select)        */
+    /* ===================================================================== */
+
+    Selector::HostPrepass Selector::analyze_host_values(const ir::IrFunction &ir_fn) {
+        HostPrepass hp;
+        hp.host_in_jit.assign(ir_fn.values.size(), 0u);
+        hp.skip_raw_free_vid.assign(ir_fn.values.size(), 0u);
+        hp.alloca_size_by_vid.assign(ir_fn.values.size(), 0ull);
+        auto &host_in_jit        = hp.host_in_jit;
+        auto &skip_raw_free_vid  = hp.skip_raw_free_vid;
+        auto &alloca_size_by_vid = hp.alloca_size_by_vid;
+
+        /* Seed inicial.  Tres categorias:
+         *   1. Valores con IR is_host_ptr=true: marcados por el frontend
+         *      (malloc/new/fields GC).  Son host_ptr en TODO modelo.
+         *   2. ALLOCA dsts + GC_ALLOC/etc: en JIT el ALLOCA emite
+         *      sub rsp host, asi que el dst es host_ptr aunque el IR
+         *      lo marque is_host_ptr=false (convencion interp).
+         *   3. Params PTR: asumimos JIT->JIT convention (caller paso
+         *      host_ptr).  (Ver comentario amplio en el git history.) */
+        for (size_t vid = 0; vid < ir_fn.values.size(); ++vid) {
+            if (ir_fn.values[vid].is_host_ptr) host_in_jit[vid] = 1u;
+        }
+        for (const auto &blk : ir_fn.blocks) {
+            for (const auto &ins : blk.instrs) {
+                if (ins.dst == ir::IR_NO_VALUE
+                 || ins.dst >= host_in_jit.size()) continue;
+                switch (ins.op) {
+                    case ir::IrOp::ALLOCA:
+                        if (ins.host_alloca()) {
+                            host_in_jit[ins.dst] = 1u;
+                            if (ins.host_alloca_explicit_free()
+                             && ins.dst < skip_raw_free_vid.size()) {
+                                skip_raw_free_vid[ins.dst] = 1u;
+                                alloca_size_by_vid[ins.dst] = ins.imm;
+                            }
+                        }
+                        break;
+                    case ir::IrOp::GC_ALLOC:
+                    case ir::IrOp::GC_ALLOCP:
+                    case ir::IrOp::GC_DEREF_HOST:
+                    case ir::IrOp::NEWOBJ:
+                    case ir::IrOp::RAW_ALLOC:
+                        host_in_jit[ins.dst] = 1u;
+                        break;
+                    /* STR_LIT_ADDR produce VM-addr, NO host_ptr: se deja
+                     * SIN marca (LOAD/STORE caera al inline cache). */
+                    case ir::IrOp::STR_LIT_ADDR:
+                        break;
+                    default: break;
+                }
+            }
+        }
+
+        /* Propagacion forward fixed-point (cota 8 iter; 2-3 en practica). */
+        for (int iter = 0; iter < 8; ++iter) {
+            bool changed = false;
+            for (const auto &blk : ir_fn.blocks) {
+                for (const auto &ins : blk.instrs) {
+                    if (ins.dst == ir::IR_NO_VALUE
+                     || ins.dst >= host_in_jit.size()) continue;
+                    if (host_in_jit[ins.dst]) continue;
+
+                    auto any_op_host = [&]() {
+                        for (ir::IrValueId v : ins.operands) {
+                            if (v != ir::IR_NO_VALUE && v < host_in_jit.size()
+                             && host_in_jit[v]) return true;
+                        }
+                        return false;
+                    };
+                    auto any_op_skip_free = [&]() {
+                        for (ir::IrValueId v : ins.operands) {
+                            if (v != ir::IR_NO_VALUE
+                             && v < skip_raw_free_vid.size()
+                             && skip_raw_free_vid[v]) return true;
+                        }
+                        return false;
+                    };
+                    auto inherit_alloca_size = [&]() -> uint64_t {
+                        for (ir::IrValueId v : ins.operands) {
+                            if (v != ir::IR_NO_VALUE
+                             && v < alloca_size_by_vid.size()
+                             && alloca_size_by_vid[v] != 0) {
+                                return alloca_size_by_vid[v];
+                            }
+                        }
+                        return 0;
+                    };
+
+                    switch (ins.op) {
+                        case ir::IrOp::ADD:
+                        case ir::IrOp::SUB:
+                        case ir::IrOp::BITCAST:
+                        case ir::IrOp::MOV:
+                        case ir::IrOp::CAST:
+                        case ir::IrOp::ZEXT:
+                        case ir::IrOp::SEXT:
+                        case ir::IrOp::TRUNC:
+                            if (any_op_host()) {
+                                host_in_jit[ins.dst] = 1u;
+                                changed = true;
+                            }
+                            if (ins.dst < skip_raw_free_vid.size()
+                             && !skip_raw_free_vid[ins.dst]
+                             && any_op_skip_free()) {
+                                skip_raw_free_vid[ins.dst] = 1u;
+                                if (ins.dst < alloca_size_by_vid.size()
+                                 && alloca_size_by_vid[ins.dst] == 0) {
+                                    alloca_size_by_vid[ins.dst] =
+                                        inherit_alloca_size();
+                                }
+                                changed = true;
+                            }
+                            break;
+                        case ir::IrOp::PHI: {
+                            if (ins.phi_args.empty()) break;
+                            bool all_host = true;
+                            for (const auto &pa : ins.phi_args) {
+                                if (pa.value == ir::IR_NO_VALUE
+                                 || pa.value >= host_in_jit.size()
+                                 || !host_in_jit[pa.value]) {
+                                    all_host = false;
+                                    break;
+                                }
+                            }
+                            if (all_host) {
+                                host_in_jit[ins.dst] = 1u;
+                                changed = true;
+                            }
+                            break;
+                        }
+                        default: break;
+                    }
+                }
+            }
+            if (!changed) break;
+        }
+
+        return hp;
     }
 
 } // namespace jit

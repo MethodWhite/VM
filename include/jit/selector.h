@@ -275,6 +275,28 @@ namespace jit {
         MFunction select(const ir::IrFunction &ir_fn, bool *out_unsupported = nullptr);
 
     private:
+        /**
+         * @brief Resultado del pre-pase de analisis de valores host del JIT.
+         *
+         * Agrupa los vectores por-VID que el selector consulta en el switch
+         * principal (LOAD/STORE, ALLOCA, RAW_FREE).  Extraido de select()
+         * para acotar el metodo gigante; la logica no cambia.
+         */
+        struct HostPrepass {
+            std::vector<uint8_t>   host_in_jit;       ///< VID -> es host_ptr en JIT
+            std::vector<uint8_t>   skip_raw_free_vid; ///< VID -> RAW_FREE a skipear
+            std::vector<uint64_t>  alloca_size_by_vid;///< VID -> tamano del ALLOCA
+        };
+
+        /**
+         * @brief Pre-pase: identifica valores host (malloc/new/ALLOCA) y
+         *        propaga skip_raw_free / alloca_size por VID.
+         *
+         * Corresponde al bloque de setup de @c select() antes del loop
+         * principal de emision.
+         */
+        HostPrepass analyze_host_values(const ir::IrFunction &ir_fn);
+
         SelectorOptions opts_;
         /// Indice en imm64_pool de la direccion del safepoint handler.
         /// Computado al inicio de @c select() si VM_ABI y handler != 0.

@@ -419,9 +419,15 @@ namespace aot {
                 if (!compile_one(fn)) return result;
             }
 
-            // 3. Emitir startup stub
-            uint64_t start_offset = text_code.size();
-            emit_startup_stub(text_code);
+            // 3. Emitir startup stub SOLO en BARE (ejecutable directo).
+            //    En FULL/EMBED el ejecutable se linka con g++ cuyo crt1.o
+            //    provee _start y llama a main; emitir otro _start causaria
+            //    definicion multiple.
+            uint64_t start_offset = 0;
+            if (options_.tier == Tier::BARE) {
+                start_offset = text_code.size();
+                emit_startup_stub(text_code);
+            }
 
             /* Resolver la relocacion interna del stub: en el ejecutable
              * directo (BARE) el _start hace `call main` con un placeholder
@@ -534,15 +540,17 @@ namespace aot {
                 symbols.push_back(sym);
             }
 
-            // Simbolo _start
-            SymbolInfo start_sym;
-            start_sym.name  = "_start";
-            start_sym.info  = st_info(STB_GLOBAL, STT_FUNC);
-            start_sym.other = STV_DEFAULT;
-            start_sym.shndx = text_shndx;
-            start_sym.value = start_offset;
-            start_sym.size  = 0;
-            symbols.push_back(start_sym);
+            // Simbolo _start (solo BARE: en FULL/EMBED lo provee el crt)
+            if (options_.tier == Tier::BARE) {
+                SymbolInfo start_sym;
+                start_sym.name  = "_start";
+                start_sym.info  = st_info(STB_GLOBAL, STT_FUNC);
+                start_sym.other = STV_DEFAULT;
+                start_sym.shndx = text_shndx;
+                start_sym.value = start_offset;
+                start_sym.size  = 0;
+                symbols.push_back(start_sym);
+            }
 
             // 6. Relocaciones para simbolos runtime
             auto rt_syms = resolve_runtime_symbols();

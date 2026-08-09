@@ -1098,20 +1098,26 @@ int main(int argc, char *argv[]) {
                 ofs.write(reinterpret_cast<const char *>(ar.object_data.data()),
                           static_cast<std::streamsize>(ar.object_data.size()));
             }
-            /* Localizar libvesta_rt: junto al ejecutable vm (build/). */
-            std::string rt_lib =
-                std::filesystem::path(fs::get_executable_path())
-                    .parent_path().string() + "/libvesta_rt.a";
-            if (!std::filesystem::exists(rt_lib)) {
-                rt_lib = "libvesta_rt.a";
-            }
+            /* Localizar la libreria de runtime (vmcore: todo salvo main.cpp;
+             * vesta_rt no es autocontenida: sus fuentes referencian
+             * annotations.cpp que no incluye).  Las rutas son ABSOLUTAS
+             * porque el link corre desde el cwd del usuario. */
+            const std::string exe_dir =
+                std::filesystem::path(fs::get_executable_path()).parent_path().string();
+            const std::string rt_lib = exe_dir + "/libvmcore.a";
             const std::string link_cmd =
-                std::string("ld -o ") + out_path + " " + obj_path + " " +
-                rt_lib + " -lc -lpthread 2>&1";
+                std::string("g++ -no-pie -o ") + out_path + " " + obj_path + " " +
+                rt_lib +
+                " -L" + exe_dir + "/src/vex -lvex_lib" +
+                " -L" + exe_dir + "/preprocessor -lvpp_lib" +
+                " -L" + exe_dir + " -lsqlite3" +
+                " -L" + exe_dir + "/libs/SourceCode/capstone -lcapstone" +
+                " -L" + exe_dir + "/libs/SourceCode/keystone/llvm/lib -lkeystone" +
+                " -lc -lpthread -lssl -lcrypto 2>&1";
             const int lrc = std::system(link_cmd.c_str());
             if (lrc != 0) {
-                std::cerr << "[aot] Link fallo (ld).  Tier "
-                          << tier_str << " requiere libvesta_rt.\n";
+                std::cerr << "[aot] Link fallo (g++).  Tier "
+                          << tier_str << " requiere las librerias del proyecto.\n";
                 return EXIT_FAILURE;
             }
             std::cerr << "[aot] " << out_path << ": linkado contra " << rt_lib << "\n";

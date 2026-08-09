@@ -298,12 +298,19 @@ namespace aot {
         // Section headers
         size_t shoff = buf.size();
 
+        /* Al insertar el ELF header (sizeof(Elf64_Ehdr)) al inicio del
+         * buffer (abajo), TODOS los offsets de datos se desplazan +ehsize.
+         * e_shoff ya se ajusta en write_ehdr; aqui se ajustan los sh_offset
+         * de cada seccion para que apunten a su contenido real en disco. */
+        const uint64_t EHDR = sizeof(Elf64_Ehdr);
+
         // SHT_NULL
         Elf64_Shdr null_shdr = {};
         write_shdr(buf, null_shdr);
 
         // Secciones de datos
         for (size_t i = 1; i < entries.size(); ++i) {
+            entries[i].shdr.sh_offset += EHDR;
             write_shdr(buf, entries[i].shdr);
         }
 
@@ -314,10 +321,13 @@ namespace aot {
             shdr.sh_type      = SHT_SYMTAB;
             shdr.sh_flags     = 0;
             shdr.sh_addr      = 0;
-            shdr.sh_offset    = symtab_offset;
+            shdr.sh_offset    = symtab_offset + EHDR;
             shdr.sh_size      = symtab_size;
             shdr.sh_link      = static_cast<uint32_t>(1 + sections_.size() + 1);
-            shdr.sh_info      = 1;
+            /* sh_info = numero de simbolos LOCALES (indice del primer
+             * simbolo global).  El symtab empieza con: [0] STN_UNDEF (local)
+             * + [1] STT_FILE (local) + globales -> 2 locales. */
+            shdr.sh_info      = 2;
             shdr.sh_addralign = 8;
             shdr.sh_entsize   = sizeof(Elf64_Sym);
             write_shdr(buf, shdr);
@@ -330,7 +340,7 @@ namespace aot {
             shdr.sh_type      = SHT_STRTAB;
             shdr.sh_flags     = SHF_STRINGS;
             shdr.sh_addr      = 0;
-            shdr.sh_offset    = strtab_offset;
+            shdr.sh_offset    = strtab_offset + EHDR;
             shdr.sh_size      = strtab_size;
             shdr.sh_link      = 0;
             shdr.sh_info      = 0;
@@ -346,7 +356,7 @@ namespace aot {
             shdr.sh_type      = SHT_STRTAB;
             shdr.sh_flags     = SHF_STRINGS;
             shdr.sh_addr      = 0;
-            shdr.sh_offset    = shstrtab_offset;
+            shdr.sh_offset    = shstrtab_offset + EHDR;
             shdr.sh_size      = shstrtab_size;
             shdr.sh_link      = 0;
             shdr.sh_info      = 0;
@@ -362,7 +372,7 @@ namespace aot {
             shdr.sh_type      = SHT_RELA;
             shdr.sh_flags     = SHF_INFO_LINK;
             shdr.sh_addr      = 0;
-            shdr.sh_offset    = rela_offset;
+            shdr.sh_offset    = rela_offset + EHDR;
             shdr.sh_size      = rela_size;
             shdr.sh_link      = static_cast<uint32_t>(1 + sections_.size());
             shdr.sh_info      = 1;
@@ -378,7 +388,7 @@ namespace aot {
             shdr.sh_type      = SHT_PROGBITS;
             shdr.sh_flags     = SHF_ALLOC;
             shdr.sh_addr      = 0;
-            shdr.sh_offset    = eh_frame_offset;
+            shdr.sh_offset    = eh_frame_offset + EHDR;
             shdr.sh_size      = eh_frame_size;
             shdr.sh_link      = 0;
             shdr.sh_info      = 0;
@@ -394,7 +404,7 @@ namespace aot {
             shdr.sh_type      = SHT_PROGBITS;
             shdr.sh_flags     = SHF_STRINGS;
             shdr.sh_addr      = 0;
-            shdr.sh_offset    = comment_offset;
+            shdr.sh_offset    = comment_offset + EHDR;
             shdr.sh_size      = comment_size;
             shdr.sh_link      = 0;
             shdr.sh_info      = 0;
@@ -410,6 +420,16 @@ namespace aot {
          * archivo se desplazan hacia delante: corregir e_shoff por +ehsize. */
         write_ehdr(header, shoff + sizeof(Elf64_Ehdr), sec_count, shstrndx);
         buf.insert(buf.begin(), header.begin(), header.end());
+
+        if (std::getenv("VESTA_AOT_ELF_DBG")) {
+            std::fprintf(stderr, "[elf-dbg] strtab(%zu): ", strtab_.size());
+            for (char c : strtab_) std::fprintf(stderr, "%c", c);
+            std::fprintf(stderr, "\n[elf-dbg] shstrtab(%zu): ", shstrtab_.size());
+            for (char c : shstrtab_) std::fprintf(stderr, "%c", c);
+            std::fprintf(stderr, "\n[elf-dbg] sec_count=%u shstrndx=%u entries=%zu sections=%zu\n",
+                         (unsigned)sec_count, (unsigned)shstrndx, entries.size(),
+                         sections_.size());
+        }
 
         return buf;
     }

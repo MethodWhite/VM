@@ -61,17 +61,17 @@ módulo.  No se arrastra código muerto de la otra rama.
   - **Verificado**: `return 42` -> 42; `if` -> 7; `fib(10)` -> 55;
     `factorial(5)` -> 120; `while` loop (0..4) -> 10.  El AOT BARE ya
     compila programas con control de flujo, llamadas y recursion.
-- **Tier FULL/EMBED (en curso)**: el emitter de objeto ELF ya genera un
-  .o valido (fixes: e_shoff, sh_offset+ehsize, sh_info=2) y el driver
-  linka contra libvmcore/vex_lib/vpp_lib con g++ -no-pie.  El stub y el
-  simbolo _start solo se emiten en BARE (el crt1.o provee el arranque).
-  **Pendiente**: main se compila con VM_ABI (espera ProcessVM*) pero el
-  crt la llama sin proc -> segfault.  Requiere inicializar el runtime VM
-  en el arranque (crear ProcessVM + cargar main), o compilar main con
-  NATIVE_ABI y que el resolver pase proc a las callees.  Es el nucleo
-  del port del AOT completo.
-- **Pendiente**: runtime FULL/EMBED (io/GC), AOT para strings/FFI,
-  multi-ISA, debug info DWARF.  Ver `src/aot/README.md` limitaciones.
+- **Tier FULL/EMBED (en curso)**: el emitter de objeto ELF genera un .o
+  valido y el driver linka con g++ contra vmcore/vex_lib.  Con
+  -nostartfiles -Ttext=0x400000 las funciones quedan en 0x400000 y las
+  vaddr de los CALLs coinciden, pero hay un bug de alineacion de los
+  simbolos _start/stub en el emitter (el stub real no coincide con el
+  offset que el simbolo apunta) -> SIGILL.  `return 42` (sin CALLs
+  internos) funciona en FULL.
+- **Pendiente**: pipeline de relocaciones PC32 + alineacion de simbolos
+  del emitter (nucleo del port AOT de Desmon con linker propio), runtime
+  FULL/EMBED para I/O/GC/strings, multi-ISA, DWARF.
+- Ver `src/aot/README.md` limitaciones.
 
 ### vectorize (P1, 30 commits)
 - Desmon: `src/vx/vectorize.cpp` (2359 LOC) — pase del Lowering que

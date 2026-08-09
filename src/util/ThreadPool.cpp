@@ -51,8 +51,10 @@ void ThreadPool::shutdown() {
 
 #ifdef WIN32
     WakeByAddressAll(&wake_flag_);      /* Windows: despertar todos */
-#else
+#elif defined(__linux__)
     futex_wake(&wake_flag_, workers_.size()); /* Linux: despertar N hilos */
+#else
+    tasks_cv_.notify_all();             /* BSD/macOS: despertar todos */
 #endif
 
     /* esperar a que cada hilo termine su iteracion actual */
@@ -86,8 +88,19 @@ void ThreadPool::worker_loop() {
 
 #ifdef WIN32
             WaitOnAddress(&wake_flag_, &expected, sizeof(int), INFINITE);
-#else
+#elif defined(__linux__)
             futex_wait(&wake_flag_, expected);
+#else
+            /* BSD/macOS: condition_variable con predicado.  La cola y
+             * stopping_ se revisan bajo el mutex, asi que el wait no pierde
+             * notificaciones: notify_one/notify_all se emiten desde enqueue,
+             * submit y shutdown con tasks_m_ protegido o tras liberarlo. */
+            {
+                std::unique_lock<std::mutex> lk(tasks_m_);
+                tasks_cv_.wait(lk, [this] {
+                    return !tasks_.empty() || stopping_.load();
+                });
+            }
 #endif
         }
 

@@ -177,8 +177,10 @@ public:
 
 #ifdef WIN32
         WakeByAddressSingle(&wake_flag_); // despertar un worker (Windows)
-#else
+#elif defined(__linux__)
         futex_wake(&wake_flag_, 1);       // despertar un worker (Linux)
+#else
+        tasks_cv_.notify_one();           // despertar un worker (BSD/macOS)
 #endif
     }
 
@@ -224,8 +226,10 @@ auto ThreadPool::submit(F &&f, Args &&... args) -> std::future<typename std::inv
 
 #ifdef WIN32
     WakeByAddressSingle(&wake_flag_);
-#else
+#elif defined(__linux__)
     futex_wake(&wake_flag_, 1);
+#else
+    tasks_cv_.notify_one();
 #endif
     return fut;
 }

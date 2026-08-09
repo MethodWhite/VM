@@ -285,6 +285,38 @@ target_compile_options(vm PRIVATE
 # LTO (Link Time Optimization)
 #set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 
+# =============================================================================
+# Hardening (SECDEVOPS).  Mitigaciones de compilador/linker para los targets
+# que ejecutan codigo no confiable (vm, vmcore, vesta_rt).  Ver SECDEVOPS.md.
+# Aplican a GCC/Clang en POSIX; macOS usa su propio linker (sin -z).
+# =============================================================================
+set(VESTA_HARDEN_COMPILE
+        -fstack-protector-strong
+        -fPIE
+)
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    list(APPEND VESTA_HARDEN_COMPILE -D_FORTIFY_SOURCE=2)
+endif()
+set(VESTA_HARDEN_LINK
+        -Wl,-z,relro
+        -Wl,-z,now
+        -Wl,-z,noexecstack
+)
+
+foreach(tgt vm vmcore vesta_rt vesta_install)
+    if(TARGET ${tgt})
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT WIN32)
+            target_compile_options(${tgt} PRIVATE ${VESTA_HARDEN_COMPILE})
+        endif()
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT WIN32 AND NOT APPLE)
+            target_link_options(${tgt} PRIVATE
+                ${VESTA_HARDEN_LINK}
+                -pie
+            )
+        endif()
+    endif()
+endforeach()
+
 # global
 if (WIN32)
 target_link_options(vm PRIVATE

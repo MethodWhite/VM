@@ -98,3 +98,60 @@ jobs:
         else
           echo "No debug leftovers found"
         fi
+
+  # ----------------------------------------------------------------------
+  # FreeBSD (BSD portability).  Corre dentro de una VM de FreeBSD porque
+  # GitHub no ofrece runners nativos de BSD.
+  # ----------------------------------------------------------------------
+  freebsd:
+    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    name: Build and test (FreeBSD)
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Build and test on FreeBSD
+      uses: vmactions/freebsd-vm@v1
+      with:
+        usesh: true
+        prepare: pkg install -y cmake ninja ccache
+        run: |
+          set -e
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DVESTA_BUILD_STDLIB=ON -DVESTA_BUILD_EXAMPLES=ON
+          cmake --build build --parallel
+          cd build && ctest --output-on-failure --parallel
+
+  # ----------------------------------------------------------------------
+  # Static analysis (Linux): cppcheck + clang-tidy on the main binary.
+  # No bloquea el merge (informative), los warnings reales se revisan.
+  # ----------------------------------------------------------------------
+  static-analysis:
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cppcheck
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DVESTA_BUILD_STDLIB=ON
+
+    - name: Run cppcheck
+      continue-on-error: true
+      run: |
+        cppcheck --enable=warning,performance,portability \
+          --std=c++17 --language=c++ --quiet \
+          --suppress=missingIncludeSystem \
+          -I include -I src \
+          src/ 2>&1 | tee cppcheck.log
+        echo "cppcheck exit: ${PIPESTATUS[0]}"
+        # El job es informativo; el CI principal (build+tests) es el gate.

@@ -401,8 +401,17 @@ target_compile_options(vm PRIVATE
 )
 
 
-add_library(vmcore STATIC ${VM_SOURCES})
-target_include_directories(vmcore PRIVATE ${VM_INCLUDES})
+# ---------------------------------------------------------------------------
+# vmcore: libreria estatica con TODO el proyecto excepto main.cpp (que solo
+# pertenece al ejecutable vm) y el frontend vex (vex_lib) / port (vex_lib).
+# Los tests se enlazan contra esta libreria en vez de recompilar todas las
+# fuentes (212K LOC x 64 tests -> OOM).  Sin main.cpp para no duplicar main().
+# ---------------------------------------------------------------------------
+set(VM_CORE_SOURCES ${VM_SOURCES})
+list(REMOVE_ITEM VM_CORE_SOURCES ${CMAKE_SOURCE_DIR}/main.cpp)
+
+add_library(vmcore STATIC ${VM_CORE_SOURCES})
+target_include_directories(vmcore PUBLIC ${VM_INCLUDES})
 target_link_libraries(vmcore
         PRIVATE sqlite3
         PRIVATE capstone

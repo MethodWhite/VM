@@ -7,16 +7,38 @@ if (NOT CMAKE_BUILD_TYPE)
 endif ()
 
 
-message(STATUS "Fuentes para ${FINAL_NAME}: ${ALL_PROJECT_SOURCES}")
+message(STATUS "Tests: enlazados contra vmcore/vex_lib/vesta_rt (no recompilan las fuentes)")
 
 # Helper function para crear tests individuales
 function(add_single_test PREFIX TEST_FILE ALL_SOURCES)
     
-    
     get_filename_component(TEST_NAME ${TEST_FILE} NAME_WE)
     set(FINAL_NAME "${PREFIX}_${TEST_NAME}")
     
-    add_executable(${FINAL_NAME} ${TEST_FILE} ${ALL_SOURCES})
+    # Compilar SOLO el archivo del test y enlazar contra las librerias ya
+    # compiladas del proyecto (vmcore = todo salvo main.cpp/vex; vex_lib =
+    # frontend; vesta_rt = runtime puro).  Antes cada test recompilaba
+    # TODAS las fuentes (212K LOC x 64 tests -> minutos + OOM en paralelo).
+    # ALL_SOURCES se ignora salvo que las librerias no esten disponibles.
+    if(TARGET vmcore AND TARGET vex_lib)
+        add_executable(${FINAL_NAME} ${TEST_FILE})
+        # Orden de link: vex_lib (frontend) referencia simbolos de vmcore
+        # (ir, comptime, assembly) y viceversa -> grupo de reescaneo para
+        # resolver la dependencia circular estatica.
+        target_link_libraries(${FINAL_NAME}
+            PRIVATE -Wl,--start-group
+            PRIVATE vmcore
+            PRIVATE vex_lib
+            PRIVATE vesta_rt
+            PRIVATE -Wl,--end-group
+        )
+        if(TARGET vpp_lib)
+            target_link_libraries(${FINAL_NAME} PRIVATE vpp_lib)
+            target_compile_definitions(${FINAL_NAME} PRIVATE VESTA_HAS_PREPROCESSOR=1)
+        endif()
+    else()
+        add_executable(${FINAL_NAME} ${TEST_FILE} ${ALL_SOURCES})
+    endif()
     
     # Si estamos en modo AsmIntel, forzar flags en el target
     if (ASM_INTEL)

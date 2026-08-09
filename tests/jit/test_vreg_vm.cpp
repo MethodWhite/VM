@@ -337,7 +337,7 @@ static void test_vm_strmake() {
     fn.append(bb, konst(len, 5));
     {
         ir::IrInstr c; c.op = ir::IrOp::STRMAKE; c.type = T; c.dst = h;
-        c.operands = { buf, len }; c.imm = 0; c.is_call_site = true;
+        c.operands = { buf, len }; c.imm = 0; c.set_is_call_site(true);
         fn.append(bb, c);
     }
     fn.append(bb, ret1(h));
@@ -410,7 +410,7 @@ static void test_vm_strcat() {
     fn.params = { s, t };
     ir::IrBlockId bb = fn.new_block("e");
     { ir::IrInstr c; c.op = ir::IrOp::STRCAT; c.type = T; c.dst = r;
-      c.operands = { s, t }; c.is_call_site = true; fn.append(bb, c); }
+      c.operands = { s, t }; c.set_is_call_site(true); fn.append(bb, c); }
     fn.append(bb, ret1(r));
     VregEntries ent; ent.str_cat =
         reinterpret_cast<uint64_t>(reinterpret_cast<void *>(&vm_strcat_stub));
@@ -466,7 +466,7 @@ static void test_vm_smartptr_free_extern() {
     ir::IrBlockId bb = fn.new_block("e");
     { ir::IrInstr c; c.op = ir::IrOp::SMARTPTR_FREE; c.type = ir::IrType::VOID;
       c.dst = ir::IR_NO_VALUE; c.operands = { ptr }; c.imm = 1;
-      c.func_name = "lib:del"; c.is_call_site = true; fn.append(bb, c); }
+      c.func_name = "lib:del"; c.set_is_call_site(true); fn.append(bb, c); }
     fn.append(bb, ret_void());
     CallResolver rn = [](const std::string &n) -> uint64_t {
         return n == "lib:del"
@@ -504,7 +504,7 @@ static void test_vm_smartptr_free_vesta() {
     ir::IrBlockId bb = fn.new_block("e");
     { ir::IrInstr c; c.op = ir::IrOp::SMARTPTR_FREE; c.type = ir::IrType::VOID;
       c.dst = ir::IR_NO_VALUE; c.operands = { ptr }; c.imm = 2;
-      c.func_name = "del"; c.is_call_site = true; fn.append(bb, c); }
+      c.func_name = "del"; c.set_is_call_site(true); fn.append(bb, c); }
     fn.append(bb, ret_void());
     CallResolver rc = [](const std::string &n) -> uint64_t {
         return n == "del"
@@ -544,7 +544,7 @@ static void test_vm_callclosure() {
     fn.append(bb, konst(fnp, 0xFACE));
     fn.append(bb, konst(env, 0xE0));
     { ir::IrInstr c; c.op = ir::IrOp::CALLCLOSURE; c.type = T; c.dst = r;
-      c.func_ptr = fnp; c.operands = { env, arg }; c.is_call_site = true;
+      c.func_ptr = fnp; c.operands = { env, arg }; c.set_is_call_site(true);
       fn.append(bb, c); }
     fn.append(bb, ret1(r));
     VregEntries ent; ent.callclosure =

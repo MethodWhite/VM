@@ -26,6 +26,9 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#ifndef _WIN32
+#  include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 

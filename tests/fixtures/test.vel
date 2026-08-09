@@ -1,0 +1,29 @@
+// VestaVM - fixture de test (.vel)
+// Usado por tests/lexer/test1.cpp, tests/linker/test1.cpp y
+// tests/loader/test1.cpp.  Generado con: vm --vex <este.vex> --emit-vel
+// Fuente equivalente:
+//   i32 main() { i32 a = 1; i32 b = 2; return a + b; }
+
+@Format("velb")
+
+@SpaceAddress {
+    @Name("anonymous"),
+    @IniAddress(0x0000000000000000),
+    @EndAddress(0xFFFFFFFFFFFFFFFF)
+}
+
+@Section {
+    @Name("code"),
+    @SpaceAddress("anonymous")
+    @Align(0x1000)
+}
+
+@Module(test_fixture)
+
+main:
+main_entry_0:
+    mov r1, 3
+    mov r0, r1
+    jmp @Absolute("code.main_ret")
+main_ret:
+    hlt

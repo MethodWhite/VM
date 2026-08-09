@@ -165,6 +165,10 @@ function(add_single_test PREFIX TEST_FILE ALL_SOURCES)
 
 endfunction()
 
+# Copiar fixtures (test.vel) al directorio de trabajo de los tests, donde
+# los tests de lexer/linker/loader los buscan por nombre relativo.
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/ DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+
 # Todos los sources de src/
 file(GLOB_RECURSE ALL_PROJECT_SOURCES
         ${CMAKE_SOURCE_DIR}/src/*.cpp

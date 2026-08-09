@@ -1105,6 +1105,11 @@ int main(int argc, char *argv[]) {
             const std::string exe_dir =
                 std::filesystem::path(fs::get_executable_path()).parent_path().string();
             const std::string rt_lib = exe_dir + "/libvmcore.a";
+            /* Link con g++ -no-pie.  Nota: los CALLs entre funciones del AOT
+             * usan vaddr absolutas (0x400000+offset) que no sobreviven al
+             * link (el .text del .o se reubica tras el runtime) -> los CALLs
+             * en tier FULL fallan si hay mas de una funcion.  Requiere
+             * relocaciones PC32 (siguiente paso del port AOT). */
             const std::string link_cmd =
                 std::string("g++ -no-pie -o ") + out_path + " " + obj_path + " " +
                 rt_lib +

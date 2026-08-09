@@ -275,20 +275,13 @@ namespace jit {
          * El ALIGN_PAD + SHADOW estan al BOTTOM del frame (en rsp side),
          * no interfieren con slots (que cuentan desde rbp hacia abajo).
          */
+        /* Layout del frame (extraido a compute_frame_layout). */
         const size_t num_values = ir_fn.values.size();
-        uint32_t slot_bytes = static_cast<uint32_t>(num_values * 8);
-        if (slot_bytes & 15) slot_bytes = (slot_bytes + 15) & ~15u;
-
-        /* Phase D.jit-mem-model VM-STACK: reservamos 16 bytes extras al
-         * tope del frame (justo bajo los slots SSA) para:
-         *   - saved_vm_rsp: VM-RSP original al entry, restaurado al RET.
-         *   - hoisted_base:  VM-RSP post-hoist, base de las ALLOCAs hoisted.
-         * Offsets desde RBP (constantes durante toda la funcion).
-         * Solo se usan si la funcion tiene ALLOCAs; el overhead es 16
-         * bytes extra del frame en CADA funcion (insignificante). */
-        const int32_t vm_rsp_save_off  = -static_cast<int32_t>(slot_bytes + 8);
-        const int32_t hoisted_base_off = -static_cast<int32_t>(slot_bytes + 16);
-        const uint32_t VM_STACK_SLOTS_BYTES = 16;
+        FrameLayout fl = compute_frame_layout(num_values);
+        const uint32_t slot_bytes           = fl.slot_bytes;
+        const int32_t  vm_rsp_save_off      = fl.vm_rsp_save_off;
+        const int32_t  hoisted_base_off     = fl.hoisted_base_off;
+        const uint32_t VM_STACK_SLOTS_BYTES = fl.vm_stack_slots_bytes;
 
         /* ===== callback-ABI: analisis del prologo/epilogo nativo ===== */
         const bool cb_entry = opts_.callback_entry
@@ -7862,6 +7855,23 @@ case IrOp::CALLCLOSURE: {
             }
         }
         return use_count;
+    }
+
+    /* ===================================================================== */
+    /* Pre-pase: layout del frame (extraido del metodo select)               */
+    /* ===================================================================== */
+
+    Selector::FrameLayout Selector::compute_frame_layout(size_t num_values) {
+        FrameLayout fl;
+        /* Los slot offsets son [rbp - 8*(vid+1)].  El ALIGN_PAD + SHADOW
+         * estan al BOTTOM del frame (lado rsp), no interfieren con slots. */
+        fl.slot_bytes = static_cast<uint32_t>(num_values * 8);
+        if (fl.slot_bytes & 15) fl.slot_bytes = (fl.slot_bytes + 15) & ~15u;
+        /* Phase D.jit-mem-model VM-STACK: 16 bytes extra al tope del frame
+         * para saved_vm_rsp (entry) y hoisted_base (base ALLOCAs hoisted). */
+        fl.vm_rsp_save_off  = -static_cast<int32_t>(fl.slot_bytes + 8);
+        fl.hoisted_base_off = -static_cast<int32_t>(fl.slot_bytes + 16);
+        return fl;
     }
 
 } // namespace jit

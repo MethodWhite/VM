@@ -317,6 +317,18 @@ namespace jit {
          */
         std::vector<uint32_t> compute_use_counts(const ir::IrFunction &ir_fn);
 
+        /**
+         * @brief Layout del frame de la funcion (slot_bytes, offsets VM).
+         *        Extraido del setup de select().
+         */
+        struct FrameLayout {
+            uint32_t   slot_bytes        = 0; ///< slots SSA alineados a 16
+            int32_t    vm_rsp_save_off   = 0; ///< [rbp+off] guarda VM-RSP entry
+            int32_t    hoisted_base_off  = 0; ///< [rbp+off] base ALLOCAs hoisted
+            uint32_t   vm_stack_slots_bytes = 16;
+        };
+        FrameLayout compute_frame_layout(size_t num_values);
+
         SelectorOptions opts_;
         /// Indice en imm64_pool de la direccion del safepoint handler.
         /// Computado al inicio de @c select() si VM_ABI y handler != 0.

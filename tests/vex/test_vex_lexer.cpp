@@ -226,17 +226,17 @@ static void test_string_unterminated() {
     (void)toks;
 }
 
-static void test_string_interpolation_rejected_in_a1() {
+static void test_string_interpolation_accepted() {
     Diagnostics diags;
     auto toks = tokenize_all("\"hola ${nombre}\"", diags);
-    VEX_ASSERT(diags.has_errors(), "interpolacion rechazada en A.1");
+    VEX_ASSERT(!diags.has_errors(), "interpolacion aceptada (superada A.1)");
     (void)toks;
 }
 
-static void test_triple_quoted_rejected_in_a1() {
+static void test_triple_quoted_accepted() {
     Diagnostics diags;
     auto toks = tokenize_all("\"\"\"abc\"\"\"", diags);
-    VEX_ASSERT(diags.has_errors(), "triple-quoted rechazado en A.1");
+    VEX_ASSERT(!diags.has_errors(), "triple-quoted aceptado (superada A.1)");
     (void)toks;
 }
 
@@ -415,8 +415,8 @@ int main() {
     test_char_literals();
     test_string_literals();
     test_string_unterminated();
-    test_string_interpolation_rejected_in_a1();
-    test_triple_quoted_rejected_in_a1();
+    test_string_interpolation_accepted();
+    test_triple_quoted_accepted();
     test_operators_compound();
     test_position_tracking();
     test_peek_idempotent();

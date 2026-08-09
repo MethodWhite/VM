@@ -173,5 +173,59 @@ namespace opt_internal {
         return false;
     }
 
+    void rewrite_as_mov(IrInstr &ins, IrValueId src_vid) {
+        ins.op = IrOp::MOV;
+        ins.operands.clear();
+        ins.operands.push_back(src_vid);
+        ins.phi_args.clear();
+        ins.imm = 0;
+        ins.func_name.clear();
+        ins.func_ptr = IR_NO_VALUE;
+        ins.target_block = IR_NO_BLOCK;
+        ins.false_block = IR_NO_BLOCK;
+    }
+
+    void rewrite_as_const(IrInstr &ins, uint64_t imm) {
+        ins.op = IrOp::CONST;
+        ins.imm = imm;
+        ins.operands.clear();
+        ins.phi_args.clear();
+        ins.func_name.clear();
+        ins.func_ptr = IR_NO_VALUE;
+        ins.target_block = IR_NO_BLOCK;
+        ins.false_block = IR_NO_BLOCK;
+    }
+
+    void rewrite_as_const_with_value(IrFunction &fn, IrInstr &ins, uint64_t imm) {
+        rewrite_as_const(ins, imm);
+        if (ins.dst != IR_NO_VALUE && ins.dst < fn.values.size()) {
+            fn.values[ins.dst].is_const  = true;
+            fn.values[ins.dst].const_val = imm;
+        }
+    }
+
+    uint64_t type_mask(IrType t) {
+        switch (t) {
+            case IrType::I8:  case IrType::U8:  case IrType::BOOL: return 0xFFu;
+            case IrType::I16: case IrType::U16: return 0xFFFFu;
+            case IrType::I32: case IrType::U32: case IrType::F32: return 0xFFFFFFFFu;
+            default: return ~static_cast<uint64_t>(0u);
+        }
+    }
+
+    bool type_is_signed_int(IrType t) {
+        return t == IrType::I8 || t == IrType::I16
+            || t == IrType::I32 || t == IrType::I64;
+    }
+
+    int64_t sign_extend_from(int64_t v, IrType from_t) {
+        switch (from_t) {
+            case IrType::I8:  return static_cast<int8_t>(v);
+            case IrType::I16: return static_cast<int16_t>(v);
+            case IrType::I32: return static_cast<int32_t>(v);
+            default: return v;
+        }
+    }
+
 } // namespace opt_internal
 } // namespace ir

@@ -57,6 +57,24 @@ namespace opt_internal {
     /// True si la funcion es un allocator puro (__new_*, etc. sin _shared).
     bool is_pure_allocator_name(const std::string &name);
 
+    /// Sustituye @p ins por un MOV de @p src_vid (mantiene dst).
+    void rewrite_as_mov(IrInstr &ins, IrValueId src_vid);
+
+    /// Convierte @p ins en un CONST con valor @p imm (no cambia tipo).
+    void rewrite_as_const(IrInstr &ins, uint64_t imm);
+
+    /// Como rewrite_as_const pero marca is_const/const_val en el IrValue.
+    void rewrite_as_const_with_value(IrFunction &fn, IrInstr &ins, uint64_t imm);
+
+    /// Mascara de bits para truncar a @p type.
+    uint64_t type_mask(IrType t);
+
+    /// True si @p t es un entero con signo.
+    bool type_is_signed_int(IrType t);
+
+    /// Sign-extiende @p v desde @p from_t a 64-bit.
+    int64_t sign_extend_from(int64_t v, IrType from_t);
+
 } // namespace opt_internal
 } // namespace ir
 

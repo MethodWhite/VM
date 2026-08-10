@@ -1961,7 +1961,7 @@ void ir_optimize(IrModule &mod, OptLevel level) {
             any |= ir_pass_reassoc(fn);             /* (x op c1) op c2 -> x op (c1 op c2) */
             any |= ir_pass_licm(fn);                /* LICM con dominators reales */
             any |= ir_pass_dead_alloc_elim(fn);
-            any |= ir_pass_dce(fn);
+            any |= ir_pass_dce(fn, &mod.native_imports);
 
             if (level >= OptLevel::O2) {
                 // O2: plegado de constantes + bloques inalcanzables + TCO.
@@ -1992,7 +1992,7 @@ void ir_optimize(IrModule &mod, OptLevel level) {
                 // por LOAD elidido.  Bench struct_field: ~270M instr ahorradas.
                 any |= ir_pass_load_narrow(fn);
                 // Segunda ronda de DCE tras plegado/TCO/loop header inline/CSE.
-                any |= ir_pass_dce(fn);
+                any |= ir_pass_dce(fn, &mod.native_imports);
             }
 
             if (level >= OptLevel::O3) {

@@ -479,7 +479,19 @@ namespace ir {
         for (const auto &ni : native_imports) {
             if (ni.lib == lib && ni.name == name) return;
         }
-        native_imports.push_back({std::move(lib), std::move(name)});
+        native_imports.push_back({std::move(lib), std::move(name), {}});
+    }
+
+    void IrModule::register_native_import(std::string lib, std::string name,
+                                          const IrNativeEffects &efectos) {
+        for (auto &ni : native_imports) {
+            if (ni.lib == lib && ni.name == name) {
+                ni.efectos = efectos; // re-declaracion: actualiza los efectos
+                return;
+            }
+        }
+        native_imports.push_back(
+            {std::move(lib), std::move(name), efectos});
     }
 
     /* =====================================================================

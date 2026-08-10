@@ -960,7 +960,8 @@ bool ir_pass_reassoc(IrFunction &fn) {
     return changed;
 }
 
-bool ir_pass_dce(IrFunction &fn) {
+bool ir_pass_dce(IrFunction &fn,
+                 const std::vector<IrNativeImport> *native_imports) {
     // Construir conjunto de valores que son usados en algun operando
     std::unordered_set<IrValueId> used;
     for (const auto &bb : fn.blocks) {
@@ -985,6 +986,41 @@ bool ir_pass_dce(IrFunction &fn) {
         }
     }
 
+    /* Port de Desmon 8d434933: una nativa puede DECIR lo que hace.  Si
+     * declara no tener efectos observables (sin io, sin escribir global ni
+     * lanzar, determinista) y el CALLN no tiene usos, el DCE lo elimina.
+     * Una nativa que ESCRIBE un buffer apuntado tambien es eliminable si
+     * nadie lee ese buffer despues (el analisis de points-to completo lo
+     * resuelve en el sitio de llamada; aqui aproximamos: el operando
+     * apuntado no debe aparecer en ninguna otra instruccion).  Sin
+     * declaracion la nativa sigue siendo opaca.  El lookup es sobre el
+     * func_name "lib:fn" de cada CALLN. */
+    auto native_pura = [native_imports](const IrInstr &ins) -> bool {
+        if (!native_imports || ins.op != IrOp::CALLN) return false;
+        if (ins.func_name.empty()) return false;
+        const size_t colon = ins.func_name.find(':');
+        if (colon == std::string::npos) return false;
+        const std::string lib = ins.func_name.substr(0, colon);
+        const std::string fn_ = ins.func_name.substr(colon + 1);
+        for (const auto &ni : *native_imports) {
+            if (ni.lib == lib && ni.name == fn_) {
+                const IrNativeEffects &e = ni.efectos;
+                if (!e.declarados) return false;
+                if (e.io || e.escribe_global || e.puede_lanzar
+                    || e.no_determinista) return false;
+                /* Puede escribir buffers apuntados: se elimina solo si nadie
+                 * los vuelve a tocar (aproximacion sin points-to). */
+                if (e.escribe_apuntado == 0) return true;
+                /* Verificar que ningun operando apuntado-escrito aparece en
+                 * otra instruccion (lectura posterior).  Se hace en el bucle
+                 * de eliminacion, no aqui; aqui solo marcamos el CALLN como
+                 * candidato. */
+                return true;
+            }
+        }
+        return false;
+    };
+
     bool changed = false;
     for (auto &bb : fn.blocks) {
         auto &instrs = bb.instrs;
@@ -1000,6 +1036,47 @@ bool ir_pass_dce(IrFunction &fn) {
                 && !ins.preserve()) {
                 keep  = false;
                 changed = true;
+            }
+            // CALLN a una nativa declarada pura con resultado sin usar.
+            if (keep
+                && ins.dst != IR_NO_VALUE
+                && !used.count(ins.dst)
+                && native_pura(ins)
+                && !ins.preserve()) {
+                /* Si la nativa escribe buffers apuntados, solo es eliminable
+                 * si nadie lee esos buffers despues.  Aproximacion sin
+                 * points-to: el operando apuntado (p.ej. el ALLOCA) no debe
+                 * aparecer como operando de NINGUNA otra instruccion. */
+                bool buffer_escrito_no_leido = true;
+                const auto fx_it = [&]() -> const IrNativeEffects * {
+                    const size_t colon = ins.func_name.find(':');
+                    if (colon == std::string::npos) return nullptr;
+                    const std::string lib = ins.func_name.substr(0, colon);
+                    const std::string fn_ = ins.func_name.substr(colon + 1);
+                    for (const auto &ni : *native_imports)
+                        if (ni.lib == lib && ni.name == fn_) return &ni.efectos;
+                    return nullptr;
+                }();
+                if (fx_it && fx_it->escribe_apuntado != 0) {
+                    std::unordered_set<IrValueId> esc;
+                    for (size_t bi = 0; bi < ins.operands.size(); ++bi) {
+                        if (fx_it->escribe_apuntado & (1u << bi))
+                            esc.insert(ins.operands[bi]);
+                    }
+                    for (const auto &bb2 : fn.blocks) {
+                        for (const auto &in2 : bb2.instrs) {
+                            if (&in2 == &ins) continue;
+                            for (IrValueId op : in2.operands)
+                                if (esc.count(op)) { buffer_escrito_no_leido = false; break; }
+                            if (!buffer_escrito_no_leido) break;
+                        }
+                        if (!buffer_escrito_no_leido) break;
+                    }
+                }
+                if (buffer_escrito_no_leido) {
+                    keep = false;
+                    changed = true;
+                }
             }
             if (keep) {
                 if (write != i) instrs[write] = std::move(instrs[i]);

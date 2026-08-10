@@ -116,7 +116,8 @@ void ir_optimize(IrModule &mod, OptLevel level);
  * @param fn Funcion a optimizar.
  * @return true si se elimino al menos una instruccion.
  */
-bool ir_pass_dce(IrFunction &fn);
+bool ir_pass_dce(IrFunction &fn,
+                 const std::vector<IrNativeImport> *native_imports = nullptr);
 
 /**
  * @brief Pase Dead Alloc Elimination.

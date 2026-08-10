@@ -767,8 +767,15 @@ namespace vex {
             // 3. CALLN al stringify nativo: returns length escrita en buf.
             //    Registramos el import con el linker para que la
             //    relocation se resuelva contra el plugin nativo.
+            //    Declaramos sus efectos (port de Desmon 8d434933): escribe
+            //    el buffer apuntado (operando 1), sin io, sin lanzar,
+            //    determinista.  Con eso el DCE puede eliminar el CALLN si el
+            //    resultado no se usa (p.ej. "${x}" cuyo valor va a strcat).
+            ir::IrNativeEffects fx;
+            fx.declarados       = true;
+            fx.escribe_apuntado = 1u << 1; // operando 1 = v_buf
             out_mod_->register_native_import(
-                std::string("stdlib/native/io/vesta_io"), native_fn);
+                std::string("stdlib/native/io/vesta_io"), native_fn, fx);
             ir::IrValueId v_len = fn_->new_value(ir::IrType::I64); {
                 ir::IrInstr cl{};
                 cl.op          = ir::IrOp::CALLN;

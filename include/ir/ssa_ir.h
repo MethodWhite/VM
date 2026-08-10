@@ -1057,9 +1057,38 @@ namespace ir {
      * IrNativeImport por cada funcion nativa que sus llamadas (CALLN) van a
      * usar.  El emisor agrupa todas en un unico bloque @Import.
      */
+    /**
+     * @brief Lo que una funcion NATIVA declara hacer (port de Desmon 8d434933).
+     *
+     * El frontend puede DECIR lo que hace una nativa (p.ej. la familia
+     * `vio_*_to_vmbuf` declara: escribe su arg2 apuntado, sin io, sin lanzar).
+     * Con eso el DCE sabe si un CALLN tiene efectos observables: si la nativa
+     * declara NO escribir estado observable y NO lanzar, y el resultado no se
+     * usa, el CALLN se puede eliminar.  Sin declaracion (@c declarados == false)
+     * el comportamiento es el de siempre: opaca, se conserva.
+     */
+    struct IrNativeEffects {
+        bool declarados = false; ///< false = nadie ha dicho nada -> opaca.
+        /// Operandos del CALLN cuyo APUNTADO se lee (bit i = operando i).
+        uint32_t lee_apuntado = 0;
+        /// Operandos del CALLN cuyo APUNTADO se escribe (bit i = operando i).
+        uint32_t escribe_apuntado = 0;
+        bool lee_global = false;      ///< Lee estado global (estatico del proceso).
+        bool escribe_global = false;  ///< Lo escribe.
+        bool io = false;              ///< E/S observable (consola, fichero, puerto).
+        bool puede_lanzar = false;    ///< Puede cortar el flujo (throw/abort).
+        bool no_determinista = false; ///< Dos llamadas iguales pueden diferir.
+        /// Corre AL COMPILAR, no en ejecucion.
+        bool comptime = false;
+    };
+
     struct IrNativeImport {
         std::string lib;   ///< Ruta logica de la libreria (p.ej. "stdlib/native/io/vesta_io")
         std::string name;  ///< Nombre de la funcion nativa (p.ej. "vio_println")
+        /// Lo que la nativa DECLARA hacer (port del fix de Desmon 8d434933).
+        /// Permite que el DCE elimine un CALLN cuyo resultado no se usa si la
+        /// nativa declara no tener efectos observables.  Sin declarar, opaca.
+        IrNativeEffects efectos;
     };
 
     // =========================================================================
@@ -1325,6 +1354,11 @@ namespace ir {
          * punto sin preocuparse de duplicados.
          */
         void register_native_import(std::string lib, std::string name);
+        /// Variante que ademas declara los efectos de la nativa (port de
+        /// Desmon 8d434933): el DCE puede eliminar CALLNs de nativas que
+        /// declaran no tener efectos observables.
+        void register_native_import(std::string lib, std::string name,
+                                    const IrNativeEffects &efectos);
     };
 
     // =========================================================================

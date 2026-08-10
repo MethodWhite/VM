@@ -127,3 +127,28 @@ módulo.  No se arrastra código muerto de la otra rama.
 - Tests del módulo (unit + e2e Vex) pasan.
 - Sin regresión en la suite existente (ctest ≥ 57/64).
 - Documentado (comentario de cabecera del módulo).
+
+## Features del lenguaje (brechas vs Desmon) y progreso
+
+### Hecho (2026-08-09)
+- **Dunder operator overloading** (`__add__`/`__eq__`/`__ne__` derivado/
+  etc.): AST `overload_method`, type checker mapea BinOp->__op__, lowering
+  sintetiza `lhs.__op__(rhs)`.  Verificado: Vec2 `+`=42, `==`, `!=`.
+  Nota: los structs locales no tienen metodos -> el dunder solo aplica a
+  CLASS; StructLayout con metodos es un port posterior.
+
+### Pendiente por valor
+- **Enteros de ancho arbitrario** (u128..u512): requiere `union`,
+  `@Abstract` (structs base) y constructores comptime
+  (`std.comptime.literal`: IntLit/parse_int_lit).
+- **Extension methods + impl blocks**: programar tipos ajenos.
+- **Variádicos** (`T... rest`), **valued enums C-style**, **unions**,
+  **`cfn`**, **`gc<T>`**, **`thread_local`**.
+- **Concepts + bounds de genéricos**.
+- **`@overlay struct`**, match sobre enteros/strings, `bytes{}`.
+
+### Optimizaciones de rendimiento pendientes
+- **FMA cross-backend** (`ir_pass_fuse_fma`) — 1 redondeo en vez de 2.
+- **Auto-PGO tier-2** (contadores de branch + if-conversion).
+- **Banco FP ZMM + vectorización VEC_*** (fp_jit -30%, array_sum -18%).
+- **Fast-path threaded del interp** (mld/mst/shifts ~8x).

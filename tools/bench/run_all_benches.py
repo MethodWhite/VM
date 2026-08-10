@@ -1804,14 +1804,14 @@ def main() -> int:
         with _futures.ThreadPoolExecutor(max_workers=n_compile_jobs) as pool:
             futures = [pool.submit(compile_one, t) for t in compile_tasks]
             for fut in _futures.as_completed(futures):
-                idx, bname, ln, compiled, err = fut.result()
+                idx, bname, ln, compiled, cerr = fut.result()
                 compiled_map[(bname, ln)] = compiled
-                if err is not None:
-                    compile_errors[(bname, ln)] = err
+                if cerr is not None:
+                    compile_errors[(bname, ln)] = cerr
     compile_elapsed = time.perf_counter() - compile_t0
     info(f"compile total: {C.BOLD}{compile_elapsed:.2f}s{C.RESET}")
     if compile_errors:
-        for (bname, ln), err in compile_errors.items():
+        for (bname, ln), cerr2 in compile_errors.items():
             warn(f"compile fail {bname}/{ln}: {err}")
 
     # -------------------------------------------------------------------

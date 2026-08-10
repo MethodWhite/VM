@@ -55,6 +55,14 @@ struct EmitOptions {
     bool        emit_debug     = false;        ///< emitir comentarios @line N para cada instruccion
     bool        export_all     = false;        ///< exportar todas las funciones con @Export
     std::string module_name;                   ///< nombre @Module (vacio = usar mod.name)
+    /// El modulo que se entrega YA viene optimizado (port de Desmon
+    /// 78b26010).  El emisor trabaja sobre una copia y la optimizaba antes de
+    /// emitir -- correcto cuando le llega IR crudo, pero el compilador ya
+    /// optimiza el modulo por su cuenta para la seccion intermedia y los
+    /// comprobadores, asi el mismo trabajo se hacia dos veces (52 ms de los
+    /// 185 ms del frontend en un fuente de 5.700 lineas).  No se expresa con
+    /// @c opt_level=O0 porque el emisor lo consulta para decidir COMO emite.
+    bool        ya_optimizado = false;
 };
 
 /**

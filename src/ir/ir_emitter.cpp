@@ -4147,8 +4147,13 @@ EmitResult ir_emit_module(const IrModule &mod_in, const EmitOptions &opts) {
     // Trabajar sobre una copia para no modificar el modulo original
     IrModule mod = mod_in;
 
-    // Aplicar optimizaciones IR
-    ir_optimize(mod, opts.opt_level);
+    // Aplicar optimizaciones IR, salvo que quien llama ya las haya aplicado
+    // (port de Desmon 78b26010: el compilador optimiza el modulo para la
+    // seccion intermedia y los comprobadores, y re-optimizarlo aqui duplicaba
+    // el trabajo -- 52 ms de los 185 ms del frontend en un fuente grande).
+    if (!opts.ya_optimizado) {
+        ir_optimize(mod, opts.opt_level);
+    }
 
     // ===================================================================
     // Math-IR-promote: pre-pase que convierte IR ops sin bytecode opcode

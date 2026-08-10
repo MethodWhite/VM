@@ -1477,6 +1477,10 @@ CompileResult compile_vex_project(const std::string &root_path,
     emit_opts.module_name   = opts.module_name.empty()
         ? work.back().module_name
         : opts.module_name;
+    // merged ya salio optimizado de ir_optimize (arriba): el emisor lo
+    // volvia a optimizar sobre su copia -> mismo trabajo dos veces.  Port de
+    // Desmon 78b26010.  En O0 ir_optimize no toca nada, no aplica.
+    emit_opts.ya_optimizado = (opts.opt_level >= 1);
     ir::EmitResult eres = ir::ir_emit_module(merged, emit_opts);
     if (!eres.ok) {
         SourceLoc loc;

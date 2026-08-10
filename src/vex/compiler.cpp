@@ -259,6 +259,11 @@ namespace vex {
         emit_opts.emit_comments = true;
         emit_opts.emit_debug    = opts.emit_debug;
         emit_opts.module_name   = mod_name;
+        // El modulo ya salio optimizado de ir_optimize (linea 162) para O1+;
+        // el emisor trabajaba sobre una copia y lo volvia a optimizar -> el
+        // mismo trabajo dos veces.  Decirselo y no repetirlo (port Desmon
+        // 78b26010).  En O0 ir_optimize no toca nada, asi que no aplica.
+        emit_opts.ya_optimizado = (opts.opt_level >= 1);
 
         ir::EmitResult eres = ir::ir_emit_module(*ctx.irmod, emit_opts);
         if (!eres.ok) {

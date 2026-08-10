@@ -324,6 +324,48 @@ patcheado directo a `code_start` (sin trampoline JIT→intérprete). Los
 no-soportados restantes (excepciones polimórficas, spawn/distrib,
 futures) caen al intérprete graciosamente.
 
+### Migración desde `upstream/feature`
+
+La rama `feature` de Desmon (vesta-lang) es la línea de desarrollo principal
+(divergida estructuralmente de este fork: `src/vx/` vs `src/vex/`, `analysis/effects`
+nuevo, AOT en `toolchain/`, `stdlib/vx`).  Se migran las mejoras que son
+portables sin arrastrar la infraestructura nueva:
+
+**Portado** (en orden cronológico de esta iteración):
+- **Unroll de bucles contados + LoopFacts** (commits de Desmon `0d7ca361`,
+  `32ebc31b`, `f254eced`, `6df11ad5`) — el port principal, en `src/ir/passes/`
+  y `src/analysis/facts/`.  El guard clona la cond-chain real del header
+  (refactor propio, más robusto que la versión original de feature).
+- **Verificador SSA conectado al pipeline** (`VESTA_IR_VERIFY=1` + abort).
+- **Metodología de medición del bench runner** (`8d668bf2`): `_stats_summary`
+  robusto con MAD/IQR, muestras individuales, ranking de ruido, calentamiento
+  adaptativo (`serie_asentada`).
+- **El módulo no se optimiza dos veces** (`6d034603`, Desmon `78b26010`):
+  `EmitOptions::ya_optimizado` evita re-optimizar el IR en el emisor.
+  Verificado: `.vel` byte-idéntico antes/después.
+- **Fix `s += literal` devolvía cadena vacía** (`270f48d2`, Desmon `fa13d6a8`):
+  el compound assign de STRING ahora emite STRCAT.  El `+=` con literal
+  funciona; los casos normales de strings sin regresión.
+
+**Bloqueado por infraestructura de feature que no existe en esta rama**:
+- **DCE con declaraciones de nativas** (Desmon `8d434933`): requiere
+  `analysis/effects` + `IrNativeEffects` (10+ archivos).  Nuestro DCE ya es
+  conservador (nunca elimina CALLN).
+- **Refactor AOT a `toolchain/`**: ~14K líneas (linker propio, object_writer,
+  multi-arquitectura, cache de dependencias) + `stdlib/vx` renombrada.
+- **ASA / análisis semántico avanzado**, **asm elevado a IR**, **análisis de
+  efectos** (`analysis/effects`), **optimización de literales como vistas
+  `.rodata`** (Desmon `f4791606`).
+
+**Bugs conocidos (deuda de backend, para auditoría de Desmon)**:
+- **Cadenas con interpolación `${...}` crashean en JIT** (SIGSEGV) aunque el
+  intérprete las maneja bien.  El lowering produce IR correcto; el selector
+  JIT falla con el patrón STRCAT/STRMAKE encadenado.  El `+=` con literal
+  (sin interpolación) está arreglado.
+- El interpolado en binop (`s = s + "a ${x}"`) falla de compilación ("tipo
+  void"): el type checker no asigna tipo STRING al literal interpolado en ese
+  contexto.
+
 ### Comparativa multi-lenguaje (workloads idénticos)
 
 Tiempos wall en ms (mediana de 3 runs; hardware i7-13700KF). Para cada

@@ -20,7 +20,7 @@ int main() {
     };
 
 
-    vm::vm_map_ptr code = vm_mem.map(0x400000, 0x10000, vm::MemPerm::READ);
+    vm::vm_map_ptr code = vm_mem.map(0x400000, 0x10000, vm::MemPerm::READ | vm::MemPerm::WRITE);
     vm_mem.vm_to_host_memset(0x400000, 0x33, 0x10000);
 
     const size_t BYTES_PER_LINE = 16;

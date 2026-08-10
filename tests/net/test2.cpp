@@ -32,9 +32,13 @@ public:
         std::vector<uint8_t> buf(msg.begin(), msg.end());
         write_data(buf);
 
-        // Cierre TLS seguro
-        int ret = 0;
-        do { ret = SSL_shutdown(get_ssl()); } while (ret == 0);
+        // Cierre TLS seguro: el SERVIDOR es el unico iniciador del shutdown.
+        // Si SSL_shutdown() devuelve 0 (close_notify enviado, peer pendiente)
+        // hay que llamarlo de nuevo: la segunda llamada bloquea esperando el
+        // close_notify del peer y completa el cierre.  Un `while(ret==0)`
+        // infinito + un peer que TAMBIEN inicia el shutdown = deadlock.
+        int ret = SSL_shutdown(get_ssl());
+        if (ret == 0) ret = SSL_shutdown(get_ssl());
 
         stop();
     }

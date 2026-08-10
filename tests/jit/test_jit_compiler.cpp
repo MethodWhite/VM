@@ -336,15 +336,14 @@ namespace {
     }
 
     /* ===================================================================== */
-    /* Test 4: Unsupported op returns nullptr cleanly                          */
+    /* Test 4: FADD compila y ejecuta (float aritmetica en el selector)        */
     /* ===================================================================== */
 
     void test_compile_unsupported() {
-        /* IR con FADD (no soportado en v1 selector; float aritmetica
-         * requiere lowering memory-roundtrip GP<->ZMM como en el interp).
-         * DIV/MOD/SHL/ALLOCA SI estan soportadas tras Fase 5. */
+        /* El selector v1 soporta float aritmetica via SSE (ADDSD) desde Fase 5;
+         * una funcion fadd(a, b) = a + b debe compilar y ejecutar nativamente. */
         ir::IrFunction fn;
-        fn.name = "fadd_unsupported";
+        fn.name = "fadd_ok";
         fn.ret_type = ir::IrType::F64;
 
         const auto a = mk_value(fn, ir::IrType::F64);
@@ -367,8 +366,12 @@ namespace {
         jit::JitCompiler comp(cache, rt);
         jit::CompileResult res = comp.compile(fn, jit::SelectorMode::NATIVE_ABI);
 
-        CHECK(res.unsupported, "FADD marca unsupported=true");
-        CHECK(res.fn == nullptr, "fn = nullptr cuando unsupported");
+        CHECK(res.fn != nullptr, "fadd compilado");
+        CHECK(!res.unsupported, "FADD no marca unsupported (soportado)");
+
+        using F = double(*)(double, double);
+        const double rr = reinterpret_cast<F>(res.fn)(1.5, 2.25);
+        CHECK(rr == 3.75, "fadd(1.5, 2.25) == 3.75");
 
         jit::JitRegistry::instance().clear();
     }

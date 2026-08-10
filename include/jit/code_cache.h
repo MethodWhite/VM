@@ -171,6 +171,11 @@ namespace jit {
         /// Activa permisos de ejecucion para una pagina (no-op en modo RWX).
         void transition_to_executable(uint8_t *ptr, size_t size);
 
+        /// Restaura permisos de escritura para una pagina (RX -> RW; no-op en
+        /// modo RWX).  Necesario para invalidate()/free_region(): escriben
+        /// 0xCC sobre memoria que commit() dejo como RX.
+        void transition_to_writable(uint8_t *ptr, size_t size);
+
         /// Flush icache (CPU-specific).
         void flush_icache(const uint8_t *ptr, size_t size);
 

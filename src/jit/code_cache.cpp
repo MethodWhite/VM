@@ -294,6 +294,10 @@ namespace jit {
         if (!contains(ptr)) return;
         // 0xCC = opcode INT3 en x86-64.  Genera SIGTRAP / EXCEPTION_BREAKPOINT
         // si se ejecuta.  En ARM cambiariamos a la instruccion BKPT.
+        // La pagina esta en RX tras commit(): hay que volver a RW para poder
+        // escribir el veneno (W^X).  Dejarla RW: codigo invalidado no se
+        // vuelve a ejecutar.
+        transition_to_writable(ptr, size);
         std::memset(ptr, 0xCC, size);
         // Tras escribir, flush icache: el CPU podria tener cacheados los
         // bytes viejos y ejecutarlos por mucho tiempo sin este flush.
@@ -311,6 +315,9 @@ namespace jit {
     void CodeCache::free_region(uint8_t *ptr, size_t size) noexcept {
         if (!ptr || size == 0) return;
         if (!contains(ptr)) return;  // defensa: solo regiones nuestras
+        // La region commit-eada esta en RX: volver a RW antes de envenenar
+        // (W^X).  El alloc que la reuse la volvera a ejecutable en commit.
+        transition_to_writable(ptr, size);
         std::memset(ptr, 0xCC, size);
         flush_icache(ptr, size);
         free_list_.push_back({ptr, size});
@@ -362,6 +369,40 @@ namespace jit {
         ::mprotect(reinterpret_cast<void *>(aligned_start),
                    aligned_size,
                    PROT_READ | PROT_EXEC);
+#endif
+    }
+
+    /**
+     * @brief Restaura permisos de escritura para una region commit-eada.
+     *
+     * @c invalidate() y @c free_region() rellenan con @c 0xCC regiones que
+     * @c commit() dejo en RX.  Escribir sobre paginas RX es SEGV, asi que
+     * hay que volver a RW antes de escribir (y el caller la vuelve a RX
+     * despues si va a seguir ejecutable; para invalidar basta dejarla RW).
+     */
+    void CodeCache::transition_to_writable(uint8_t *ptr, size_t size) {
+        if (!ptr || size == 0) return;
+        size_t page_size = 4096;
+#if defined(_WIN32)
+        SYSTEM_INFO si;
+        ::GetSystemInfo(&si);
+        page_size = si.dwPageSize;
+#else
+        page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+#endif
+        uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+        uintptr_t aligned_start = start & ~(page_size - 1);
+        size_t aligned_size = round_up(size + (start - aligned_start), page_size);
+#if defined(_WIN32)
+        DWORD old;
+        ::VirtualProtect(reinterpret_cast<void *>(aligned_start),
+                         aligned_size,
+                         PAGE_READWRITE,
+                         &old);
+#else
+        ::mprotect(reinterpret_cast<void *>(aligned_start),
+                   aligned_size,
+                   PROT_READ | PROT_WRITE);
 #endif
     }
 

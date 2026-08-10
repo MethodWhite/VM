@@ -1574,6 +1574,14 @@ int main() {
 #else
     setenv("VESTA_JIT_VREG_IDIV", "1", 1);
 #endif
+    /* El test de CALLVIRT verifica el fallback a vrt_callvirt con un objeto
+     * sintetico (no es un objeto GC real): desactivar el inline dispatch,
+     * que de lo contrario dereferenciaria [obj] (0xABCD) y crashearia. */
+#if defined(_WIN32)
+    _putenv("VESTA_JIT_NO_INLINE_CALLVIRT=1");
+#else
+    setenv("VESTA_JIT_NO_INLINE_CALLVIRT", "1", 1);
+#endif
     std::printf("=== test_vreg_vm (Phase D.7 commit 5a, VM_ABI) ===\n");
     test_vm_divmod();
     test_vm_divmod_loop();

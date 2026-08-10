@@ -169,6 +169,26 @@ endfunction()
 # los tests de lexer/linker/loader los buscan por nombre relativo.
 file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/ DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 
+# Generar certificados self-signed para los tests de TLS (net/test2.cpp,
+# runtime/test_distrib_session_tls.cpp) que cargan server_cert.pem y
+# server_key.pem desde el working dir.  Si openssl no esta disponible los
+# tests de TLS fallaran con un mensaje claro en vez de generar un .pem.
+find_program(OPENSSL_EXEC openssl)
+if(OPENSSL_EXEC)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/server_cert.pem
+               ${CMAKE_CURRENT_BINARY_DIR}/server_key.pem
+        COMMAND ${OPENSSL_EXEC} req -x509 -newkey rsa:2048
+                -keyout ${CMAKE_CURRENT_BINARY_DIR}/server_key.pem
+                -out    ${CMAKE_CURRENT_BINARY_DIR}/server_cert.pem
+                -days 3650 -nodes -subj "/CN=localhost"
+        COMMENT "Generando certificados TLS de test"
+        VERBATIM)
+    add_custom_target(gen_tls_test_certs ALL
+        DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/server_cert.pem
+                ${CMAKE_CURRENT_BINARY_DIR}/server_key.pem)
+endif()
+
 # Todos los sources de src/
 file(GLOB_RECURSE ALL_PROJECT_SOURCES
         ${CMAKE_SOURCE_DIR}/src/*.cpp
@@ -200,4 +220,10 @@ foreach (TEST_FILE ${TEST_FILES})
     add_test(NAME "test_${REL_DIR_SAFE}_${TEST_NAME}"
              COMMAND "test_${REL_DIR_SAFE}_${TEST_NAME}"
              WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    # tests/net/test1.cpp es un DEMO interactivo (abre un server TCP y duerme
+    # 30s esperando que el usuario conecte con telnet/nc): no es automatizable
+    # para CI.  El binario se sigue compilando para uso manual; ctest lo omite.
+    if (TEST_FILE STREQUAL "net/test1.cpp")
+        set_tests_properties("test_${REL_DIR_SAFE}_${TEST_NAME}" PROPERTIES DISABLED TRUE)
+    endif()
 endforeach ()

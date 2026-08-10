@@ -58,14 +58,32 @@ bool TCPServer::start() {
     running.store(true);
     std::cout << "[TCPServer] listening on port " << port << std::endl;
 
-    std::thread(&TCPServer::accept_loop, this).detach();
+    accept_thread = std::thread(&TCPServer::accept_loop, this);
     return true;
 }
 
 void TCPServer::stop() {
     if (!running.load()) return;
     running.store(false);
-    if (server_fd >= 0) { close_socket(server_fd); server_fd = -1; }
+    if (server_fd >= 0) {
+        /* shutdown() despierta un accept() bloqueado en OTRO hilo; close()
+         * desde un hilo distinto NO lo interrumpe en Linux/POSIX.  Sin esto
+         * el accept_loop quedaria colgado en accept() y el join() de stop()
+         * nunca retornaria. */
+#if defined(_WIN32)
+        ::shutdown(server_fd, SD_BOTH);
+#else
+        ::shutdown(server_fd, SHUT_RDWR);
+#endif
+        close_socket(server_fd);
+        server_fd = -1;
+    }
+
+    /* El accept_loop puede estar bloqueado en accept(): al cerrar server_fd
+     * el accept devuelve <0 y (con running=false) sale del bucle y une los
+     * hilos de clientes.  Unirlo aqui garantiza que el accept_loop no siga
+     * accediendo a `this` despues de que el destructor corra. */
+    if (accept_thread.joinable()) accept_thread.join();
 
 #ifdef _WIN32
     WSACleanup();
@@ -77,7 +95,12 @@ void TCPServer::accept_loop() {
         sockaddr_in client_addr{};
         socklen_t len = sizeof(client_addr);
         socket_t client_fd = accept(server_fd, (sockaddr*)&client_addr, &len);
-        if (client_fd < 0) continue;
+        if (client_fd < 0) {
+            /* accept() fallo: o bien se cerro server_fd (stop()) -> salir, o un
+             * error transitorio (EINTR) -> reintentar mientras siga corriendo. */
+            if (!running.load()) break;
+            continue;
+        }
 
         std::cout << "[TCPServer] client connected\n";
 

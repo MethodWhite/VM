@@ -31,6 +31,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -477,6 +478,13 @@ static void test_session_tls_with_token(uint16_t port, const TestCert &tc,
 // Punto de entrada
 // ---------------------------------------------------------------------------
 int main() {
+#if !defined(_WIN32)
+    /* Un peer que cierra un socket durante el test (o el shutdown de una
+     * sesion) provoca SIGPIPE en el write: si no lo ignoramos, el proceso
+     * muere (exit 141) en vez de dejar que write() devuelva EPIPE y que el
+     * test lo maneje.  Estandar en programas de red. */
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
     init_winsock();
     SSL_library_init();
     SSL_load_error_strings();

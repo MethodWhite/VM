@@ -88,6 +88,7 @@ protected:
     TLSContext *tls_ctx{nullptr};    ///< Contexto TLS (puede ser nullptr para TCP plano)
 
     std::vector<std::thread> threads; ///< Hilos de los clientes activos
+    std::thread accept_thread;        ///< Hilo del bucle de aceptacion (joinable)
 
 public:
     /**

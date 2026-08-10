@@ -639,6 +639,20 @@ namespace jit {
             const size_t MAX_REG_ARGS = 6;
 #endif
             for (size_t i = 0; i < ir_fn.params.size() && i < MAX_REG_ARGS; ++i) {
+                /* SysV/Win64 pasan f64/f32 en regs XMM (XMM0, XMM1, ...), no en
+                 * GP.  El selector vive los FP como bits en GP, asi que leemos
+                 * el arg de XMMi y lo bajamos a GP antes del store_op. */
+                const uint32_t pid = ir_fn.params[i];
+                const ir::IrType pty = (pid < ir_fn.values.size())
+                    ? ir_fn.values[pid].type : ir::IrType::I64;
+                if (pty == ir::IrType::F64 || pty == ir::IrType::F32) {
+                    const MReg xr = (i < 8) ? (MReg)((int)MReg::XMM0 + (int)i)
+                                            : MReg::XMM0;
+                    mf.blocks.back().instrs.push_back(
+                        MInstr::make_unary(MOp::MOVQ_XMM_GP,
+                            MOperand::make_reg(arg_regs[i]),
+                            MOperand::make_reg(xr)));
+                }
                 store_op(mf, ir_fn.params[i], arg_regs[i]);
             }
         } else if (cb_entry) {
@@ -3356,6 +3370,19 @@ case IrOp::CALLCLOSURE: {
                         if (!ins.operands.empty()
                          && ins.operands[0] != ir::IR_NO_VALUE) {
                             load_op_rematerializable(mf, ir_fn, ins.operands[0], MReg::RAX);
+                            /* Convencion SysV: los f64/f32 se devuelven en
+                             * XMM0, no RAX.  El valor vive en GP como bits
+                             * (el selector no tiene regs FP persistentes);
+                             * moverlo a XMM0 antes del ret. */
+                            const uint32_t rv = ins.operands[0];
+                            const ir::IrType rty = (rv < ir_fn.values.size())
+                                ? ir_fn.values[rv].type : ir::IrType::I64;
+                            if (rty == ir::IrType::F64 || rty == ir::IrType::F32) {
+                                mf.blocks.back().instrs.push_back(
+                                    MInstr::make_unary(MOp::MOVQ_GP_XMM,
+                                        MOperand::make_reg(MReg::XMM0),
+                                        MOperand::make_reg(MReg::RAX)));
+                            }
                         }
                         /* VM_ABI: ademas escribir RAX a proc->registers.regs[0]
                          * para que el caller bytecode/interprete vea el return.

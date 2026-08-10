@@ -19,8 +19,8 @@
  * (rax..r15 en ORDEN DE ENCODING, igual que @c MReg y el encoder); las demas
  * clases (FP/VEC) y arch (arm64) llegan despues.
  */
-#ifndef VX_ASM_PHYS_REG_H
-#define VX_ASM_PHYS_REG_H
+#ifndef VEX_ASM_PHYS_REG_H
+#define VEX_ASM_PHYS_REG_H
 
 #include "ir/ssa_ir.h"
 
@@ -177,4 +177,4 @@ inline std::string asm_body_subst_greedy(
 
 } // namespace vex
 
-#endif // VX_ASM_PHYS_REG_H
+#endif // VEX_ASM_PHYS_REG_H

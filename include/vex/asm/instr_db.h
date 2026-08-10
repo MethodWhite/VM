@@ -13,8 +13,8 @@
  * (misma identidad que la DB); un @c match(mnemonico, operandos) resuelve el
  * texto de un @c asm { } a su FormID.
  */
-#ifndef VX_INSTR_DB_H
-#define VX_INSTR_DB_H
+#ifndef VEX_INSTR_DB_H
+#define VEX_INSTR_DB_H
 
 #include <cstdint>
 #include <string>
@@ -322,4 +322,4 @@ uint32_t form_count(Isa isa);
 } // namespace instr_db
 } // namespace vex
 
-#endif // VX_INSTR_DB_H
+#endif // VEX_INSTR_DB_H

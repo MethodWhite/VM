@@ -6,8 +6,8 @@
  *  registros, direccionamiento x86) y lo baja al IR NEUTRO via el core
  *  (@ref asm_lift_core.h).  Anadir un ISA = anadir su lift_<isa>; el core y el
  *  dispatcher no cambian. */
-#ifndef VESTA_VX_ASM_ASM_LIFT_X86_H
-#define VESTA_VX_ASM_ASM_LIFT_X86_H
+#ifndef VESTA_VEX_ASM_ASM_LIFT_X86_H
+#define VESTA_VEX_ASM_ASM_LIFT_X86_H
 
 #include "vex/asm/asm_lift_general.h" // AsmBoundReg
 #include <cstdint>
@@ -24,4 +24,4 @@ bool lift_x86(ir::IrFunction &fn, uint32_t block, const std::string &body,
               uint32_t line, uint32_t *out_exit);
 } // namespace vex
 
-#endif // VESTA_VX_ASM_ASM_LIFT_X86_H
+#endif // VESTA_VEX_ASM_ASM_LIFT_X86_H

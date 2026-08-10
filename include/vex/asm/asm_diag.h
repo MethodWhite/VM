@@ -28,8 +28,8 @@
  * La cadena de codigos es estable (VXA0xx) para el catalogo de diagnosticos.
  */
 
-#ifndef VX_ASM_DIAG_H
-#define VX_ASM_DIAG_H
+#ifndef VEX_ASM_DIAG_H
+#define VEX_ASM_DIAG_H
 
 #include <cstdint>
 #include <string>
@@ -97,4 +97,4 @@ asm_diagnose_uninit(const AsmCfg &cfg, instr_db::Isa isa,
 
 } // namespace vex
 
-#endif // VX_ASM_DIAG_H
+#endif // VEX_ASM_DIAG_H

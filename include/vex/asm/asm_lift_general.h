@@ -24,8 +24,8 @@
  * soportado -> devuelve false (el llamador cae a la emision INLINE_ASM opaca).
  */
 
-#ifndef VESTA_VX_ASM_ASM_LIFT_GENERAL_H
-#define VESTA_VX_ASM_ASM_LIFT_GENERAL_H
+#ifndef VESTA_VEX_ASM_ASM_LIFT_GENERAL_H
+#define VESTA_VEX_ASM_ASM_LIFT_GENERAL_H
 
 #include "vex/asm/instr_db.h"
 
@@ -72,4 +72,4 @@ bool asm_lift_general(
 
 } // namespace vex
 
-#endif // VESTA_VX_ASM_ASM_LIFT_GENERAL_H
+#endif // VESTA_VEX_ASM_ASM_LIFT_GENERAL_H

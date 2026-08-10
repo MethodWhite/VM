@@ -24,8 +24,8 @@
  * botella).  Un encabezado resume el bloque entero y lista los diagnosticos.
  */
 
-#ifndef VX_ASM_DIAGRAM_H
-#define VX_ASM_DIAGRAM_H
+#ifndef VEX_ASM_DIAGRAM_H
+#define VEX_ASM_DIAGRAM_H
 
 #include <cstdint>
 #include <string>
@@ -64,4 +64,4 @@ std::string asm_cfg_graphviz(const std::string &body,
 
 } // namespace vex
 
-#endif // VX_ASM_DIAGRAM_H
+#endif // VEX_ASM_DIAGRAM_H

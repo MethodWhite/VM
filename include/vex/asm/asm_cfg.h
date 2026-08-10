@@ -32,8 +32,8 @@
  * la tabla de efectos por-arquitectura, y su propio troceo de lineas.
  */
 
-#ifndef VX_ASM_CFG_H
-#define VX_ASM_CFG_H
+#ifndef VEX_ASM_CFG_H
+#define VEX_ASM_CFG_H
 
 #include <cstdint>
 #include <string>
@@ -113,4 +113,4 @@ AsmTerm asm_classify_term(instr_db::Isa isa, const std::string &line,
 
 } // namespace vex
 
-#endif // VX_ASM_CFG_H
+#endif // VEX_ASM_CFG_H

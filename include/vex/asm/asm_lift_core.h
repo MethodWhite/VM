@@ -7,8 +7,8 @@
  *  a IR-CFG.  Cada frontend por-ISA (lift_x86, futuro lift_arm64) la reusa; el
  *  IR resultante es el mismo para todas las arquitecturas.  Header-only (inline)
  *  para compartir sin dependencia de enlace. */
-#ifndef VESTA_VX_ASM_ASM_LIFT_CORE_H
-#define VESTA_VX_ASM_ASM_LIFT_CORE_H
+#ifndef VESTA_VEX_ASM_ASM_LIFT_CORE_H
+#define VESTA_VEX_ASM_ASM_LIFT_CORE_H
 
 #include "ir/ssa_ir.h"
 #include "vex/asm/asm_cfg.h"
@@ -317,4 +317,4 @@ inline bool lift_cfg_neutral(LiftCtx &c, const vex::AsmCfg &cfg, const CfgHooks 
 } // namespace asmlift
 } // namespace vex
 
-#endif // VESTA_VX_ASM_ASM_LIFT_CORE_H
+#endif // VESTA_VEX_ASM_ASM_LIFT_CORE_H

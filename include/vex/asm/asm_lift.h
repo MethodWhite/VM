@@ -30,8 +30,8 @@
  * su ruta @c INLINE_ASM normal.
  */
 
-#ifndef VX_ASM_LIFT_H
-#define VX_ASM_LIFT_H
+#ifndef VEX_ASM_LIFT_H
+#define VEX_ASM_LIFT_H
 
 #include <cstdint>
 #include <string>
@@ -71,4 +71,4 @@ AsmLift asm_lift_detect(instr_db::Isa isa, const std::string &body);
 
 } // namespace vex
 
-#endif // VX_ASM_LIFT_H
+#endif // VEX_ASM_LIFT_H

@@ -39,8 +39,8 @@
  * reportara desde el backend, no desde el texto.
  */
 
-#ifndef VX_ASM_ANALYZE_H
-#define VX_ASM_ANALYZE_H
+#ifndef VEX_ASM_ANALYZE_H
+#define VEX_ASM_ANALYZE_H
 
 #include <cstdint>
 #include <string>
@@ -87,4 +87,4 @@ AsmBlockEffects asm_analyze_block(const std::string &nasm_body,
 
 } // namespace vex
 
-#endif // VX_ASM_ANALYZE_H
+#endif // VEX_ASM_ANALYZE_H

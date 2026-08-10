@@ -26,8 +26,8 @@
  * caja opaca @c INLINE_ASM).
  */
 
-#ifndef VESTA_VX_ASM_ASM_LIFT_MICRO_H
-#define VESTA_VX_ASM_ASM_LIFT_MICRO_H
+#ifndef VESTA_VEX_ASM_ASM_LIFT_MICRO_H
+#define VESTA_VEX_ASM_ASM_LIFT_MICRO_H
 
 #include "vex/asm/instr_db.h"
 
@@ -70,4 +70,4 @@ bool asm_lift_micro(
 
 } // namespace vex
 
-#endif // VESTA_VX_ASM_ASM_LIFT_MICRO_H
+#endif // VESTA_VEX_ASM_ASM_LIFT_MICRO_H

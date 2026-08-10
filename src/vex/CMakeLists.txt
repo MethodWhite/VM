@@ -59,6 +59,7 @@ add_library(vex_lib STATIC
     # ASA: base de datos de instrucciones + lifting de patrones.
     asm/instr_db.cpp
     asm/asm_lift.cpp
+    asm/asm_lift_emit.cpp
     asm/asm_cfg.cpp
     asm/asm_diag.cpp
     asm/asm_diagram.cpp

@@ -23,8 +23,8 @@
  * toca el IR y devuelve false (el lowering sigue con la ruta @c INLINE_ASM).
  */
 
-#ifndef VX_ASM_LIFT_EMIT_H
-#define VX_ASM_LIFT_EMIT_H
+#ifndef VEX_ASM_LIFT_EMIT_H
+#define VEX_ASM_LIFT_EMIT_H
 
 #include <cstdint>
 #include <string>
@@ -56,4 +56,4 @@ bool asm_lift_emit(
 
 } // namespace vex
 
-#endif // VX_ASM_LIFT_EMIT_H
+#endif // VEX_ASM_LIFT_EMIT_H

@@ -868,6 +868,9 @@ namespace ir {
         std::vector<IrInstr>   instrs;  ///< instrucciones en orden
         std::vector<IrBlockId> preds;   ///< bloques predecesores (para consistencia de Phi)
         std::vector<IrBlockId> succs;   ///< bloques sucesores
+        /// Marcado por el pase de unroll para no re-desenrollar un header
+        /// ya transformado (el remainder del desenrollado previo).
+        bool                   no_unroll = false;
     };
 
     // =========================================================================

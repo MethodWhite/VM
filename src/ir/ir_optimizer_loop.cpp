@@ -7,6 +7,7 @@
 
 #include "ir/ir_optimizer.h"
 #include "ir/ir_optimizer_internal.h"
+#include "ir/passes/unroll.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1825,6 +1826,27 @@ void ir_optimize(IrModule &mod, OptLevel level) {
      * el codigo expandido. */
     if (level >= OptLevel::O1) {
         ir_pass_inline(mod);
+    }
+
+    /* Unroll de bucles contados (port de Desmon): amortiza el overhead de
+     * dispatch del loop en el interp y expone ILP en el JIT/AOT.  El factor es
+     * automatico (segun el tamano del cuerpo).
+     *
+     * IMPORTANTE: DESACTIVADO por defecto.  El JIT de Vesta despacha cada
+     * instruccion via helper (sin register allocation), asi que el unroll solo
+     * replica los dispatch points y anade spills -> regresion medible en ambos
+     * modos (bench array_sum: 0.07s -> 0.09s).  Activable para A/B testing con
+     * VESTA_UNROLL=1 (o VESTA_NO_UNROLL=1 para desactivar si se fuerza en build). */
+    if (level >= OptLevel::O2) {
+        const char *on = std::getenv("VESTA_UNROLL");
+        const bool enabled = on && on[0] != '\0' && on[0] != '0';
+        const char *off = std::getenv("VESTA_NO_UNROLL");
+        const bool disabled = off && off[0] != '\0' && off[0] != '0';
+        if (enabled && !disabled) {
+            for (auto &fn : mod.functions) {
+                if (!fn.is_native) ir_pass_unroll(fn);
+            }
+        }
     }
 
     /* Phase D.jit-mem-model AUTO-PROMOTE: marca ALLOCAs que fluyen a

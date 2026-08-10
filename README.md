@@ -357,14 +357,17 @@ portables sin arrastrar la infraestructura nueva:
   efectos** (`analysis/effects`), **optimización de literales como vistas
   `.rodata`** (Desmon `f4791606`).
 
-**Bugs conocidos (deuda de backend, para auditoría de Desmon)**:
-- **Cadenas con interpolación `${...}` crashean en JIT** (SIGSEGV) aunque el
-  intérprete las maneja bien.  El lowering produce IR correcto; el selector
-  JIT falla con el patrón STRCAT/STRMAKE encadenado.  El `+=` con literal
-  (sin interpolación) está arreglado.
-- El interpolado en binop (`s = s + "a ${x}"`) falla de compilación ("tipo
-  void"): el type checker no asigna tipo STRING al literal interpolado en ese
-  contexto.
+**Bugs de backend arreglados (commit `33c87a49`)**:
+- **Cadenas con interpolación `${...}` en JIT**: crasheaban (SIGSEGV) y daban
+  contenido incorrecto aunque el intérprete las manejaba bien.  Tres causas
+  corregidas: (1) el slot del inline cache de STRMAKE/STRCAT se alocaba del
+  CodeCache (RX por W^X) y el selector lo escribía → ahora malloc RW; (2) el
+  IC de string ops cacheaba contenido dinámico (STRMAKE del stringify) →
+  desactivado para string ops; (3) el STRMAKE leía vm_mem de un buffer host →
+  nuevo `vrt_str_make_host` cuando el buffer tiene `is_host_ptr`.
+- **Binop interpolado con "tipo void"**: `s = s + "a ${x}"` fallaba de
+  compilación porque el type checker excluía los literales interpolados de
+  `is_str_lit` → ahora los incluye.
 
 ### Comparativa multi-lenguaje (workloads idénticos)
 

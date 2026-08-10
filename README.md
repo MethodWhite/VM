@@ -438,30 +438,30 @@ genera una gráfica dedicada por cada uno de los 27 benches en
 **Roadmap completo** (hasta JIT C2 con regalloc real + AOT con ejecutables
 `.exe` nativos en 3 tiers): [doc/ROADMAP.md](./doc/ROADMAP.md).
 
-### Informe de rendimiento local (Linux, build Debug)
+### Informe de rendimiento local (Linux, build Release)
 
 Benchmarks del runner en esta máquina (Linux x86_64, 8 cores, 24.9 GB RAM,
-`build/vm` Debug `-O0`, mediana de 3 runs, wall externo):
+`build_release/vm` Release `-O3 -march=native`, mediana de 3 runs, wall
+externo):
 
 ![JIT vs intérprete](./docs/benchmarks/jit_vs_interp.png)
 
-El JIT C1 da **~3-178×** sobre el intérprete según el bench (los intérprete
-puros como `int_mixed`/`memcpy_loop`/`nested_loops` son ~150× más lentos sin
-JIT; los `fib_recursive` ~10×).  Estos valores son de un build **Debug sin
-optimizar**; el Release (~`-O3`) mejora ambos términos.  Para números
-representativos del proyecto (build Release, i7-13700KF) ver la tabla de
+El JIT C1 da **~5-119×** sobre el intérprete según el bench en Release
+(`fib_recursive` ~4×, los intérprete puros como `nested_loops`/`int_mixed`
+~28-119×).  Estos son los números locales reales; para la comparativa
+multi-lenguaje completa (27 benches, i7-13700KF de Desmon) ver la tabla de
 "Estadísticas clave".
 
-**Impacto del unroll en el JIT** (array_sum, 400M LOAD, build Debug):
+**Impacto del unroll en el JIT** (array_sum, 400M LOAD, build Release):
 
 ![Impacto del unroll](./docs/benchmarks/unroll_impact_jit.png)
 
 Hallazgo honesto para la auditoría: en el JIT C1 actual el unroll es una
-**regresión** (~+65%).  La causa es arquitectónica — el C1 despacha cada
-instrucción vía helper sin register allocation, así que desenrollar solo
-multiplica los dispatch points y añade spills de stack.  El pase queda
-implementado, correcto (mismo resultado con/sin) y auditado, pero **off por
-defecto** hasta que el JIT C2 (regalloc real) lo pueda aprovechar.
+**regresión** (~+94% en Release, ~+65% en Debug).  La causa es arquitectónica
+— el C1 despacha cada instrucción vía helper sin register allocation, así que
+desenrollar solo multiplica los dispatch points y añade spills de stack.  El
+pase queda implementado, correcto (mismo resultado con/sin) y auditado, pero
+**off por defecto** hasta que el JIT C2 (regalloc real) lo pueda aprovechar.
 
 **Progreso de la suite de tests** (durante esta iteración):
 

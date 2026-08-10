@@ -19,6 +19,8 @@ cmake-build-release
 cmake-build-*
 cmake-*
 build/
+build_release/
+build-debug/
 build-windows/
 build-linux/
 

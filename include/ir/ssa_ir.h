@@ -527,6 +527,11 @@ namespace ir {
         PANIC     = 0xFD, ///< panic %msg_addr, %msg_len      (FatalError USER_ABORT)
 
         // ---- codigo ensamblador incrustado (0xFF) ----
+        /// una instruccion asm OPACA liftada a IR (ver @ref AsmMicro):
+        /// lleva su identidad (isa + form_id) en la base de datos de
+        /// instrucciones, de donde se consultan efectos/timing.  El
+        /// interprete NO la ejecuta; la materializan JIT/AOT.
+        ASM_MICRO = 0xFE,
         RAW_ASM   = 0xFF, ///< raw_asm "texto"  (ensamblador .vel verbatim; nunca optimizado)
     };
 
@@ -711,6 +716,85 @@ namespace ir {
      *   SWAPCTX:       operands[0]=dst_ctx, operands[1]=src_ctx
      *   RAW_ASM:       func_name=texto_ensamblador (sin dst, sin operandos, nunca optimizado)
      */
+
+    // -------------------------------------------------------------------
+    // ASM_MICRO: instrucciones asm opacas liftadas a IR (ASA)
+    // -------------------------------------------------------------------
+
+    /// Binding de un @c register() de asm inline: ALLOCA del var + registro.
+    struct AsmRegBinding {
+        IrValueId alloca_value = IR_NO_VALUE; ///< dst del ALLOCA del var
+        std::string reg;        ///< registro RAW (eax/rax/xmm0...); vacio si reg_auto
+        IrType type = IrType::VOID; ///< tipo escalar del var
+        bool is_vector = false;     ///< true si reg es xmm/ymm/zmm
+        std::string name;       ///< nombre Vesta de la variable
+        /// operando `reg` (AUTO): el RA ELIGE el registro y el ensamblado
+        /// se aplaza a post-regalloc (placeholder $ph_index).  false = pin fijo.
+        bool reg_auto = false;
+        int ph_index = -1;      ///< indice $N del placeholder (reg_auto)
+    };
+
+    /**
+     * @brief Flags de ROL de un operando @c ASM_MICRO (bitmask, NO exclusivos).
+     *
+     * Reflejan los flags de la base de datos (@c DbOperand.flags:
+     * bit0 read, bit1 write, bit2 implicit, bit3 suppressed) mas @c CLOBBER.
+     */
+    enum AsmOperandFlag : uint8_t {
+        ASM_OP_READ      = 1u << 0, ///< el operando se LEE
+        ASM_OP_WRITE     = 1u << 1, ///< el operando se ESCRIBE
+        ASM_OP_IMPLICIT  = 1u << 2, ///< implicito (no en la sintaxis textual)
+        ASM_OP_SUPPRESSED= 1u << 3, ///< leido/escrito pero fuera del encoding
+        ASM_OP_CLOBBER   = 1u << 4, ///< destruido sin valor observable
+    };
+
+    /// TIPO de un operando @c ASM_MICRO (REG / MEM / IMM).
+    enum class AsmOperandKind : uint8_t {
+        REG = 0, ///< registro (clase en regclass, fisico en fixed_phys)
+        MEM = 1, ///< memoria (base/index en value; regclass del registro base)
+        IMM = 2, ///< inmediato (valor en imm)
+    };
+
+    /**
+     * @brief Un operando de una instruccion @c ASM_MICRO (asm opaca liftada).
+     *
+     * Modelo de LISTA PLANA en ORDEN TEXTUAL: la instruccion tiene UNA lista
+     * de operandos, cada uno con su rol como @c flags.  @c $0,$1,... de
+     * @c AsmMicro::tmpl referencian esta lista por indice.  @c regclass es
+     * arch-neutra; el ancho y sintaxis concreta los da la DB (@c form_id).
+     * @c fixed_phys fija un registro fisico REQUERIDO (-1 = libre).
+     */
+    struct AsmMicroOperand {
+        AsmOperandKind kind = AsmOperandKind::REG;
+        uint8_t  flags = 0;      ///< @ref AsmOperandFlag
+        uint8_t  regclass = 0;   ///< 0=GP 1=FP 2=VEC 3=PRED 4=FLAGS
+        uint16_t width = 0;      ///< ancho en bits (de la forma DB)
+        int16_t  fixed_phys = -1;///< reg fisico fijo (-1 = libre)
+        IrValueId value = 0;     ///< SSA leido/definido; IR_NO_VALUE si no
+        int64_t  imm = 0;        ///< inmediato (solo kind==IMM)
+
+        bool reads()  const { return (flags & ASM_OP_READ)  != 0; }
+        bool writes() const { return (flags & ASM_OP_WRITE) != 0; }
+    };
+
+    /**
+     * @brief Una instruccion de asm OPACA liftada a IR (@ref IrOp::ASM_MICRO).
+     *
+     * Lleva su identidad en la base de datos (@c isa + @c form_id) de donde
+     * se consultan todos los efectos (lee/escribe/flags/mem/barrera/timing)
+     * sin duplicarlos.  El backend (JIT/AOT) la re-emite verbatim rellenando
+     * la plantilla con los registros asignados por el regalloc.  El interp
+     * NO la ejecuta.  Multi-arch: @c isa == @c instr_db::Isa.
+     */
+    struct AsmMicro {
+        uint8_t  isa = 0;      ///< ISA (instr_db::Isa)
+        uint32_t form_id = 0;  ///< indice de la forma en la DB de @c isa
+        std::string tmpl;      ///< plantilla NASM con $0,$1,... por operando
+        std::vector<AsmMicroOperand> operands; ///< lista plana en orden textual
+        uint8_t eff = 0;       ///< cache: bit0 mem, bit1 flags_r, bit2 flags_w,
+                               ///<   bit3 barrera, bit4 call
+    };
+
     /**
      * @struct IrInstr
      * @brief Una instruccion SSA del IR.
@@ -829,6 +913,9 @@ namespace ir {
         std::vector<IrBlock>     blocks;          ///< bloques basicos (bloques[0] = entry)
         bool                     is_native   = false; ///< true si es stub para funcion nativa
         bool                     is_variadic = false; ///< true si acepta argc variable
+        /// ASM_MICRO pool: instrucciones asm opacas liftadas a IR.  Cada
+        /// @c IrOp::ASM_MICRO referencia una entrada por indice en @c imm.
+        std::vector<AsmMicro>    asm_micros;
 
         /**
          * @brief Contract de monomorphizacion: provenance de

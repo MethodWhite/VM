@@ -303,6 +303,7 @@ namespace ir {
         {"callsuper",        IrOp::CALLSUPER},
         {"proceed",          IrOp::PROCEED},
         // ensamblador incrustado
+        {"asm_micro",  IrOp::ASM_MICRO},
         {"raw_asm",    IrOp::RAW_ASM},
         {nullptr,      IrOp::NOP},
     };
@@ -784,6 +785,12 @@ namespace ir {
                 // raw_asm "texto de ensamblador verbatim"
                 o << " \"" << ins.func_name << "\"";
                 break;
+
+            case IrOp::ASM_MICRO: {
+                // asm_micro <imm>  (indice al pool AsmMicro de la funcion)
+                o << " " << ins.imm;
+                break;
+            }
 
             case IrOp::GEP:
                 // gep.ptr %handle, byte_offset

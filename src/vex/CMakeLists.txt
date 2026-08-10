@@ -60,6 +60,10 @@ add_library(vex_lib STATIC
     asm/instr_db.cpp
     asm/asm_lift.cpp
     asm/asm_lift_emit.cpp
+    asm/asm_lift_general.cpp
+    asm/asm_lift_micro.cpp
+    asm/asm_lift_x86.cpp
+    asm/asm_phys_reg.cpp
     asm/asm_cfg.cpp
     asm/asm_diag.cpp
     asm/asm_diagram.cpp

@@ -3947,6 +3947,44 @@ static void emit_instr(EmitCtx &ctx, const IrBlock &bb, size_t idx,
             break;
         }
 
+        case IrOp::ASM_MICRO: {
+            /* ASM_MICRO: instruccion asm opaca liftada a IR.  El tmpl usa
+             * placeholders $0,$1,... por operando (lista plana).  Cada
+             * operando: si tiene fixed_phys usa ese reg; si tiene value,
+             * usa el reg del valor SSA (load_src si esta spilled). */
+            const ir::AsmMicro &am =
+                (ins.imm < ctx.fn.asm_micros.size())
+                    ? ctx.fn.asm_micros[ins.imm]
+                    : ir::AsmMicro{};
+            std::vector<std::string> op_regs;
+            op_regs.reserve(am.operands.size());
+            for (size_t k = 0; k < am.operands.size(); ++k) {
+                const auto &op = am.operands[k];
+                if (op.fixed_phys >= 0) {
+                    /* Registro fisico del .vel: r0..r15.  El lifter x86 mapea
+                     * rax->r0, rcx->r1, rdx->r2, rbx->r3, rsp->r4, rbp->r5,
+                     * rsi->r6, rdi->r7, r8..r15 -> r8..r15 (convencion VM). */
+                    op_regs.push_back("r" + std::to_string(op.fixed_phys));
+                } else if (op.value != IR_NO_VALUE) {
+                    op_regs.push_back(ctx.load_src(op.value, static_cast<int>(k % 2)));
+                } else {
+                    op_regs.emplace_back();
+                }
+            }
+            std::string ln = am.tmpl;
+            for (size_t k = 0; k < op_regs.size(); ++k) {
+                if (op_regs[k].empty()) continue;
+                const std::string tok = "$" + std::to_string(k);
+                size_t pos = 0;
+                while ((pos = ln.find(tok, pos)) != std::string::npos) {
+                    ln.replace(pos, tok.size(), op_regs[k]);
+                    pos += op_regs[k].size();
+                }
+            }
+            ctx.out << "    " << ln << "\n";
+            break;
+        }
+
         default:
             ctx.comment("instruccion no soportada: " +
                         std::string(ir_op_name(ins.op)));

@@ -1,5 +1,7 @@
 #include "vex/asm_parser.h"
 #include "vex/asm/asm_effects.h" // ASA: inferencia de clobbers + efectos
+#include "vex/asm/asm_lift_emit.h" // ASA: lift de patrones atomicos a IR tipado
+#include "vex/asm/instr_db.h"
 #include "vex/lowering.h"
 #include "vex/type_checker.h"
 #include "ir/ssa_ir.h"
@@ -144,6 +146,31 @@ ir::IrValueId lower_inline_asm(
 
     // 3. Emit the main inline assembly block
     std::string resolved_asm = result.resolve(reg_assignments);
+
+    /* ASA: intentar liftar el bloque a IR tipado (atomics).  Si encaja
+     * con un patron (lock cmpxchg -> ATOMIC_CAS, lock xadd -> ATOMIC_ADD),
+     * se emiten las instrucciones tipadas y se omite el asm opaco.  El
+     * mapa slot_of relaciona cada registro canonico asignado con el valor
+     * SSA del operando correspondiente. */
+    {
+        std::unordered_map<std::string, ir::IrValueId> slot_of;
+        size_t in_idx = 0;
+        for (size_t i = 0; i < result.operands.size(); ++i) {
+            auto &op = result.operands[i];
+            std::string reg = (i < reg_assignments.size())
+                ? reg_assignments[i] : "";
+            if (reg.empty()) continue;
+            std::string canon = vex::asm_canonical_reg(reg);
+            if (canon.empty()) continue;
+            if ((op.is_input || op.is_readwrite) && in_idx < input_values.size()) {
+                slot_of[canon] = input_values[in_idx++];
+            }
+        }
+        if (vex::asm_lift_emit(fn, block, vex::instr_db::Isa::X86,
+                               resolved_asm, slot_of, source_line)) {
+            return ir::IR_NO_VALUE; // se emitio IR tipado; no asm opaco
+        }
+    }
 
     ir::IrInstr ra{};
     ra.op          = ir::IrOp::RAW_ASM;

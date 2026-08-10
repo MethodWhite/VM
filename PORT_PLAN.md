@@ -93,11 +93,14 @@ módulo.  No se arrastra código muerto de la otra rama.
   - `asm_effects` (tabla mnemonic->efectos x86/arm64, inferencia de
     clobbers, canonicalizacion de registros, normalizacion de numeros).
   - `asm_analyze` (modelo de efectos por bloque).
-  - Integrado en `asm_lowering.cpp`: el lowering deduce los clobbers del
-    cuerpo NASM automaticamente.
-  - Test: `tests/vex/test_asm_effects.cpp` (11 checks).
-- **Pendiente**: `asm_lift*` (lifting a IR tipado: ASM_MICRO, flags-as-SSA,
-  CFG) — requiere IR ops nuevas + emision en el runtime.
+  - `instr_db` + tablas generadas (11 archivos): DB embebida por ISA.
+  - `asm_lift` (reconocimiento de atomicos: lock cmpxchg -> ATOMIC_CAS,
+    lock xadd -> ATOMIC_ADD) + `asm_lift_emit` (emision tipada).
+  - Integrado en el lowering: los patrones atomicos se liftan a
+    ATOMIC_CAS_I64/ATOMIC_ADD_I64; los clobbers se infieren del cuerpo.
+  - Tests: `test_asm_effects.cpp` (11) + `test_asm_lift.cpp` (9).
+- **Pendiente**: `asm_lift_micro`/`asm_lift_x86` (lifting micro completo)
+  requiere la IR op `ASM_MICRO` (cambio de pipeline IR+emitter+runtime).
 
 ## Criterio de "hecho" por módulo
 

@@ -116,7 +116,6 @@ bool detect_loop_iv(const ir::IrFunction &fn,
             int64_t off = 0;
             IrValueId bound = IR_NO_VALUE;
             IrValueId cbase = cmp_a;
-            IrOp ext_op = IrOp::NOP;
             for (;;) {
                 if (cbase == in.dst) break; // cmp compara el IV directo.
                 const int ci = (cbase < def_block.size()) ? def_block[cbase] : -1;
@@ -130,7 +129,6 @@ bool detect_loop_iv(const ir::IrFunction &fn,
                 if (def->op == IrOp::SEXT || def->op == IrOp::ZEXT ||
                     def->op == IrOp::CAST || def->op == IrOp::TRUNC) {
                     if (def->operands.empty()) { cbase = IR_NO_VALUE; break; }
-                    if (ext_op == IrOp::NOP) ext_op = def->op;
                     cbase = def->operands[0];
                     continue;
                 }
@@ -155,7 +153,6 @@ bool detect_loop_iv(const ir::IrFunction &fn,
             out.cmp_offset = off;
             out.bound = bound;
             out.cmp_a = cmp_a;
-            out.iv_ext_op = ext_op;
             return true;
         }
     }

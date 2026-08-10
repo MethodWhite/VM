@@ -45,9 +45,6 @@ struct LoopIV {
     /// que la cond-chain del header produce a partir del PHI.  El unroll lo
     /// usa para localizar la instrucción clonada en el guard del UH.
     ir::IrValueId cmp_a = ir::IR_NO_VALUE;
-    /// Extension de tipo del IV antes del cmp (SEXT/ZEXT si el IV es i32 y la
-    /// cota i64).  NOP si el cmp compara el IV directamente.
-    ir::IrOp iv_ext_op = ir::IrOp::NOP;
 };
 
 /**

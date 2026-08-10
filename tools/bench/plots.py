@@ -351,8 +351,13 @@ def plot_boxplot_variability(rows: list[dict], langs: list[str],
         if not data:
             ax.set_visible(False)
             continue
-        bp = ax.boxplot(data, labels=labels, patch_artist=True,
-                         widths=0.6, showmeans=True)
+        try:
+            bp = ax.boxplot(data, labels=labels, patch_artist=True,
+                            widths=0.6, showmeans=True)
+        except TypeError:
+            # matplotlib >= 3.9: labels -> tick_labels.
+            bp = ax.boxplot(data, tick_labels=labels, patch_artist=True,
+                            widths=0.6, showmeans=True)
         for patch, c in zip(bp["boxes"], colors):
             patch.set_facecolor(c)
             patch.set_alpha(0.6)

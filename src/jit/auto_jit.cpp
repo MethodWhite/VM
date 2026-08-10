@@ -1156,9 +1156,10 @@ namespace jit {
                 CompileResult r{};
                 r.fn = reinterpret_cast<JitFn>(vcode);
                 r.code_start = vcode;
+                r.code_size = vcode_size;
                 if (g_jit_warn_unsupported)
-                    std::fprintf(stderr, "[jit-vreg] eager compilado '%s'\n",
-                                 ir_fn.name.c_str());
+                    std::fprintf(stderr, "[jit-vreg] eager compilado '%s' (%zu bytes)\n",
+                                 ir_fn.name.c_str(), vcode_size);
                 return r;
             }
             if (g_jit_warn_unsupported)

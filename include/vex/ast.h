@@ -535,6 +535,11 @@ namespace vex::ast {
         BinOp                 op;
         std::unique_ptr<Expr> lhs;
         std::unique_ptr<Expr> rhs;
+        /// Sobrecarga de operador via metodo dunder (C-1).  Lo rellena el
+        /// type checker cuando @c lhs es una CLASS/STRUCT que declara el
+        /// metodo @c __op__ aceptando el tipo de @c rhs.  Vacio = aritmetica
+        /// clasica.  El lowering despacha a @c lhs.__op__(rhs).
+        std::string           overload_method;
         BinaryExpr() : Expr(NodeKind::BinaryExpr) {}
     };
 

@@ -98,9 +98,14 @@ módulo.  No se arrastra código muerto de la otra rama.
     lock xadd -> ATOMIC_ADD) + `asm_lift_emit` (emision tipada).
   - Integrado en el lowering: los patrones atomicos se liftan a
     ATOMIC_CAS_I64/ATOMIC_ADD_I64; los clobbers se infieren del cuerpo.
-  - Tests: `test_asm_effects.cpp` (11) + `test_asm_lift.cpp` (9).
-- **Pendiente**: `asm_lift_micro`/`asm_lift_x86` (lifting micro completo)
-  requiere la IR op `ASM_MICRO` (cambio de pipeline IR+emitter+runtime).
+  - Tests: `test_asm_effects.cpp` (11) + `test_asm_lift.cpp` (9) +
+    `test_asm_lift_micro.cpp` (5).
+- **Hecho (IR op ASM_MICRO)**: IrOp::ASM_MICRO + AsmMicro/AsmMicroOperand/
+  AsmOperandFlag/AsmRegBinding en el IR local, emitter que re-emite el
+  tmpl con los registros, y lifting micro completo (asm_lift_micro/
+  asm_lift_x86/asm_lift_general/asm_phys_reg) habilitado.  El asm se
+  modela como IR con la DB (efectos/timing), el regalloc asigna, el
+  backend re-emite verbatim.
 
 ## Criterio de "hecho" por módulo
 

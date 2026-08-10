@@ -689,12 +689,16 @@ namespace vex {
                     for (const auto &ft : vd.field_types) {
                         vi_info.field_types.push_back(type_from_node(ft.get()));
                     }
+                    // Valued enum C-style: guardar el valor explicito.
+                    vi_info.has_value = vd.has_value;
+                    vi_info.value_text = vd.value_text;
                     if (vi_info.field_types.size() > max_pl) {
                         max_pl = static_cast<uint32_t>(vi_info.field_types.size());
                     }
                     elay.variants.push_back(std::move(vi_info));
                 }
                 elay.max_payload_fields = max_pl;
+                elay.backing_type_name = en->backing_type_name;
                 // Layout: 8 (tag) + 8 * max_payload_fields.  Cada payload
                 // se padea a 8 bytes para uniformidad del offset acceso
                 // (i*8 a partir de offset 8) sin tablas por variante.

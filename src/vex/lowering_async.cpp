@@ -1178,6 +1178,41 @@ namespace {
     // Optional / Result.
     // ---------------------------------------------------------------------
 
+    /// Kind del backing de un valued enum (i32/u64/...); default I64.
+    static PrimitiveKind backing_kind_of(const EnumLayout &elay) {
+        const std::string &b = elay.backing_type_name;
+        if (b == "i8" || b == "int8_t")      return PrimitiveKind::I8;
+        if (b == "i16" || b == "int16_t")    return PrimitiveKind::I16;
+        if (b == "i32" || b == "int32_t")    return PrimitiveKind::I32;
+        if (b == "i64" || b == "int64_t")    return PrimitiveKind::I64;
+        if (b == "u8" || b == "uint8_t")     return PrimitiveKind::U8;
+        if (b == "u16" || b == "uint16_t")   return PrimitiveKind::U16;
+        if (b == "u32" || b == "uint32_t")   return PrimitiveKind::U32;
+        if (b == "u64" || b == "uint64_t")   return PrimitiveKind::U64;
+        if (b == "string")                   return PrimitiveKind::STRING;
+        if (b == "float")                    return PrimitiveKind::F32;
+        if (b == "double")                   return PrimitiveKind::F64;
+        return PrimitiveKind::I64;
+    }
+
+    /// Parsea el literal de un valor de variante a @c val (signed int64).
+    static bool parse_enum_value(const std::string &text, PrimitiveKind bk,
+                                 int64_t &val, const SourceLoc &loc) {
+        (void)loc;
+        std::string t = text;
+        bool neg = false;
+        if (!t.empty() && t[0] == '-') { neg = true; t = t.substr(1); }
+        try {
+            size_t pos = 0;
+            int64_t v = std::stoll(t, &pos, 0);
+            if (pos != t.size()) return false;
+            val = neg ? -v : v;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
     ir::IrValueId Lowering::lower_enum_constructor(
         const std::string &                             enum_name,
         const std::string &                             variant_name,
@@ -1202,6 +1237,21 @@ namespace {
             error_at(loc, "lowering: variante desconocida '" + variant_name +
                      "' en enum '" + enum_name + "'");
             return ir::IR_NO_VALUE;
+        }
+
+        // Valued enum C-style: la variante tiene un valor explicito
+        // (`A = 42`).  Devolvemos el valor como constante en lugar de
+        // alocar un slot ADT con tag.
+        if (var->has_value) {
+            const PrimitiveKind bk = backing_kind_of(elay);
+            const ir::IrType ir_t  = ir_type_from_primitive(bk);
+            int64_t val = 0;
+            if (!parse_enum_value(var->value_text, bk, val, loc)) {
+                error_at(loc, "valor de variante '" + variant_name +
+                         "' no parseable: '" + var->value_text + "'");
+                return ir::IR_NO_VALUE;
+            }
+            return emit_const(ir_t, static_cast<uint64_t>(val), loc.line);
         }
 
         // marker: MAKE_VARIANT identifica la construccion completa de

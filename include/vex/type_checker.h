@@ -183,6 +183,10 @@ namespace vex {
         std::string       name;
         uint32_t          tag = 0;
         std::vector<Type> field_types;
+        /// Valued enum C-style: valor explicito (`A = 42`).
+        /// @c has_value=true si se declaro; @c value_text es el literal crudo.
+        bool              has_value = false;
+        std::string       value_text;
     };
 
     /**
@@ -203,6 +207,9 @@ namespace vex {
         std::vector<EnumVariantInfo> variants;
         uint32_t                     size_bytes        = 8;  ///< Minimum: solo el tag.
         uint32_t                     max_payload_fields = 0; ///< 0 si todas son sin payload.
+        /// Valued enum C-style: nombre del tipo del backing (`i32`...).
+        /// Vacio si es un ADT clasico.
+        std::string                  backing_type_name;
         /// marca `@Introspect`.
         bool                         is_introspect = false;
         /// Phase M6.a L.3: visibilidad cross-module.

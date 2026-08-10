@@ -1818,6 +1818,60 @@ bool ir_pass_loop_memcpy_idiom(IrFunction &fn) {
 //  Punto de entrada principal
 // =========================================================================
 
+// ---------------------------------------------------------------------------
+// Verificacion de forma SSA tras cada fase del pipeline (control de errores
+// avanzado).  ir_verify() valida que el IR siga siendo SSA correcto (def
+// unica, terminadores, operandos en rango, phi args).  Llamarla tras cada
+// pasada de optimizacion detecta un bug de transformacion en el instante en
+// que corrompe el IR, en vez de un crash/silent-corruption muchas pasadas
+// despues (el caso tipico: una pass deja un valor sin definir o un terminator
+// roto y el siguiente consumidor produce codigo basura).
+//
+// Control:
+//   VESTA_IR_VERIFY=1      verificar tras CADA fase del fix-point + finales
+//   VESTA_IR_VERIFY_ABORT=1  abort() ante el primer error (detener en el
+//                           punto exacto de corrupcion para un core-dump)
+//
+// Siempre imprime los errores encontrados (aunque no aborte) para que el
+// diagnostico no se pierda silenciosamente.
+// ---------------------------------------------------------------------------
+namespace {
+
+bool ir_verify_enabled() {
+    static const bool v = [] {
+        const char *e = std::getenv("VESTA_IR_VERIFY");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return v;
+}
+
+bool ir_verify_abort_on_error() {
+    static const bool v = [] {
+        const char *e = std::getenv("VESTA_IR_VERIFY_ABORT");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return v;
+}
+
+void ir_verify_phase(const IrModule &mod, const char *phase) {
+    if (!ir_verify_enabled()) return;
+    std::vector<std::string> errors;
+    if (ir::ir_verify(mod, errors)) return;
+    std::fprintf(stderr,
+        "[ir-verify] FALLO tras la fase '%s' (%zu errores):\n",
+        phase ? phase : "?", errors.size());
+    for (size_t i = 0; i < errors.size() && i < 50; ++i)
+        std::fprintf(stderr, "    %s\n", errors[i].c_str());
+    if (errors.size() > 50)
+        std::fprintf(stderr, "    ... y %zu mas\n", errors.size() - 50);
+    if (ir_verify_abort_on_error()) {
+        std::fprintf(stderr, "[ir-verify] abort() por VESTA_IR_VERIFY_ABORT\n");
+        std::abort();
+    }
+}
+
+} // namespace
+
 void ir_optimize(IrModule &mod, OptLevel level) {
     if (level == OptLevel::O0) return; // sin optimizacion
 
@@ -1827,6 +1881,7 @@ void ir_optimize(IrModule &mod, OptLevel level) {
     if (level >= OptLevel::O1) {
         ir_pass_inline(mod);
     }
+    ir_verify_phase(mod, "inline-inicial");
 
     /* Unroll de bucles contados (port de Desmon): amortiza el overhead de
      * dispatch del loop en el interp y expone ILP en el JIT/AOT.  El factor es
@@ -1847,6 +1902,7 @@ void ir_optimize(IrModule &mod, OptLevel level) {
                 if (!fn.is_native) ir_pass_unroll(fn);
             }
         }
+        ir_verify_phase(mod, "unroll");
     }
 
     /* Phase D.jit-mem-model AUTO-PROMOTE: marca ALLOCAs que fluyen a
@@ -1889,6 +1945,7 @@ void ir_optimize(IrModule &mod, OptLevel level) {
             }
         }
     }
+    ir_verify_phase(mod, "promote-allocas");
 
     // Iterar hasta punto fijo o maximo 8 pasadas
     for (int pass = 0; pass < 8; ++pass) {
@@ -1986,6 +2043,7 @@ void ir_optimize(IrModule &mod, OptLevel level) {
                 }
             }
         }
+        ir_verify_phase(mod, "fix-point");
 
         if (!any) break; // punto fijo alcanzado
     }
@@ -2011,6 +2069,7 @@ void ir_optimize(IrModule &mod, OptLevel level) {
             ir_pass_schedule(fn);
         }
     }
+    ir_verify_phase(mod, "final");
 }
 
 // Set global de helpers @c __new_<X> marcados como puros por el frontend.

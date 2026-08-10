@@ -184,6 +184,13 @@ programas) y showcase curado en [doc/EXAMPLES.md](./doc/EXAMPLES.md).
   fase a fase + bytes emitidos por sección).
 - **Ensamblador/desensamblador nativo** integrado (Keystone + Capstone) para
   x86, x86_64, ARM, AArch64.
+- **Verificador de forma SSA en el pipeline** (`VESTA_IR_VERIFY=1`): valida el
+  IR tras cada fase del optimizador (inline inicial, unroll, promote-allocas,
+  cada iteración del fix-point y la fase final).  Detecta en el instante un
+  bug de transformación (def SSA duplicada, terminador roto, operando fuera de
+  rango, phi arg inválido) en vez de un crash o corrupción silenciosa varias
+  pasadas después.  Con `VESTA_IR_VERIFY_ABORT=1` hace `abort()` ante el primer
+  error para obtener un core-dump en el punto exacto de la corrupción.
 - **Profile dump** via `--profile [path]` (default: `program.vprof`).
   Alternativa por entorno: `VESTA_PROFILE_DUMP=path`. Genera `.vprof`
   binario al exit con counters de branches, tipos observados en cada

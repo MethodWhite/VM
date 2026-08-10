@@ -1544,6 +1544,11 @@ namespace vex::ast {
     struct EnumVariantDecl {
         std::string                            name;
         std::vector<std::unique_ptr<TypeNode>> field_types; ///< Vacio para variantes sin payload.
+        /// Valor explicito C-style (`A = 42`).  @c has_value=true si se
+        /// declaro un valor; @c value_text es el literal crudo (entero,
+        /// string o float) que el type checker resuelve.
+        bool                                   has_value = false;
+        std::string                            value_text;
         SourceLoc                              loc;
     };
 
@@ -1585,6 +1590,10 @@ namespace vex::ast {
         /// Si no esta vacio, el enum es un template y se monomorphiza on demand
         /// en cada uso `Maybe<i32>` (mismo modelo que generic classes A.8).
         std::vector<std::string>     type_params;
+        /// Valued enum C-style: `enum N : tipo { A = valor, ... }`.
+        /// Nombre del tipo del backing (i32/u64/string/etc.); vacio si el
+        /// enum es un ADT (tagged union) clasico.
+        std::string                  backing_type_name;
         EnumDecl() : Node(NodeKind::EnumDecl) {}
     };
 

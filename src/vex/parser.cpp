@@ -2097,6 +2097,27 @@ namespace vex {
         }
         e->name = consume().lexeme;
 
+        // Valued enum C-style: `enum N : tipo { A = valor, ... }`.
+        if (current_.kind == TokenKind::COLON) {
+            (void)consume(); // ':'
+            if (current_.kind == TokenKind::IDENTIFIER
+             || current_.kind == TokenKind::KW_INT32
+             || current_.kind == TokenKind::KW_INT64
+             || current_.kind == TokenKind::KW_UINT32
+             || current_.kind == TokenKind::KW_UINT64
+             || current_.kind == TokenKind::KW_INT8
+             || current_.kind == TokenKind::KW_UINT8
+             || current_.kind == TokenKind::KW_INT16
+             || current_.kind == TokenKind::KW_UINT16
+             || current_.kind == TokenKind::KW_STRING
+             || current_.kind == TokenKind::KW_FLOAT
+             || current_.kind == TokenKind::KW_DOUBLE) {
+                e->backing_type_name = consume().lexeme;
+            } else {
+                error_here("se esperaba el tipo del backing tras ':' en el enum");
+            }
+        }
+
         // L2.3: generics opcionales `<T>`, `<K, V>` tras el nombre del enum.
         // Mismo patron que parse_class_decl: cada parametro es un identificador
         // simple; el enum se trata como plantilla y se monomorphiza en cada
@@ -2133,6 +2154,20 @@ namespace vex {
                     if (!match(TokenKind::COMMA)) break;
                 }
                 (void)expect(TokenKind::RPAREN, "se esperaba ')' al cerrar payload de variante");
+            }
+            // Valor explicito C-style: `A = 42` / `B = "txt"`.
+            if (current_.kind == TokenKind::ASSIGN) {
+                (void)consume(); // '='
+                v.has_value = true;
+                if (current_.kind == TokenKind::INT_LIT
+                 || current_.kind == TokenKind::STRING_LIT
+                 || current_.kind == TokenKind::FLOAT_LIT
+                 || current_.kind == TokenKind::CHAR_LIT
+                 || current_.kind == TokenKind::MINUS) {
+                    v.value_text = consume().lexeme;
+                } else {
+                    error_here("se esperaba un literal como valor de la variante");
+                }
             }
             e->variants.push_back(std::move(v));
             // Coma separadora (con coma trailing opcional gracias al check

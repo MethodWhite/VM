@@ -104,6 +104,7 @@ namespace vex {
             case TokenKind::KW_USING:        return "using";
             case TokenKind::KW_NAMESPACE:    return "namespace";
             case TokenKind::KW_STRUCT:       return "struct";
+            case TokenKind::KW_UNION:        return "union";
             case TokenKind::KW_CLASS:        return "class";
             case TokenKind::KW_INTERFACE:    return "interface";
             case TokenKind::KW_ENUM:         return "enum";
@@ -353,6 +354,7 @@ namespace vex {
                 VEX_KW_EXACT("uint16_t", TokenKind::KW_UINT16_T);
                 VEX_KW_EXACT("uint32_t", TokenKind::KW_UINT32_T);
                 VEX_KW_EXACT("uint64_t", TokenKind::KW_UINT64_T);
+                VEX_KW_EXACT("union",    TokenKind::KW_UNION);
                 VEX_KW_EXACT("using",    TokenKind::KW_USING);
                 VEX_KW_EXACT("unique",   TokenKind::KW_UNIQUE);
                 break;

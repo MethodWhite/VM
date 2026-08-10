@@ -1512,6 +1512,10 @@ namespace vex::ast {
         std::vector<StructFieldDecl> fields;
         /// Phase M6.a L.3: visibilidad cross-module (default true).
         bool                         is_public = true;
+        /// union C-style: todos los campos comparten el mismo offset (0)
+        /// y el tamano es el del campo mas grande.  Los campos son vistas
+        /// alternativas del mismo bloque de bits (patron LARGE_INTEGER).
+        bool                         is_union = false;
         /// marca `@Introspect` -- el compilador
         /// emite IntrospectInfo POD en static_data y registra el tipo en
         /// el global `__introspect_registry` para que `find_type("Name")`

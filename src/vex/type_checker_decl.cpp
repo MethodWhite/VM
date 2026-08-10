@@ -598,19 +598,23 @@ namespace vex {
                     // Campo normal: cerrar bit field activo si lo hay.
                     close_bf();
 
-                    // Padding hasta multiplo de falign.
-                    if (offset % falign != 0) {
-                        offset += falign - (offset % falign);
-                    }
+                    /* Union C-style: todos los campos comparten offset 0
+                     * (vistas del mismo bloque de bits).  El tamano total
+                     * es el del campo mas grande. */
+                    const uint32_t field_offset = s->is_union ? 0u : offset;
 
                     StructFieldInfo fi;
                     fi.name   = f.name;
                     fi.type   = ft;
-                    fi.offset = offset;
+                    fi.offset = field_offset;
                     fi.size   = fsize;
                     layout.fields.push_back(std::move(fi));
 
-                    offset += fsize;
+                    if (s->is_union) {
+                        if (fsize > offset) offset = fsize;
+                    } else {
+                        offset += fsize;
+                    }
                     if (falign > max_align) max_align = falign;
                 }
                 // Cerrar bit field activo al final del struct.

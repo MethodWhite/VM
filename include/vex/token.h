@@ -152,6 +152,7 @@ namespace vex {
         KW_USING,
         KW_NAMESPACE,   ///< Phase M.7.c: namespace foo { ... } inline.
         KW_STRUCT,
+        KW_UNION,       ///< union C-style: campos comparten offset 0.
         KW_CLASS,
         KW_INTERFACE,
         KW_ENUM,

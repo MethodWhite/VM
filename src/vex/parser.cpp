@@ -839,7 +839,8 @@ namespace vex {
             (void)consume();
         }
         // struct <nombre> { ... }
-        if (current_.kind == TokenKind::KW_STRUCT) {
+        if (current_.kind == TokenKind::KW_STRUCT
+         || current_.kind == TokenKind::KW_UNION) {
             auto sd = parse_struct_decl();
             if (sd && top_is_introspect) sd->is_introspect = true;
             apply_pending_visibility(sd.get());
@@ -2252,7 +2253,8 @@ namespace vex {
     std::unique_ptr<ast::StructDecl> Parser::parse_struct_decl() {
         auto s = std::make_unique<ast::StructDecl>();
         s->loc = current_.loc;
-        (void)consume(); // 'struct'
+        s->is_union = (current_.kind == TokenKind::KW_UNION);
+        (void)consume(); // 'struct' / 'union'
 
         if (current_.kind != TokenKind::IDENTIFIER) {
             error_here("se esperaba un nombre tras 'struct'");

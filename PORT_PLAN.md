@@ -80,9 +80,21 @@ módulo.  No se arrastra código muerto de la otra rama.
   reconoce loops `dst[i]=f(src[i])` y baja a VEC ops.
 - Requiere: IR ops `VEC_UNOP/BINOP/FMA/BCAST/FMA_S` + codegen (JIT SIMD)
   + `jit/vec_isa.h` (ancho SSE2/AVX2/AVX512).
-- Port: mapear el pase a `vex::Lowering` (los métodos ya se declaran en
-  `include/vex/lowering.h`), añadir VEC ops al `ssa_ir.h` local y su
-  emisión en `ir_emitter.cpp`/`x86_encoder.cpp`.
+- **Estado**: el memcpy idiom ya existe en local (`ir_pass_loop_memcpy_idiom`).
+  Las VEC ops SIMD requieren backend SIMD en el selector x86 (pendiente).
+- Port: mapear el pase a `vex::Lowering`, añadir VEC ops al `ssa_ir.h`
+  local y su emisión.
+
+### import/packaging (P2, 23 commits)
+- Los fixes de módulos de Desmon (structs importados con métodos, enums
+  con valor) requieren que el `StructLayout` local soporte métodos, que
+  hoy no tiene (los structs Vex locales no serializan métodos en `.vxi`).
+  Es un cambio del type checker/lowering, no un port directo.
+
+### vxdbg / diagnóstico (P3, 24+14 commits)
+- El `--explain` de Desmon requiere el acompañante `.vxdbg` del AOT con
+  debug info (sistema de grafo semántico del binario).  Port grande;
+  el local tiene `src/debug/debug_info.cpp` + el JIT line-map portado.
 
 ### ASA / inline asm (P2, 37 commits)
 - Local: `src/vex/asm_parser.cpp` + `asm_lowering.cpp` (RAW_ASM opaco).

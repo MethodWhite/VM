@@ -20,6 +20,29 @@ std::string mangle_args(const std::vector<Type> &args);
 
 namespace vex {
 
+    /// Nombre del metodo dunder (__op__) para un operador binario, o vacio.
+    static const char *dunder_method_for_binop(ast::BinOp op) {
+        switch (op) {
+            case ast::BinOp::Add:          return "__add__";
+            case ast::BinOp::Sub:          return "__sub__";
+            case ast::BinOp::Mul:          return "__mul__";
+            case ast::BinOp::Div:          return "__div__";
+            case ast::BinOp::Mod:          return "__mod__";
+            case ast::BinOp::Eq:           return "__eq__";
+            case ast::BinOp::Neq:          return "__ne__";
+            case ast::BinOp::Lt:           return "__lt__";
+            case ast::BinOp::Le:           return "__le__";
+            case ast::BinOp::Gt:           return "__gt__";
+            case ast::BinOp::Ge:           return "__ge__";
+            case ast::BinOp::BitAnd:       return "__and__";
+            case ast::BinOp::BitOr:        return "__or__";
+            case ast::BinOp::BitXor:       return "__xor__";
+            case ast::BinOp::Shl:          return "__shl__";
+            case ast::BinOp::Shr:          return "__shr__";
+            default:                       return nullptr;
+        }
+    }
+
     Type TypeChecker::check_expr(ast::Expr *e) {
         if (!e) return Type{};
         Type t;
@@ -1336,6 +1359,29 @@ namespace vex {
     Type TypeChecker::check_binary(ast::BinaryExpr *e) {
         const Type tl = check_expr(e->lhs.get());
         const Type tr = check_expr(e->rhs.get());
+
+        /* Operator overloading via metodos dunder (C-1).  Si el lhs es una
+         * CLASS/STRUCT que declara el metodo __op__ aceptando el tipo del
+         * rhs, se marca e->overload_method para que el lowering despache a
+         * lhs.__op__(rhs) en vez de la aritmetica clasica.  Sin el dunder,
+         * el comportamiento clasico queda intacto. */
+        if (tl.kind == PrimitiveKind::CLASS || tl.kind == PrimitiveKind::STRUCT) {
+            const std::string dunder = dunder_method_for_binop(e->op);
+            if (!dunder.empty() && !tl.struct_name.empty()) {
+                /* Solo las CLASS tienen metodos en esta version (los structs
+                 * son POD).  El dunder de structs es un port posterior de
+                 * Desmon (StructLayout con metodos). */
+                auto itc = class_layouts_.find(tl.struct_name);
+                if (itc != class_layouts_.end()) {
+                    for (const auto &m : itc->second.methods) {
+                        if (m.name == dunder) {
+                            e->overload_method = dunder;
+                            return m.return_type;
+                        }
+                    }
+                }
+            }
+        }
 
         // Operadores nativos para STRING.
         // Auto-coerce: si un lado es STRING y el otro es un literal de

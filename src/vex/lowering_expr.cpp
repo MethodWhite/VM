@@ -1210,6 +1210,26 @@ namespace vex {
     }
 
     ir::IrValueId Lowering::lower_binary(ast::BinaryExpr *e) {
+        // Operator overloading (dunder): el type checker dejo el metodo
+        // __op__ en e->overload_method.  Despachamos a lhs.__op__(rhs)
+        // sintetizando un CallExpr y bajandolo con lower_call.
+        if (!e->overload_method.empty() && e->lhs && e->rhs) {
+            auto meth = std::make_unique<ast::FieldAccessExpr>();
+            meth->base = std::move(e->lhs);
+            meth->field_name = e->overload_method;
+            meth->property_kind = 0;
+            meth->loc = e->loc;
+            meth->result_type = e->result_type;
+
+            auto call = std::make_unique<ast::CallExpr>();
+            call->callee = std::move(meth);
+            call->loc = e->loc;
+            call->result_type = e->result_type;
+            call->args.push_back(std::move(e->rhs));
+
+            return lower_call(call.get());
+        }
+
         // Tipos canonicos del checker.
         const PrimitiveKind ltk = e->lhs ? e->lhs->result_type.kind : PrimitiveKind::COUNT;
         const PrimitiveKind rtk = e->rhs ? e->rhs->result_type.kind : PrimitiveKind::COUNT;

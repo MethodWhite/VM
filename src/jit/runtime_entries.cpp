@@ -148,6 +148,7 @@ namespace jit {
 
         // ----- String ops (Sprint JIT-cobertura 2026-06-01) -----
         str_make      = &vrt_str_make;
+        str_make_host = &vrt_str_make_host;
         str_len       = &vrt_str_len;
         str_get_bytes = &vrt_str_get_bytes;
         str_raw       = &vrt_str_raw;
@@ -195,6 +196,7 @@ namespace jit {
                deffield          && defmethod       && addadvice        &&
                findmethod        && findfield       && setmethdbg       &&
                str_make          && str_len         && str_get_bytes   &&
+               str_make_host     &&
                str_raw           && str_cat         && str_cmp          &&
                panic_str         && gc_alloc_payload &&
                safepoint_poll    && safepoint_handler;

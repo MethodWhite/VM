@@ -6227,7 +6227,21 @@ case IrOp::CALLCLOSURE: {
                         if (opts_.runtime) {
                             switch (ins.op) {
                                 case ir::IrOp::STRMAKE:
-                                    fn_addr = reinterpret_cast<uint64_t>(opts_.runtime->str_make);
+                                    /* Si el buffer es HOST (is_host_ptr, p.ej.
+                                     * el ALLOCA del stringify promovido por
+                                     * ir_pass_promote_callned_allocas), usar
+                                     * str_make_host que lee el puntero crudo.
+                                     * Con str_make (vm_addr) leeria vm_mem en
+                                     * la direccion host -> basura/vacio en JIT
+                                     * (el interp funcionaba por su heap dual). */
+                                    if (!ins.operands.empty()
+                                     && ins.operands[0] < ir_fn.values.size()
+                                     && ir_fn.values[ins.operands[0]].is_host_ptr
+                                     && opts_.runtime->str_make_host) {
+                                        fn_addr = reinterpret_cast<uint64_t>(opts_.runtime->str_make_host);
+                                    } else {
+                                        fn_addr = reinterpret_cast<uint64_t>(opts_.runtime->str_make);
+                                    }
                                     nargs = 2; break;
                                 case ir::IrOp::STRLEN:
                                     fn_addr = reinterpret_cast<uint64_t>(opts_.runtime->str_len);
@@ -6303,7 +6317,24 @@ case IrOp::CALLCLOSURE: {
                         // contenido (via runtime::get_intern_hash), no la
                         // GcHandle directa, eliminando falsos misses por
                         // handles diferentes al mismo contenido.
-                        bool use_ic = true;
+                        //
+                        // Bug fix (2026-08-10): IC desactivado para TODOS los
+                        // string ops.  Dos fallos independientes:
+                        //   1. El slot del IC se alocaba del CodeCache (RX
+                        //      tras commit, W^X) y el selector lo ESCRIBE en
+                        //      cada miss -> SIGSEGV en cadenas interpoladas
+                        //      en JIT (el interp no usa el IC, por eso
+                        //      funcionaba).  Corregido al alocar el slot en
+                        //      memoria de datos RW (malloc).
+                        //   2. STRMAKE/STRCAT cachean por (arg1,arg2) pero el
+                        //      contenido de un STRMAKE dinamico (el buffer del
+                        //      stringify de interpolacion) muta entre llamadas:
+                        //      un IC hit devuelve el handle cacheado de un
+                        //      contenido distinto ("a b " en vez de "a b 7";
+                        //      o un STRCAT que duplica el RHS interpolado).
+                        //      El runtime intern hash cache ya cubre las
+                        //      STRMAKEs de literales (el caso caliente ~50ns).
+                        bool use_ic = false;
                         (void)opts_.reserve_ic_slot;
                         uint64_t str_ic_slot = 0;
                         MLabelId ic_hit_label = 0, ic_miss_label = 0, ic_done_label = 0;

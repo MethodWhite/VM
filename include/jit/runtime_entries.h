@@ -145,6 +145,7 @@ namespace jit {
 
         /* ----- String ops (Sprint JIT-cobertura 2026-06-01) ----- */
         vrt_handle (*str_make)        (vrt_proc *, uint64_t, uint32_t)        = nullptr;
+        vrt_handle (*str_make_host)   (vrt_proc *, uint64_t, uint32_t)        = nullptr;
         uint64_t   (*str_len)         (vrt_proc *, vrt_handle)                = nullptr;
         uint64_t   (*str_get_bytes)   (vrt_proc *, vrt_handle)                = nullptr;
         uint64_t   (*str_raw)         (vrt_proc *, vrt_handle)                = nullptr;

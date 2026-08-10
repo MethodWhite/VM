@@ -1395,13 +1395,13 @@ namespace vex {
 
         // Operadores nativos para STRING.
         // Auto-coerce: si un lado es STRING y el otro es un literal de
-        // string (PTR no-interp), el lowering lo promovera a StringObject
-        // via STRMAKE.  Permite escribir "ASCII " + var sin declarar
-        // variables intermedias.
+        // string (PTR, interpolado o no), el lowering lo promovera a
+        // StringObject via STRMAKE.  Permite escribir "ASCII " + var y
+        // "ASCII ${x}" + var sin variables intermedias.  (Antes se excluia
+        // al interpolado, cuyo result_type queda VOID hasta el lowering, y
+        // `s + "a ${x}"` caia en la aritmetica generica -> error de tipo.)
         auto is_str_lit = [](ast::Expr *e) {
-            if (!e || e->kind != ast::NodeKind::StringLitExpr) return false;
-            auto *sl = static_cast<ast::StringLitExpr *>(e);
-            return !sl->is_interpolated();
+            return e && e->kind == ast::NodeKind::StringLitExpr;
         };
         const bool lhs_str = (tl.kind == PrimitiveKind::STRING)
                           || (tl.kind == PrimitiveKind::PTR && is_str_lit(e->lhs.get()));

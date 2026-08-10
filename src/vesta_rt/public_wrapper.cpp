@@ -1424,6 +1424,20 @@ vrt_handle vrt_str_make(vrt_proc *proc, uint64_t vm_addr, uint32_t byte_len) {
         runtime::make_string_from_vm_mem(p, vm_addr, byte_len));
 }
 
+/* Variante HOST: crea el StringObject desde un buffer del proceso host
+ * (puntero crudo), no desde vm_mem.  Necesaria para las cadenas
+ * interpoladas en JIT: el stringify de primitivos escribe en un ALLOCA
+ * host (ir_pass_promote_callned_allocas lo subio a host stack), y el
+ * STRMAKE con vm_addr leeria vm_mem en esa direccion (basura o SIGSEGV).
+ * El interp no la usa (su ALLOCA host es heap con mapeo dual). */
+vrt_handle vrt_str_make_host(vrt_proc *proc, uint64_t host_ptr, uint32_t byte_len) {
+    if (!proc) return VRT_NULL_HANDLE;
+    runtime::ProcessVM *p = as_proc(proc);
+    if (byte_len > (1u << 24)) return VRT_NULL_HANDLE; /* sanity: 16 MB cap */
+    return static_cast<vrt_handle>(runtime::make_string_flat(
+        p, reinterpret_cast<const uint8_t *>(host_ptr), byte_len));
+}
+
 /* STRLEN: numero de code points del StringObject. */
 uint64_t vrt_str_len(vrt_proc *proc, vrt_handle h) {
     if (!proc || h == VRT_NULL_HANDLE) return 0;

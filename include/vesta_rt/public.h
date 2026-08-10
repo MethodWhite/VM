@@ -663,6 +663,9 @@ uint8_t *vrt_gc_alloc_payload(vrt_proc *proc, size_t size);
  */
 vrt_handle vrt_str_make(vrt_proc *proc, uint64_t vm_addr, uint32_t byte_len);
 
+/** @brief Crea un StringObject FLAT desde un buffer HOST (puntero crudo). */
+vrt_handle vrt_str_make_host(vrt_proc *proc, uint64_t host_ptr, uint32_t byte_len);
+
 /** @brief Devuelve el numero de code-points del string. */
 uint64_t vrt_str_len(vrt_proc *proc, vrt_handle h);
 

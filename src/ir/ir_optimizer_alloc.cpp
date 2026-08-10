@@ -182,11 +182,17 @@ bool ir_pass_promote_callned_allocas(IrFunction &fn) {
     std::vector<IrValueId> promoted_dsts;
     for (auto &blk : fn.blocks) {
         for (auto &ins : blk.instrs) {
+            /* preserve = "no transformes esta instruccion".  Cualquier
+             * consumidor del IR puede marcar con preserve un ALLOCA que debe
+             * quedarse en vm_addr (p.ej. buffers que un helper nativo espera
+             * como vaddr): respetarlo aqui evita promoverlo a host stack y
+             * romper ese contrato. */
             if (ins.op == IrOp::ALLOCA
              && ins.dst != IR_NO_VALUE
              && ins.dst < reaches_calln.size()
              && reaches_calln[ins.dst]
-             && !ins.host_alloca()) {
+             && !ins.host_alloca()
+             && !ins.preserve()) {
                 ins.set_host_alloca(true);
                 promoted_dsts.push_back(ins.dst);
                 changed = true;

@@ -288,7 +288,14 @@ namespace jit {
                 auto it = g_ic_slots.find(key);
                 if (it != g_ic_slots.end()) return it->second;
             }
-            uint8_t *slot = g_code_cache->alloc(64, 64);
+            /* Bug fix (2026-08-10): los slots IC se alocaban del CodeCache
+             * (memoria de codigo que `commit` deja en RX, W^X).  El selector
+             * ESCRIBE el slot en cada miss (guardar arg1/arg2/resultado), asi
+             * que una pagina RX era SIGSEGV.  Solo afectaba a los ICs de
+             * strings (STRMAKE/STRCAT) y a las cadenas interpoladas en JIT
+             * (el interp no usa el IC, por eso funcionaba).  Ahora se alocan
+             * en memoria de DATOS RW (malloc), nunca en el code cache. */
+            uint8_t *slot = static_cast<uint8_t *>(std::malloc(64));
             if (slot == nullptr) return 0;
             std::memset(slot, 0, 64);
             const uint64_t addr = reinterpret_cast<uint64_t>(slot);

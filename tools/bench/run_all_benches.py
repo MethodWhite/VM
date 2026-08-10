@@ -799,6 +799,59 @@ def all_runs(cmd: list[str], env: dict | None, runs: int,
     return times
 
 
+# Topes del calentamiento adaptativo.  El primero acota los casos patologicos;
+# el segundo es el que manda: en un bench que tarda segundos, la paginacion del
+# binario es ruido de fondo y seguir calentando son minutos tirados.
+CALENTAMIENTO_MAX = 12
+CALENTAMIENTO_PRESUPUESTO_MS = 20000.0
+
+
+def una_medida(cmd: list[str], env: dict | None, timeout: float,
+               cwd: Optional[Path], use_vex_walltime: bool = False,
+               intentos: int = 5) -> float:
+    """UNA ejecucion medida, con reintentos ante un flake del entorno.
+
+    Misma resiliencia que @c all_runs (antivirus, contencion de handles, carga
+    puntual), pero para una sola medida: es la pieza que necesitan tanto el
+    calentamiento como la medicion por rondas.
+    """
+    espera_ms = [0, 250, 500, 1000, 2000]
+    timer = run_timed_vex if use_vex_walltime else run_timed
+    for intento in range(max(1, intentos)):
+        if intento > 0:
+            time.sleep(espera_ms[min(intento, len(espera_ms) - 1)] / 1000.0)
+        ms = timer(cmd, env=env, timeout=timeout, cwd=cwd)
+        if ms >= 0:
+            return ms
+    return -1.0
+
+
+def serie_asentada(traza: list[float]) -> bool:
+    """¿Ha dejado de BAJAR esta serie de medidas?
+
+    La primera ejecucion de un programa es sistematicamente mas lenta que las
+    siguientes, no por el programa sino porque el sistema pagina el binario.
+    Cuanto mas grande es el runtime, mas dura la caida (en la maquina de
+    desarrollo un .exe de C se asienta en 2 ejecuciones y la JVM tarda 7).
+    Descartar un numero FIJO de warmups falla por los dos lados.
+
+    El criterio NO es que la serie sea plana (una medida de 2 ms nunca lo es).
+    Lo que se comprueba es que haya dejado de DESCENDER: la mediana de las
+    tres ultimas contra la de las tres anteriores; se sigue calentando mientras
+    caiga mas de un 10%.  Asi el umbral se ajusta solo al nivel de ruido de
+    cada medida.
+    """
+    if len(traza) < 6:
+        return False
+    ult = sorted(traza[-3:])
+    prev = sorted(traza[-6:-3])
+    med_ult = statistics.median(ult)
+    med_prev = statistics.median(prev)
+    if med_prev <= 0:
+        return True
+    return (med_ult / med_prev) >= 0.90  # dejo de caer >10%
+
+
 # Compilers: cada uno devuelve (cmd_to_run, work_cwd, normalize_factor).
 # normalize_factor: multiplicar wall time medido por este factor para
 # obtener el equivalente "100% workload".  Util cuando Python reduce
@@ -875,27 +928,63 @@ def colored_time(ms: float, color: str) -> str:
     return f"{color}{ms:>10.1f}{C.RESET}"
 
 
+def _percentil(ordenados: list[float], q: float) -> float:
+    """Percentil @p q (0..1) con interpolacion lineal sobre @p ordenados."""
+    n = len(ordenados)
+    if n == 1:
+        return ordenados[0]
+    idx = q * (n - 1)
+    lo = int(idx)
+    hi = min(lo + 1, n - 1)
+    return ordenados[lo] + (ordenados[hi] - ordenados[lo]) * (idx - lo)
+
+
 def _stats_summary(runs: list[float]) -> dict:
-    """min/p50/p95/max/stddev en ms para una lista de runs."""
+    """Resumen robusto de una serie de medidas, en ms.
+
+    La ESTIMACION es la MEDIANA, no la media: una interferencia puntual del
+    sistema (AV scan, contention) desplaza la media pero apenas la mediana.
+    La dispersion se describe con MAD (mediana de desviaciones absolutas) e
+    IQR, que son robustos frente a atipicos, junto con la dispersion RELATIVA
+    (mad_pct/iqr_pct) -- lo unico comparable entre un bench de 4 ms y uno de
+    900 ms.  La media y el sesgo (media vs mediana) se conservan como dato:
+    un sesgo grande delata la presencia de una cola.
+    """
     if not runs:
         return {}
     sorted_r = sorted(runs)
     n = len(sorted_r)
     p50 = statistics.median(sorted_r)
-    # p95 con interpolacion linear simple.
-    idx = 0.95 * (n - 1)
-    lo = int(idx)
-    hi = min(lo + 1, n - 1)
-    frac = idx - lo
-    p95 = sorted_r[lo] + (sorted_r[hi] - sorted_r[lo]) * frac
+    q1 = _percentil(sorted_r, 0.25)
+    q3 = _percentil(sorted_r, 0.75)
+    mad = statistics.median([abs(x - p50) for x in sorted_r])
+    media = statistics.fmean(sorted_r)
     return {
         "min": sorted_r[0],
+        "q1": q1,
         "p50": p50,
-        "p95": p95,
+        "q3": q3,
+        "p95": _percentil(sorted_r, 0.95),
         "max": sorted_r[-1],
+        "iqr": q3 - q1,
+        "mad": mad,
+        "mad_pct": (100.0 * mad / p50) if p50 > 0 else 0.0,
+        "iqr_pct": (100.0 * (q3 - q1) / p50) if p50 > 0 else 0.0,
+        "mean": media,
+        "sesgo_pct": (100.0 * (media - p50) / p50) if p50 > 0 else 0.0,
         "stddev": (statistics.stdev(sorted_r) if n >= 2 else 0.0),
         "n": n,
     }
+
+
+def _color_ruido(mad_pct: float) -> str:
+    """Color segun cuanto ruido tiene una medida.  Guia de lectura: por
+    encima de cierto punto el numero ya no distingue dos configuraciones."""
+    if mad_pct < 2.0:
+        return C.GREEN
+    if mad_pct < 5.0:
+        return C.YELLOW
+    return C.RED
 
 
 def print_verbose_stats_table(rows: list[dict], active_langs: list[str],
@@ -926,6 +1015,101 @@ def print_verbose_stats_table(rows: list[dict], active_langs: list[str],
                   f"{s['min']:>10.1f}{s['p50']:>10.1f}{s['p95']:>10.1f}"
                   f"{s['max']:>10.1f}{sdev_pct:>8.1f}%")
     print("-" * 90)
+
+
+def print_samples_table(rows: list[dict], active_langs: list[str],
+                        tc: dict[str, Toolchain]) -> None:
+    """TODAS las muestras, una fila por lenguaje.
+
+    Un resumen es una interpretacion; las muestras son el dato.  Verlas en fila
+    deja ver de un vistazo la forma de la serie -- si es plana, si sube, si hay
+    un salto suelto --, y eso ningun estadistico lo dice.  La mediana va
+    marcada con `*` para poder situarla entre las demas.
+    """
+    print()
+    print(f"{C.BOLD}Muestras individuales (ms) -- una fila por lenguaje{C.RESET}")
+    print(f"{C.DIM}  `*` la muestra mas cercana a la mediana; "
+          f"`!` las que se apartan de ella mas de 3 sigmas estimadas "
+          f"desde la MAD{C.RESET}")
+    for row in rows:
+        runs_map = row.get("_runs", {})
+        hay = [ln for ln in active_langs if runs_map.get(ln)]
+        if not hay:
+            continue
+        print(f"\n  {C.BOLD}{row['bench']}{C.RESET}")
+        for ln in hay:
+            rs = runs_map[ln]
+            s = _stats_summary(rs)
+            umbral = 3.0 * 1.4826 * s["mad"] if s["mad"] > 0 else float("inf")
+            i_p50 = min(range(len(rs)), key=lambda i: abs(rs[i] - s["p50"]))
+            piezas = []
+            for i, x in enumerate(rs):
+                if i == i_p50:
+                    sufijo, col = "*", C.BOLD
+                elif abs(x - s["p50"]) > umbral:
+                    sufijo, col = "!", C.RED
+                else:
+                    sufijo, col = " ", ""
+                fin = C.RESET if col else ""
+                piezas.append(f"{col}{x:8.1f}{sufijo}{fin}")
+            print(f"    {tc[ln].color}{ln:<14}{C.RESET}" + "".join(piezas))
+
+
+def print_noise_ranking(rows: list[dict], active_langs: list[str],
+                        tc: dict[str, Toolchain]) -> None:
+    """Cuanto ruido tiene cada lenguaje, y donde esta el peor.
+
+    Dos vistas: la primera dice de que lenguaje se puede uno fiar en esta
+    maquina; la segunda senala las medidas concretas que hay que mirar con lupa
+    antes de sacar conclusiones de ellas.
+    """
+    por_lang: dict[str, list[float]] = {}
+    peores: list[tuple[float, str, str, dict]] = []
+    for row in rows:
+        runs_map = row.get("_runs", {})
+        for ln in active_langs:
+            rs = runs_map.get(ln)
+            if not rs:
+                continue
+            s = _stats_summary(rs)
+            por_lang.setdefault(ln, []).append(s["mad_pct"])
+            peores.append((s["mad_pct"], row["bench"], ln, s))
+    if not por_lang:
+        return
+
+    print()
+    print(f"{C.BOLD}Ruido por lenguaje (MAD relativa, mediana sobre los "
+          f"benches){C.RESET}")
+    print(f"{C.DIM}  mas bajo = medida mas repetible.  No dice nada de lo "
+          f"rapido que es: dice de cuanto fiarse del numero.{C.RESET}")
+    orden = sorted(por_lang.items(), key=lambda kv: statistics.median(kv[1]))
+    peor = max(statistics.median(v) for v in por_lang.values()) or 1.0
+    for pos, (ln, vals) in enumerate(orden, 1):
+        m = statistics.median(vals)
+        alto = max(vals)
+        barra = ascii_bar(m, peor, width=24, color=_color_ruido(m))
+        print(f"  {pos:>2}. {tc[ln].color}{tc[ln].label:<22}{C.RESET}"
+              f"{m:>6.1f}%  {barra}  (peor bench: {alto:.1f}%)")
+
+    peores.sort(key=lambda t: -t[0])
+    con_ruido = [p for p in peores if p[0] >= 5.0]
+    print()
+    if not con_ruido:
+        print(f"{C.GREEN}  Ninguna medida pasa del 5% de MAD relativa: la "
+              f"corrida entera es estable.{C.RESET}")
+        return
+    print(f"{C.BOLD}Medidas mas ruidosas (MAD relativa >= 5%): "
+          f"{len(con_ruido)} de {len(peores)}{C.RESET}")
+    print(f"{C.DIM}  De estas, una diferencia menor que su propio ruido no es "
+          f"una diferencia.{C.RESET}")
+    for mad_pct, bench, ln, s in con_ruido[:15]:
+        print(f"    {tc[ln].color}{bench + '/' + ln:<30}{C.RESET}"
+              f"p50={s['p50']:>8.1f}  "
+              f"{_color_ruido(mad_pct)}MAD={mad_pct:>5.1f}%{C.RESET}  "
+              f"min..max = {s['min']:.1f}..{s['max']:.1f}  "
+              f"media-p50 = {s['sesgo_pct']:+.1f}%")
+    if len(con_ruido) > 15:
+        print(f"    {C.DIM}... y {len(con_ruido) - 15} mas{C.RESET}")
 
 
 def print_baseline_comparison(rows: list[dict], active_langs: list[str],
@@ -1565,6 +1749,13 @@ def rerender_from_json(json_path: Path, project_root: Path,
         print_baseline_comparison(rows, active_langs, tc,
                                    baseline_path, threshold_pct)
 
+    # Calidad de la medicion: muestras y ruido (port del runner de Desmon).
+    # La mediana sola oculta la variancia; ver las muestras y el ruido es lo
+    # que permite distinguir una mejora real de una diferencia de ruido.
+    if verbose_stats:
+        print_samples_table(rows, active_langs, tc)
+    print_noise_ranking(rows, active_langs, tc)
+
     # Plots.
     plot_dir = project_root / "bench_plots"
     if not no_plot:
@@ -1852,19 +2043,42 @@ def main() -> int:
 
             # Run + capturar TODOS los runs individuales (no solo mediana).
             warm = args.warmup
-            label_run = (f"[{idx}/{len(benches)}] {b.name} | "
-                         f"{tc[ln].label} run ({args.runs}x"
-                         + (f"+{warm}W" if warm > 0 else "")
-                         + ")")
             # Sprint bench-fair (2026-06-03): por default mode FAIR usa
             # wall externo para TODOS los lenguajes (incluye fork + runtime
             # init).  Mode --unfair restaura el comportamiento legacy
             # (Vex usa --stats interno, otros wall externo).
             use_vex_wt = (not args.fair) and ln in ("vex_interp", "vex_jit")
+            # Calentamiento ADAPTATIVO (port del runner de Desmon): en vez de
+            # descartar un numero fijo de warmups (que sobra para C y se queda
+            # corto para JVM), se calienta hasta que la serie deja de DESCENDER
+            # (serie_asentada), con un tope de rondas y de presupuesto de
+            # tiempo.  Asi el umbral se ajusta al ruido real de cada medida.
+            traza_cal: list[float] = []
+            if warm != 0:
+                with Spinner(f"[{idx}/{len(benches)}] {b.name} | "
+                             f"{tc[ln].label} calentando",
+                             color=tc[ln].color):
+                    gastado_ms = 0.0
+                    for _ronda in range(CALENTAMIENTO_MAX):
+                        ms_c = una_medida(cmd, env=env, timeout=args.timeout,
+                                          cwd=cwd, use_vex_walltime=use_vex_wt)
+                        if ms_c < 0:
+                            break
+                        traza_cal.append(ms_c)
+                        gastado_ms += ms_c
+                        if serie_asentada(traza_cal):
+                            break
+                        if gastado_ms >= CALENTAMIENTO_PRESUPUESTO_MS:
+                            break
+
+            label_run = (f"[{idx}/{len(benches)}] {b.name} | "
+                         f"{tc[ln].label} run ({args.runs}x"
+                         + (f"+{len(traza_cal)}W" if traza_cal else "")
+                         + ")")
             with Spinner(label_run, color=tc[ln].color):
                 runs_ms = all_runs(cmd, env=env, runs=args.runs,
                                     timeout=args.timeout, cwd=cwd,
-                                    warmup=warm,
+                                    warmup=0,
                                     use_vex_walltime=use_vex_wt)
             if not runs_ms:
                 row[ln] = -1.0
@@ -1904,6 +2118,12 @@ def main() -> int:
     # Sprint bench-stats (2026-06-02): tabla verbose con min/p50/p95/max/stddev.
     if args.verbose_stats:
         print_verbose_stats_table(rows, active_langs, tc)
+        print_samples_table(rows, active_langs, tc)
+
+    # Port del runner de Desmon: ruido (MAD relativa) por lenguaje.  La
+    # mediana sola oculta la variancia; el ruido es lo que permite distinguir
+    # una mejora real de una diferencia de ruido del entorno.
+    print_noise_ranking(rows, active_langs, tc)
 
     # Sprint bench-baseline (2026-06-02): comparacion vs JSON previo.
     if args.baseline:

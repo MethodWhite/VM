@@ -1447,19 +1447,22 @@ namespace vex {
         auto coerce_string_operand = [&](ast::Expr *ex) -> ir::IrValueId {
             if (ex && ex->kind == ast::NodeKind::StringLitExpr) {
                 auto *sl = static_cast<ast::StringLitExpr *>(ex);
-                if (!sl->is_interpolated()) {
-                    return lower_string_literal_to_string_object(sl);
-                }
+                /* Interpolados TAMBIEN se promueven: lower_string_literal_
+                 * to_string_object construye la cadena de trozos
+                 * (STRMAKE+STRCAT).  Excluirlos (como se hacia antes) hacia
+                 * que `s + "a ${x}"` o `s += "${x}"` cayera en la ruta
+                 * aritmetica generica que no concatena (o peor, devolvia
+                 * cadena vacia / crasheaba). */
+                return lower_string_literal_to_string_object(sl);
             }
             return lower_expr(ex);
         };
         /* En el body de @Macro los StringLitExpr pueden no haber pasado
          * por check_string (que setea result_type=PTR).  Aceptamos
-         * literales no interpolados como strings aunque su result_type
-         * sea VOID -- solo importa el StringLitExpr kind. */
+         * literales como strings aunque su result_type sea VOID -- solo
+         * importa el StringLitExpr kind.  Incluye interpolados. */
         auto is_string_lit_node = [](const ast::Expr *ex) -> bool {
-            return ex && ex->kind == ast::NodeKind::StringLitExpr
-                && !static_cast<const ast::StringLitExpr *>(ex)->is_interpolated();
+            return ex && ex->kind == ast::NodeKind::StringLitExpr;
         };
         const bool lhs_is_str = (ltk == PrimitiveKind::STRING) ||
             (is_string_lit_node(e->lhs.get())
@@ -4000,7 +4003,7 @@ namespace vex {
                     break;
                 case ast::AssignOp::BitAndAssign: bop = ast::BinOp::BitAnd;
                     break;
-                case ast::AssignOp::BitOrAssign: bop = ast::BinOp::BitOr;
+                case ast::AssignOp::BitOrAssign:  bop = ast::BinOp::BitOr;
                     break;
                 case ast::AssignOp::BitXorAssign: bop = ast::BinOp::BitXor;
                     break;
@@ -4010,7 +4013,17 @@ namespace vex {
                     break;
                 case ast::AssignOp::Assign: break; // ya filtrado arriba
             }
-            rhs = emit_binop_ir(bop, l, r, common, e->loc);
+            /* Bug fix (port de Desmon fa13d6a8): `s += "algo ${x}"` devolvia
+             * cadena VACIA -- el compound assign de STRING iba por
+             * emit_binop_ir(BinOp::Add), que emite ADD aritmetico y NO
+             * concatena.  Para STRING la unica suma es STRCAT; emitirla aqui
+             * (el RHS literal ya vino promovido a StringObject arriba). */
+            if (e->op == ast::AssignOp::AddAssign
+                && e->target->result_type.kind == PrimitiveKind::STRING) {
+                rhs = emit_strcat(l, r, e->loc.line);
+            } else {
+                rhs = emit_binop_ir(bop, l, r, common, e->loc);
+            }
         }
 
         // Cast final al tipo declarado de la variable y actualizar el scope.

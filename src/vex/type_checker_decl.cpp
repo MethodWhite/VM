@@ -633,6 +633,7 @@ namespace vex {
                 layout.is_introspect = s->is_introspect;
                 // Phase M6.a L.3.
                 layout.is_public = s->is_public;
+                layout.is_abstract = s->is_abstract;
 
                 // Sobrescribir la entrada vacia pre-registrada con el layout
                 // ya completo.  Usar operator[] = porque la entrada existe.

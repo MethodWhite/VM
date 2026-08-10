@@ -1516,6 +1516,8 @@ namespace vex::ast {
         /// y el tamano es el del campo mas grande.  Los campos son vistas
         /// alternativas del mismo bloque de bits (patron LARGE_INTEGER).
         bool                         is_union = false;
+        /// @Abstract struct: no instanciable, solo base para heredar.
+        bool                         is_abstract = false;
         /// marca `@Introspect` -- el compilador
         /// emite IntrospectInfo POD en static_data y registra el tipo en
         /// el global `__introspect_registry` para que `find_type("Name")`

@@ -684,6 +684,7 @@ namespace vex {
         bool top_is_introspect = false;
         bool top_is_macro      = false;  /* A.43.16: @Macro */
         bool top_is_pure       = false;  /* A.43.20: @Pure -- memoizable */
+        bool top_is_abstract   = false;  /* @Abstract struct: no instanciable */
         bool top_target_skip   = false;  /* L.24: @Target no matchea */
         // Sprint lombok (2026-06-03): anotaciones tipo Lombok a nivel
         // de clase.  El TypeChecker pre-pase las consume y genera
@@ -715,6 +716,7 @@ namespace vex {
                 else if (current_.lexeme == "Introspect") top_is_introspect = true;
                 else if (current_.lexeme == "Macro") top_is_macro = true;
                 else if (current_.lexeme == "Pure")  top_is_pure  = true;
+                else if (current_.lexeme == "Abstract") top_is_abstract = true;
                 // Sprint lombok (2026-06-03): anotaciones class-level.
                 // El parser solo marca los flags; el pre-pase del
                 // TypeChecker (expand_lombok_annotations) genera los
@@ -843,6 +845,7 @@ namespace vex {
          || current_.kind == TokenKind::KW_UNION) {
             auto sd = parse_struct_decl();
             if (sd && top_is_introspect) sd->is_introspect = true;
+            if (sd && top_is_abstract)   sd->is_abstract = true;
             apply_pending_visibility(sd.get());
             return sd;
         }

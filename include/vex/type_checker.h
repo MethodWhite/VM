@@ -167,6 +167,8 @@ namespace vex {
         /// source: @c true (default permisivo).  Sin esto en false, otros
         /// modulos podrian importar el struct via @c only.
         bool                         is_public  = true;
+        /// @Abstract struct: no instanciable, solo base para heredar.
+        bool                         is_abstract = false;
     };
 
     /**

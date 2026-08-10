@@ -536,6 +536,16 @@ namespace vex {
                 return PrimitiveKind::COUNT;
             };
             PrimitiveKind pk = pk_from_name(e->class_name);
+            /* @Abstract struct: no instanciable, solo base. */
+            if (pk == PrimitiveKind::STRUCT) {
+                auto ita = struct_layouts_.find(e->class_name);
+                if (ita != struct_layouts_.end() && ita->second.is_abstract) {
+                    diags_.error(e->loc,
+                        "no se puede instanciar el struct abstracto '" +
+                        e->class_name + "'");
+                    return Type{};
+                }
+            }
             // BugFix R5: builtins genericos Optional/Result/Future como
             // tipo elemento del array.
             bool elem_set = false;

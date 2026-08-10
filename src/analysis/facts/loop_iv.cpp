@@ -154,6 +154,7 @@ bool detect_loop_iv(const ir::IrFunction &fn,
             out.cmp_op = cmp_op;
             out.cmp_offset = off;
             out.bound = bound;
+            out.cmp_a = cmp_a;
             out.iv_ext_op = ext_op;
             return true;
         }

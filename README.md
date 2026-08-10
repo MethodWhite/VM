@@ -126,6 +126,16 @@ programas) y showcase curado en [doc/EXAMPLES.md](./doc/EXAMPLES.md).
 
 - **Pipeline SSA completo**: ~15 pasadas (DCE, CSE, copy-prop, const-fold, TCO,
   LICM, DSE+SLF, devirt+inline, load_narrow, list scheduling para ILP).
+- **Unroll de bucles contados** (portado desde la rama `upstream/feature` de
+  Desmon) con subsistema de análisis de loops completo (`LoopFacts`,
+  `LoopIV`, `LoopMetrics`, `LoopStructure`, `LoopTripCount`).  Detecta IV
+  contados (incluida la extensión i32→i64 del frontend), calcula trip-count
+  constante y elige factor por política (full/partial/remainder) según tamaño
+  de cuerpo, presión de registros y peso PGO.  **Desactivado por defecto**
+  (`VESTA_UNROLL=1` para A/B): el JIT C1 actual despacha cada instrucción vía
+  helper sin regalloc real, así que el unroll replica dispatch points y añade
+  spills → regresión medible (ver `docs/benchmarks/unroll_impact_jit.png`).
+  El análisis LoopFacts queda operativo y auditado.
 - **Asignador de registros linear scan** con register hinting / coalesce
   (steal-from-active).
 - **Dispatcher threaded computed-goto** + inline del icache hit path
@@ -222,6 +232,32 @@ y el futuro compilador AOT (decisiones especulativas hard-coded).
 **Suite de tests E2E**: **213/213 PASS** (`tests/vex/test_vex_e2e.sh`), cubriendo
 los 180+ ejemplos del repo + 6 tests negativos del borrow checker + 11 tests
 positivos realistas del borrow checker.
+
+**Suite ctest (C++)**: **66/66 PASS** (0 FAIL).  Durante el port del unroll se
+auditó la suite y se repararon **7 tests** que fallaban en HEAD:
+
+- **Bugs reales del runtime** (arreglados):
+  1. `jit/code_cache`: `invalidate()`/`free_region()` escribían `0xCC` sobre
+     páginas RX (W^X) sin re-proteger a RW → SEGV.  Añadido
+     `transition_to_writable()`.
+  2. `jit/selector`: `RET` de `f64/f32` devolvía en RAX en vez de XMM0, y los
+     params `f64` en `NATIVE_ABI` se leían de regs GP → el FADD nativo
+     devolvía basura.  Añadidos `MOVQ_GP_XMM`/`MOVQ_XMM_GP`.
+  3. `net/tcp_server`: el accept_loop era un hilo `detached` que compartía el
+     vector de threads sin sincronización (→ `std::terminate`) y `close()` no
+     despertaba un `accept()` bloqueado (→ hang).  Ahora el accept thread es
+     joinable, `stop()` hace `shutdown(SHUT_RDWR)` + `join()`.
+- **Bugs de tests** (arreglados): `arena/test4` escribía sobre una región
+  solo-READ; `jit/test_safepoint` pasaba un `ProcProxy` truncado al handler
+  real; `jit/test_vreg_vm` verificaba el fallback de CALLVIRT con un objeto
+  sintético inválido (se fuerza `VESTA_JIT_NO_INLINE_CALLVIRT=1`);
+  `jit/test_jit_compiler` asumía FADD sin soportar (ya soportado);
+  `net/test2` tenía deadlock de `SSL_shutdown` bidireccional; y el test TLS
+  distribuido moría por SIGPIPE (ahora `SIGPIPE=SIG_IGN`).
+- `test_net_test1` está **disabled** en ctest (demo interactivo manual que
+  duerme 30s esperando conexiones telnet/nc).
+- Los certs TLS self-signed de los tests se generan automáticamente en el build
+  (`tests/CMakeLists.txt` → `gen_tls_test_certs`).
 
 ### Estadísticas clave
 
@@ -394,6 +430,39 @@ genera una gráfica dedicada por cada uno de los 27 benches en
 
 **Roadmap completo** (hasta JIT C2 con regalloc real + AOT con ejecutables
 `.exe` nativos en 3 tiers): [doc/ROADMAP.md](./doc/ROADMAP.md).
+
+### Informe de rendimiento local (Linux, build Debug)
+
+Benchmarks del runner en esta máquina (Linux x86_64, 8 cores, 24.9 GB RAM,
+`build/vm` Debug `-O0`, mediana de 3 runs, wall externo):
+
+![JIT vs intérprete](./docs/benchmarks/jit_vs_interp.png)
+
+El JIT C1 da **~3-178×** sobre el intérprete según el bench (los intérprete
+puros como `int_mixed`/`memcpy_loop`/`nested_loops` son ~150× más lentos sin
+JIT; los `fib_recursive` ~10×).  Estos valores son de un build **Debug sin
+optimizar**; el Release (~`-O3`) mejora ambos términos.  Para números
+representativos del proyecto (build Release, i7-13700KF) ver la tabla de
+"Estadísticas clave".
+
+**Impacto del unroll en el JIT** (array_sum, 400M LOAD, build Debug):
+
+![Impacto del unroll](./docs/benchmarks/unroll_impact_jit.png)
+
+Hallazgo honesto para la auditoría: en el JIT C1 actual el unroll es una
+**regresión** (~+65%).  La causa es arquitectónica — el C1 despacha cada
+instrucción vía helper sin register allocation, así que desenrollar solo
+multiplica los dispatch points y añade spills de stack.  El pase queda
+implementado, correcto (mismo resultado con/sin) y auditado, pero **off por
+defecto** hasta que el JIT C2 (regalloc real) lo pueda aprovechar.
+
+**Progreso de la suite de tests** (durante esta iteración):
+
+![Suite ctest](./docs/benchmarks/test_suite_progress.png)
+
+Las imágenes base del runner (dashboard, heatmap, radar, boxplot, geomean…)
+se regeneran con `python tools/bench/run_all_benches.py` y quedan en
+`bench_plots/`.
 
 ---
 

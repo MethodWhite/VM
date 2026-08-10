@@ -1,0 +1,70 @@
+{
+  "vm_binary": "build/vm (Debug -O0)",
+  "project_root": "/mnt/workspace/Proyectos/seguridad/VM-fork",
+  "runs_per_mode": 3,
+  "warmup_runs": 1,
+  "active_langs": [
+    "vex_interp",
+    "vex_jit"
+  ],
+  "system_info": {
+    "date": "2026-08-10",
+    "hardware": {
+      "arch": "x86_64",
+      "cpu_logical": 8,
+      "cpu_physical": 8,
+      "cpu_freq_mhz": "4800 MHz",
+      "cpu_model": "x86_64",
+      "ram_gb": 24.9
+    },
+    "os": {
+      "platform": "Linux (WSL)",
+      "version": "",
+      "release": ""
+    },
+    "tooling": {
+      "Vex VM": {
+        "available": true,
+        "version": "Vesta v0.1.0 (build/vm, Debug -O0)",
+        "path": "build/vm"
+      },
+      "compiler": {
+        "available": true,
+        "version": "g++ 14 (Debug -O0)",
+        "path": ""
+      }
+    }
+  },
+  "results": [
+    {
+      "bench": "array_sum",
+      "is_legacy": false,
+      "vex_interp": 114.0,
+      "vex_jit": 64.0
+    },
+    {
+      "bench": "fib_recursive",
+      "is_legacy": false,
+      "vex_interp": 2118.0,
+      "vex_jit": 214.0
+    },
+    {
+      "bench": "int_mixed",
+      "is_legacy": false,
+      "vex_interp": 20314.0,
+      "vex_jit": 114.0
+    },
+    {
+      "bench": "memcpy_loop",
+      "is_legacy": false,
+      "vex_interp": 15657.0,
+      "vex_jit": 164.0
+    },
+    {
+      "bench": "nested_loops",
+      "is_legacy": false,
+      "vex_interp": 17207.0,
+      "vex_jit": 114.0
+    }
+  ]
+}

@@ -41,6 +41,10 @@ struct LoopIV {
     ir::IrOp cmp_op = ir::IrOp::NOP;       ///< CMP_LT/LE/ULT/ULE de la guarda.
     int64_t cmp_offset = 0;                ///< c de cmp(iv + c, bound) (0 = iv).
     ir::IrValueId bound = ir::IR_NO_VALUE; ///< cota N (invariante del bucle).
+    /// Operando del cmp derivado del IV (tras extensión/offset): es el valor
+    /// que la cond-chain del header produce a partir del PHI.  El unroll lo
+    /// usa para localizar la instrucción clonada en el guard del UH.
+    ir::IrValueId cmp_a = ir::IR_NO_VALUE;
     /// Extension de tipo del IV antes del cmp (SEXT/ZEXT si el IV es i32 y la
     /// cota i64).  NOP si el cmp compara el IV directamente.
     ir::IrOp iv_ext_op = ir::IrOp::NOP;

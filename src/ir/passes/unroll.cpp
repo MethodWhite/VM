@@ -256,16 +256,19 @@ void do_unroll(IrFunction &fn, const LoopInfo &li, int U) {
                 {back_prev[li.st.phis[i].dst], blk_clone[U - 1].at(li.st.latch)});
             uh.push_back(std::move(phi));
         }
-        // Guarda: replica la del header con lookahead de (U-1) iteraciones.
-        // Original: cmp(iv + cmp_offset, N).  Unrollada: las U iteraciones son
-        // validas si cmp(iv + (U-1)*S + cmp_offset, N) -> iv_last = iv_uh + K.
+        // Guarda: replica la cond-chain REAL del header (header_body) con el
+        // IV en lookahead de (U-1) iteraciones, en vez de reconstruir el cmp a
+        // mano.  Original: la cadena produce cmp(iv + c, N) (posiblemente con
+        // SEXT/ZEXT del IV i32->i64).  Unrollada: las U iteraciones son validas
+        // si cmp(iv + (U-1)*S + c, N) -> clonamos la cadena con el PHI del IV
+        // sustituido por iv_uh + (U-1)*S.
         const IrValueId c_uh = fn.new_value(iv_ty);
         {
             IrInstr c{};
             c.op = IrOp::CONST;
             c.type = iv_ty;
             c.dst = c_uh;
-            c.imm = (uint64_t)((int64_t)(U - 1) * li.iv.stride + li.iv.cmp_offset);
+            c.imm = (uint64_t)((int64_t)(U - 1) * li.iv.stride);
             fn.values[c_uh].is_const = true;
             fn.values[c_uh].const_val = c.imm;
             uh.push_back(std::move(c));
@@ -279,27 +282,32 @@ void do_unroll(IrFunction &fn, const LoopInfo &li, int U) {
             a.operands = {uphi[li.iv.phi_index], c_uh};
             uh.push_back(std::move(a));
         }
+        // Clonar la cond-chain del header.  vmap: PHIs del header -> uphi, y el
+        // PHI del IV -> iv_last (lookahead).  El valor que produce cmp_a en el
+        // clon es el operando del guard.
+        std::unordered_map<IrValueId, IrValueId> hvmap;
+        for (size_t i = 0; i < li.st.phis.size(); ++i)
+            hvmap[li.st.phis[i].dst] = uphi[i];
+        hvmap[li.iv.phi] = iv_last;
+        IrValueId cmp_op_a = iv_last;
+        for (const IrInstr &hin : li.st.header_body) {
+            IrInstr hc = hin;
+            hc.dst = fn.new_value(hin.type);
+            for (IrValueId &o : hc.operands) {
+                auto it = hvmap.find(o);
+                if (it != hvmap.end()) o = it->second;
+            }
+            if (hin.dst == li.iv.cmp_a) cmp_op_a = hc.dst;
+            hvmap[hin.dst] = hc.dst;
+            uh.push_back(std::move(hc));
+        }
         const IrValueId guard = fn.new_value(IrType::BOOL);
         {
             IrInstr g{};
             g.op = li.iv.cmp_op;
             g.type = IrType::BOOL;
             g.dst = guard;
-            // Si el cmp original comparaba SEXT(iv) con la cota (i32->i64),
-            // el guard debe extender iv_last igual que el IR original.
-            if (li.iv.iv_ext_op != IrOp::NOP) {
-                IrInstr e{};
-                e.op = li.iv.iv_ext_op;
-                e.type = (li.iv.bound < fn.values.size())
-                             ? fn.values[li.iv.bound].type
-                             : IrType::I64;
-                e.dst = fn.new_value(e.type);
-                e.operands = {iv_last};
-                uh.push_back(std::move(e));
-                g.operands = {uh.back().dst, li.iv.bound}; // (sext(iv_last), N)
-            } else {
-                g.operands = {iv_last, li.iv.bound}; // iv_first: (iv_last, N)
-            }
+            g.operands = {cmp_op_a, li.iv.bound};
             uh.push_back(std::move(g));
         }
         {

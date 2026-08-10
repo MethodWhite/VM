@@ -80,10 +80,12 @@ módulo.  No se arrastra código muerto de la otra rama.
   reconoce loops `dst[i]=f(src[i])` y baja a VEC ops.
 - Requiere: IR ops `VEC_UNOP/BINOP/FMA/BCAST/FMA_S` + codegen (JIT SIMD)
   + `jit/vec_isa.h` (ancho SSE2/AVX2/AVX512).
-- **Estado**: el memcpy idiom ya existe en local (`ir_pass_loop_memcpy_idiom`).
-  Las VEC ops SIMD requieren backend SIMD en el selector x86 (pendiente).
-- Port: mapear el pase a `vex::Lowering`, añadir VEC ops al `ssa_ir.h`
-  local y su emisión.
+- **Estado**: el memcpy idiom local (`ir_pass_loop_memcpy_idiom`) cubre la
+  copia host->host.  Se probo portar el idiom a nivel AST (lowering) pero
+  la semantica de `vmcopy` local es VM->host (curN = host dst, src = dir
+  VM), NO host->host: el idiom de Desmon asume ambos host.  Portar requiere
+  ajustar la semantica de MEMCPY/vmcopy en el runtime (trabajo del runtime,
+  no del frontend).  Las VEC ops SIMD requieren backend SIMD (pendiente).
 
 ### import/packaging (P2, 23 commits)
 - Los fixes de módulos de Desmon (structs importados con métodos, enums

@@ -347,12 +347,19 @@ portables sin arrastrar la infraestructura nueva:
   el compound assign de STRING ahora emite STRCAT.  El `+=` con literal
   funciona; los casos normales de strings sin regresión.
 
+**Portado sin arrastrar la infraestructura de feature**:
+- **DCE con declaraciones de nativas** (Desmon `8d434933`, commit `921bdda1`):
+  se añadió `IrNativeEffects` al IR (declarados, lee/escribe_apuntado, io,
+  escribe_global, puede_lanzar) y el DCE elimina un CALLN cuyo resultado no se
+  usa cuando la nativa declara no tener efectos observables (y, si escribe
+  buffers, nadie los lee).  El lowering declara los efectos de `vio_*_to_vmbuf`.
+  Cubierto por `tests/ir/test_dce_nativas.cpp` (4 casos).
+
 **Bloqueado por infraestructura de feature que no existe en esta rama**:
-- **DCE con declaraciones de nativas** (Desmon `8d434933`): requiere
-  `analysis/effects` + `IrNativeEffects` (10+ archivos).  Nuestro DCE ya es
-  conservador (nunca elimina CALLN).
-- **Refactor AOT a `toolchain/`**: ~14K líneas (linker propio, object_writer,
-  multi-arquitectura, cache de dependencias) + `stdlib/vx` renombrada.
+- **Refactor AOT a `toolchain/`**: ~10K líneas (linker propio, object_writer,
+  multi-arquitectura x86_16/32/64, cache de dependencias) + `stdlib/vx`
+  renombrada.  El AOT actual de esta rama es básico (aritmética simple; el
+  LOAD de arrays cae al selector no-soportado).
 - **ASA / análisis semántico avanzado**, **asm elevado a IR**, **análisis de
   efectos** (`analysis/effects`), **optimización de literales como vistas
   `.rodata`** (Desmon `f4791606`).

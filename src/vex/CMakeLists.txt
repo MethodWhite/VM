@@ -56,6 +56,25 @@ add_library(vex_lib STATIC
     # Inline asm (ASA): analisis de efectos + inferencia de clobbers.
     asm/asm_effects.cpp
     asm/asm_analyze.cpp
+    # ASA: base de datos de instrucciones + lifting de patrones.
+    asm/instr_db.cpp
+    asm/asm_lift.cpp
+    asm/asm_cfg.cpp
+    asm/asm_diag.cpp
+    asm/asm_diagram.cpp
+    asm/asm_backend.cpp
+    # DB de instrucciones generada (tablas por ISA embebidas).
+    asm/gen/instr_db_x86_gen.cpp
+    asm/gen/instr_db_x86_cost_gen.cpp
+    asm/gen/instr_db_x86_feat_gen.cpp
+    asm/gen/instr_db_arm64_gen.cpp
+    asm/gen/instr_db_arm64_cost_gen.cpp
+    asm/gen/instr_db_arm32_gen.cpp
+    asm/gen/instr_db_arm32_cost_gen.cpp
+    asm/gen/instr_db_arm_feat_gen.cpp
+    asm/gen/instr_db_riscv_gen.cpp
+    asm/gen/instr_db_riscv_cost_gen.cpp
+    asm/gen/instr_db_riscv_feat_gen.cpp
 )
 
 # La libreria expone sus headers desde include/vex/; PUBLIC para que los

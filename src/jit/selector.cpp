@@ -4282,6 +4282,43 @@ case IrOp::CALLCLOSURE: {
                             emit_stackmap_for_safepoint(call_instr);
                             mf.blocks.back().instrs.push_back(call_instr);
                             store_op(mf, ins.dst, MReg::RAX);
+                        } else if (ins.operands.size() == 1
+                                && ins.dst != ir::IR_NO_VALUE
+                                && opts_.resolve_user_fn) {
+                            /* AOT / sin runtime: malloc(size) de libc, call
+                             * a un simbolo externo (1 arg, sin proc).  El
+                             * imm64 se marca como user-call para que el AOT
+                             * genere una relocacion al simbolo "malloc". */
+                            const uint64_t fn_addr = opts_.resolve_user_fn("malloc");
+                            if (fn_addr != 0) {
+#if defined(_WIN32)
+                                const MReg arg0 = MReg::RCX;
+#else
+                                const MReg arg0 = MReg::RDI;
+#endif
+                                load_op_rematerializable(mf, ir_fn, ins.operands[0], arg0);
+                                const uint32_t fn_pool_idx = mf.intern_imm64(fn_addr);
+                                bool already = false;
+                                for (uint32_t v : mf.user_call_imm64_indices)
+                                    if (v == fn_pool_idx) { already = true; break; }
+                                if (!already)
+                                    mf.user_call_imm64_indices.push_back(fn_pool_idx);
+                                mf.blocks.back().instrs.push_back(
+                                    MInstr::make_unary(MOp::MOV,
+                                        MOperand::make_reg(MReg::RAX),
+                                        MOperand::make_imm64_idx(fn_pool_idx)));
+                                MInstr call_instr;
+                                call_instr.op = MOp::CALL;
+                                call_instr.src1 = MOperand::make_reg(MReg::RAX);
+                                mf.blocks.back().instrs.push_back(call_instr);
+                                store_op(mf, ins.dst, MReg::RAX);
+                                break;
+                            }
+                            warn_unsupported(ins.op, ins.source_line,
+                                "malloc no resuelto (AOT)");
+                            unsupported = true;
+                            mf.blocks.back().instrs.push_back(
+                                {MOp::INT3, 0, 0, 0, {}, {}, {}});
                         } else {
                             warn_unsupported(ins.op, ins.source_line,
                                 "runtime->raw_alloc null o operandos invalidos");
@@ -4356,6 +4393,39 @@ case IrOp::CALLCLOSURE: {
                             call_instr.src1 = MOperand::make_reg(MReg::RAX);
                             emit_stackmap_for_safepoint(call_instr);
                             mf.blocks.back().instrs.push_back(call_instr);
+                        } else if (ins.operands.size() == 1
+                                && opts_.resolve_user_fn) {
+                            /* AOT / sin runtime: free(ptr) de libc, call a un
+                             * simbolo externo (1 arg, sin proc). */
+                            const uint64_t fn_addr = opts_.resolve_user_fn("free");
+                            if (fn_addr != 0) {
+#if defined(_WIN32)
+                                const MReg arg0 = MReg::RCX;
+#else
+                                const MReg arg0 = MReg::RDI;
+#endif
+                                load_op_rematerializable(mf, ir_fn, ins.operands[0], arg0);
+                                const uint32_t fn_pool_idx = mf.intern_imm64(fn_addr);
+                                bool already = false;
+                                for (uint32_t v : mf.user_call_imm64_indices)
+                                    if (v == fn_pool_idx) { already = true; break; }
+                                if (!already)
+                                    mf.user_call_imm64_indices.push_back(fn_pool_idx);
+                                mf.blocks.back().instrs.push_back(
+                                    MInstr::make_unary(MOp::MOV,
+                                        MOperand::make_reg(MReg::RAX),
+                                        MOperand::make_imm64_idx(fn_pool_idx)));
+                                MInstr call_instr;
+                                call_instr.op = MOp::CALL;
+                                call_instr.src1 = MOperand::make_reg(MReg::RAX);
+                                mf.blocks.back().instrs.push_back(call_instr);
+                                break;
+                            }
+                            warn_unsupported(ins.op, ins.source_line,
+                                "free no resuelto (AOT)");
+                            unsupported = true;
+                            mf.blocks.back().instrs.push_back(
+                                {MOp::INT3, 0, 0, 0, {}, {}, {}});
                         } else {
                             warn_unsupported(ins.op, ins.source_line,
                                 "runtime->raw_free null o operandos invalidos");

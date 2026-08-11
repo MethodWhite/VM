@@ -402,6 +402,22 @@ namespace aot {
              * (todavia no registrada en fn_offsets), se devuelve la direccion
              * basada en el offset ACTUAL del texto (donde empieza esta fn). */
             const uint64_t AOT_TEXT_BASE = 0x400000u;
+            /* Vaddr base para los simbolos externos del runtime (malloc/free
+             * y los vrt_*).  Fuera del texto (0x400000+); el AOT las mapea a
+             * los simbolos SHN_UNDEF en las relocaciones. */
+            const uint64_t AOT_RT_BASE = 0x600000u;
+            auto rt_sym_vaddr = [&](const std::string &name) -> uint64_t {
+                static const std::vector<std::string> order = {
+                    "vrt_gc_alloc","vrt_gc_alloc_pinned","vrt_gc_deref",
+                    "vrt_gc_handle_for_ptr","vrt_gc_drop","vrt_gc_write_barrier",
+                    "vrt_throw_fatal","vrt_safepoint_poll","vrt_async_spawn",
+                    "vrt_async_await","vrt_sched_yield","vrt_monitor_enter",
+                    "vrt_monitor_exit","malloc","free","memcpy","memset",
+                };
+                for (size_t i = 0; i < order.size(); ++i)
+                    if (order[i] == name) return AOT_RT_BASE + i * 0x1000;
+                return 0;
+            };
             uint64_t cur_fn_offset = 0; // offset del texto de la fn en curso
             auto aot_resolver = [&](const std::string &name) -> uint64_t {
                 auto it = fn_offsets.find(name);
@@ -410,6 +426,10 @@ namespace aot {
                 /* Self-ref: la fn se esta compilando; su offset es el actual. */
                 if (name == current_fn_name_)
                     return AOT_TEXT_BASE + cur_fn_offset;
+                /* Simbolo externo del runtime (malloc/free/...): vaddr
+                 * reservada que el AOT mapea al simbolo SHN_UNDEF. */
+                const uint64_t rv = rt_sym_vaddr(name);
+                if (rv != 0) return rv;
                 if (std::getenv("VESTA_JIT_WARN"))
                     std::fprintf(stderr, "[aot-resolver] '%s' NO compilada (offsets=%zu)\n",
                                  name.c_str(), fn_offsets.size());
@@ -615,6 +635,17 @@ namespace aot {
                 for (uint32_t si = 0; si < symbols.size(); ++si) {
                     if (symbols[si].shndx == text_shndx && !symbols[si].name.empty())
                         name_to_symidx[symbols[si].name] = si + 1; // +STN_UNDEF
+                }
+                /* Simbolos externos del runtime (malloc/free/...): tambien
+                 * relocables.  Sus vaddrs reservadas (AOT_RT_BASE+i) se
+                 * mapean al nombre para que un user-call de RAW_ALLOC/RAW_FREE
+                 * genere la relocacion al simbolo SHN_UNDEF. */
+                for (uint32_t si = 0; si < symbols.size(); ++si) {
+                    if (symbols[si].shndx == SHN_UNDEF && !symbols[si].name.empty()) {
+                        const uint64_t rv = rt_sym_vaddr(symbols[si].name);
+                        if (rv != 0) vaddr_to_name[rv] = symbols[si].name;
+                        name_to_symidx[symbols[si].name] = si + 1;
+                    }
                 }
 
                 for (const auto &[pos, vaddr] : user_call_sites) {

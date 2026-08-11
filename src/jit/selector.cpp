@@ -869,13 +869,24 @@ namespace jit {
                             mf.blocks.back().instrs.push_back({MOp::INT3, 0, 0, 0, {}, {}, {}});
                             break;
                         }
-                        /* mov rax, addr (via imm64 pool si necesario). */
-                        const uint32_t pool_idx = mf.intern_imm64(addr);
-                        mf.blocks.back().instrs.push_back(
-                            MInstr::make_unary(MOp::MOV,
-                                MOperand::make_reg(SCRATCH_A),
-                                MOperand::make_imm64_idx(pool_idx)));
-                        store_op(mf, ins.dst, SCRATCH_A);
+                         /* mov rax, addr (via imm64 pool si necesario). */
+                         const uint32_t pool_idx = mf.intern_imm64(addr);
+                         /* AOT: marcar el imm64 como user-call para que el
+                          * encoder registre su posicion y el AOT relocalice
+                          * al simbolo del literal (.rodata).  En JIT el
+                          * registro es inofensivo (el JIT no relocaliza). */
+                         {
+                             bool already = false;
+                             for (uint32_t v : mf.user_call_imm64_indices)
+                                 if (v == pool_idx) { already = true; break; }
+                             if (!already)
+                                 mf.user_call_imm64_indices.push_back(pool_idx);
+                         }
+                         mf.blocks.back().instrs.push_back(
+                             MInstr::make_unary(MOp::MOV,
+                                 MOperand::make_reg(SCRATCH_A),
+                                 MOperand::make_imm64_idx(pool_idx)));
+                         store_op(mf, ins.dst, SCRATCH_A);
                         break;
                     }
                     case IrOp::LABEL_ADDR: {

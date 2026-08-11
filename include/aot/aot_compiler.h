@@ -170,6 +170,7 @@ namespace aot {
                               std::unordered_map<std::string, uint64_t> &sym_offsets,
                               const std::function<uint64_t(const std::string &)> &resolve_user_fn = {},
                               const std::function<uint64_t(const std::string &)> &resolve_native_fn = {},
+                              const std::function<uint64_t(const std::string &)> &resolve_symbol = {},
                               std::vector<std::pair<size_t, uint64_t>> *out_user_call_sites = nullptr);
 
         /**

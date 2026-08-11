@@ -42,6 +42,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <unordered_set>
 
@@ -309,6 +310,7 @@ namespace aot {
                                        std::unordered_map<std::string, uint64_t> &sym_offsets,
                                        const std::function<uint64_t(const std::string &)> &resolve_user_fn,
                                        const std::function<uint64_t(const std::string &)> &resolve_native_fn,
+                                       const std::function<uint64_t(const std::string &)> &resolve_symbol,
                                        std::vector<std::pair<size_t, uint64_t>> *out_user_call_sites) {
         // 1. Calcular liveness
         ir::LivenessResult liveness;
@@ -329,6 +331,7 @@ namespace aot {
         sel_opts.mode = selector_mode_for_tier(options_.tier);
         sel_opts.resolve_user_fn = resolve_user_fn;
         sel_opts.resolve_native_fn = resolve_native_fn;
+        sel_opts.resolve_symbol = resolve_symbol;
 
         /* Diagnostico: si VESTA_JIT_WARN esta activo, que el selector
          * emita el detalle de la op no soportada DURANTE la seleccion. */
@@ -463,6 +466,20 @@ namespace aot {
                  const uint64_t r2 = rt_sym_vaddr(name);
                  return r2;
              };
+             /* Literales de string usados (STR_LIT_ADDR "code.s_<imm>"):
+              * vaddr reservada -> indice del literal en static_data, para
+              * crear el simbolo local en .rodata y relocalizar. */
+             const uint64_t AOT_STR_BASE = 0x800000u;
+             std::unordered_map<uint64_t, uint32_t> g_str_syms;
+             auto aot_symbol_resolver =
+                 [&](const std::string &sym) -> uint64_t {
+                 if (sym.compare(0, 7, "code.s_") != 0) return 0;
+                 const uint32_t idx = static_cast<uint32_t>(
+                     std::strtoul(sym.c_str() + 7, nullptr, 10));
+                 const uint64_t vaddr = AOT_STR_BASE + idx * 0x1000;
+                 g_str_syms[vaddr] = idx;
+                 return vaddr;
+             };
             uint64_t cur_fn_offset = 0; // offset del texto de la fn en curso
             auto aot_resolver = [&](const std::string &name) -> uint64_t {
                 auto it = fn_offsets.find(name);
@@ -493,7 +510,8 @@ namespace aot {
                 current_fn_name_ = fn.name;
                 cur_fn_offset    = offset_before;
                 if (!compile_function(fn, text_code, fn_offsets, aot_resolver,
-                                      aot_native_resolver, &user_call_sites)) {
+                                      aot_native_resolver, aot_symbol_resolver,
+                                      &user_call_sites)) {
                     current_fn_name_.clear();
                     result.error = "Fallo al compilar funcion: " + fn.name;
                     return false;
@@ -645,6 +663,27 @@ namespace aot {
                 symbols.push_back(start_sym);
             }
 
+            /* Simbolos locales de los literales de string (STR_LIT_ADDR):
+             * uno por literal usado, apuntando al offset dentro de .rodata.
+             * El imm64 del STR_LIT_ADDR se relocaliza contra estos. */
+            const uint16_t rodata_shndx =
+                section_index(sections, ".rodata");
+            std::unordered_map<uint64_t, std::string> g_str_names;
+            if (rodata_shndx != SHN_UNDEF) {
+                for (const auto &[vaddr, idx] : g_str_syms) {
+                    SymbolInfo sym;
+                    sym.name  = ".Lstr_" + std::to_string(idx);
+                    sym.info  = st_info(STB_LOCAL, STT_NOTYPE);
+                    sym.other = STV_DEFAULT;
+                    sym.shndx = rodata_shndx;
+                    sym.value = (idx < mod.static_data.entries.size())
+                        ? mod.static_data.entries[idx].byte_offset : 0;
+                    sym.size  = 0;
+                    symbols.push_back(sym);
+                    g_str_names[vaddr] = sym.name;
+                }
+            }
+
             // 6. Relocaciones para simbolos runtime
             auto rt_syms = resolve_runtime_symbols();
             uint32_t extern_sym_idx = static_cast<uint32_t>(symbols.size());
@@ -686,6 +725,10 @@ namespace aot {
                 std::unordered_map<uint64_t, std::string> vaddr_to_name;
                 for (const auto &kv : fn_offsets)
                     vaddr_to_name[AOT_TEXT_BASE + kv.second] = kv.first;
+                /* Literales de string: vaddr reservada -> nombre del simbolo
+                 * local en .rodata. */
+                for (const auto &[vaddr, name] : g_str_names)
+                    vaddr_to_name[vaddr] = name;
 
                 /* Los simbolos de funciones van primero.  El symtab del .o
                  * empieza con STN_UNDEF (indice 0), asi el indice final de

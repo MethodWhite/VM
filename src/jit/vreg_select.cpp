@@ -1521,10 +1521,37 @@ namespace jit {
                                 }
                                 return d;
                             };
-                            /* cls = [obj]  (class_ptr offset 0). */
-                            const ir::IrValueId cls = load_field(obj, 0);
-                            O.push_back(mk_test(cls, cls));
-                            O.push_back(MInstr::make_jcc(MCond::E, Lfb));
+                             /* cls = [obj]  (class_ptr offset 0).
+                              * Si el receptor es un GcHandle (objeto GC), hay
+                              * que DEREFERENCIARLO antes: [handle] es el slot
+                              * de la HandleTable, no el ObjectHeader.  El
+                              * emisor del bytecode (interp) ya hace el deref
+                              * en load_src; el JIT inline dispatch no -> crash
+                              * SIGSEGV en callvirt de objetos GC. */
+                             ir::IrValueId obj_base = obj;
+                             const bool obj_is_gc =
+                                 (obj < out.vreg_is_gc.size())
+                                 && out.vreg_is_gc[obj] == 1; // HANDLE
+                             if (obj_is_gc && ent.gc_deref != 0) {
+                                 obj_base = new_tmp();
+#if defined(_WIN32)
+                                 const MReg d0 = MReg::RCX, d1 = MReg::RDX;
+#else
+                                 const MReg d0 = MReg::RDI, d1 = MReg::RSI;
+#endif
+                                 O.push_back(MInstr::make_unary(MOp::MOV,
+                                     MOperand::make_reg(d1, 8), vr(obj)));
+                                 O.push_back(MInstr::make_unary(MOp::MOV,
+                                     MOperand::make_reg(d0, 8),
+                                     MOperand::make_reg(MReg::RBX, 8)));
+                                 O.push_back(MInstr::make_call_abs(
+                                     out.intern_imm64(ent.gc_deref)));
+                                 O.push_back(MInstr::make_unary(MOp::MOV,
+                                     vr(obj_base), MOperand::make_reg(MReg::RAX, 8)));
+                             }
+                             const ir::IrValueId cls = load_field(obj_base, 0);
+                             O.push_back(mk_test(cls, cls));
+                             O.push_back(MInstr::make_jcc(MCond::E, Lfb));
                             /* vtbl = [cls + VTABLE_OFFSET]. */
                             const ir::IrValueId vtbl =
                                 load_field(cls, VESTA_CLASSINFO_VTABLE_OFFSET);

@@ -212,3 +212,40 @@ jobs:
           fi
           echo "OK: sin gaps de equivalencia (los de eficiencia son avisos)"
         timeout-minutes: 10
+
+  # S-22 testing-quality: coverage gate.  Compila con --coverage, corre los
+  # tests CTest, genera reporte de cobertura (gcovr) y valida un umbral de
+  # linea sobre el VM core.  Coverage gate bloqueante (el estandar exige
+  # umbral minimo).
+  coverage:
+    name: Coverage gate (S-22)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build gcovr
+
+      - name: Configure with coverage
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug -DVESTA_BUILD_STDLIB=ON \
+            -DCMAKE_CXX_FLAGS="--coverage -O0 -g" \
+            -DCMAKE_C_FLAGS="--coverage -O0 -g"
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Run tests (collect coverage)
+        run: |
+          cd build
+          ctest --output-on-failure --parallel 2 || true
+          cd ..
+
+      - name: Coverage gate
+        run: |
+          gcovr --root . --filter 'src/(runtime|ir|jit|gc)/' \
+            --xml-pretty -o coverage.xml --fail-under-line 15
+          echo "coverage report OK"

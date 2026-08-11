@@ -11,10 +11,15 @@ Modos:
   jit-vreg   : -m jit (path por defecto, regalloc vreg).
   jit-slots  : VESTA_JIT_VREGS=0 -m jit (path selector).
   aot        : compila ELF nativo (--aot) y lo ejecuta.
+  c-native   : compila <bench>/main.c equivalente con clang/gcc -O3
+               (--cc, default clang) y lo ejecuta.  Permite comparar Vesta
+               contra C REAL.  Recomendacion de Desmon: usar clang/LLVM
+               sobre gcc/mingw para medir si Vesta supera a C de verdad.
 
 Salida:
-  Tabla en consola (bench | interp | jit-vreg | jit-slots | aot | speedup max)
-  + comparacion vs --baseline si se guardo con --save-baseline.
+  Tabla en consola (bench | interp | jit-vreg | jit-slots | aot | C-native |
+  Vesta/C) + comparacion vs --baseline si se guardo con --save-baseline.
+  La columna "Vesta/C" muestra x < 1 = Vesta mas rapido que C.
 
 Uso:
   python tools/bench_runner.py [vm.exe]
@@ -74,6 +79,30 @@ def compile_aot(vm: Path, vex: Path, out: Path, timeout: float) -> bool:
     except subprocess.TimeoutExpired:
         return False
     return r.returncode == 0 and out.exists()
+
+
+def run_c_native(c_file: Path, exe: Path, cc: str, timeout: float):
+    """Compila un .c equivalente del bench con clang/gcc -O3 y lo ejecuta.
+    Devuelve (status, r0, seconds).  El exit code de C es el return del
+    programa (== el R0 truncado a 8 bits)."""
+    ccmd = [cc, "-O3", "-march=native", "-o", str(exe), str(c_file)]
+    try:
+        cr = subprocess.run(ccmd, capture_output=True, text=True,
+                            timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return "timeout", None, timeout
+    if cr.returncode != 0:
+        return "no-compila", None, 0.0
+    t0 = time.perf_counter()
+    try:
+        r = subprocess.run([str(exe)], capture_output=True, text=True,
+                           timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return "timeout", None, timeout
+    dt = time.perf_counter() - t0
+    if r.returncode is not None:
+        return "ok", format(r.returncode & 0xFF, "x"), dt
+    return "crash", None, dt
 
 
 def run_mode(vm: Path, velb: Path, mode: str, timeout: float, tmp: Path):
@@ -141,6 +170,12 @@ def main() -> int:
                     help="JSON detallado (default bench_results/bench_runner.json)")
     ap.add_argument("--reps", type=int, default=1,
                     help="repeticiones por modo (usa el mejor tiempo)")
+    ap.add_argument("--cc", default="clang",
+                    help="compilador C nativo para comparar (default: clang). "
+                         "Desmon recomienda clang/LLVM sobre gcc/mingw para medir "
+                         "si Vesta es mas rapido que C de verdad.")
+    ap.add_argument("--no-c-native", action="store_true",
+                    help="no compilar/ejecutar la version C nativa equivalente")
     args = ap.parse_args()
 
     vm = Path(args.vm).resolve()
@@ -157,6 +192,7 @@ def main() -> int:
 
     print(f"[bench] {len(vex_files)} benchmarks, modos: interp/jit-vreg/jit-slots"
           + ("" if args.no_aot else "/aot")
+          + ("" if args.no_c_native else f"/c-native({args.cc})")
           + f", timeout {args.timeout:.0f}s\n")
 
     rows = []
@@ -196,30 +232,50 @@ def main() -> int:
             else:
                 results["aot"] = {"status": "no-compila"}
 
+        # Modo c-native: compilar la version C equivalente del bench
+        # (<nombre-sin-bench_>/main.c) con clang/gcc -O3 y medir.  Permite
+        # comparar Vesta contra C REAL (recomendacion de Desmon: usar
+        # clang/LLVM, no gcc/mingw, para medir si supera a C de verdad).
+        if not args.no_c_native:
+            # bench_tight_loop.vex -> dir tight_loop/main.c
+            c_name = prefix
+            if c_name.startswith("bench_"):
+                c_name = c_name[len("bench_"):]
+            c_dir = bench_dir / c_name
+            c_file = c_dir / "main.c"
+            if c_file.exists():
+                cexe = tmp / (prefix + ".c_native")
+                st, r0, dt = run_c_native(c_file, cexe, args.cc, args.timeout)
+                results["c-native"] = {"status": st, "r0": r0, "s": dt}
+            else:
+                results["c-native"] = {"status": "no-main.c"}
+
         rows.append({"name": name, "results": results})
 
     # ---- tabla ----
-    print(f"{'bench':<34} {'interp':>9} {'jit-vreg':>9} {'jit-slots':>9}"
-          + (f"{'aot':>9}" if not args.no_aot else "")
-          + "   R0  status")
-    print("-" * (80 if args.no_aot else 90))
+    print(f"{'bench':<30} {'interp':>8} {'jit-vreg':>8} {'jit-slots':>8}"
+          + (f"{'aot':>8}" if not args.no_aot else "")
+          + (f"{'C-native':>9}" if not args.no_c_native else "")
+          + f"{'Vesta/C':>8}  R0")
+    print("-" * (80 + (8 if not args.no_aot else 0) + (9 if not args.no_c_native else 0)))
 
     for row in rows:
         if "error" in row:
-            print(f"{row['name']:<34} {'-':>9} {'-':>9} {'-':>9}   -- {row['error']}")
+            print(f"{row['name']:<30} {'-':>8} {'-':>8} {'-':>8}   -- {row['error']}")
             continue
         r = row["results"]
         cells = []
         r0s = set()
         all_ok = True
         for mode in (["interp"] + [m for m, _ in MODES if m != "interp"]
-                     + (["aot"] if not args.no_aot else [])):
+                     + (["aot"] if not args.no_aot else [])
+                     + (["c-native"] if not args.no_c_native else [])):
             if mode not in r:
                 cells.append("--")
                 continue
             d = r[mode]
             if d["status"] == "ok":
-                cells.append(f"{d['s']*1000:7.1f}ms")
+                cells.append(f"{d['s']*1000:7.1f}")
                 if d["r0"]:
                     r0s.add(d["r0"])
             elif d["status"] == "crash":
@@ -231,9 +287,9 @@ def main() -> int:
             else:
                 cells.append("N/A")
                 all_ok = False
-        # consistencia R0 (excepto NODET).  El AOT solo propaga los 8 bits
-        # bajos del return (exit code), asi que truncamos los r0 de los modos
-        # VM a 8 bits antes de comparar.
+        # consistencia R0 (excepto NODET).  El AOT y C-nativo solo propagan
+        # los 8 bits bajos del return (exit code), asi que truncamos los r0
+        # de los modos VM a 8 bits antes de comparar.
         def low8(x: str) -> str:
             return format(int(x, 16) & 0xFF, "x")
 
@@ -242,9 +298,34 @@ def main() -> int:
         if not all_ok:
             r0_ok = "!!"
         r0_show = next(iter(r0s)) if r0s else "-"
-        print(f"{row['name']:<34} {cells[0]:>9} {cells[1]:>9} {cells[2]:>9}"
-              + (f" {cells[3]:>9}" if not args.no_aot else "")
-              + f"   {r0_show[:4]:<4} {r0_ok}")
+        # Ratio Vesta vs C: jit-vreg / c-native.  Solo se reporta si el
+        # resultado coincide (low8 igual) -> garantiza que la version C del
+        # bench es funcionalmente equivalente al .vex.  Si difiere, el main.c
+        # esta desactualizado y la comparacion no es justa.
+        ratio = "--"
+        jv = r.get("jit-vreg", {}); cn = r.get("c-native", {})
+        if (jv.get("status") == "ok" and cn.get("status") == "ok"
+                and cn["s"] > 0 and jv.get("r0") and cn.get("r0")):
+            try:
+                jv_low = low8(jv["r0"])
+                cn_clean = cn["r0"].lstrip("0") or "0"
+                if jv_low == cn_clean:
+                    ratio = (f"{jv['s']/cn['s']:6.2f}x"
+                             if jv["s"] <= cn["s"]
+                             else f"{cn['s']/jv['s']:5.2f}xC")
+                else:
+                    ratio = "neq"
+            except Exception:
+                ratio = "--"
+        extra = ""
+        idx = 3
+        if not args.no_aot:
+            extra += f" {cells[idx]:>8}"
+            idx += 1
+        if not args.no_c_native:
+            extra += f" {cells[idx]:>9}"
+        print(f"{row['name']:<30} {cells[0]:>8} {cells[1]:>8} {cells[2]:>8}{extra}"
+              f"{ratio:>8}  {r0_show[:4]:<4} {r0_ok}")
 
     # ---- baseline ----
     if args.save_baseline:

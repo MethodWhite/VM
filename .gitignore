@@ -123,3 +123,6 @@ tests/bugs/m_l789_test/prog.vel
 tests/bugs/m_reexport_plain/base.vel
 tests/bugs/m_reexport_plain/mid.vel
 tests/bugs/README.md
+
+# resultados ad-hoc del runner de benchmarks (los baselines versionados viven en bench_results/)
+bench_result.json

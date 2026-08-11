@@ -61,6 +61,20 @@ bool ir_pass_simplify(IrFunction &fn) {
         return true;
     };
 
+    /* vid -> instr definidora, para folding de casts encadenados
+     * (SEXT(TRUNC(x)), ZEXT(TRUNC(x)), ...). */
+    struct DefInfo { IrBlockId bb; size_t idx; };
+    std::unordered_map<IrValueId, DefInfo> defs;
+    for (size_t bi = 0; bi < fn.blocks.size(); ++bi) {
+        const auto &bb = fn.blocks[bi];
+        for (size_t i = 0; i < bb.instrs.size(); ++i) {
+            const auto &ins = bb.instrs[i];
+            if (ins.dst != IR_NO_VALUE) {
+                defs[ins.dst] = {static_cast<IrBlockId>(bi), i};
+            }
+        }
+    }
+
     for (auto &bb : fn.blocks) {
         for (auto &ins : bb.instrs) {
             switch (ins.op) {
@@ -241,6 +255,22 @@ bool ir_pass_simplify(IrFunction &fn) {
                         rewrite_as_mov(ins, ins.operands[0]);
                         changed = true;
                         break;
+                    }
+                    /* SEXT(TRUNC(x, T)) == TRUNC(x, T): el TRUNC ya deja el
+                     * valor normalizado al ancho del tipo destino (sign-
+                     * extendido si T es signed), asi que el SEXT siguiente
+                     * es un no-op y se colapsa a un MOV del TRUNC.  Evita
+                     * cadenas SEXT(TRUNC(SEXT(...))) en loops con casts. */
+                    {
+                        auto it = defs.find(ins.operands[0]);
+                        if (it != defs.end()) {
+                            const auto &p = fn.blocks[it->second.bb].instrs[it->second.idx];
+                            if (p.op == IrOp::TRUNC && p.type == ins.type) {
+                                rewrite_as_mov(ins, ins.operands[0]);
+                                changed = true;
+                                break;
+                            }
+                        }
                     }
                     int64_t c = 0;
                     if (get_const(ins.operands[0], c)) {

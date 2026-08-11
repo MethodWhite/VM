@@ -1,0 +1,91 @@
+name: SAST + SCA
+
+# Tier S++ SecDevOps §10 (CI/CD y supply chain): SAST y SCA para C/C++.
+#  - SAST: cppcheck (warnings como error en severidades media/alta).
+#  - SCA : clang-tidy con checks de seguridad/calidad sobre las fuentes.
+#  - Secrets ya cubierto por secret-scan.yml (gitleaks); scorecard.yml sube
+#    SARIF a CodeQL (scanning estático de GitHub).
+#
+# Corre en push a ramas principales y en PRs.
+
+on:
+  push:
+    branches: [ release, main, master, develop, "fix/**", "feature/**" ]
+  pull_request:
+    branches: [ release, main, master, develop ]
+
+permissions:
+  contents: read
+
+jobs:
+  sast-sca:
+    name: cppcheck + clang-tidy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install SAST tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cppcheck clang-tidy
+
+      - name: SAST - cppcheck (sources del VM, sin third-party vendored)
+        run: |
+          cppcheck --enable=warning,performance,portability \
+            --error-exitcode=1 \
+            --inline-suppr \
+            --suppress=missingIncludeSystem \
+            --std=c++17 \
+            --quiet \
+            src/ main.cpp 2>&1 || { echo "::error::cppcheck reportó hallazgos"; exit 1; }
+
+      - name: SCA - clang-tidy (checks de seguridad y calidad sobre src/)
+        run: |
+          set -o pipefail
+          # Include dirs del proyecto (sin resolver -I, clang-tidy no encuentra
+          # ir/ir_optimizer.h, json.hpp, cxxopts.hpp, etc.).
+          INCS="-Iinclude -Ilibs/SourceCode/json -Ilibs/SourceCode/cxxopts -Ilibs/SourceCode/capstone/include -Isrc"
+          # Checks de seguridad y de buenas practicas, excluyendo los ruidosos
+          # de estilo (easily-swappable) y los que requieren config de build.
+          CHECKS='clang-analyzer-*,bugprone-*,security-*,-bugprone-easily-swappable-parameters,-clang-analyzer-cplusplus*,clang-diagnostic-*'
+          FILES=$(find src -name '*.cpp' -o -name '*.h' | head -50)
+          if [ -z "$FILES" ]; then
+            echo "no hay fuentes para analizar"
+            exit 0
+          fi
+          FAILED=0
+          for f in $FILES; do
+            out=$(clang-tidy "$f" -checks="$CHECKS" $INCS --quiet 2>&1)
+            # Los diagnostic-errors por includes faltantes son esperables en un
+            # analisis sin compile_commands.json; los warnings reales no.
+            real=$(echo "$out" | grep -E "warning:" | grep -vE "file not found|'ir/|'json|'cxxopts" || true)
+            if [ -n "$real" ]; then
+              echo "$real"
+              FAILED=1
+            fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::clang-tidy reportó hallazgos"
+            exit 1
+          fi
+          echo "clang-tidy: sin hallazgos (checks: ${CHECKS})"
+
+      - name: SCA - dependencias vendored (solo presencia de BOM de versiones)
+        run: |
+          # Las libs third-party viven vendored en libs/SourceCode/.  SCA de
+          # vulnerabilidades CVE requeriria un gestor de dependencias (vcpkg/
+          # Conan); aqui verificamos que cada lib tiene un VERSION o README
+          # identificable para la revision manual por Dependabot-equivalente.
+          MISSING=""
+          for d in libs/SourceCode/*/; do
+            if [ -d "$d" ] && [ -z "$(ls "$d" | grep -iE 'version|readme|license' )" ]; then
+              MISSING="$MISSING $d"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "libs sin VERSION/README/LICENCE identificable:$MISSING"
+            echo "::warning::libs vendored sin metadatos de version - revisar manualmente"
+          else
+            echo "todas las libs vendored tienen metadatos de version/licencia"
+          fi

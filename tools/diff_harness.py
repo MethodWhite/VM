@@ -101,6 +101,7 @@ def run_mode(vm: Path, velb: Path, mode: str, timeout: float, tmp: Path):
         env["VESTA_JIT_VREGS"] = "0"
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
+                           errors="replace",
                            timeout=timeout, env=env, cwd=str(tmp), check=False)
     except subprocess.TimeoutExpired:
         return "timeout", None
@@ -156,7 +157,8 @@ def main() -> int:
         velb = tmp / (name + ".velb")
         try:
             cr = subprocess.run([str(vm), "--vex", str(path), "-o", str(tmp / name)],
-                                capture_output=True, text=True, timeout=120, check=False)
+                                capture_output=True, text=True, errors="replace",
+                                timeout=120, check=False)
         except subprocess.TimeoutExpired:
             cats["NOCOMPILA"].append(name); detail.append({"name": name, "cat": "NOCOMPILA",
                 "note": "compile timeout"}); continue

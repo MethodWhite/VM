@@ -227,3 +227,24 @@ foreach (TEST_FILE ${TEST_FILES})
         set_tests_properties("test_${REL_DIR_SAFE}_${TEST_NAME}" PROPERTIES DISABLED TRUE)
     endif()
 endforeach ()
+# --------------------------------------------------------------------------
+# Regresion del JIT: diff_harness (interp vs jit-vreg vs jit-slots) sobre el
+# corpus.  check_jit_regressions.py falla si aparece un DIVERGE/CRASH que no
+# estaba en el baseline de bugs conocidos (backlog tolerado).
+# Se omite por defecto (etiqueta "regression"): CI puede activarlo con:
+#   ctest -L regression
+# o desactivar el backlog con --filter para una pasada rapida.
+# --------------------------------------------------------------------------
+find_program(VESTA_PYTHON3 python3)
+if (VESTA_PYTHON3)
+    add_test(NAME "jit_regression_diff_harness"
+             COMMAND ${VESTA_PYTHON3}
+                     ${CMAKE_SOURCE_DIR}/tools/check_jit_regressions.py
+                     $<TARGET_FILE:vm>
+                     --timeout 30
+                     --no-benchmarks)
+    set_tests_properties(jit_regression_diff_harness PROPERTIES
+                         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                         LABELS "regression"
+                         TIMEOUT 600)
+endif()

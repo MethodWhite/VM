@@ -1166,6 +1166,90 @@ int main(int argc, char *argv[]) {
     //     -> .velb
     //
     // Ejemplo: vm.exe --vex src/main.vex -o main.velb
+
+    // Modo standalone: vm.exe --vex-emit-ir archivo.vex [-o prefijo]
+    // Emite el SSA IR (pre y post optimizacion) sin compilar a .velb.
+    // El flag tambien funciona combinado con --vex (bloque siguiente).
+    // El archivo .vex se toma del primer argumento posicional (sin --).
+    if (result.count("vex-emit-ir") && !result.count("vex")) {
+        std::string vex_path;
+        if (result.count("positional")) {
+            const auto &pos = result["positional"].as<std::vector<std::string>>();
+            if (!pos.empty()) vex_path = pos[0];
+        }
+        if (vex_path.empty()) {
+            std::cerr << "[vex] --vex-emit-ir requiere un archivo .vex\n";
+            std::cerr << "  uso: vm.exe --vex-emit-ir programa.vex [-o prefijo]\n";
+            return EXIT_FAILURE;
+        }
+        std::ifstream ifs(vex_path);
+        if (!ifs.is_open()) {
+            std::cerr << "[vex] No se puede abrir: " << vex_path << "\n";
+            return EXIT_FAILURE;
+        }
+        std::string vex_source((std::istreambuf_iterator<char>(ifs)),
+                                std::istreambuf_iterator<char>());
+
+        std::string mod_name = "m_main";
+        {
+            std::string raw = vex_path;
+            const size_t slash = raw.find_last_of("/\\");
+            if (slash != std::string::npos) raw = raw.substr(slash + 1);
+            const size_t dot = raw.find_last_of('.');
+            if (dot != std::string::npos) raw = raw.substr(0, dot);
+            if (raw.empty()) raw = "main";
+            if (!(raw[0] >= 'a' && raw[0] <= 'z')
+             && !(raw[0] >= 'A' && raw[0] <= 'Z')
+             && !(raw[0] >= '0' && raw[0] <= '9')) {
+                raw = "m_" + raw;
+            }
+            mod_name = "m_";
+            for (char c : raw) {
+                const bool ok = (c >= 'a' && c <= 'z')
+                             || (c >= 'A' && c <= 'Z')
+                             || (c >= '0' && c <= '9')
+                             || c == '_';
+                mod_name.push_back(ok ? c : '_');
+            }
+            if (mod_name.empty()) mod_name = "m_main";
+        }
+
+        vex::CompileOptions copts;
+        copts.module_name = mod_name;
+        copts.opt_level   = 2;
+        copts.dump_ir     = true;  // habilita CompileResult::ir_text
+        copts.instrument_mode = result["instrument"].as<std::string>();
+        if (copts.instrument_mode != "none"
+         && copts.instrument_mode != "trace"
+         && copts.instrument_mode != "profile") {
+            std::cerr << "[vex] --instrument invalido: "
+                      << copts.instrument_mode
+                      << " (valores: none|trace|profile)\n";
+            return 2;
+        }
+
+        vex::CompileResult cr = vex::compile_vex_source(vex_source, vex_path, copts);
+        if (!cr.ok) {
+            for (const auto &d : cr.diagnostics.all())
+                std::cerr << d.loc.file << ":" << d.loc.line << ": "
+                          << d.message << "\n";
+            std::cerr << "[vex] Error de compilacion de " << vex_path << "\n";
+            return EXIT_FAILURE;
+        }
+
+        std::string ir_path = out_prefix.empty()
+                                ? (mod_name + ".ir")
+                                : (out_prefix + ".ir");
+        std::ofstream ofs_ir(ir_path);
+        if (!ofs_ir.is_open()) {
+            std::cerr << "[vex] No se puede escribir: " << ir_path << "\n";
+            return EXIT_FAILURE;
+        }
+        ofs_ir << cr.ir_text;
+        vesta::scout() << "[vex] .ir generado: " << ir_path << "\n";
+        return EXIT_SUCCESS;
+    }
+
     if (result.count("vex")) {
         const std::string &vex_path = result["vex"].as<std::string>();
         bool emit_only = result.count("vex-emit-only") > 0;

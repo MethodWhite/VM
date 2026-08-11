@@ -135,3 +135,43 @@ vexfmt --check src/
 # Lint with CI mode
 vexlint --ci src/
 ```
+
+## bench_runner.py
+
+Runner comparativo de benchmarks para VestaVM.  Compila cada `bench_*.vex`,
+lo ejecuta en los modos interp / jit-vreg / jit-slots (y opcionalmente AOT),
+mide el wall-time, valida que el resultado (R0) sea consistente entre modos y
+detecta regresiones comparando contra un baseline guardado.
+
+```bash
+# Corrida completa (sin AOT), guardando baseline:
+python tools/bench_runner.py ./build/vm --no-aot --save-baseline build/bench_baseline.json
+
+# Comparar contra un baseline y detectar regresiones (> x1.5):
+python tools/bench_runner.py ./build/vm --baseline build/bench_baseline.json --threshold 1.5
+
+# Solo un bench:
+python tools/bench_runner.py ./build/vm --filter tight_loop --no-aot
+```
+
+Los baselines versionados de rendimiento viven en `bench_results/`.
+
+## check_jit_regressions.py
+
+Gate de CI para regresiones del JIT.  Corre `diff_harness.py` (interp vs
+jit-vreg vs jit-slots sobre el corpus) y FALLA si aparece un DIVERGE/CRASH
+que no estaba en el baseline de bugs conocidos (`bench_results/known_jit_bugs.json`).
+El backlog conocido se tolera; solo se bloquean los bugs NUEVOS.
+
+```bash
+python tools/check_jit_regressions.py ./build/vm --timeout 30 --no-benchmarks
+```
+
+Integrado en CTest como `jit_regression_diff_harness` (etiqueta `regression`):
+
+```bash
+ctest -L regression
+```
+
+Para regenerar el baseline de bugs conocidos tras arreglar un bug del JIT:
+corre `diff_harness.py` y copia el resultado a `bench_results/known_jit_bugs.json`.

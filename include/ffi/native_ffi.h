@@ -127,8 +127,12 @@ namespace ffi {
      */
     static inline void patch_call(uint8_t *bytecode_base, uint32_t off, void *fn) {
         uint64_t  addr          = reinterpret_cast<uint64_t>(fn); /* convierte puntero a entero de 64 bits */
-        uint64_t *address_patch = reinterpret_cast<uint64_t *>(bytecode_base + off);
-        *address_patch          = addr; /* escribe la direccion en el bytecode */
+        /* memcpy en vez de store directo: el offset del CALLN en el bytecode
+         * no es multiplo de 8 (los CALLN pueden estar en cualquier offset) y
+         * un store uint64 desalineado es UB (UBSan lo reporta; en x86 el
+         * hardware lo tolera pero puede cruzar un limite de pagina).  memcpy
+         * se compila al mismo store alineado cuando es posible y es definido. */
+        std::memcpy(bytecode_base + off, &addr, sizeof(addr));
     }
 
     /**

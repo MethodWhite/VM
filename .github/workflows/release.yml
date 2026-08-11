@@ -1,0 +1,95 @@
+name: Release (SBOM + checksums + SLSA)
+
+# Tier S++ §10 / §29.3 + S-10: integridad de releases.
+# En cada tag v* se genera:
+#   - binario vm compilado en Release
+#   - checksums.sha256 de los artefactos
+#   - SBOM CycloneDX (components: libs vendored + binario)
+#   - subida a GitHub Release (softprops/action-gh-release)
+# SLSA provenance se añade con slsa-framework/slsa-github-action (se puede
+# activar al hacer el release definitivo; documentado aqui como requisito).
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  packages: write
+
+jobs:
+  release:
+    name: Build + SBOM + checksums
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Build vm (Release)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DVESTA_BUILD_STDLIB=ON
+          cmake --build build --target vm --parallel 2
+
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          # SBOM simple para C/C++ con libs vendored: lista cada componente
+          # vendored con su ruta.  Un SBOM completo de C/C++ requiere un
+          # generador (syft/cyclonedx-cmake) — aqui se emite el JSON canonico
+          # CycloneDX v1.4 con los components conocidos.
+          TAG="${GITHUB_REF_NAME#v}"
+          python3 - "$TAG" <<'PY'
+          import json, sys, pathlib
+          tag = sys.argv[1]
+          comps = []
+          for d in sorted(pathlib.Path('libs/SourceCode').iterdir()):
+              if d.is_dir():
+                  comps.append({
+                      "type": "library",
+                      "name": d.name,
+                      "version": "vendored",
+                      "group": "libs.SourceCode",
+                  })
+          comps.append({"type": "application", "name": "vm", "version": tag,
+                        "group": "VestaVM"})
+          bom = {
+              "bomFormat": "CycloneDX",
+              "specVersion": "1.4",
+              "version": 1,
+              "metadata": {"component": comps[-1]},
+              "components": comps,
+          }
+          pathlib.Path('sbom.json').write_text(json.dumps(bom, indent=2))
+          print(f"SBOM: {len(comps)} components")
+          PY
+
+      - name: Generate checksums + artifacts
+        run: |
+          mkdir -p release-artifacts
+          cp build/vm release-artifacts/vm-linux-x86_64
+          cp sbom.json release-artifacts/sbom.json
+          cd release-artifacts
+          sha256sum vm-linux-x86_64 sbom.json > checksums.sha256
+          cat checksums.sha256
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/*
+          generate_release_notes: true
+
+      # SLSA provenance: genera attestation de que el artefacto fue build por
+      # este workflow.  Requiere id-token: write + attestations: write (ya
+      # declarados).  Activar para releases definitivos.
+      # - name: Generate SLSA provenance
+      #   uses: slsa-framework/slsa-github-action@v2.1.0
+      #   with:
+      #     artifact-name: vm-linux-x86_64
+      #     digest: ${{ env.DIGEST }}

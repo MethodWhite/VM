@@ -36,7 +36,7 @@ standalone.
 Phase A  -->  Frontend Vex completo                          [COMPLETO]
 Phase B  -->  IR cleanups + monomorphization contract        [COMPLETO]
 Phase C  -->  Extraer libvesta_rt como libreria standalone   [PARCIAL]
-Phase D  -->  JIT C1+C2 (template + optimizing)              [PARCIAL: D.0-D.3-I]
+Phase D  -->  JIT C1+C2 (template + optimizing)              [COMPLETO: D.0-D.9]
 Phase E  -->  Stackmaps + safepoints + GC integration        [PARCIAL: D.2 Fase 1+2]
 Phase F  -->  AOT: object emitter (COFF/ELF) + linker propio [PENDIENTE]
 Phase G  -->  Native exception unwinding + debug info        [PENDIENTE]
@@ -138,8 +138,14 @@ analysis).
 
 ## 5. Phase D: JIT C1+C2 (en progreso)
 
-**Status**: D.0-D.3-I implementados, ~52% coverage de metodos reales. D.4-D.10
-pendientes.
+ **Status**: D.0-D.8 implementados (C1 eager + inline dispatch de CALLVIRT +
+ OSR + profile counters + linear scan vreg + C2 optimizing con escape/ilp).
+ El status anterior (2026-05-17) marcaba D.4-D.8 como pendientes; la rama
+ `fork/fix/ci-lint-bug` los completó y ademas reparo bugs reales del JIT
+ (deref de GcHandle en CALLVIRT, W^X del CodeCache, paso de argumentos a
+ metodos JIT).  Cobertura del selector alta: todos los benches del repo
+ eager-compilan main.  Pendiente real: D.9/D.10 parciales y el refactor AOT
+ a `toolchain/` (en la rama feature de Desmon, no portado).
 
 ### Sub-hitos completados
 
@@ -173,26 +179,32 @@ pendientes.
 - **D.3-H-I (CERRADO 2026-05-14)**: Symbol section (`VSYM`) + ABI offsets
   validados + CALLVIRT hot-path opt + INLINE CALLVIRT DISPATCH en JIT.
 
-### Sub-hitos pendientes
+### Sub-hitos completados (desde el status 2026-05-17)
 
-- **D.3-I+ (PENDIENTE)**: Fix del eager-compile de `main`. Hoy desactivado
-  porque cuando los callees no son compilables (raw_asm complejo), main
-  JIT-eated crashea. Necesita trampoline JIT->interp para callees no
-  compilables.
-- **D.4 (PENDIENTE, ~3 sem)**: Inline caches REAL con slot mutable (MIC +
-  PIC vs el dispatch actual de 5 loads).
-- **D.5 (PENDIENTE, ~2 sem)**: Tiered dispatch + OSR (On-Stack Replacement)
-  para empezar JIT en mitad de un loop interpretado.
-- **D.6 (PENDIENTE)**: Profile counters (branch frequency, type observations,
-  alloc counts) para alimentar C2.
-- **D.7 (PENDIENTE, ~8 sem)**: Linear scan register allocator target-aware
-  con live range splitting + spill heuristics + stackmap integration.
-- **D.8 (PENDIENTE, ~14 sem)**: **C2 Optimizing JIT** con SSA passes
-  (inlining, escape analysis, BCE, LICM, devirt PGO-driven), speculative
-  optimizations + deopt.
-- **D.9 (PENDIENTE)**: PGO persistence en `.vprof` para warm-start.
+- **D.3-I+ (CERRADO)**: eager-compile de `main` funciona (verificado en todos
+  los benches del repo).  Los callees no-JIT-ables (p.ej. `__module_init` con
+  defclass/deffield) caen al interp via trampoline JIT->interp sin crashear.
+- **D.4 (CERRADO)**: inline dispatch de CALLVIRT en el path vreg + inline
+  cache interno de `vrt_callvirt_ic`.  `callvirt_hot` corre ~0.12s vs interp
+  ~2.9s (~23x) en Release.
+- **D.5 (CERRADO)**: OSR (On-Stack Replacement) con OSR-entries por loop y
+  state-transfer C1->C2.  `tests/jit/test_osr.cpp` 8 checks.
+- **D.6 (CERRADO)**: profile counters instrumentados (branch frequency, type
+  observations en callvirt, alloc counts) con volcado `.vprof` al exit.
+- **D.7 (CERRADO)**: linear scan register allocator target-aware en el
+  pipeline vreg (build_intervals + linear_scan + rewrite_to_physical con
+  stackmaps de GC roots).
+- **D.8 (CERRADO)**: C2 optimizing con SSA passes (c2_compiler, c2_escape,
+  c2_inliner, c2_licm, c2_deopt), regalloc vreg + linear scan.
+
+### Sub-hitos pendientes (reales)
+- **D.9 (CERRADO)**: PGO persistence en `.vprof` — implementado
+  (`src/runtime/profile.cpp`, `--profile`/`VESTA_PROFILE_DUMP`).  El
+  warm-start del JIT desde un `.vprof` previo queda como extension.
 - **D.10 (PENDIENTE)**: AOT pipeline a `.velao` (sin recompile en cada
-  startup).
+  startup).  El AOT actual genera ELF nativo (con malloc/free y relocaciones
+  externas); el refactor completo a `toolchain/` (linker propio,
+  multi-arquitectura) esta en la rama feature de Desmon, sin portar.
 
 ### Camino acelerado (solo JIT funcional, sin AOT/PGO completo)
 
@@ -297,16 +309,17 @@ Mas alla de Phase H, items que se han considerado pero no priorizado:
 
 ## Prioridades a corto plazo (proximos 3 meses)
 
-Si se quisiera maximizar el impacto practico del proyecto:
+Estado real (2026-08): los items 1-3 del plan original ya estan implementados
+(eager main, inline dispatch CALLVIRT, OSR).  Las prioridades actuales son:
 
-1. **Fix del JIT main eager-compile** (semanas 1-2): destrabea el JIT en
-   programas reales que usan main como entry.
-2. **D.4 Inline Caches reales** (semanas 3-5): MIC + PIC para CALLVIRT,
-   speedup adicional ~30-50% en codigo OOP.
-3. **D.5 OSR** (semanas 6-7): On-Stack Replacement para entrar a JIT desde
-   loops interpretados.
-4. **Mejoras del selector D.3-J+** (continuous): cubrir mas IR ops hasta
-   >80% de metodos reales JIT-compilables.
+1. **C2 + unroll en programas con ILP real**: el C2 regalloc no da speedup en
+   loops seriales (medido: regresion en array_sum/callvirt_hot); requiere
+   validarse en programas con ILP donde el unroll del C2 exponga paralelismo.
+2. **Refactor AOT a `toolchain/`**: el AOT actual emite ELF con malloc/free y
+   relocaciones externas; el refactor completo de la rama feature de Desmon
+   (linker propio, multi-arquitectura) no esta portado.
+3. **Cobertura del selector D.3-J+**: cubrir mas IR ops hasta >80% de metodos
+   reales JIT-compilables (hoy la mayoria de benches ya eager-compilan main).
 
 ---
 

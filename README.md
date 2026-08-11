@@ -358,8 +358,13 @@ portables sin arrastrar la infraestructura nueva:
 **Bloqueado por infraestructura de feature que no existe en esta rama**:
 - **Refactor AOT a `toolchain/`**: ~10K líneas (linker propio, object_writer,
   multi-arquitectura x86_16/32/64, cache de dependencias) + `stdlib/vx`
-  renombrada.  El AOT actual de esta rama es básico (aritmética simple; el
-  LOAD de arrays cae al selector no-soportado).
+  renombrada.  El AOT actual de esta rama ya soporta: aritmética, structs,
+  punteros, loops, malloc/free (RAW_ALLOC→malloc de libc), CALLN a la stdlib
+  (vio_* → símbolos externos + link del plugin vesta_io.so), literales de
+  string (STR_LIT_ADDR → relocación a .rodata), y el tier BARE genera un
+  ejecutable directo ejecutable (chmod 0755).  Queda pendiente el STRMAKE
+  (StringObject con runtime GC enlazado) y las relocaciones a símbolos del
+  runtime — el núcleo del refactor `toolchain/`.
 - **ASA / análisis semántico avanzado**, **asm elevado a IR**, **análisis de
   efectos** (`analysis/effects`), **optimización de literales como vistas
   `.rodata`** (Desmon `f4791606`).

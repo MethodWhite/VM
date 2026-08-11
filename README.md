@@ -375,6 +375,17 @@ portables sin arrastrar la infraestructura nueva:
 - **Binop interpolado con "tipo void"**: `s = s + "a ${x}"` fallaba de
   compilación porque el type checker excluía los literales interpolados de
   `is_str_lit` → ahora los incluye.
+- **Inline dispatch de CALLVIRT sobre objetos GC** (commit `d3ac37fa`): leía
+  `[handle]` como ObjectHeader (basura → SIGSEGV); ahora dereferencia el
+  GcHandle del receptor antes del walk del class_ptr.
+
+**Bug de backend pendiente (para una sesión dedicada de JIT)**:
+- **`benchmarks/callvirt_hot` crashea en JIT** (SIGSEGV) aunque el intérprete
+  lo maneja bien: el método `inc()` compilado (LOAD/STORE de campos de objeto
+  GC) crashea en ambos selectors (vreg y clásico).  El deref del receptor en
+  CALLVIRT ya está arreglado; el fallo está en el cuerpo del método con
+  campos.  Se documenta para diagnóstico con el disasm del código JIT en
+  runtime.
 
 ### Comparativa multi-lenguaje (workloads idénticos)
 

@@ -308,6 +308,7 @@ namespace aot {
                                        std::vector<uint8_t> &code,
                                        std::unordered_map<std::string, uint64_t> &sym_offsets,
                                        const std::function<uint64_t(const std::string &)> &resolve_user_fn,
+                                       const std::function<uint64_t(const std::string &)> &resolve_native_fn,
                                        std::vector<std::pair<size_t, uint64_t>> *out_user_call_sites) {
         // 1. Calcular liveness
         ir::LivenessResult liveness;
@@ -327,6 +328,7 @@ namespace aot {
         jit::SelectorOptions sel_opts;
         sel_opts.mode = selector_mode_for_tier(options_.tier);
         sel_opts.resolve_user_fn = resolve_user_fn;
+        sel_opts.resolve_native_fn = resolve_native_fn;
 
         /* Diagnostico: si VESTA_JIT_WARN esta activo, que el selector
          * emita el detalle de la op no soportada DURANTE la seleccion. */
@@ -406,6 +408,10 @@ namespace aot {
              * y los vrt_*).  Fuera del texto (0x400000+); el AOT las mapea a
              * los simbolos SHN_UNDEF en las relocaciones. */
             const uint64_t AOT_RT_BASE = 0x600000u;
+            /* Vaddr reservada para un simbolo externo (runtime o stdlib).
+             * Fuera del texto; el AOT la mapea al simbolo SHN_UNDEF.  Se
+             * indexa por un hash del nombre para que sea estable entre
+             * compilaciones del mismo programa. */
             auto rt_sym_vaddr = [&](const std::string &name) -> uint64_t {
                 static const std::vector<std::string> order = {
                     "vrt_gc_alloc","vrt_gc_alloc_pinned","vrt_gc_deref",
@@ -418,6 +424,45 @@ namespace aot {
                     if (order[i] == name) return AOT_RT_BASE + i * 0x1000;
                 return 0;
             };
+            /* Vaddr para un CALLN de la stdlib ("lib:func", p.ej.
+             * "stdlib/native/io/vesta_io:vio_println").  Usa un rango alto
+             * (0x700000+) indexado por el nombre de la funcion, de modo que
+             * cada helper de stdlib obtenga una vaddr estable. */
+            const uint64_t AOT_LIB_BASE = 0x700000u;
+            auto lib_fn_vaddr = [&](const std::string &func_name) -> uint64_t {
+                const size_t colon = func_name.find(':');
+                if (colon == std::string::npos) return 0;
+                const std::string fn = func_name.substr(colon + 1);
+                if (fn.empty()) return 0;
+                uint64_t h = 1469598103934665603ULL;
+                for (unsigned char c : fn) {
+                    h ^= c;
+                    h *= 1099511628211ULL;
+                }
+                return AOT_LIB_BASE + (h & 0xFFFFu) * 0x1000;
+            };
+            /* Resolver de CALLN nativo: el selector lo usa para los CALLN a
+             * la stdlib (io, math, ...).  Devuelve la vaddr reservada; las
+             * relocaciones la mapean al simbolo SHN_UNDEF que el link
+             * resuelve contra el plugin.  Si no se resuelve, el selector
+             * marca unsupported (falla el AOT, como antes). */
+             /* Nombres de las funciones de stdlib usadas: vaddr reservada ->
+              * nombre simple (p.ej. "vio_println"), para crear los simbolos
+              * SHN_UNDEF y relocalizar los CALLN. */
+             std::unordered_map<uint64_t, std::string> g_lib_syms;
+             auto aot_native_resolver =
+                 [&](const std::string &name) -> uint64_t {
+                 const uint64_t rv = lib_fn_vaddr(name);
+                 if (rv != 0) {
+                     const size_t colon = name.find(':');
+                     if (colon != std::string::npos)
+                         g_lib_syms[rv] = name.substr(colon + 1);
+                     return rv;
+                 }
+                 /* tambien los runtime syms por si el CALLN los nombra. */
+                 const uint64_t r2 = rt_sym_vaddr(name);
+                 return r2;
+             };
             uint64_t cur_fn_offset = 0; // offset del texto de la fn en curso
             auto aot_resolver = [&](const std::string &name) -> uint64_t {
                 auto it = fn_offsets.find(name);
@@ -448,7 +493,7 @@ namespace aot {
                 current_fn_name_ = fn.name;
                 cur_fn_offset    = offset_before;
                 if (!compile_function(fn, text_code, fn_offsets, aot_resolver,
-                                      &user_call_sites)) {
+                                      aot_native_resolver, &user_call_sites)) {
                     current_fn_name_.clear();
                     result.error = "Fallo al compilar funcion: " + fn.name;
                     return false;
@@ -604,16 +649,30 @@ namespace aot {
             auto rt_syms = resolve_runtime_symbols();
             uint32_t extern_sym_idx = static_cast<uint32_t>(symbols.size());
 
-            for (const auto &rt : rt_syms) {
-                SymbolInfo sym;
-                sym.name  = rt.first;
-                sym.info  = st_info(STB_GLOBAL, STT_NOTYPE);
-                sym.other = STV_DEFAULT;
-                sym.shndx = SHN_UNDEF;  // simbolo externo no definido
-                sym.value = 0;
-                sym.size  = 0;
-                symbols.push_back(sym);
-            }
+             for (const auto &rt : rt_syms) {
+                 SymbolInfo sym;
+                 sym.name  = rt.first;
+                 sym.info  = st_info(STB_GLOBAL, STT_NOTYPE);
+                 sym.other = STV_DEFAULT;
+                 sym.shndx = SHN_UNDEF;  // simbolo externo no definido
+                 sym.value = 0;
+                 sym.size  = 0;
+                 symbols.push_back(sym);
+             }
+
+             /* Simbolos externos de la stdlib (vio_*, vmath_*, ...): un
+              * SHN_UNDEF por cada funcion usada, para que el linker resuelva
+              * el CALLN contra el plugin. */
+             for (const auto &[vaddr, name] : g_lib_syms) {
+                 SymbolInfo sym;
+                 sym.name  = name;
+                 sym.info  = st_info(STB_GLOBAL, STT_NOTYPE);
+                 sym.other = STV_DEFAULT;
+                 sym.shndx = SHN_UNDEF;
+                 sym.value = 0;
+                 sym.size  = 0;
+                 symbols.push_back(sym);
+             }
 
             // Relocaciones: por ahora placeholder para _start -> main
             // En un sistema real, el linker (ld) resuelve estas.
@@ -636,17 +695,21 @@ namespace aot {
                     if (symbols[si].shndx == text_shndx && !symbols[si].name.empty())
                         name_to_symidx[symbols[si].name] = si + 1; // +STN_UNDEF
                 }
-                /* Simbolos externos del runtime (malloc/free/...): tambien
-                 * relocables.  Sus vaddrs reservadas (AOT_RT_BASE+i) se
-                 * mapean al nombre para que un user-call de RAW_ALLOC/RAW_FREE
-                 * genere la relocacion al simbolo SHN_UNDEF. */
-                for (uint32_t si = 0; si < symbols.size(); ++si) {
-                    if (symbols[si].shndx == SHN_UNDEF && !symbols[si].name.empty()) {
-                        const uint64_t rv = rt_sym_vaddr(symbols[si].name);
-                        if (rv != 0) vaddr_to_name[rv] = symbols[si].name;
-                        name_to_symidx[symbols[si].name] = si + 1;
-                    }
-                }
+                 /* Simbolos externos del runtime (malloc/free/...): tambien
+                  * relocables.  Sus vaddrs reservadas (AOT_RT_BASE+i) se
+                  * mapean al nombre para que un user-call de RAW_ALLOC/RAW_FREE
+                  * genere la relocacion al simbolo SHN_UNDEF. */
+                 for (uint32_t si = 0; si < symbols.size(); ++si) {
+                     if (symbols[si].shndx == SHN_UNDEF && !symbols[si].name.empty()) {
+                         const uint64_t rv = rt_sym_vaddr(symbols[si].name);
+                         if (rv != 0) vaddr_to_name[rv] = symbols[si].name;
+                         name_to_symidx[symbols[si].name] = si + 1;
+                     }
+                 }
+                 /* Simbolos de la stdlib: mapear su vaddr reservada al nombre
+                  * para que el CALLN genere la relocacion. */
+                 for (const auto &[vaddr, name] : g_lib_syms)
+                     vaddr_to_name[vaddr] = name;
 
                 for (const auto &[pos, vaddr] : user_call_sites) {
                     auto it = vaddr_to_name.find(vaddr);

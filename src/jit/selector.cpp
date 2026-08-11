@@ -2780,6 +2780,13 @@ namespace jit {
                             break;
                         }
                         uint64_t fn_addr = opts_.resolve_native_fn(ins.func_name);
+                        /* El AOT resuelve los CALLN a la stdlib como vaddrs
+                         * reservadas que debe relocalizar al simbolo externo.
+                         * Marcar el imm64 como user-call para que el encoder
+                         * registre su posicion y el AOT genere la relocacion.
+                         * En JIT la direccion es el fn_ptr real del plugin y
+                         * el registro es inofensivo (el JIT no relocaliza). */
+                        const bool ext_calln = (fn_addr != 0);
                         if (fn_addr == 0) {
                             if (jit::g_jit_warn_unsupported) {
                                 auto key = std::make_pair(static_cast<int>(ins.op), ins.source_line);
@@ -2825,6 +2832,13 @@ namespace jit {
 
                         /* mov rax, fn_addr (via imm64 pool). */
                         const uint32_t fn_pool_idx = mf.intern_imm64(fn_addr);
+                        if (ext_calln) {
+                            bool already = false;
+                            for (uint32_t v : mf.user_call_imm64_indices)
+                                if (v == fn_pool_idx) { already = true; break; }
+                            if (!already)
+                                mf.user_call_imm64_indices.push_back(fn_pool_idx);
+                        }
                         mf.blocks.back().instrs.push_back(
                             MInstr::make_unary(MOp::MOV,
                                 MOperand::make_reg(MReg::RAX),

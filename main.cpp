@@ -1105,6 +1105,9 @@ int main(int argc, char *argv[]) {
             const std::string exe_dir =
                 std::filesystem::path(fs::get_executable_path()).parent_path().string();
             const std::string rt_lib = exe_dir + "/libvmcore.a";
+            /* Plugin de la stdlib nativa (io): resuelve los CALLN a
+             * vio_* (println, etc.) que el AOT emite como simbolos externos. */
+            const std::string io_so = exe_dir + "/stdlib/native/io/vesta_io.so";
             /* Link con g++ -no-pie.  Nota: los CALLs entre funciones del AOT
              * usan vaddr absolutas (0x400000+offset) que no sobreviven al
              * link (el .text del .o se reubica tras el runtime) -> los CALLs
@@ -1112,13 +1115,13 @@ int main(int argc, char *argv[]) {
              * relocaciones PC32 (siguiente paso del port AOT). */
             const std::string link_cmd =
                 std::string("g++ -no-pie -o ") + out_path + " " + obj_path + " " +
-                rt_lib +
+                rt_lib + " " + io_so +
                 " -L" + exe_dir + "/src/vex -lvex_lib" +
                 " -L" + exe_dir + "/preprocessor -lvpp_lib" +
                 " -L" + exe_dir + " -lsqlite3" +
                 " -L" + exe_dir + "/libs/SourceCode/capstone -lcapstone" +
                 " -L" + exe_dir + "/libs/SourceCode/keystone/llvm/lib -lkeystone" +
-                " -lc -lpthread -lssl -lcrypto 2>&1";
+                " -lc -lpthread -lssl -lcrypto -Wl,-rpath," + exe_dir + "/stdlib/native/io 2>&1";
             const int lrc = std::system(link_cmd.c_str());
             if (lrc != 0) {
                 std::cerr << "[aot] Link fallo (g++).  Tier "

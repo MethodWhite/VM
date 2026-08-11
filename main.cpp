@@ -55,6 +55,9 @@
 #include "install/install.h"
 
 #include <filesystem>
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
 #include <map>     // Phase MC.16: per-macro manifest map
 #include <set>     // Phase MC.16: manifest diff seen-set
 #include <cctype>  // Phase MC.16: isalnum en find_macro_ranges_with_names
@@ -1140,6 +1143,11 @@ int main(int argc, char *argv[]) {
             ofs.write(reinterpret_cast<const char *>(ar.executable.data()),
                       static_cast<std::streamsize>(ar.executable.size()));
             ofs.close();
+            /* El BARE genera el ELF directo; el linker de g++ no corre, asi
+             * que no hereda el bit de ejecucion.  Añadirlo explicitamente. */
+#if !defined(_WIN32)
+            ::chmod(out_path.c_str(), 0755);
+#endif
         }
         std::cerr << "[aot] " << out_path << ": " << ar.executable.size()
                   << " bytes (code=" << ar.code_size

@@ -224,6 +224,10 @@ namespace jit {
                 if (remainder >= 64u) {
                     free_list_.push_back({ret + size, remainder});
                 }
+                /* W^X: la pagina puede estar RX (una funcion previa de la
+                 * misma pagina se commit-eo).  El caller va a escribir el
+                 * codigo (memcpy) antes del commit: asegurar RW aqui. */
+                transition_to_writable(ret, size);
                 return ret;
             }
         }
@@ -249,6 +253,10 @@ namespace jit {
                     // padding por alignment).  Usado para reportes de
                     // memory usage al usuario.
                     used_            += c.used - prev;
+                    /* W^X: asegurar que la pagina del chunk es RW antes de
+                     * que el caller escriba el codigo (una funcion previa en
+                     * la misma pagina pudo commit-earla a RX). */
+                    transition_to_writable(ptr, size);
                     return ptr;
                 }
             }

@@ -666,6 +666,7 @@ namespace loader {
 
         GlobalPID           pid      = vm.spawn_process();
         runtime::ProcessVM *proccess = vm.get_process(pid);
+        proccess->is_root = true;   // el proceso main es la raiz de la ejecucion
 
         // configuramos RIP (PC tambien llamado)
         proccess->registers.rip.qword(exe->init_pc);

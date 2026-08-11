@@ -317,7 +317,10 @@ namespace runtime {
 
             if (!instance) {
                 // no hay procesos listos; verificar si quedan procesos vivos en toda la VM
-                if (!vm_reference.has_alive_processes()) {
+                // (o si el raiz main ya termino -> la ejecucion esta completa aunque
+                // queden hijos huerfanos; esos se limpian en el destructor).
+                if (!vm_reference.has_alive_processes()
+                 || vm_reference.root_finished.load(std::memory_order_acquire)) {
                     if (!vm_reference.vm_persistent) {
                         // perf: notificar al hilo principal
                         // via condition_variable para evitar el polling
@@ -380,6 +383,14 @@ namespace runtime {
                  * done_cv.wait() -> deadlock visible como "[jit] eager-
                  * compiled main (...)" + cuelgue. */
                 alive_count--;
+                /* PROPIEDAD NATIVA del runtime: cuando el proceso raiz (main)
+                 * termina, marcar root_finished para que la VM salga sin
+                 * esperar a los hijos huerfanos (spawn) que puedan quedar
+                 * vivos (p.ej. wait() sin notify) -> evita zombies que
+                 * cuelgan la ejecucion.  El main JIT retorna aqui -> es el
+                 * punto de cierre de la ejecucion de main. */
+                if (instance->is_root)
+                    kill_orphans(instance);
                 continue;  /* volver al outer loop a buscar otro proceso */
             }
 
@@ -955,6 +966,11 @@ namespace runtime {
                         if (instance->state.load(std::memory_order_relaxed) == HALT
                          || instance->state.load(std::memory_order_relaxed) == DEAD) {
                             alive_count--;
+                            /* Propiedad nativa: al terminar el raiz (main),
+                             * marcar root_finished para no colgar la VM
+                             * esperando hijos huerfanos. */
+                            if (instance->is_root)
+                                kill_orphans(instance);
                             DIST_DBG("SCHED %u: proceso PID=(sched=%u local=%llu) -> %s  "
                                      "r0=%llu err=%d tsc=%llu PC=0x%llX",
                                      id_scheduler,
@@ -1298,6 +1314,8 @@ namespace runtime {
                     if (instance->state.load(std::memory_order_relaxed) == HALT
                      || instance->state.load(std::memory_order_relaxed) == DEAD) {
                         alive_count--; // decrementar el contador de procesos vivos
+                        if (instance->is_root)
+                            kill_orphans(instance);
                         DIST_DBG("SCHED %u: proceso PID=(sched=%u local=%llu) -> %s  "
                                  "r0=%llu err=%d tsc=%llu PC=0x%llX",
                                  id_scheduler,
@@ -1409,6 +1427,8 @@ namespace runtime {
                     // comprobar si el proceso alcanzo un estado terminal o bloqueante
                     if (instance->state == DEAD || instance->state == HALT) {
                         alive_count--; // decrementar el contador de procesos vivos
+                        if (instance->is_root)
+                            kill_orphans(instance);
                         DIST_DBG("SCHED %u (slow): proceso PID=(sched=%u local=%llu) -> %s  "
                                  "r0=%llu err=%d tsc=%llu PC=0x%llX",
                                  id_scheduler,
@@ -1645,6 +1665,22 @@ namespace runtime {
                 break;
             }
         }
+    }
+
+    void Scheduler::kill_orphans(ProcessVM *root) {
+        (void)root;
+        /* Propiedad nativa del runtime: cuando main termina, la ejecucion se
+         * considera completada.  Marcar root_finished + vm_running=false para
+         * que TODOS los schedulers salgan del run_loop (el chequeo de salida
+         * es `!has_alive_processes() || root_finished`), sin esperar a los
+         * procesos hijo huerfanos (spawn) que puedan quedar vivos esperando
+         * (p.ej. wait() sin notify).  NO se matan los procesos directamente:
+         * un spawn con frame JIT activo no debe liberarse en medio del run_loop
+         * (use-after-free); se deja que la VM salga y el destructor del
+         * scheduler limpie los unique_ptr. */
+        vm_reference.root_finished.store(true, std::memory_order_release);
+        vm_reference.vm_running.store(false, std::memory_order_release);
+        vm_reference.done_cv.notify_all();
     }
 
     /**

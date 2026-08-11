@@ -282,6 +282,15 @@ namespace runtime {
         void kill(GlobalPID pid);
 
         /**
+         * @brief Mata todos los procesos vivos de la VM excepto el raiz
+         * (main) que acaba de terminar.  Evita que procesos hijo huerfanos
+         * (spawn) dejen la VM colgada esperando a que terminen.
+         *
+         * @param root El proceso raiz que termino (no se toca a si mismo).
+         */
+        void kill_orphans(ProcessVM *root);
+
+        /**
          * @brief Crea un nuevo proceso virtual dentro de este scheduler.
          *
          * Asigna un PID local, construye el ProcessVM y lo registra en pid_index.

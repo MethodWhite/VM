@@ -368,6 +368,13 @@ namespace runtime {
 
         GlobalPID pid; ///< Identificador global del proceso (scheduler_id + local_pid)
 
+        /// 1 si este proceso es el RAIZ de la ejecucion (el "main" creado por
+        /// load_executable).  Cuando el raiz termina, la VM considera la
+        /// ejecucion completada y los procesos hijo huerfanos (spawn) deben
+        /// morir con el — evitando que un main que retorna deje la VM colgada
+        /// esperando a hijos que nunca terminan (zombies virtuales).
+        bool is_root = false;
+
         /**
          * @brief Contador de reducciones restantes antes del proximo cambio de contexto.
          *

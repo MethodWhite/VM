@@ -292,6 +292,10 @@ namespace runtime {
         }
 
         std::atomic<bool> vm_running{true};      ///< true mientras haya schedulers en ejecucion
+        /// true cuando el proceso raiz (main) termino.  Permite que la VM
+        /// salga aunque queden procesos hijo huerfanos (spawn) vivos, evitando
+        /// zombies que cuelgan la ejecucion.
+        std::atomic<bool> root_finished{false};
         std::atomic<bool> vm_persistent{false};  ///< si true, el scheduler espera nuevos procesos en lugar de terminar al quedarse sin trabajo
 
         size_t num_schedulers; ///< Numero de schedulers creados al inicializar la VM

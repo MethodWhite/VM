@@ -79,6 +79,19 @@ jobs:
           sha256sum vm-linux-x86_64 sbom.json > checksums.sha256
           cat checksums.sha256
 
+      # Crypto post-cuantico (S-20): firmar los checksums con ML-DSA (FIPS 204)
+      # para integridad resistente a cuantico de los artefactos de release.
+      # Se genera una clave efimera ML-DSA-44 por release; la publica se
+      # adjunta y debe registrarse fuera de banda (KEV/PKI).
+      - name: Sign checksums with ML-DSA (post-quantum)
+        run: |
+          cd release-artifacts
+          openssl genpkey -algorithm ML-DSA-44 -out ml-dsa-release.key 2>/dev/null
+          openssl pkey -in ml-dsa-release.key -pubout -out ml-dsa-release.pub 2>/dev/null
+          openssl dgst -provider default -sign ml-dsa-release.key \
+            -out checksums.sha256.mldsa.sig checksums.sha256
+          ls -la checksums.sha256* ml-dsa-release.pub
+
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:

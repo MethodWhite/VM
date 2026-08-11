@@ -182,3 +182,33 @@ jobs:
             exit 1
           fi
         timeout-minutes: 10
+
+  # S-22 testing-quality / mini-ASA: verificar que el asm emitido por el JIT
+  # es semanticamente equivalente al IR (cada op IR -> instruccion nativa,
+  # no CALL a vmath).  Falla si hay un gap de EQUIVALENCIA (op IR sin nativa).
+  # Los gaps de eficiencia (movq round-trip FP) se reportan como aviso, no
+  # bloquean (es el gap conocido del FP, no un bug de correccion).
+  ir-asm-equivalence:
+    name: IR<->asm equivalence (S-22)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Build vm
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DVESTA_BUILD_STDLIB=ON
+          cmake --build build --target vm --parallel 2
+
+      - name: Run IR<->asm equivalence check
+        run: |
+          python3 tools/ir_asm_equivalence.py ./build/vm 2>&1 | tee /tmp/asa.log
+          if grep -qE '\[equivalencia' /tmp/asa.log; then
+            echo "::error::Gap de equivalencia IR->asm detectado (op sin nativa)"
+            exit 1
+          fi
+          echo "OK: sin gaps de equivalencia (los de eficiencia son avisos)"
+        timeout-minutes: 10

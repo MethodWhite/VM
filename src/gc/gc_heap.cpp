@@ -248,19 +248,13 @@ namespace gc {
 
         /* Sprint alloc-pool (2026-06-02): reserva inicial de capacidad
          * para evitar reallocs en hot paths de alocacion masiva.
-         *
-         * Estimacion: nursery_bytes / 40 (avg obj size incluyendo header)
-         * = handles vivos esperados en un ciclo del nursery.  Pero como
-         * los handles persisten cross-minor_gc hasta release, multiplicar
-         * por ~8 para programas con vida media larga.
-         *
-         * 1 MB nursery -> 25K objetos -> ~200K handles cap = ~3 MB para
-         * @c handles_ (struct HandleEntry = ~16 bytes).  Aceptable. */
-        const size_t avg_obj_bytes = 40;
-        const size_t live_obj_estimate = nursery_bytes / avg_obj_bytes;
-        const size_t handles_reserve = std::min<size_t>(
-            std::max<size_t>(live_obj_estimate * 8, 4096),
-            1u << 20);  /* cap 1M handles para no inflar al inicio */
+         * Reserve inicial MODESTA: el vector<HandleEntry> crece dinamicamente,
+         * asi que no necesitamos pre-reservar para el peor caso.  El cap previo
+         * (live*8, ~419K handles = 6.7 MB) zero-inicializaba ~23 ms en cada
+         * spawn de proceso, dominando el load_executable.  Con este valor la
+         * HandleTable arranca en 32K handles (512 KB, <1 ms) y crece on-demand.
+         * (Medido 2026-08-11: spawn 23 ms -> objetivo <1 ms.) */
+        const size_t handles_reserve = 32 * 1024;
         handles_.reserve(handles_reserve);
         free_handles_.reserve(handles_reserve / 4);
         ptr_to_handle_.reserve(handles_reserve);

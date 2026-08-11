@@ -380,12 +380,19 @@ portables sin arrastrar la infraestructura nueva:
   GcHandle del receptor antes del walk del class_ptr.
 
 **Bug de backend pendiente (para una sesión dedicada de JIT)**:
-- **`benchmarks/callvirt_hot` crashea en JIT** (SIGSEGV) aunque el intérprete
-  lo maneja bien: el método `inc()` compilado (LOAD/STORE de campos de objeto
-  GC) crashea en ambos selectors (vreg y clásico).  El deref del receptor en
-  CALLVIRT ya está arreglado; el fallo está en el cuerpo del método con
-  campos.  Se documenta para diagnóstico con el disasm del código JIT en
-  runtime.
+- **`benchmarks/callvirt_hot` daba SIGSEGV en JIT** (el intérprete lo manejaba
+  bien).  El **crash está resuelto** (commit `8b858b57`): el eager compile de
+  main commit-eaba su página a RX y el método `inc()` alocaba en la misma
+  página del chunk → el `memcpy` del caller escribía a RX (W^X).  Ahora
+  `CodeCache::alloc` garantiza RW antes de devolver el puntero.
+- **Queda un bug de valor**: con el crash resuelto, el método `inc()` da un
+  resultado incorrecto en JIT (el intérprete da el valor correcto).  El disasm
+  del `inc` [vreg] muestra que carga `this` de `proc->registers[1]` y lee el
+  campo a offset 24, pero el valor leído es basura — el `this`/obj_payload que
+  recibe el método (vía `enter_jit` desde `vrt_callvirt`) no es el payload del
+  objeto esperado.  `c.n` leído directamente en `main` SÍ funciona (N=0);
+  el fallo es específico del paso del `this` como parámetro GC a un método
+  compilado.
 
 ### Comparativa multi-lenguaje (workloads idénticos)
 

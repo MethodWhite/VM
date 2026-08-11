@@ -397,6 +397,14 @@ portables sin arrastrar la infraestructura nueva:
   regs[2..N] antes de `vrt_callvirt`.  Verificado: `add(d)` → 6, `inc(d)` con
   campos GC → 5 (antes basura), y `callvirt_hot` (10M callvirt) corre ~0.12s
   vs interp ~2.9s (~23× speedup) en Release.
+- **`benchmarks/intops_jit` crashea en JIT** (SIGSEGV `addr=0x0`, call a null)
+  aunque el intérprete lo maneja bien.  Es el bench peak del roadmap de Desmon
+  (~600-800×).  Aislado: un método con **`imin`/`imax` + `abs`** (vmath ops
+  inline) en un loop crashea; `imin` solo o `imin+imax` funcionan, y el mismo
+  loop en `main` directo (sin clase/método) funciona.  El crash es específico
+  del `abs` (con SUB previo) combinado con otros vmath en un **método** JIT.
+  Reproduce en vreg y slots.  Pendiente de backend (el C2 con unroll a veces lo
+  evita, inestable).
 
 ### Comparativa multi-lenguaje (workloads idénticos)
 

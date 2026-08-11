@@ -385,22 +385,13 @@ portables sin arrastrar la infraestructura nueva:
   main commit-eaba su página a RX y el método `inc()` alocaba en la misma
   página del chunk → el `memcpy` del caller escribía a RX (W^X).  Ahora
   `CodeCache::alloc` garantiza RW antes de devolver el puntero.
-- **Queda un bug de valor (paso de argumentos a métodos JIT)**: con el crash
-  resuelto, los métodos JIT reciben los argumentos (regs[2..N]) como basura.
-  Aislado: un método `add(i32 d) { return d + 1; }` (sin campos, sin `this`)
-  devuelve basura en JIT (el intérprete da 6).  El `this` (regs[1]) SÍ llega
-  bien (un método `get()` que lee `this.n` devuelve 0).  El disasm del método
-  muestra que lee `[rbx+0x70]` (regs[2]) pero ese slot contiene basura cuando
-  se ejecuta — el paso de args del CALLVIRT del caller (vreg_select paso 1,
-  `vm_reg_mem(i+1) = vr(operand)`) no materializa el argumento correctamente
-  en el registro antes del store, o el valor se pierde en el dispatch.
-  Reproduce en ambos selectors (vreg y slots).  Es el siguiente paso del port
-  de métodos JIT: arreglar el materializado de args en el CALLVIRT del caller.
-  Hipótesis raíz: `vr()` en vreg_select siempre crea el vreg con ancho 8
-  (`make_vreg(v, GP, 8)`), y el paso 1 del CALLVIRT escribe `[regs[i+1]]`
-  con ese ancho — un argumento i32 (4 bytes) se escribe como 8 bytes, dejando
-  basura en los 4 bytes altos que el método lee.  El intérprete extiende el i32
-  correctamente; el JIT no.
+- **Bug del paso de argumentos a métodos JIT — RESUELTO** (commit `20144258`):
+  los métodos JIT con argumentos devolvían basura porque el CALLVIRT del
+  selector de slots no escribía los argumentos a `proc->registers.regs[2..N]`
+  (solo el path vreg lo hacía).  Ahora el selector escribe operands[1..N] a
+  regs[2..N] antes de `vrt_callvirt`.  Verificado: `add(d)` → 6, `inc(d)` con
+  campos GC → 5 (antes basura), y `callvirt_hot` (10M callvirt) corre ~0.12s
+  vs interp ~2.9s (~23× speedup) en Release.
 
 ### Comparativa multi-lenguaje (workloads idénticos)
 

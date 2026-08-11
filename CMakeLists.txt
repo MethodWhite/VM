@@ -202,6 +202,11 @@ list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/node_registry.cpp
 list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/vdp_session.cpp)
 list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/distrib/dist_runtime.cpp)
 
+# Sampling profiler JIT (--profile-samples).  Registrado explicitamente:
+# el GLOB_RECURSE de arriba no se re-evalua sin reconfigure, y main.cpp
+# referencia sus simbolos -> el build incremental debe verlo siempre.
+list(APPEND VM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/sampler_profiler.cpp)
+
 
 set(CAPSTONE_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(CAPSTONE_BUILD_SHARED OFF CACHE BOOL "" FORCE)

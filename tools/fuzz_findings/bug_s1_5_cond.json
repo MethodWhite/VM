@@ -1,0 +1,17 @@
+{
+  "id": "bug_s1_5_cond",
+  "recipe": "cond",
+  "seed": 1,
+  "iter": 5,
+  "interp": [
+    "ok",
+    "0"
+  ],
+  "buggy": [
+    [
+      "jit-vreg",
+      "CRASH"
+    ]
+  ],
+  "minimized": false
+}

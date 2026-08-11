@@ -1,0 +1,17 @@
+{
+  "id": "bug_s1_6_class_method",
+  "recipe": "class_method",
+  "seed": 1,
+  "iter": 6,
+  "interp": [
+    "ok",
+    "0"
+  ],
+  "buggy": [
+    [
+      "jit-slots",
+      "CRASH"
+    ]
+  ],
+  "minimized": false
+}

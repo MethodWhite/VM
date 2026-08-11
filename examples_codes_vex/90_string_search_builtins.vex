@@ -1,0 +1,59 @@
+// examples_codes_vex/90_string_search_builtins.vex
+//
+// Builtins runtime de busqueda/slice sobre `string`.
+//
+// Cubre:
+//   - str_starts_with(s, prefix)  / s.startsWith(prefix)  -> bool
+//   - str_ends_with(s, suffix)    / s.endsWith(suffix)    -> bool
+//   - str_index_of(s, needle)     / s.indexOf(needle)     -> i64 (-1 si no existe)
+//   - str_substr(s, start, len)   / s.substr(start, len)  -> string (SLICE O(1))
+//
+// Los metodos OO son azucar sintactico sobre los builtins libres (mismo
+// bytecode emitido).  Las busquedas delegan en vesta_collections
+// (memmem/memcmp, zero-copy sobre el buffer host); substr baja a STRSLICE
+// sin copia (vista).
+//
+// Esperado: R00 == 42 (todas las validaciones pasan).
+
+i32 main() {
+    string s = "Hello World";
+
+    // ---- str_starts_with / s.startsWith ----
+    if (!str_starts_with(s, "Hello")) return 1;
+    if (!s.startsWith("Hell"))        return 2;
+    if (s.startsWith("World"))        return 3;
+    if (!s.startsWith(""))            return 4;   // prefijo vacio = true
+
+    // ---- str_ends_with / s.endsWith ----
+    if (!str_ends_with(s, "World"))   return 5;
+    if (!s.endsWith("rld"))           return 6;
+    if (s.endsWith("Hello"))          return 7;
+    if (!s.endsWith(""))              return 8;   // sufijo vacio = true
+
+    // ---- str_index_of / s.indexOf ----
+    if (str_index_of(s, "World") != 6) return 9;
+    if (s.indexOf("l") != 2)           return 10;  // primera ocurrencia
+    if (s.indexOf("Wor") != 6)         return 11;
+    if (str_index_of(s, "xyz") != -1)  return 12;  // not found -> -1
+
+    // ---- str_substr / s.substr ----
+    string sub = str_substr(s, 6, 5);               // "World"
+    if (!str_equals(sub, "World"))      return 13;
+    string head = s.substr(0, 5);                   // "Hello"
+    if (!str_equals(head, "Hello"))     return 14;
+    string tail = str_substr(s, 6, 100);            // se capa al final: "World"
+    if (!str_equals(tail, "World"))     return 15;
+    string body = s.substr(6, 0);                   // slice vacio
+    if (str_length(body) != 0)          return 16;
+
+    // ---- combinacion con builtins ya existentes ----
+    string rest = s.substr(s.indexOf(" ") + 1, 100);  // "World"
+    if (!str_ends_with(rest, "World"))  return 17;
+    if (!contains(rest, "rld"))         return 18;   // contains (builtin previo)
+    if (s.length() != 11)               return 19;
+    if (rest.indexOf("o") != 1)         return 20;   // composicion metodo+metodo
+
+    println("90_string_search_builtins: OK");
+    flush();
+    return 42;
+}

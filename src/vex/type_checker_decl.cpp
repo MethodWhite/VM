@@ -137,6 +137,21 @@ namespace vex {
         reg_builtin("str_concat", Type{PrimitiveKind::STRING}, {PrimitiveKind::STRING, PrimitiveKind::STRING});
         reg_builtin("str_equals", Type{PrimitiveKind::BOOL},   {PrimitiveKind::STRING, PrimitiveKind::STRING});
         reg_builtin("str_make",   Type{PrimitiveKind::STRING}, {PrimitiveKind::PTR, PrimitiveKind::I64});
+        // substr runtime: extrae un rango (start, len) en code-points y
+        // devuelve una vista SLICE sin copia (STRSLICE bytecode O(1)).
+        reg_builtin("str_substr", Type{PrimitiveKind::STRING},
+                    {PrimitiveKind::STRING, PrimitiveKind::I64, PrimitiveKind::I64});
+        // Busqueda de subcadenas.  str_starts_with / str_ends_with /
+        // str_index_of delegan en el plugin vesta_collections
+        // (vstr_starts_with / vstr_ends_with / vstr_indexof) que operan
+        // zero-copy sobre los buffers host (memmem / memcmp).  str_index_of
+        // devuelve la posicion byte del primer match o -1 si no existe.
+        reg_builtin("str_starts_with", Type{PrimitiveKind::BOOL},
+                    {PrimitiveKind::STRING, PrimitiveKind::STRING});
+        reg_builtin("str_ends_with", Type{PrimitiveKind::BOOL},
+                    {PrimitiveKind::STRING, PrimitiveKind::STRING});
+        reg_builtin("str_index_of", Type{PrimitiveKind::I64},
+                    {PrimitiveKind::STRING, PrimitiveKind::STRING});
         // Encoding explicito.  str_convert(s, enc) usa
         // STRCONV bytecode.  Acepta cualquier int de las constantes
         // ENC_* (ASCII=0, ANSI=1, UTF8=2, UTF16=3, UTF32=4) declaradas

@@ -1075,12 +1075,19 @@ namespace {
         const bool is_str_equals  = (name == "str_equals" || name == "comptime_streq");
         const bool is_str_make    = (name == "str_make");
         const bool is_str_convert = (name == "str_convert");
+        // Builtins runtime de busqueda/slice sobre string.  str_substr baja
+        // a STRSLICE (vista sin copia); los de busqueda delegan en el plugin
+        // vesta_collections (zero-copy sobre buffers host via memmem/memcmp).
+        const bool is_str_substr      = (name == "str_substr");
+        const bool is_str_starts_with = (name == "str_starts_with");
+        const bool is_str_ends_with   = (name == "str_ends_with");
+        const bool is_str_index_of    = (name == "str_index_of");
         /* Phase MC.15C: aliases comptime adicionales que lowerean a
          * codigo runtime (eliminando rejection en macro pre-validation). */
         const bool is_to_str       = (name == "to_str" || name == "comptime_to_str");
         const bool is_chr_b        = (name == "chr"    || name == "comptime_chr");
         const bool is_ord_b        = (name == "ord"    || name == "comptime_ord");
-        const bool is_substr_b     = (name == "substr" || name == "comptime_substr");
+        const bool is_substr_b     = (name == "substr" || name == "comptime_substr" || is_str_substr);
         const bool is_gensym_b     = (name == "gensym");
         const bool is_repeat_b     = (name == "repeat"   || name == "comptime_repeat");
         const bool is_replace_b    = (name == "replace"  || name == "comptime_replace");
@@ -1120,6 +1127,8 @@ namespace {
                 || is_str_hash || is_str_intern
                 || is_str_concat || is_str_equals
                 || is_str_make || is_str_convert
+                || is_str_substr || is_str_starts_with
+                || is_str_ends_with || is_str_index_of
                 || is_to_str || is_chr_b || is_ord_b
                 || is_substr_b || is_gensym_b
                 || is_repeat_b || is_replace_b || is_contains_b
@@ -2811,7 +2820,8 @@ namespace {
             return true;
         }
 
-        if (is_repeat_b || is_replace_b || is_contains_b) {
+        if (is_repeat_b || is_replace_b || is_contains_b
+            || is_str_starts_with || is_str_ends_with || is_str_index_of) {
             /* Phase MC.15D: builtins de string que requieren acceso a
              * los bytes RAW de StringObjects (via STRRAW) y un buffer
              * destino en vm_mem.  Layout comun:
@@ -3010,6 +3020,48 @@ namespace {
                 }
                 ir::IrValueId v_h = emit_strmake(v_dst_buf, v_len, e->loc.line);
                 out_value = v_h;
+                return true;
+            }
+
+            // str_starts_with / str_ends_with / str_index_of:
+            // busqueda zero-copy via natives de vesta_collections.  Los
+            // helpers aceptan DIRECTAMENTE los host_ptr de STRRAW (mismo
+            // patron que vstr_contains de vesta_io) y no reciben proc.
+            if (is_str_starts_with || is_str_ends_with || is_str_index_of) {
+                const char *native = is_str_starts_with ? "vstr_starts_with"
+                                 : (is_str_ends_with ? "vstr_ends_with"
+                                                     : "vstr_indexof");
+                if (e->args.size() != 2) {
+                    error_at(e->loc, std::string("'") + name
+                                     + "': se esperaban 2 argumentos (string, substring)");
+                    out_value = ir::IR_NO_VALUE;
+                    return true;
+                }
+                const ir::IrValueId v_hay = coerce_str_arg(e->args[0].get());
+                const ir::IrValueId v_ndl = coerce_str_arg(e->args[1].get());
+                if (v_hay == ir::IR_NO_VALUE || v_ndl == ir::IR_NO_VALUE) {
+                    out_value = ir::IR_NO_VALUE;
+                    return true;
+                }
+                auto [v_h_addr, v_h_len] =
+                    materialize_str_to_vmbuf(v_hay, e->loc.line);
+                auto [v_n_addr, v_n_len] =
+                    materialize_str_to_vmbuf(v_ndl, e->loc.line);
+                const std::string lib = "stdlib/native/collections/vesta_collections";
+                out_mod_->register_native_import(lib, native);
+                ir::IrType rt = is_str_index_of ? ir::IrType::I64 : ir::IrType::BOOL;
+                ir::IrValueId v_dst = fn_->new_value(rt);
+                {
+                    ir::IrInstr cl{};
+                    cl.op          = ir::IrOp::CALLN;
+                    cl.type        = rt;
+                    cl.dst         = v_dst;
+                    cl.func_name   = lib + ":" + native;
+                    cl.operands    = {v_h_addr, v_h_len, v_n_addr, v_n_len};
+                    cl.source_line = e->loc.line;
+                    fn_->append(current_block_, std::move(cl));
+                }
+                out_value = v_dst;
                 return true;
             }
         }

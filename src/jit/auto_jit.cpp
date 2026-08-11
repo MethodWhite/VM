@@ -947,7 +947,13 @@ namespace jit {
                  * Pasamos el PROPIO resolver (recursivo) para que los CALLs
                  * del callee se resuelvan a sus direcciones. */
                 if (g_jit_use_vregs) {
-                    uint8_t *vc = vreg_compile(child_ir, *g_code_cache, *resolver_holder, make_vreg_entries(), resolve_native_fn, sym_resolver);
+                    std::vector<LineMapEntry> vcode_lines;
+                    size_t vcode_size = 0;
+                    uint8_t *vc = vreg_compile(child_ir, *g_code_cache,
+                                               *resolver_holder,
+                                               make_vreg_entries(),
+                                               resolve_native_fn, sym_resolver,
+                                               &vcode_lines, &vcode_size);
                     if (vc != nullptr) {
                         const uint64_t va = reinterpret_cast<uint64_t>(vc);
                         g_eager_cache[name] = va;
@@ -957,6 +963,12 @@ namespace jit {
                             if (pc != 0)
                                 register_jit_code_at_pc(pc, reinterpret_cast<void *>(vc));
                         }
+                        /* Registrar region nativa -> funcion (igual que el
+                         * top-level en 1060).  Sin esto, el sampling profiler
+                         * y el diagnostico de crash no pueden traducir un PC
+                         * dentro de esta callee a su nombre. */
+                        register_jit_region(vc, vcode_size, &vcode_lines,
+                                            name.c_str());
                         if (g_jit_warn_unsupported)
                             std::fprintf(stderr,
                                 "[jit-vreg] eager callee compilado '%s'\n", name.c_str());
@@ -1382,8 +1394,15 @@ namespace jit {
         g_native_regions.push_back(std::move(r));
         if (const char *dbg = std::getenv("VESTA_JIT_REGIONS")) {
             if (dbg[0] && dbg[0] != '0') {
+                /* Imprimir la region YA en el vector (g_native_regions.back()):
+                 * @c r fue movida por el push_back, leer r.name seria la
+                 * string moved-from (vacia).  Bug diagnostico pre-existente
+                 * que ocultaba el nombre de la funcion. */
                 std::fprintf(stderr, "[jit-region] 0x%llx +%zu fn='%s' lines=%zu\n",
-                    (unsigned long long)r.start, r.size, r.name.c_str(), r.lines.size());
+                    (unsigned long long)g_native_regions.back().start,
+                    g_native_regions.back().size,
+                    g_native_regions.back().name.c_str(),
+                    g_native_regions.back().lines.size());
             }
         }
     }

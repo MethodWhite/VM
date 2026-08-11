@@ -95,6 +95,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdlib>   // std::realloc/free/abort (HandleTable)
+#include <string>    // gc_stats_summary()
 #include <utility>   // std::move (HandleTable)
 #include <vector>
 #include <unordered_set>
@@ -269,6 +270,27 @@ namespace gc {
      * En modo unbuffered es no-op (las trazas ya estan en disco).
      */
     void gc_debug_flush() noexcept;
+
+    /**
+     * @brief Activa/desactiva la medicion de pausas del GC (--gc-stats).
+     *
+     * Cuando esta activado, @c minor_gc() y @c major_gc() miden su duracion
+     * con @c std::chrono::steady_clock y acumulan los microsegundos en
+     * @c GcStats (minor_gc_us, major_gc_us, last/max_*_gc_us).
+     *
+     * Coste cuando esta apagado (default): cero en el hot path.  Los
+     * contadores de volumen (@c alloc_bytes, @c promoted_bytes, ...) se
+     * incrementan SIEMPRE (1 ADD por evento, coste ya existente); el timing
+     * es el unico costo adicional y solo se paga cuando el flag esta activo
+     * (1 load + 2 reads de reloj por coleccion).
+     *
+     * Activacion:
+     *   - CLI: @c --gc-stats
+     *   - Env: @c VESTA_GC_STATS=1
+     *   - API: @c gc::set_gc_stats(true) desde codigo C++ o tests
+     */
+    void set_gc_stats(bool enabled) noexcept;
+    bool gc_stats_enabled() noexcept;
 
     /**
      * @brief Estado del objeto dentro del algoritmo de marcado tri-color.
@@ -470,6 +492,18 @@ namespace gc {
         uint64_t major_gc_count = 0; /**< Ciclos de major GC ejecutados. */
         uint64_t peak_nursery   = 0; /**< Uso maximo de Nursery en bytes. */
         uint64_t peak_old       = 0; /**< Uso maximo de OldGen en bytes. */
+        // ---- bytes utiles pedidos por generacion destino ----
+        uint64_t alloc_nursery_bytes = 0; /**< Bytes de payload asignados via bump en Nursery. */
+        uint64_t alloc_old_bytes     = 0; /**< Bytes de payload asignados directo en OldGen. */
+        // ---- timing de pausas (microsegundos).  Solo se miden si
+        //      gc_stats_enabled() (--gc-stats).  Con el flag apagado estos
+        //      campos permanecen a 0 sin coste en el hot path. ----
+        uint64_t minor_gc_us     = 0; /**< Pausa total acumulada de minor GC en us. */
+        uint64_t major_gc_us     = 0; /**< Pausa total acumulada de major GC en us. */
+        uint64_t last_minor_gc_us = 0; /**< Pausa del ultimo minor GC en us. */
+        uint64_t last_major_gc_us = 0; /**< Pausa del ultimo major GC en us. */
+        uint64_t max_minor_gc_us  = 0; /**< Pausa maxima de un minor GC en us. */
+        uint64_t max_major_gc_us  = 0; /**< Pausa maxima de un major GC en us. */
         // ---- GC no-moving en OldGen: metricas de fragmentacion ----
         uint64_t old_reserved_bytes = 0; /**< Bytes reservados por bump pointer en bloques OldGen. */
         uint64_t old_freelist_bytes = 0; /**< Bytes acumulados en free lists tras el ultimo sweep. */
@@ -1149,6 +1183,31 @@ namespace gc {
         const GcStats &stats() const {
             return stats_;
         }
+
+        /** @brief Bytes de heap GC actualmente en uso (Nursery + OldGen). */
+        size_t heap_used() const noexcept {
+            return nursery_used() + old_used_;
+        }
+
+        /** @brief Bytes reservados por el heap (Nursery + todos los bloques OldGen). */
+        size_t heap_reserved() const noexcept;
+
+        /** @brief Numero de handles vivos en la tabla.  Coste O(N); solo debug. */
+        size_t live_handle_count() const noexcept;
+
+        /** @brief Total de colecciones ejecutadas (minor + major). */
+        uint64_t total_collections() const noexcept {
+            return stats_.minor_gc_count + stats_.major_gc_count;
+        }
+
+        /**
+         * @brief Resumen formateado de metricas del GC para @c --gc-stats.
+         *
+         * Linea unica con prefijo @c [GC]: minor_gc/major_gc/collections,
+         * bytes en nursery/old/heap, promocionados, liberados, handles vivos
+         * y pausas acumuladas en microsegundos.
+         */
+        std::string gc_stats_summary() const;
 
         /**
          * @brief Phase D.7.opt: wrapper publico de @c new_handle para que

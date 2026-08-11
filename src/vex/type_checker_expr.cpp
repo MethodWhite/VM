@@ -2298,6 +2298,13 @@ namespace vex {
                         {"intern", PrimitiveKind::STRING},
                         {"equals", PrimitiveKind::BOOL},
                         {"concat", PrimitiveKind::STRING},
+                        {"substr", PrimitiveKind::STRING},
+                        {"startsWith", PrimitiveKind::BOOL},
+                        {"startswith", PrimitiveKind::BOOL},
+                        {"endsWith", PrimitiveKind::BOOL},
+                        {"endswith", PrimitiveKind::BOOL},
+                        {"indexOf", PrimitiveKind::I64},
+                        {"indexof", PrimitiveKind::I64},
                     };
                     for (const auto &m : MAP) {
                         if (fa->field_name == m.m) {

@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
+#include <chrono>
 #include <algorithm>
 #ifdef _WIN32
 #  include <io.h>      // _write, _fileno
@@ -208,6 +209,55 @@ namespace gc {
         gc_dbg_flush_tls();
         std::fflush(stderr);
     }
+
+    // -------------------------------------------------------------------------
+    // Metricas de pausas del GC (--gc-stats).
+    //
+    // Global con static initializer (mismo patron que g_gc_debug): se lee una
+    // vez al cargar la libreria via env VESTA_GC_STATS y --gc-stats lo
+    // sobreescribe desde CLI antes de crear la VM.  El hot path lee el global
+    // con un branch predicho; cuando el flag esta apagado no se toca ningun
+    // reloj y los contadores de timing quedan a 0.  Los contadores de volumen
+    // (alloc/promoted/freed) son independientes y se incrementan siempre.
+    // -------------------------------------------------------------------------
+    namespace {
+        bool g_gc_stats = []() noexcept -> bool {
+            const char *env = std::getenv("VESTA_GC_STATS");
+            return (env != nullptr && env[0] != '\0' && env[0] != '0');
+        }();
+    }
+
+    void set_gc_stats(bool enabled) noexcept {
+        g_gc_stats = enabled;
+    }
+
+    bool gc_stats_enabled() noexcept {
+        return g_gc_stats;
+    }
+
+    // Helper: si el timing esta activo, devuelve la pausa en microsegundos
+    // entre @p t0 y el reloj actual y actualiza los campos de GcStats; si no,
+    // no-op (cero overhead).  Compartido por minor_gc y major_gc.
+    namespace {
+        inline void record_gc_pause(GcStats &s,
+                                    const std::chrono::steady_clock::time_point &t0,
+                                    bool timing,
+                                    bool is_major) noexcept {
+            if (!timing) return;
+            const auto t1 = std::chrono::steady_clock::now();
+            const uint64_t us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+            if (is_major) {
+                s.major_gc_us += us;
+                s.last_major_gc_us = us;
+                if (us > s.max_major_gc_us) s.max_major_gc_us = us;
+            } else {
+                s.minor_gc_us += us;
+                s.last_minor_gc_us = us;
+                if (us > s.max_minor_gc_us) s.max_minor_gc_us = us;
+            }
+        }
+    } // namespace anonimo
 
     // Macros con hint de branch (cold path) y opcion de compile-time disable.
     #ifdef VESTA_GC_DEBUG_DISABLE
@@ -548,6 +598,10 @@ namespace gc {
 
             stats_.alloc_count++;
             stats_.alloc_bytes += size;          // bytes utiles pedidos
+            if (gen == GcGen::YOUNG)
+                stats_.alloc_nursery_bytes += size;
+            else
+                stats_.alloc_old_bytes += size;
             size_t nu = nursery_used();
             if (nu > stats_.peak_nursery) stats_.peak_nursery = nu;
             if (old_used_ > stats_.peak_old) stats_.peak_old = old_used_;
@@ -944,6 +998,7 @@ namespace gc {
         std::memset(raw + sizeof(GcHeader), 0, size);
         stats_.alloc_count++;
         stats_.alloc_bytes += size;
+        stats_.alloc_old_bytes += size;
         if (old_used_ > stats_.peak_old) stats_.peak_old = old_used_;
         return new_handle(raw);
     }
@@ -1139,6 +1194,10 @@ namespace gc {
     // -------------------------------------------------------------------------
 
     void GcHeap::minor_gc() {
+        const bool timing = gc_stats_enabled();
+        const auto t0 = timing
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         stats_.minor_gc_count++;
         GC_LOGF("minor_gc start (count=%llu, nursery_used=%llu)",
                 (unsigned long long)stats_.minor_gc_count,
@@ -1311,6 +1370,8 @@ namespace gc {
         }
         forward_table_.clear();
 
+        record_gc_pause(stats_, t0, timing, /*is_major=*/false);
+
         // Reset BLACK -> WHITE para los YOUNG no procesados (ninguno tras
         // el sweep arriba) y para mantener invariante post-minor.
         // (No necesario en realidad porque los WHITE ya murieron y los
@@ -1327,6 +1388,10 @@ namespace gc {
     // -------------------------------------------------------------------------
 
     void GcHeap::major_gc() {
+        const bool timing = gc_stats_enabled();
+        const auto t0 = timing
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         stats_.major_gc_count++;
         GC_LOGF("major_gc start (count=%llu, n_old_blocks=%zu)",
                 (unsigned long long)stats_.major_gc_count,
@@ -1473,6 +1538,8 @@ namespace gc {
             }
             if (!alive) entry.target = GC_NULL_HANDLE; // objeto muerto: anular referencia
         }
+
+        record_gc_pause(stats_, t0, timing, /*is_major=*/true);
     }
 
     // -------------------------------------------------------------------------
@@ -1866,6 +1933,55 @@ namespace gc {
     std::vector<uint64_t> GcHeap::condvar_pop_all_waiters(GcHandle h) {
         return wait_table_for(h).pop_all(static_cast<uint32_t>(h),
                                           WaitKind::CONDVAR);
+    }
+
+    // -------------------------------------------------------------------------
+    // Metricas / inspeccion (--gc-stats y debugger GC_STATS)
+    // -------------------------------------------------------------------------
+
+    size_t GcHeap::heap_reserved() const noexcept {
+        size_t total = nursery_size_;
+        for (const auto &b : old_blocks_) total += b.size;
+        return total;
+    }
+
+    size_t GcHeap::live_handle_count() const noexcept {
+        size_t n = 0;
+        for (size_t i = 0; i < handles_.size(); ++i) {
+            if (handles_[i].live) ++n;
+        }
+        return n;
+    }
+
+    std::string GcHeap::gc_stats_summary() const {
+        const GcStats &s = stats_;
+        char buf[512];
+        const int n = std::snprintf(buf, sizeof(buf),
+            "[GC] minor_gc=%llu major_gc=%llu collections=%llu "
+            "nursery_bytes=%llu alloc_nursery=%llu alloc_old=%llu "
+            "old_bytes=%llu heap_bytes=%llu heap_reserved=%llu "
+            "promoted_bytes=%llu freed_bytes=%llu live_handles=%zu "
+            "gc_us=%llu (minor=%llu major=%llu, max_minor=%llu max_major=%llu)",
+            (unsigned long long)s.minor_gc_count,
+            (unsigned long long)s.major_gc_count,
+            (unsigned long long)total_collections(),
+            (unsigned long long)nursery_used(),
+            (unsigned long long)s.alloc_nursery_bytes,
+            (unsigned long long)s.alloc_old_bytes,
+            (unsigned long long)old_used(),
+            (unsigned long long)heap_used(),
+            (unsigned long long)heap_reserved(),
+            (unsigned long long)s.promoted_bytes,
+            (unsigned long long)s.freed_bytes,
+            live_handle_count(),
+            (unsigned long long)(s.minor_gc_us + s.major_gc_us),
+            (unsigned long long)s.minor_gc_us,
+            (unsigned long long)s.major_gc_us,
+            (unsigned long long)s.max_minor_gc_us,
+            (unsigned long long)s.max_major_gc_us);
+        if (n < 0 || n >= static_cast<int>(sizeof(buf)))
+            return std::string("[GC] (resumen demasiado largo)");
+        return std::string(buf);
     }
 
     // set_owner_process esta inlineada en el header (gc_heap.h).

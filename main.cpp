@@ -29,6 +29,7 @@
 #include "cli/vsh.h"
 #include "ir/ir_emitter.h"
 #include "jit/auto_jit.h"
+#include "jit/sampler_profiler.h"     // --profile-samples: sampling profiler JIT
 #include "runtime/profile.h"          // Sprint D.6 (2026-06-03)
 #include "runtime/exception_runtime.h" // codigo de salida tras un fallo
 #include "pkg/cli.h"
@@ -243,6 +244,7 @@ int main(int argc, char *argv[]) {
             ("prefix",    "Directorio destino", cxxopts::value<std::string>())
             ("manifest",  "Ruta a install_manifest.json", cxxopts::value<std::string>())
             ("stats", "Mostrar estadísticas de ejecución al finalizar (tiempo, MIPS)")
+            ("gc-stats", "Imprimir resumen de metricas del GC al finalizar (minor/major GC, bytes en nursery/old/heap, handles vivos, pausas en us). Activa la medicion de pausas del GC; sin este flag el overhead es cero. Alt: env VESTA_GC_STATS=1.")
             // ---- opciones de JIT ----
             ("jit-threshold", "Umbral de invocaciones de un metodo para disparar JIT (default: UINT32_MAX = JIT off; sugerido para test: 1)",
                 cxxopts::value<uint32_t>())
@@ -252,6 +254,11 @@ int main(int argc, char *argv[]) {
             // ---- opciones de profiling (D.6 PGO) ----
             ("profile",       "Generar @c .vprof con branch/type/alloc counters al exit (PGO para C2). Path opcional; default: 'program.vprof'.",
                 cxxopts::value<std::string>()->implicit_value("program.vprof"))
+            // ---- sampling profiler (rendimiento) ----
+            ("profile-samples", "Sampling profiler: muestrear el PC del hilo de ejecucion cada N ms durante --run y reportar donde pasa el tiempo (funcion JIT / interp / runtime). Solo POSIX.",
+                cxxopts::value<int>()->default_value("0"))
+            ("profile-folded",  "Ruta del archivo folded (Brendan Gregg) a escribir al parar el sampling profiler. Default: '<programa>.folded' junto al .velb.",
+                cxxopts::value<std::string>())
             // ---- opciones de runtime distribuido ----
             ("dist-port",         "Puerto VDP del servidor distribuido (0 = sin servidor TCP)",
                 cxxopts::value<uint16_t>()->default_value("0"))
@@ -398,6 +405,11 @@ int main(int argc, char *argv[]) {
         gc::set_gc_debug(true);
         gc::set_gc_debug_buffered(true);
     }
+
+    // activar la medicion de pausas del GC (--gc-stats).  Tambien respeta
+    // env VESTA_GC_STATS=1 (la inicializacion estatica corre antes de main).
+    if (result.count("gc-stats"))
+        gc::set_gc_stats(true);
 
     // ---- Configuracion del JIT ----
     //
@@ -2497,6 +2509,22 @@ int main(int argc, char *argv[]) {
 
             Timer t_run;
             Timer t_start_phase;
+            /* --profile-samples: arrancar el sampling profiler ANTES de
+             * vm.start() para muestrear toda la ejecucion (incluido el
+             * eager-compile de main).  La ruta folded por defecto es
+             * '<programa>.folded' junto al .velb. */
+            const int profile_ms = result["profile-samples"].as<int>();
+            if (profile_ms > 0) {
+                std::string folded = velb_path + ".folded";
+                if (result.count("profile-folded")) {
+                    folded = result["profile-folded"].as<std::string>();
+                }
+                if (jit::sampler_profiler_start(profile_ms, folded)) {
+                    vesta::scout() << "[sampler] profiling activo (cada "
+                                   << profile_ms << " ms); folded: '"
+                                   << folded << "'\n";
+                }
+            }
             vm->start();
             const long long ns_start = t_start_phase.ns();
 
@@ -2519,6 +2547,13 @@ int main(int argc, char *argv[]) {
             vm->stop();
             const long long ns_stop = t_stop.ns();
             const long long ns_total_run = t_total_run.ns();
+
+            /* --profile-samples: detener el sampling profiler y reportar
+             * el ranking + escribir el archivo folded.  Idempotente; no-op
+             * si nunca se arranco. */
+            if (jit::sampler_profiler_active()) {
+                jit::sampler_profiler_stop();
+            }
 
             if (result.count("stats")) {
                 long long elapsed_ms = elapsed_ns / 1'000'000;
@@ -2613,6 +2648,14 @@ int main(int argc, char *argv[]) {
             if (jit_stats_requested) {
                 vesta::scout() << "\n=== JIT STATS ===\n";
                 vesta::scout() << jit::get_jit_stats_summary() << "\n";
+            }
+
+            /* --gc-stats: resumen de metricas del Garbage Collector del
+             * proceso main al final de la ejecucion.  Independiente de
+             * --stats; las pausas solo se miden si el flag esta presente. */
+            if (result.count("gc-stats")) {
+                vesta::scout() << "\n=== GC STATS ===\n";
+                vesta::scout() << proc->gc_heap.gc_stats_summary() << "\n";
             }
         } catch (const std::exception &e) {
             std::cerr << "Error al ejecutar " << velb_path << ": " << e.what() << "\n";

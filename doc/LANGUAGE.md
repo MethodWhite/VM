@@ -441,6 +441,12 @@ string path = r"C:\Users\name";
 // Operadores nativos
 string s = "Hola" + " " + name;
 bool same = (s == "Hola World");
+
+// Builtins runtime + metodos OO (mismo bytecode emitido)
+i64 pos = s.indexOf("World");       // posicion byte; -1 si no existe
+bool sw  = s.startsWith("Hola");    // prefijo?
+bool ew  = s.endsWith("ndo");       // sufijo?
+string sub = s.substr(0, 4);        // vista SLICE sin copia
 ```
 
 `string` es GcHandle a StringObject. Soporta UTF-8/16/32, FNV-1a hash cacheado,

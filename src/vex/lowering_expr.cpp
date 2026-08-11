@@ -2427,6 +2427,13 @@ namespace vex {
                     {"intern", "str_intern"},
                     {"equals", "str_equals"},
                     {"concat", "str_concat"},
+                    {"substr", "str_substr"},
+                    {"startsWith", "str_starts_with"},
+                    {"startswith", "str_starts_with"},
+                    {"endsWith", "str_ends_with"},
+                    {"endswith", "str_ends_with"},
+                    {"indexOf", "str_index_of"},
+                    {"indexof", "str_index_of"},
                 };
                 for (const auto &m: METHOD_TO_BUILTIN) {
                     if (fa->field_name == m[0]) {

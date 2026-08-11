@@ -1,0 +1,102 @@
+{
+  "seed": 1,
+  "iters": 20,
+  "elapsed_s": 1.6208388805389404,
+  "throughput": 12.34,
+  "stats": {
+    "generados": 20,
+    "compilados": 20,
+    "corridos": 20,
+    "NOCOMPILA": 0,
+    "INTERP_BAD": 0,
+    "OK": 15,
+    "BUGS": 5
+  },
+  "findings": [
+    {
+      "id": "bug_s1_5_cond",
+      "recipe": "cond",
+      "seed": 1,
+      "iter": 5,
+      "interp": [
+        "ok",
+        "0"
+      ],
+      "buggy": [
+        [
+          "jit-vreg",
+          "CRASH"
+        ]
+      ],
+      "minimized": false
+    },
+    {
+      "id": "bug_s1_6_class_method",
+      "recipe": "class_method",
+      "seed": 1,
+      "iter": 6,
+      "interp": [
+        "ok",
+        "0"
+      ],
+      "buggy": [
+        [
+          "jit-slots",
+          "CRASH"
+        ]
+      ],
+      "minimized": false
+    },
+    {
+      "id": "bug_s1_7_cond",
+      "recipe": "cond",
+      "seed": 1,
+      "iter": 7,
+      "interp": [
+        "ok",
+        "0"
+      ],
+      "buggy": [
+        [
+          "jit-vreg",
+          "CRASH"
+        ]
+      ],
+      "minimized": false
+    },
+    {
+      "id": "bug_s1_9_cond",
+      "recipe": "cond",
+      "seed": 1,
+      "iter": 9,
+      "interp": [
+        "ok",
+        "0"
+      ],
+      "buggy": [
+        [
+          "jit-vreg",
+          "CRASH"
+        ]
+      ],
+      "minimized": false
+    },
+    {
+      "id": "bug_s1_12_cond",
+      "recipe": "cond",
+      "seed": 1,
+      "iter": 12,
+      "interp": [
+        "ok",
+        "0"
+      ],
+      "buggy": [
+        [
+          "jit-vreg",
+          "CRASH"
+        ]
+      ],
+      "minimized": false
+    }
+  ]
+}

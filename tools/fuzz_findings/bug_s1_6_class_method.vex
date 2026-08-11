@@ -1,0 +1,22 @@
+class Calc {
+ public i64 total;
+ public i32 k;
+ public Calc(i32 init) { this.total = (i64)init; this.k = 3; }
+ public i64 step(i32 x) {
+   i64 v = (i64)x * (i64)this.k;
+   this.total = this.total + imax(v, (i64)this.k) + (i64)this.k;
+   this.total = this.total + abs((i64)this.k - v) ^ (i64)this.k;
+   return this.total;
+ }
+}
+
+i32 main() {
+Calc c = new Calc(5);
+i64 a64 = 0;
+i32 i = 0;
+while (i < 19) {
+a64 = a64 ^ c.step(i);
+i = i + 1;
+}
+i32 r = (i32)(a64 & 0xffffffff);
+}

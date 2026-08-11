@@ -1765,6 +1765,8 @@ namespace debug {
                 d << "{"
                   << "\"alloc_count\":"     << s.alloc_count
                   << ",\"alloc_bytes\":"    << s.alloc_bytes
+                  << ",\"alloc_nursery_bytes\":" << s.alloc_nursery_bytes
+                  << ",\"alloc_old_bytes\":"     << s.alloc_old_bytes
                   << ",\"freed_count\":"    << s.freed_count
                   << ",\"freed_bytes\":"    << s.freed_bytes
                   << ",\"promoted_count\":" << s.promoted_count
@@ -1777,8 +1779,17 @@ namespace debug {
                   << ",\"old_freelist_bytes\":" << s.old_freelist_bytes
                   << ",\"nursery_used\":"   << p->gc_heap.nursery_used()
                   << ",\"nursery_total\":"  << p->gc_heap.nursery_total()
+                  << ",\"old_used\":"       << p->gc_heap.old_used()
+                  << ",\"heap_used\":"      << p->gc_heap.heap_used()
+                  << ",\"heap_reserved\":"  << p->gc_heap.heap_reserved()
                   << ",\"live_handles\":"   << live_count
                   << ",\"handle_slots\":"   << total_slots
+                  << ",\"minor_gc_us\":"    << s.minor_gc_us
+                  << ",\"major_gc_us\":"    << s.major_gc_us
+                  << ",\"last_minor_gc_us\":" << s.last_minor_gc_us
+                  << ",\"last_major_gc_us\":" << s.last_major_gc_us
+                  << ",\"max_minor_gc_us\":"  << s.max_minor_gc_us
+                  << ",\"max_major_gc_us\":"  << s.max_major_gc_us
                   << "}";
                 ok_resp(d.str());
                 break;

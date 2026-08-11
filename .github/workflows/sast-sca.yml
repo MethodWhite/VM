@@ -89,3 +89,10 @@ jobs:
           else
             echo "todas las libs vendored tienen metadatos de version/licencia"
           fi
+          # Referencia canonica de terceras partes (Tier S++ §10): el manifest
+          # debe existir y listar cada lib vendored con version/commit.
+          if [ ! -f THIRD_PARTY.md ]; then
+            echo "::error::falta THIRD_PARTY.md (manifest de terceras partes vendored)"
+            exit 1
+          fi
+          echo "THIRD_PARTY.md presente (manifest de terceras partes vendored)"

@@ -2896,6 +2896,22 @@ namespace jit {
                         }
                         {
                             const uint32_t vtbl_idx = static_cast<uint32_t>(ins.imm);
+                            /* Argumentos del metodo a proc->registers.regs[2..N]
+                             * (regs[1] = obj/this lo pone vrt_callvirt).  Sin
+                             * esto, un metodo con args (p.ej. inc(d)) lee basura
+                             * de regs[2].  El path vreg ya lo hace; el selector
+                             * de slots no -> bug del paso de args a metodos JIT. */
+                            for (size_t ai = 1; ai < ins.operands.size(); ++ai) {
+                                load_op_rematerializable(mf, ir_fn,
+                                    ins.operands[ai], SCRATCH_A);
+                                mf.blocks.back().instrs.push_back(
+                                    MInstr::make_unary(MOp::MOV,
+                                        MOperand::make_mem(MReg::RBX,
+                                            VESTA_PROC_REGISTERS_OFFSET
+                                            + static_cast<int32_t>((ai + 1)
+                                                * VESTA_REGISTER_SIZE)),
+                                        MOperand::make_reg(SCRATCH_A)));
+                            }
                             /* obj a R10 (scratch, no-colisionable) */
                             load_op_rematerializable(mf, ir_fn, ins.operands[0], MReg::R10);
 #if defined(_WIN32)

@@ -1440,13 +1440,18 @@ namespace Assembly::Bytecode::Linker {
             std::vector<bool> keep(bc.size(), true);
             size_t eliminated = 0;
 
-            // 1a. Eliminar NOPs (0x90).
-            for (size_t i = 0; i < bc.size(); ++i) {
-                if (bc[i] == 0x90) {
-                    keep[i] = false;
-                    ++eliminated;
-                }
-            }
+            // 1a. (ELIMINADO) El bytecode VM no tiene NOPs 0x90 como
+            // instruccion: el opcode 0x90 no existe en la decode table
+            // (primario ni extendido).  Un byte 0x90 en el stream es SIEMPRE
+            // parte de los operandos de una instruccion legitima, p.ej. el
+            // byte `(r_src2 << 4)` del adds3/subs3 con r9 (0x90) o el byte
+            // reg/base de un mov.  Eliminarlo a ciegas corrompia el bytecode:
+            //   adds3 r4, r3, r9  ->  00 73 34 90  -> (se borra el 90)
+            //   -> 00 73 34 <byte siguiente>, desalineando todo el decode
+            //   y descarrilando la vtable (metodo nunca registrado, callvirt
+            //   a clase sin metodos -> THREAD_ILLEGAL_INSTRUCTION, exit 132).
+            // Si en el futuro se introducen NOPs reales, emitirlos con un
+            // opcode dedicado y eliminarlos por ese opcode, nunca por el byte.
 
             // 1b. Eliminar pares MOV R,R (0xB0 <reg> 0xB0 <mismo_reg>).
             for (size_t i = 0; i + 3 < bc.size(); ) {

@@ -1,14 +1,14 @@
 {
-  "vm": "cmake-build-release\\vm.exe",
-  "elapsed_s": 233.35753726959229,
+  "vm": "/mnt/workspace/Proyectos/seguridad/VM-fork/build/vm",
+  "elapsed_s": 115.04391193389893,
   "summary": {
-    "OK": 213,
-    "DIVERGE": 2,
-    "CRASH": 5,
-    "TIMEOUT": 0,
-    "NOCOMPILA": 10,
+    "OK": 170,
+    "DIVERGE": 11,
+    "CRASH": 12,
+    "TIMEOUT": 1,
+    "NOCOMPILA": 20,
     "NORUN": 0,
-    "NODET": 2,
+    "NODET": 1,
     "SKIP": 1
   },
   "categories": {
@@ -23,18 +23,13 @@
       "07_punteros",
       "08_punteros_loop",
       "09_punteros_arith",
-      "100_reflection_full",
-      "101_raii_casos_limite",
       "102_closure_env_gc",
       "103_async_args_typed",
       "104_hot_loop_bench",
       "105_decjnz_bench",
       "105_unique_with_vesta",
       "105b_decjnz_simple",
-      "106_virtualalloc_unique",
-      "107_unique_lifo_move_chain",
       "108_shared_use_count",
-      "109_unique_comprehensive",
       "10_heap_malloc",
       "110_unique_return_from_fn",
       "112_borrow_mut_ok",
@@ -64,7 +59,6 @@
       "141_metaprog_nested",
       "142_type_first_class",
       "143_type_composable",
-      "144_method_enum_introspect",
       "145_auto_inference",
       "146_wait_inside_synchronized",
       "147_macros_comptime_compile",
@@ -77,11 +71,11 @@
       "153_macros_compose_recurse_global",
       "154_macros_zero_runtime_overhead",
       "155_concat_loop_optimized",
-      "156_macros_pure_memoization",
       "157_concat_multichunk",
       "158_macros_lowered_to_ir",
       "159_macro_expr_capture",
       "15_herencia_basica",
+      "160_macro_walk_pchase",
       "162_macro_comptime_data",
       "163_try_operator",
       "164_enum_f64_payload",
@@ -90,25 +84,21 @@
       "167_z_gc_sweep",
       "168_newtypes",
       "169_newtype_advanced",
-      "16_aop_basico",
       "170_local_to_calln_native",
-      "171_callback_qsort",
       "172_string_array_natural",
-      "173_wndproc_win32",
-      "173b_wndproc_visible",
       "174_async_chains_complex",
       "175_generics_deep_nesting",
       "176_adt_complex_payloads",
       "177_callback_many_args",
       "178_escape_scalar_repl",
-      "179_spec_devirt_inherit",
       "17_ecs_basico",
+      "180_vreg_obj_loop_callvirt",
+      "181_vreg_alloca_vm_escape",
       "18_reflexion_basica",
       "19_tco_basico",
       "20_reflexion_field",
       "21_interfaces_basico",
       "22_iface_polimorfismo",
-      "23_aop_around",
       "24_try_catch",
       "25_try_multi_finally",
       "26_foreach",
@@ -120,11 +110,9 @@
       "32_bangbang_decl",
       "33_optional_result_builtin",
       "34_optional_result_avanzado",
-      "35_synchronized_basico",
       "35b_sync_tiny",
       "36_synchronized_exception",
       "36b_sync_throw_simple",
-      "37_synchronized_return",
       "38_spawn_basico",
       "39_spawn_pingpong",
       "39b_spawn_recv_only",
@@ -143,13 +131,10 @@
       "52_lambda_hof",
       "53_enum_simple",
       "54_enum_payload",
-      "56_linkedlist_hof",
       "57_linkedlist_option",
       "58_quicksort",
       "60_stack_iface",
       "61_rpn_calc",
-      "62_compose_curry",
-      "63_topfn_as_fnvalue",
       "64_curry_returning_closures",
       "65_io_format",
       "66_io_colors",
@@ -171,8 +156,6 @@
       "82_host_ptr_addr_taken",
       "83_host_ptr_indirect",
       "84_static_fields",
-      "85_extern_winapi",
-      "86_ffi_runtime",
       "87_collections_hashmap",
       "88_collections_queue_deque_tree",
       "89_string_array_ops",
@@ -189,7 +172,6 @@
       "97_shared_basico",
       "98_arraylist_string_natural",
       "99_dtor_recursive_fields",
-      "beep_bepp",
       "bug3",
       "bug3_class",
       "bug4",
@@ -200,45 +182,38 @@
       "test_av_catch",
       "test_av_mixed",
       "test_fmt_spec",
-      "test_print_formats",
-      "alloc",
-      "array_sum",
-      "bitops",
-      "callvirt",
-      "callvirt_hot",
-      "cmp_fusion",
-      "fib_recursive",
-      "fp_jit",
-      "hash_lookup",
-      "int_mixed",
-      "intops_jit",
-      "jit_method",
-      "mem_class",
-      "mem_malloc_free",
-      "mem_struct",
-      "nested_loops",
-      "obj_accum",
-      "pic_real",
-      "polymorphic",
-      "quicksort",
-      "rotops_jit",
-      "string_hot",
-      "string_workout",
-      "struct_field",
-      "tight_loop"
+      "test_print_formats"
     ],
     "DIVERGE": [
-      "branch_unpredict",
-      "state_machine"
+      "101_raii_casos_limite",
+      "107_unique_lifo_move_chain",
+      "109_unique_comprehensive",
+      "16_aop_basico",
+      "179_spec_devirt_inherit",
+      "23_aop_around",
+      "35_synchronized_basico",
+      "37_synchronized_return",
+      "56_linkedlist_hof",
+      "62_compose_curry",
+      "63_topfn_as_fnvalue"
     ],
     "CRASH": [
+      "106_virtualalloc_unique",
       "111_borrow_shared_ok",
       "119_borrow_reborrow",
+      "144_method_enum_introspect",
+      "171_callback_qsort",
+      "173_wndproc_win32",
+      "173b_wndproc_visible",
       "55_linkedlist_basico",
       "59_arraylist",
-      "memcpy_loop"
+      "85_extern_winapi",
+      "86_ffi_runtime",
+      "beep_bepp"
     ],
-    "TIMEOUT": [],
+    "TIMEOUT": [
+      "100_reflection_full"
+    ],
     "NOCOMPILA": [
       "113_borrow_err_mut_shared",
       "114_borrow_err_double_mut",
@@ -248,12 +223,21 @@
       "130_borrow_err_return_local",
       "137_static_assert_fail",
       "146b_wait_outside_synchronized",
+      "156_macros_pure_memoization",
       "161_macro_ffi_compile_time",
-      "96b_destructor_illegal_escape"
+      "96b_destructor_illegal_escape",
+      "inline_asm",
+      "materia_demo",
+      "photonic_hello",
+      "photonic_jepa_learn",
+      "quantum_ghz",
+      "quantum_qft",
+      "quantum_teleport",
+      "solid_basic",
+      "solid_photonic"
     ],
     "NORUN": [],
     "NODET": [
-      "160_macro_walk_pchase",
       "bug3_struct"
     ],
     "SKIP": [
@@ -261,6 +245,86 @@
     ]
   },
   "detail": [
+    {
+      "name": "100_reflection_full",
+      "interp": [
+        "timeout",
+        null
+      ],
+      "jit-vreg": [
+        "ok",
+        "2a"
+      ],
+      "jit-slots": [
+        "ok",
+        "2a"
+      ],
+      "cat": "TIMEOUT"
+    },
+    {
+      "name": "101_raii_casos_limite",
+      "interp": [
+        "ok",
+        "2a"
+      ],
+      "jit-vreg": [
+        "ok",
+        "a"
+      ],
+      "jit-slots": [
+        "ok",
+        "a"
+      ],
+      "cat": "DIVERGE"
+    },
+    {
+      "name": "106_virtualalloc_unique",
+      "interp": [
+        "crash",
+        null
+      ],
+      "jit-vreg": [
+        "crash",
+        null
+      ],
+      "jit-slots": [
+        "crash",
+        null
+      ],
+      "cat": "CRASH"
+    },
+    {
+      "name": "107_unique_lifo_move_chain",
+      "interp": [
+        "ok",
+        "2a"
+      ],
+      "jit-vreg": [
+        "ok",
+        "2a"
+      ],
+      "jit-slots": [
+        "ok",
+        "64"
+      ],
+      "cat": "DIVERGE"
+    },
+    {
+      "name": "109_unique_comprehensive",
+      "interp": [
+        "ok",
+        "2a"
+      ],
+      "jit-vreg": [
+        "ok",
+        "2a"
+      ],
+      "jit-slots": [
+        "ok",
+        "c8"
+      ],
+      "cat": "DIVERGE"
+    },
     {
       "name": "111_borrow_shared_ok",
       "interp": [
@@ -322,28 +386,160 @@
       "cat": "NOCOMPILA"
     },
     {
+      "name": "144_method_enum_introspect",
+      "interp": [
+        "ok",
+        "2a"
+      ],
+      "jit-vreg": [
+        "crash",
+        null
+      ],
+      "jit-slots": [
+        "crash",
+        null
+      ],
+      "cat": "CRASH"
+    },
+    {
       "name": "146b_wait_outside_synchronized",
       "cat": "NOCOMPILA"
     },
     {
-      "name": "160_macro_walk_pchase",
+      "name": "156_macros_pure_memoization",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "161_macro_ffi_compile_time",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "16_aop_basico",
+      "interp": [
+        "ok",
+        "63"
+      ],
+      "jit-vreg": [
+        "ok",
+        "1"
+      ],
+      "jit-slots": [
+        "ok",
+        "1"
+      ],
+      "cat": "DIVERGE"
+    },
+    {
+      "name": "171_callback_qsort",
       "interp": [
         "crash",
         null
       ],
       "jit-vreg": [
+        "crash",
+        null
+      ],
+      "jit-slots": [
+        "crash",
+        null
+      ],
+      "cat": "CRASH"
+    },
+    {
+      "name": "173_wndproc_win32",
+      "interp": [
+        "crash",
+        null
+      ],
+      "jit-vreg": [
+        "crash",
+        null
+      ],
+      "jit-slots": [
+        "crash",
+        null
+      ],
+      "cat": "CRASH"
+    },
+    {
+      "name": "173b_wndproc_visible",
+      "interp": [
+        "crash",
+        null
+      ],
+      "jit-vreg": [
+        "crash",
+        null
+      ],
+      "jit-slots": [
+        "crash",
+        null
+      ],
+      "cat": "CRASH"
+    },
+    {
+      "name": "179_spec_devirt_inherit",
+      "interp": [
         "ok",
-        "2a"
+        "62"
+      ],
+      "jit-vreg": [
+        "ok",
+        "31"
       ],
       "jit-slots": [
         "ok",
-        "2a"
+        "31"
       ],
-      "cat": "NODET"
+      "cat": "DIVERGE"
     },
     {
-      "name": "161_macro_ffi_compile_time",
-      "cat": "NOCOMPILA"
+      "name": "23_aop_around",
+      "interp": [
+        "ok",
+        "3ef"
+      ],
+      "jit-vreg": [
+        "ok",
+        "1"
+      ],
+      "jit-slots": [
+        "ok",
+        "1"
+      ],
+      "cat": "DIVERGE"
+    },
+    {
+      "name": "35_synchronized_basico",
+      "interp": [
+        "ok",
+        "a"
+      ],
+      "jit-vreg": [
+        "ok",
+        "0"
+      ],
+      "jit-slots": [
+        "ok",
+        "0"
+      ],
+      "cat": "DIVERGE"
+    },
+    {
+      "name": "37_synchronized_return",
+      "interp": [
+        "ok",
+        "6"
+      ],
+      "jit-vreg": [
+        "ok",
+        "5"
+      ],
+      "jit-slots": [
+        "ok",
+        "5"
+      ],
+      "cat": "DIVERGE"
     },
     {
       "name": "55_linkedlist_basico",
@@ -362,6 +558,22 @@
       "cat": "CRASH"
     },
     {
+      "name": "56_linkedlist_hof",
+      "interp": [
+        "ok",
+        "15"
+      ],
+      "jit-vreg": [
+        "ok",
+        "6"
+      ],
+      "jit-slots": [
+        "ok",
+        "6"
+      ],
+      "cat": "DIVERGE"
+    },
+    {
       "name": "59_arraylist",
       "interp": [
         "ok",
@@ -378,8 +590,88 @@
       "cat": "CRASH"
     },
     {
+      "name": "62_compose_curry",
+      "interp": [
+        "ok",
+        "2a"
+      ],
+      "jit-vreg": [
+        "ok",
+        "b"
+      ],
+      "jit-slots": [
+        "ok",
+        "b"
+      ],
+      "cat": "DIVERGE"
+    },
+    {
+      "name": "63_topfn_as_fnvalue",
+      "interp": [
+        "ok",
+        "2a"
+      ],
+      "jit-vreg": [
+        "ok",
+        "b"
+      ],
+      "jit-slots": [
+        "ok",
+        "b"
+      ],
+      "cat": "DIVERGE"
+    },
+    {
+      "name": "85_extern_winapi",
+      "interp": [
+        "crash",
+        null
+      ],
+      "jit-vreg": [
+        "crash",
+        null
+      ],
+      "jit-slots": [
+        "crash",
+        null
+      ],
+      "cat": "CRASH"
+    },
+    {
+      "name": "86_ffi_runtime",
+      "interp": [
+        "crash",
+        null
+      ],
+      "jit-vreg": [
+        "crash",
+        null
+      ],
+      "jit-slots": [
+        "crash",
+        null
+      ],
+      "cat": "CRASH"
+    },
+    {
       "name": "96b_destructor_illegal_escape",
       "cat": "NOCOMPILA"
+    },
+    {
+      "name": "beep_bepp",
+      "interp": [
+        "crash",
+        null
+      ],
+      "jit-vreg": [
+        "crash",
+        null
+      ],
+      "jit-slots": [
+        "crash",
+        null
+      ],
+      "cat": "CRASH"
     },
     {
       "name": "bug3_struct",
@@ -398,52 +690,40 @@
       "cat": "NODET"
     },
     {
-      "name": "branch_unpredict",
-      "interp": [
-        "ok",
-        "b8"
-      ],
-      "jit-vreg": [
-        "ok",
-        "b8"
-      ],
-      "jit-slots": [
-        "ok",
-        "68"
-      ],
-      "cat": "DIVERGE"
+      "name": "inline_asm",
+      "cat": "NOCOMPILA"
     },
     {
-      "name": "memcpy_loop",
-      "interp": [
-        "ok",
-        "d2"
-      ],
-      "jit-vreg": [
-        "ok",
-        "d2"
-      ],
-      "jit-slots": [
-        "crash",
-        null
-      ],
-      "cat": "CRASH"
+      "name": "materia_demo",
+      "cat": "NOCOMPILA"
     },
     {
-      "name": "state_machine",
-      "interp": [
-        "ok",
-        "b7d4"
-      ],
-      "jit-vreg": [
-        "ok",
-        "b7d4"
-      ],
-      "jit-slots": [
-        "ok",
-        "7"
-      ],
-      "cat": "DIVERGE"
+      "name": "photonic_hello",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "photonic_jepa_learn",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "quantum_ghz",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "quantum_qft",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "quantum_teleport",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "solid_basic",
+      "cat": "NOCOMPILA"
+    },
+    {
+      "name": "solid_photonic",
+      "cat": "NOCOMPILA"
     }
   ]
 }

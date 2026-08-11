@@ -397,17 +397,19 @@ portables sin arrastrar la infraestructura nueva:
   regs[2..N] antes de `vrt_callvirt`.  Verificado: `add(d)` → 6, `inc(d)` con
   campos GC → 5 (antes basura), y `callvirt_hot` (10M callvirt) corre ~0.12s
   vs interp ~2.9s (~23× speedup) en Release.
-- **`benchmarks/intops_jit` crashea en JIT** (SIGSEGV `addr=0x0`, call a null)
-  aunque el intérprete lo maneja bien (interp puro exit 0).  Es el bench peak
-  del roadmap de Desmon (~600-800×).  Aislado al mínimo: un método con un loop
-  i32 que hace `a=(i64)i; b=(i64)(i+7); imin(a,b); abs(a-5000)` crashea; con un
-  solo SEXT, con i64 puro, o en `main` directo funciona.  El diagnóstico del
-  dispatch: el método NO se JIT-compila (no aparece en ir_lookup con la key del
-  maybe_compile_method, ni el disasm del método se genera) y el crash `addr=0x0`
-  ocurre en el callvirt → dispatch del método no-JIT-compilable (fallback al
-  mini-interp), que crashea con el patrón de vmath aunque el interp normal lo
-  ejecuta bien.  Pendiente de backend (el C2 con unroll a veces lo evita,
-  inestable).
+- **RESUELTO: `benchmarks/intops_jit` y los crashes de benchmarks con métodos**
+  (SIGSEGV `addr=0x0`, SIGILL exit 132, vtable vacía).  Causa raíz encontrada y
+  arreglada (2026-08-11): el optimizador de bytecode del linker
+  (`velb_linker_bytecode.cpp`, `optimize_modules`) eliminaba a ciegas los bytes
+  `0x90` del stream como si fueran NOPs, pero el opcode `0x90` NO existe en el
+  bytecode VM — un byte `0x90` es SIEMPRE parte de operandos legítimos (p.ej. el
+  byte `(r_src2<<4)` de un `adds3 rN,rN,r9` = `0x90`).  Eliminarlo corrompía el
+  bytecode: desalineaba el decode, el `defmethod` del `__module_init` quedaba
+  descarrilado (la clase quedaba sin vtable → callvirt a clase sin métodos →
+  `THREAD_ILLEGAL_INSTRUCTION`/exit 132 o call a null).  El fix elimina esa fase
+  del optimizer.  Afectaba a TODOS los métodos de clase que usan `r9` en operandos
+  (bitops, rotops, fp, polymorphic, pic_real, cmp_fusion, memcpy_loop,
+  state_machine, intops_jit y más) — todos resueltos con este único fix.
 
 ### Comparativa multi-lenguaje (workloads idénticos)
 

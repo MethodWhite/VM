@@ -322,12 +322,6 @@ static uint64_t vrt_run_callvirt_with_advices(runtime::ProcessVM *p,
                                               uint32_t vtbl_idx);
 
 uint64_t vrt_callvirt(vrt_proc *proc, uint8_t *obj_payload, uint32_t vtbl_idx) {
-    static std::atomic<int> _dbg_cv(0);
-    if (_dbg_cv.fetch_add(1) < 5) {
-        std::fprintf(stderr, "[DBG] vrt_callvirt proc=%p obj=%p vtbl=%u\n",
-                (void*)proc, (void*)obj_payload, (unsigned)vtbl_idx);
-        std::fflush(stderr);
-    }
     if (!proc || !obj_payload) {
         if (proc) {
             runtime::throw_fatal(as_proc(proc), VESTA_FATAL_NULL_POINTER,
@@ -413,12 +407,6 @@ uint64_t vrt_callvirt(vrt_proc *proc, uint8_t *obj_payload, uint32_t vtbl_idx) {
  */
 uint64_t vrt_callvirt_ic(vrt_proc *proc, uint8_t *obj_payload,
                           uint32_t vtbl_idx, uint64_t ic_slot_addr) {
-    static std::atomic<int> _dbg_cv2(0);
-    if (_dbg_cv2.fetch_add(1) < 5) {
-        std::fprintf(stderr, "[DBG] vrt_callvirt_ic proc=%p obj=%p vtbl=%u slot=0x%lx\n",
-                (void*)proc, (void*)obj_payload, (unsigned)vtbl_idx, (unsigned long)ic_slot_addr);
-        std::fflush(stderr);
-    }
     if (!proc || !obj_payload) {
         if (proc) {
             runtime::throw_fatal(as_proc(proc), VESTA_FATAL_NULL_POINTER,

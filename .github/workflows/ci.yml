@@ -155,3 +155,30 @@ jobs:
           src/ 2>&1 | tee cppcheck.log
         echo "cppcheck exit: ${PIPESTATUS[0]}"
         # El job es informativo; el CI principal (build+tests) es el gate.
+
+  # S-10 DevSecOps: fuzzing del JIT en CI.  Genera programas Vex aleatorios
+  # y compara interp vs JIT para detectar bugs de correccion/crash del codegen.
+  # Bloqueante: cualquier divergencia nueva del JIT falla el pipeline.
+  jit-fuzz:
+    name: JIT fuzz (S-10)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Build vm
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DVESTA_BUILD_STDLIB=ON
+          cmake --build build --target vm --parallel 2
+
+      - name: Run JIT fuzzer (40 iters, semilla fija)
+        run: |
+          python3 tools/jit_fuzzer.py ./build/vm --iters 40 --seed 9 --timeout 15 --no-slots --out /tmp/fuzz_ci
+          if ls /tmp/fuzz_ci/*.vex 2>/dev/null | grep -q .; then
+            echo "::error::El fuzzer encontro bugs del JIT. Revisar /tmp/fuzz_ci/"
+            exit 1
+          fi
+        timeout-minutes: 10

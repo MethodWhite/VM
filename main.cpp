@@ -2578,7 +2578,10 @@ int main(int argc, char *argv[]) {
 
 
                 for (auto &sched: vm->schedulers) {
-                    vesta::scout()
+                    /* S-08 CLI standard: el detalle de diagnostico va a
+                     * stderr, no a stdout.  stdout = datos pipeables;
+                     * stderr = mensajes. */
+                    vesta::scout(std::cerr)
                             << "[Scheduler " << sched->id_scheduler
                             << "] Estados de procesos: " << sched->ready_queue.size()
                             << " "
@@ -2588,14 +2591,14 @@ int main(int argc, char *argv[]) {
                             << " "
                             << sched->should_kill // indica si la instancia debe morir.
                             << std::endl;
-                    vesta::scout() << sched->to_string() << std::endl;
+                    vesta::scout(std::cerr) << sched->to_string() << std::endl;
                     for (auto &p: sched->processes) {
-                        vesta::scout()
+                        vesta::scout(std::cerr)
                                 << "\t[Process " << p->pid.local_pid
                                 << "] Estados de procesos: " << runtime::vm_state_to_str(p->state)
                                 << " "
                                 << std::endl;
-                        vesta::scout() << p->to_string() << std::endl;
+                        vesta::scout(std::cerr) << p->to_string() << std::endl;
                     }
                 }
 
@@ -2633,13 +2636,13 @@ int main(int argc, char *argv[]) {
                 }
                 vesta::scout() << "MIPS:          " << mips
                         << (active_time_ns > 0 ? "" : "  (wall time)") << "\n";
-                vesta::scout() << "\n=== OVERHEAD BREAKDOWN ===\n";
-                vesta::scout() << "VM construct:    " << ns_construct/1000 << " us\n";
-                vesta::scout() << "load_executable: " << ns_load/1000 << " us\n";
-                vesta::scout() << "vm.start:        " << ns_start/1000 << " us  (lanzar threads)\n";
-                vesta::scout() << "wait until done: " << ns_poll/1000 << " us  (cv wait)\n";
-                vesta::scout() << "vm.stop:         " << ns_stop/1000 << " us  (join threads)\n";
-                vesta::scout() << "Total --run:     " << ns_total_run/1000 << " us\n";
+                vesta::scout(std::cerr) << "\n=== OVERHEAD BREAKDOWN ===\n";
+                vesta::scout(std::cerr) << "VM construct:    " << ns_construct/1000 << " us\n";
+                vesta::scout(std::cerr) << "load_executable: " << ns_load/1000 << " us\n";
+                vesta::scout(std::cerr) << "vm.start:        " << ns_start/1000 << " us  (lanzar threads)\n";
+                vesta::scout(std::cerr) << "wait until done: " << ns_poll/1000 << " us  (cv wait)\n";
+                vesta::scout(std::cerr) << "vm.stop:         " << ns_stop/1000 << " us  (join threads)\n";
+                vesta::scout(std::cerr) << "Total --run:     " << ns_total_run/1000 << " us\n";
             }
 
             /* --jit-stats: imprimir contadores del JIT al final.

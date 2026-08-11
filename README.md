@@ -398,13 +398,16 @@ portables sin arrastrar la infraestructura nueva:
   campos GC → 5 (antes basura), y `callvirt_hot` (10M callvirt) corre ~0.12s
   vs interp ~2.9s (~23× speedup) en Release.
 - **`benchmarks/intops_jit` crashea en JIT** (SIGSEGV `addr=0x0`, call a null)
-  aunque el intérprete lo maneja bien.  Es el bench peak del roadmap de Desmon
-  (~600-800×).  Aislado al mínimo: un método con un loop i32 que hace
-  `a=(i64)i; b=(i64)(i+7); imin(a,b); abs(a-5000)` crashea; con un solo SEXT
-  (i32→i64), con i64 puro, o en `main` directo funciona.  El crash requiere
-  **`imin` con dos operandos SEXT + `abs`** dentro de un método JIT (vreg y
-  slots).  El `abs` con SUB previo tras un `imin` de SEXTs produce el call a
-  null.  Pendiente de backend (el C2 con unroll a veces lo evita, inestable).
+  aunque el intérprete lo maneja bien (interp puro exit 0).  Es el bench peak
+  del roadmap de Desmon (~600-800×).  Aislado al mínimo: un método con un loop
+  i32 que hace `a=(i64)i; b=(i64)(i+7); imin(a,b); abs(a-5000)` crashea; con un
+  solo SEXT, con i64 puro, o en `main` directo funciona.  El diagnóstico del
+  dispatch: el método NO se JIT-compila (no aparece en ir_lookup con la key del
+  maybe_compile_method, ni el disasm del método se genera) y el crash `addr=0x0`
+  ocurre en el callvirt → dispatch del método no-JIT-compilable (fallback al
+  mini-interp), que crashea con el patrón de vmath aunque el interp normal lo
+  ejecuta bien.  Pendiente de backend (el C2 con unroll a veces lo evita,
+  inestable).
 
 ### Comparativa multi-lenguaje (workloads idénticos)
 

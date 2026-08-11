@@ -399,12 +399,12 @@ portables sin arrastrar la infraestructura nueva:
   vs interp ~2.9s (~23× speedup) en Release.
 - **`benchmarks/intops_jit` crashea en JIT** (SIGSEGV `addr=0x0`, call a null)
   aunque el intérprete lo maneja bien.  Es el bench peak del roadmap de Desmon
-  (~600-800×).  Aislado: un método con **`imin`/`imax` + `abs`** (vmath ops
-  inline) en un loop crashea; `imin` solo o `imin+imax` funcionan, y el mismo
-  loop en `main` directo (sin clase/método) funciona.  El crash es específico
-  del `abs` (con SUB previo) combinado con otros vmath en un **método** JIT.
-  Reproduce en vreg y slots.  Pendiente de backend (el C2 con unroll a veces lo
-  evita, inestable).
+  (~600-800×).  Aislado al mínimo: un método con un loop i32 que hace
+  `a=(i64)i; b=(i64)(i+7); imin(a,b); abs(a-5000)` crashea; con un solo SEXT
+  (i32→i64), con i64 puro, o en `main` directo funciona.  El crash requiere
+  **`imin` con dos operandos SEXT + `abs`** dentro de un método JIT (vreg y
+  slots).  El `abs` con SUB previo tras un `imin` de SEXTs produce el call a
+  null.  Pendiente de backend (el C2 con unroll a veces lo evita, inestable).
 
 ### Comparativa multi-lenguaje (workloads idénticos)
 
